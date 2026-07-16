@@ -352,7 +352,7 @@ impl Transaction {
 const HNSW_MAX_NB_CONNECTION: usize = 16;
 const HNSW_MAX_LAYER: usize = 16;
 const HNSW_EF_CONSTRUCTION: usize = 200;
-const EF_SEARCH_DEFAULT: usize = 64;
+const EF_SEARCH_DEFAULT: usize = 32;
 const MIN_SELECTIVITY_FLOOR: f64 = 0.01;
 const MAX_EF_SCALE: f64 = 20.0;
 
