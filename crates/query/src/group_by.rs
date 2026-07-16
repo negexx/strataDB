@@ -236,7 +236,7 @@ fn build_result_batch(
 mod tests {
     use std::sync::Arc;
 
-    use arrow::array::{Int64Array, RecordBatch, StringArray};
+    use arrow::array::{Float64Array, Int64Array, RecordBatch, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
 
     use super::*;
@@ -279,5 +279,109 @@ mod tests {
             .collect();
         got.sort();
         assert_eq!(got, vec![("a".to_string(), 3), ("b".to_string(), 2)]);
+    }
+
+    #[test]
+    fn multi_column_grouping_and_multiple_agg_funcs() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("region", DataType::Utf8, false),
+            Field::new("category", DataType::Utf8, false),
+            Field::new("amount", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["east", "east", "west", "east"])),
+                Arc::new(StringArray::from(vec!["a", "a", "a", "b"])),
+                Arc::new(Int64Array::from(vec![10, 20, 30, 40])),
+            ],
+        )
+        .unwrap();
+
+        let result = group_by(
+            &batch,
+            &["region", "category"],
+            &[("amount", AggFunc::Sum), ("amount", AggFunc::Max)],
+        )
+        .unwrap();
+
+        assert_eq!(result.num_rows(), 3); // (east,a) (west,a) (east,b)
+        assert_eq!(result.num_columns(), 4); // region, category, amount_sum, amount_max
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn each_agg_func_computes_correctly_for_a_single_group() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Utf8, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["x", "x", "x"])),
+                Arc::new(Int64Array::from(vec![10, 20, 30])),
+            ],
+        )
+        .unwrap();
+
+        // Count's result column is Int64, not Float64 like every other
+        // AggFunc — COUNT is semantically an integer, and the reference
+        // implementation special-cases it in `build_result_batch` rather
+        // than uniformly emitting Float64 for every aggregate. Checked
+        // separately from the float-producing funcs below.
+        let count_result = group_by(&batch, &["k"], &[("v", AggFunc::Count)]).unwrap();
+        let count_values = count_result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(count_values.value(0), 3, "AggFunc::Count");
+
+        for (func, expected) in [
+            (AggFunc::Sum, 60.0),
+            (AggFunc::Min, 10.0),
+            (AggFunc::Max, 30.0),
+            (AggFunc::Avg, 20.0),
+        ] {
+            let result = group_by(&batch, &["k"], &[("v", func)]).unwrap();
+            let values = result
+                .column(1)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap();
+            assert_eq!(values.value(0), expected, "AggFunc::{func:?}");
+        }
+    }
+
+    #[test]
+    fn empty_group_cols_errors() {
+        let batch = sample_batch();
+        let result = group_by(&batch, &[], &[("amount", AggFunc::Count)]);
+        assert!(matches!(result, Err(ArrowError::InvalidArgumentError(_))));
+    }
+
+    #[test]
+    fn unknown_column_errors() {
+        let batch = sample_batch();
+        let result = group_by(&batch, &["not_a_column"], &[("amount", AggFunc::Count)]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn non_numeric_agg_column_errors() {
+        let batch = sample_batch();
+        let result = group_by(&batch, &["category"], &[("category", AggFunc::Sum)]);
+        assert!(matches!(result, Err(ArrowError::InvalidArgumentError(_))));
+    }
+
+    #[test]
+    fn count_on_non_numeric_column_succeeds() {
+        // Count must NOT require a numeric column — see Task 3's
+        // Accumulator/agg_arrays design note on why casting a Utf8 column
+        // to Float64 just to support Count would be wrong.
+        let batch = sample_batch();
+        let result = group_by(&batch, &["category"], &[("category", AggFunc::Count)]).unwrap();
+        assert_eq!(result.num_rows(), 2); // "a" and "b"
     }
 }
