@@ -1539,6 +1539,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "hnsw_rs",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
