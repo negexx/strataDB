@@ -109,4 +109,36 @@ mod tests {
         assert_eq!(encoded.num_rows(), 10);
         assert_eq!(encoded.schema_ref().field(0).name(), "name");
     }
+
+    #[test]
+    fn dictionary_encoding_round_trip_preserves_data() {
+        // Create a low-cardinality batch (100 rows, 2 distinct values)
+        let names: Vec<&str> = (0..100)
+            .map(|i| if i % 2 == 0 { "alice" } else { "bob" })
+            .collect();
+        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)]));
+        let original_batch =
+            RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(names))]).unwrap();
+
+        // Encode the batch
+        let encoded = encode_batch(&original_batch).unwrap();
+
+        // Write to file and read back
+        let dir = std::env::temp_dir().join(format!("strata-encoding-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.arrow");
+
+        crate::datafile::write_batch(&path, &encoded).unwrap();
+        let read_back = crate::datafile::read_batch(&path).unwrap();
+
+        // Cast the read-back column back to the original type for comparison
+        let read_column = read_back.column(0);
+        let cast_back = cast(read_column.as_ref(), &DataType::Utf8).unwrap();
+
+        // Compare with the original data
+        let original_array = original_batch.column(0);
+        assert_eq!(cast_back.as_ref(), original_array.as_ref());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
