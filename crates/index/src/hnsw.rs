@@ -10,6 +10,12 @@ use hnsw_rs::prelude::{DistL2, FilterT, Hnsw};
 /// query vector. `row_id` is the persistent, global identity from
 /// `.claude/docs/design/phase-0-transaction-and-format-spec.md` §8 — not a
 /// position within any particular array, unlike `brute_force::Neighbor`.
+///
+/// `squared_distance` is the sum of squared per-dimension differences (no
+/// square root), the same units as `brute_force::Neighbor::squared_distance`
+/// — `hnsw_rs`'s underlying `anndists::DistL2` returns true (non-squared)
+/// Euclidean distance, so `to_matches` squares it before constructing this
+/// struct.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VectorMatch {
     pub row_id: u64,
@@ -155,9 +161,22 @@ impl HnswIndex {
 
     fn to_matches(raw: Vec<hnsw_rs::prelude::Neighbour>) -> Vec<VectorMatch> {
         raw.into_iter()
-            .map(|n| VectorMatch {
-                row_id: Self::to_row_id(n.get_origin_id()),
-                squared_distance: n.get_distance(),
+            .map(|n| {
+                // `anndists::DistL2::eval` (the distance fn passed to
+                // `Hnsw::new`) computes true (non-squared) Euclidean L2
+                // distance for f32 — verified against the installed
+                // `anndists-0.1.5` source, where `eval` ends in
+                // `norm.sqrt()`. Squaring here restores the squared-L2
+                // units `VectorMatch::squared_distance` promises, matching
+                // `brute_force::Neighbor::squared_distance`'s units.
+                // Squaring is monotonic for non-negative inputs, so it
+                // can't change which neighbors were found or their
+                // relative order — only the reported magnitude.
+                let distance = n.get_distance();
+                VectorMatch {
+                    row_id: Self::to_row_id(n.get_origin_id()),
+                    squared_distance: distance * distance,
+                }
             })
             .collect()
     }
@@ -430,6 +449,38 @@ mod tests {
             "the returned row must be a genuine near-cluster neighbor, not a \
              fallback to the far cluster: {results:?}"
         );
+    }
+
+    #[test]
+    fn search_reports_squared_l2_distance_not_plain_l2() {
+        // `anndists::DistL2::eval` returns true (non-squared) Euclidean
+        // distance for f32 — verified against the installed
+        // `anndists-0.1.5` source. A single point lets us hand-compute the
+        // exact expected value and catch a regression to plain L2, which a
+        // relative-ordering-only test (as above) cannot: a 3-4-5 triangle
+        // gives distance 5.0 but squared distance 25.0, and those two
+        // values are different enough that a `sqrt` vs. no-`sqrt` bug
+        // can't accidentally pass.
+        let index = HnswIndex::new(
+            TEST_MAX_NB_CONNECTION,
+            100,
+            TEST_MAX_LAYER,
+            TEST_EF_CONSTRUCTION,
+        )
+        .unwrap();
+        index.insert(0, &[0.0, 0.0, 0.0]);
+
+        let results = index.search(&[3.0, 4.0, 0.0], 1, TEST_EF_SEARCH).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].row_id, 0);
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(
+                results[0].squared_distance, 25.0,
+                "expected squared L2 distance (3^2 + 4^2 = 25), not plain L2 \
+                 distance (sqrt(25) = 5): {results:?}"
+            );
+        }
     }
 
     #[test]
