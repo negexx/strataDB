@@ -12,7 +12,9 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, RecordBatch};
 use arrow::compute::{cast, concat_batches};
 use arrow::datatypes::SchemaRef;
-use strata_storage::{Manifest, commit_manifest, read_batch, read_current, write_batch};
+use strata_storage::{
+    DataFileEntry, Manifest, commit_manifest, compute_stats, read_batch, read_current, write_batch,
+};
 
 use crate::error::{Result, TxnError};
 
@@ -68,11 +70,11 @@ impl Dataset {
         self.dir.join("data")
     }
 
-    /// Data file names (relative to `data_dir()`) belonging to the current
+    /// Data file entries (name + per-column stats) belonging to the current
     /// version. Exposed for tests that need to inspect the raw on-disk
     /// representation directly.
     #[must_use]
-    pub fn data_files(&self) -> &[String] {
+    pub fn data_files(&self) -> &[DataFileEntry] {
         &self.manifest.data_files
     }
 
@@ -104,8 +106,8 @@ impl Dataset {
             .manifest
             .data_files
             .iter()
-            .map(|name| {
-                let batch = read_batch(&data_dir.join(name))?;
+            .map(|entry| {
+                let batch = read_batch(&data_dir.join(&entry.name))?;
                 cast_batch_to_schema(&batch, schema)
             })
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -151,10 +153,17 @@ impl Transaction {
         std::fs::create_dir_all(&data_dir)?;
 
         for (i, batch) in self.pending.iter().enumerate() {
+            // Stats computed on the original, pre-encoding batch — see
+            // .claude/docs/design/phase-3-query-refinement-spec.md §1 for why
+            // (logical values, no dictionary-decode step needed later).
+            let stats = compute_stats(batch);
             let encoded = strata_storage::encode_batch(batch)?;
             let file_name = format!("{new_version:020}-{i}.arrow");
             write_batch(&data_dir.join(&file_name), &encoded)?;
-            manifest.data_files.push(file_name);
+            manifest.data_files.push(DataFileEntry {
+                name: file_name,
+                stats,
+            });
         }
         manifest.version = new_version;
 
@@ -246,7 +255,7 @@ mod tests {
 
         // Confirm the file really was dictionary-encoded, so this test
         // can't silently stop testing the regression it exists to catch.
-        let on_disk = read_batch(&ds.data_dir().join(&ds.data_files()[0])).unwrap();
+        let on_disk = read_batch(&ds.data_dir().join(&ds.data_files()[0].name)).unwrap();
         assert!(
             matches!(
                 on_disk.schema_ref().field(0).data_type(),
@@ -312,6 +321,27 @@ mod tests {
     }
 
     #[test]
+    fn commit_computes_and_stores_column_stats() {
+        let dir = temp_dir("commit-stats");
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let ds = Dataset::create(&dir).unwrap();
+
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![30, 10, 20]))])
+                .unwrap();
+        let mut txn = ds.begin();
+        txn.insert(batch);
+        let ds = txn.commit().unwrap();
+
+        let entry = &ds.data_files()[0];
+        let id_stats = entry.stats.get("id").unwrap();
+        assert_eq!(id_stats.min, strata_storage::Value::Int64(10));
+        assert_eq!(id_stats.max, strata_storage::Value::Int64(30));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn low_cardinality_column_is_dictionary_encoded_on_commit() {
         use arrow::array::StringArray;
         use arrow::datatypes::DataType;
@@ -331,7 +361,7 @@ mod tests {
         // reading the file directly proves the *durable* representation is
         // encoded, not just an in-memory artifact).
         let data_dir = ds.data_dir();
-        let file_name = &ds.data_files()[0];
+        let file_name = &ds.data_files()[0].name;
         let on_disk = strata_storage::read_batch(&data_dir.join(file_name)).unwrap();
         assert!(matches!(
             on_disk.schema_ref().field(0).data_type(),
