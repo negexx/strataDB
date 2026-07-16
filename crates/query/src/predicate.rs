@@ -246,4 +246,108 @@ mod tests {
             &Predicate::GtEq("id".to_string(), Value::Int64(200))
         ));
     }
+
+    #[test]
+    fn should_scan_file_lteq_prunes_when_value_below_range() {
+        let mut stats = HashMap::new();
+        stats.insert(
+            "id".to_string(),
+            ColumnStats {
+                min: Value::Int64(100),
+                max: Value::Int64(200),
+            },
+        );
+        // LtEq(id, 50): no value in [100, 200] is <= 50 -> should prune.
+        assert!(!should_scan_file(
+            &stats,
+            &Predicate::LtEq("id".to_string(), Value::Int64(50))
+        ));
+    }
+
+    #[test]
+    fn should_scan_file_lteq_scans_at_boundary() {
+        let mut stats = HashMap::new();
+        stats.insert(
+            "id".to_string(),
+            ColumnStats {
+                min: Value::Int64(100),
+                max: Value::Int64(200),
+            },
+        );
+        // LtEq(id, 100): 100 <= 100 -> the boundary value qualifies, must scan.
+        assert!(should_scan_file(
+            &stats,
+            &Predicate::LtEq("id".to_string(), Value::Int64(100))
+        ));
+    }
+
+    #[test]
+    fn should_scan_file_lt_scans_when_value_could_match() {
+        let mut stats = HashMap::new();
+        stats.insert(
+            "id".to_string(),
+            ColumnStats {
+                min: Value::Int64(100),
+                max: Value::Int64(200),
+            },
+        );
+        // Lt(id, 150): 100 < 150 -> some value in range qualifies, must scan.
+        assert!(should_scan_file(
+            &stats,
+            &Predicate::Lt("id".to_string(), Value::Int64(150))
+        ));
+    }
+
+    #[test]
+    fn should_scan_file_gt_scans_when_value_could_match() {
+        let mut stats = HashMap::new();
+        stats.insert(
+            "id".to_string(),
+            ColumnStats {
+                min: Value::Int64(100),
+                max: Value::Int64(200),
+            },
+        );
+        // Gt(id, 150): 200 > 150 -> some value in range qualifies, must scan.
+        assert!(should_scan_file(
+            &stats,
+            &Predicate::Gt("id".to_string(), Value::Int64(150))
+        ));
+    }
+
+    #[test]
+    fn should_scan_file_gteq_prunes_when_value_above_range() {
+        let mut stats = HashMap::new();
+        stats.insert(
+            "id".to_string(),
+            ColumnStats {
+                min: Value::Int64(100),
+                max: Value::Int64(200),
+            },
+        );
+        // GtEq(id, 250): no value in [100, 200] is >= 250 -> should prune.
+        assert!(!should_scan_file(
+            &stats,
+            &Predicate::GtEq("id".to_string(), Value::Int64(250))
+        ));
+    }
+
+    #[test]
+    fn should_scan_file_fails_open_on_value_variant_mismatch() {
+        let mut stats = HashMap::new();
+        stats.insert(
+            "id".to_string(),
+            ColumnStats {
+                min: Value::Int64(100),
+                max: Value::Int64(200),
+            },
+        );
+        // Eq(id, "x"): a Utf8 predicate value against Int64-typed stats -
+        // the discriminant guard must fail open rather than trust derived
+        // PartialOrd's cross-variant, declaration-order comparison.
+        assert!(should_scan_file(
+            &stats,
+            &Predicate::Eq("id".to_string(), Value::Utf8("x".to_string()))
+        ));
+    }
 }
