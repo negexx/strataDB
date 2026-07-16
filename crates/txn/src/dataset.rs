@@ -66,6 +66,14 @@ impl Dataset {
         self.dir.join("data")
     }
 
+    /// Data file names (relative to `data_dir()`) belonging to the current
+    /// version. Exposed for tests that need to inspect the raw on-disk
+    /// representation directly.
+    #[must_use]
+    pub fn data_files(&self) -> &[String] {
+        &self.manifest.data_files
+    }
+
     /// Reads every committed row as a single `RecordBatch`. Phase 1 has no
     /// per-fragment scan pushdown — see `crates/query` and Phase 2/3 of the
     /// roadmap for real vectorized scan.
@@ -123,8 +131,9 @@ impl Transaction {
         std::fs::create_dir_all(&data_dir)?;
 
         for (i, batch) in self.pending.iter().enumerate() {
+            let encoded = strata_storage::encode_batch(batch)?;
             let file_name = format!("{new_version:020}-{i}.arrow");
-            write_batch(&data_dir.join(&file_name), batch)?;
+            write_batch(&data_dir.join(&file_name), &encoded)?;
             manifest.data_files.push(file_name);
         }
         manifest.version = new_version;
@@ -202,6 +211,35 @@ mod tests {
         let _ds = Dataset::create(&dir).unwrap();
         let result = Dataset::create(&dir);
         assert!(matches!(result, Err(TxnError::AlreadyExists(_))));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn low_cardinality_column_is_dictionary_encoded_on_commit() {
+        use arrow::array::StringArray;
+        use arrow::datatypes::DataType;
+
+        let dir = temp_dir("encode-on-commit");
+        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)]));
+        let ds = Dataset::create(&dir).unwrap();
+
+        let names: Vec<&str> = vec!["x"; 20]; // single distinct value, well under threshold
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(names))]).unwrap();
+        let mut txn = ds.begin();
+        txn.insert(batch);
+        let ds = txn.commit().unwrap();
+
+        // Read the raw written file back directly (bypassing Dataset::scan's
+        // concat_batches, which would already show us the encoded type, but
+        // reading the file directly proves the *durable* representation is
+        // encoded, not just an in-memory artifact).
+        let data_dir = ds.data_dir();
+        let file_name = &ds.data_files()[0];
+        let on_disk = strata_storage::read_batch(&data_dir.join(file_name)).unwrap();
+        assert!(matches!(
+            on_disk.schema_ref().field(0).data_type(),
+            DataType::Dictionary(_, _)
+        ));
         std::fs::remove_dir_all(&dir).ok();
     }
 }
