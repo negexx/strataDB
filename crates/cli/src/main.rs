@@ -50,7 +50,7 @@ fn main() -> ExitCode {
 fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
     let Some(cmd) = args.get(1) else {
         eprintln!(
-            "usage: strata <create|insert|scan|filter|search|inspect|crash-loop> <dir> [...]"
+            "usage: strata <create|insert|scan|filter|search|inspect|explain|crash-loop> <dir> [...]"
         );
         return Ok(());
     };
@@ -126,6 +126,9 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
                 batch.num_rows()
             );
         }
+        "explain" => {
+            handle_explain(dir, args)?;
+        }
         "crash-loop" => {
             let n: usize = args.get(3).ok_or("missing <num_commits>")?.parse()?;
             let mut ds = strata_txn::Dataset::open(dir)?;
@@ -157,6 +160,41 @@ fn print_batch(batch: &RecordBatch) -> Result<(), Box<dyn Error>> {
         .ok_or("name column has wrong type")?;
     for i in 0..batch.num_rows() {
         println!("  id={} name={}", ids.value(i), names.value(i));
+    }
+    Ok(())
+}
+
+fn handle_explain(dir: &str, args: &[String]) -> Result<(), Box<dyn Error>> {
+    let column = args.get(3).ok_or("missing <column>")?;
+    let op = args.get(4).ok_or("missing <op: eq|lt|lteq|gt|gteq>")?;
+    let value: i64 = args.get(5).ok_or("missing <value>")?.parse()?;
+    let predicate = match op.as_str() {
+        "eq" => strata_query::Predicate::Eq(column.clone(), strata_storage::Value::Int64(value)),
+        "lt" => strata_query::Predicate::Lt(column.clone(), strata_storage::Value::Int64(value)),
+        "lteq" => {
+            strata_query::Predicate::LtEq(column.clone(), strata_storage::Value::Int64(value))
+        }
+        "gt" => strata_query::Predicate::Gt(column.clone(), strata_storage::Value::Int64(value)),
+        "gteq" => {
+            strata_query::Predicate::GtEq(column.clone(), strata_storage::Value::Int64(value))
+        }
+        other => {
+            return Err(format!("unknown op: {other} (expected eq|lt|lteq|gt|gteq)").into());
+        }
+    };
+    let ds = strata_txn::Dataset::open(dir)?;
+    let result = ds.explain(&predicate);
+    println!(
+        "total_files={} scanned={} skipped={}",
+        result.total_files,
+        result.scanned.len(),
+        result.skipped.len()
+    );
+    for name in &result.scanned {
+        println!("  scan:  {name}");
+    }
+    for name in &result.skipped {
+        println!("  skip:  {name}");
     }
     Ok(())
 }
