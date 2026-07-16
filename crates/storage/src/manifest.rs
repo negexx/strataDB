@@ -10,6 +10,7 @@
 //! mechanism the Phase 1 "kill -9 mid-write, restart, recover last
 //! committed version" MVP checklist item tests.
 
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -17,13 +18,25 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, StorageError};
+use crate::stats::ColumnStats;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// One committed data file's name and the per-column statistics computed
+/// for it at commit time — see
+/// `.claude/docs/design/phase-3-query-refinement-spec.md` §1.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DataFileEntry {
+    /// Relative to the dataset's `data/` directory.
+    pub name: String,
+    /// Column name -> stats. Absent key means "no stats for this column in
+    /// this file" (non-orderable type, or all-null) — never a wrong entry.
+    pub stats: HashMap<String, ColumnStats>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
     pub version: u64,
-    /// Data file names (relative to the dataset's `data/` directory),
-    /// accumulated across every committed version so far.
-    pub data_files: Vec<String>,
+    /// Accumulated across every committed version so far.
+    pub data_files: Vec<DataFileEntry>,
 }
 
 impl Manifest {
@@ -148,12 +161,24 @@ mod tests {
         let dir = temp_dataset_dir("roundtrip");
         let m0 = Manifest {
             version: 0,
-            data_files: vec!["a.arrow".to_string()],
+            data_files: vec![DataFileEntry {
+                name: "a.arrow".to_string(),
+                stats: HashMap::new(),
+            }],
         };
         commit_manifest(&dir, &m0).unwrap();
         let m1 = Manifest {
             version: 1,
-            data_files: vec!["a.arrow".to_string(), "b.arrow".to_string()],
+            data_files: vec![
+                DataFileEntry {
+                    name: "a.arrow".to_string(),
+                    stats: HashMap::new(),
+                },
+                DataFileEntry {
+                    name: "b.arrow".to_string(),
+                    stats: HashMap::new(),
+                },
+            ],
         };
         commit_manifest(&dir, &m1).unwrap();
 
@@ -170,7 +195,10 @@ mod tests {
         let dir = temp_dataset_dir("crash-sim");
         let m0 = Manifest {
             version: 0,
-            data_files: vec!["a.arrow".to_string()],
+            data_files: vec![DataFileEntry {
+                name: "a.arrow".to_string(),
+                stats: HashMap::new(),
+            }],
         };
         commit_manifest(&dir, &m0).unwrap();
 
