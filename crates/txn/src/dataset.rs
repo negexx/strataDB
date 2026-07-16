@@ -6,12 +6,13 @@
 //! before adding real conflict detection here; this API is shaped so Phase 6
 //! can slot it in without a rewrite, but it is not implemented yet.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, RecordBatch, UInt64Array};
+use arrow::array::{Array, ArrayRef, RecordBatch, UInt64Array};
 use arrow::compute::{cast, concat_batches};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use strata_index::{DeltaEntry, HnswIndex, read_delta_log, write_delta_log};
 use strata_query::{Predicate, filter, should_scan_file};
 use strata_storage::{
     DataFileEntry, Manifest, commit_manifest, compute_stats, read_batch, read_current, write_batch,
@@ -30,6 +31,10 @@ pub const ROW_ID_COLUMN: &str = "_row_id";
 pub struct Dataset {
     dir: PathBuf,
     manifest: Manifest,
+    // Read by `Dataset::vector_search`, landing in Task 5 (same crate, same
+    // struct) — not read anywhere yet, hence the lint suppression.
+    #[allow(dead_code)]
+    index: HnswIndex,
 }
 
 /// The outcome of [`Dataset::explain`] — which files a predicate would
@@ -58,7 +63,12 @@ impl Dataset {
         std::fs::create_dir_all(dir.join("data"))?;
         let manifest = Manifest::empty();
         commit_manifest(&dir, &manifest)?;
-        Ok(Self { dir, manifest })
+        let index = new_hnsw_index(0)?;
+        Ok(Self {
+            dir,
+            manifest,
+            index,
+        })
     }
 
     /// Opens an existing dataset, recovering to the last successfully
@@ -75,7 +85,12 @@ impl Dataset {
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self> {
         let dir = dir.into();
         let manifest = read_current(&dir)?.ok_or_else(|| TxnError::NotFound(dir.clone()))?;
-        Ok(Self { dir, manifest })
+        let index = replay_index(&dir, &manifest)?;
+        Ok(Self {
+            dir,
+            manifest,
+            index,
+        })
     }
 
     #[must_use]
@@ -239,9 +254,15 @@ impl Transaction {
             let encoded = strata_storage::encode_batch(&with_row_id)?;
             let file_name = format!("{new_version:020}-{i}.arrow");
             write_batch(&data_dir.join(&file_name), &encoded)?;
+
+            let deltas = build_delta_entries(batch, row_id_base)?;
+            let delta_file_name = format!("{new_version:020}-{i}.deltalog");
+            write_delta_log(&data_dir.join(&delta_file_name), &deltas)?;
+
             manifest.data_files.push(DataFileEntry {
                 name: file_name,
                 stats,
+                delta_log: delta_file_name,
             });
         }
         manifest.version = new_version;
@@ -256,11 +277,106 @@ impl Transaction {
 
         commit_manifest(&self.dir, &manifest)?;
 
+        // Rebuilt from the just-committed manifest's full delta-log history
+        // (the same path `Dataset::open` uses), not carried over from the
+        // base `Dataset` the transaction started from — this is what
+        // guarantees the returned `Dataset`'s index can never diverge from
+        // what a fresh `open()` of the same directory would produce.
+        let index = replay_index(&self.dir, &manifest)?;
+
         Ok(Dataset {
             dir: self.dir,
             manifest,
+            index,
         })
     }
+}
+
+// HNSW parameter defaults — small, correctness-only values for now.
+// Task 7's benchmark is what tunes the real production defaults; see
+// .claude/rules/vector-index.md ("tuned via benchmarks, not guessed").
+const HNSW_MAX_NB_CONNECTION: usize = 16;
+const HNSW_MAX_LAYER: usize = 16;
+const HNSW_EF_CONSTRUCTION: usize = 200;
+
+fn new_hnsw_index(capacity: usize) -> Result<HnswIndex> {
+    Ok(HnswIndex::new(
+        HNSW_MAX_NB_CONNECTION,
+        capacity.max(1),
+        HNSW_MAX_LAYER,
+        HNSW_EF_CONSTRUCTION,
+    )?)
+}
+
+/// Rebuilds a fresh `HnswIndex` by replaying every delta-log entry across
+/// every committed data file in `manifest`, in order. Used by both
+/// `Dataset::open` (crash recovery) and `Transaction::commit` (so a
+/// newly-committed `Dataset`'s index can never diverge from what a fresh
+/// `open()` of the same directory would produce) — see
+/// `.claude/rules/vector-index.md` ("index lives inside the same
+/// transaction boundary as row data").
+///
+/// # Errors
+///
+/// Returns an error if any delta-log file listed in `manifest` fails to
+/// read or parse.
+fn replay_index(dir: &Path, manifest: &Manifest) -> Result<HnswIndex> {
+    let capacity = usize::try_from(manifest.next_row_id).unwrap_or(usize::MAX);
+    let mut index = new_hnsw_index(capacity)?;
+    let data_dir = dir.join("data");
+    for entry in &manifest.data_files {
+        for delta in read_delta_log(&data_dir.join(&entry.delta_log))? {
+            match delta {
+                DeltaEntry::Insert { row_id, vector } => index.insert(row_id, &vector),
+                DeltaEntry::Tombstone { row_id } => index.tombstone(row_id),
+            }
+        }
+    }
+    Ok(index)
+}
+
+/// Builds one `Insert` delta-log entry per row in `batch` with a non-null
+/// vector, keyed by the row-ids assigned starting at `row_id_base` — see
+/// `.claude/docs/design/phase-4-vector-index-spec.md` §2. A `batch` with no
+/// `"vector"` column at all (a table with no vector column defined) simply
+/// produces no entries — that's not an error, unlike a `"vector"` column
+/// present with the wrong type, which is.
+///
+/// # Errors
+///
+/// Returns an error if `batch` has a `"vector"` column that isn't a
+/// `FixedSizeList<Float32>`.
+fn build_delta_entries(batch: &RecordBatch, row_id_base: u64) -> Result<Vec<DeltaEntry>> {
+    let Ok(vec_idx) = batch.schema_ref().index_of("vector") else {
+        return Ok(Vec::new());
+    };
+    let vectors = batch
+        .column(vec_idx)
+        .as_any()
+        .downcast_ref::<arrow::array::FixedSizeListArray>()
+        .ok_or_else(|| {
+            TxnError::Arrow(arrow::error::ArrowError::CastError(
+                "vector column must be FixedSizeList".to_string(),
+            ))
+        })?;
+
+    let mut entries = Vec::with_capacity(vectors.len());
+    for i in 0..vectors.len() {
+        if vectors.is_null(i) {
+            continue;
+        }
+        let row = vectors.value(i);
+        let row: &arrow::array::Float32Array = row.as_any().downcast_ref().ok_or_else(|| {
+            TxnError::Arrow(arrow::error::ArrowError::CastError(
+                "vector column's inner type must be Float32".to_string(),
+            ))
+        })?;
+        entries.push(DeltaEntry::Insert {
+            row_id: row_id_base + u64::try_from(i)?,
+            vector: row.values().to_vec(),
+        });
+    }
+    Ok(entries)
 }
 
 /// Casts every column of `batch` to the corresponding field type in
@@ -623,6 +739,51 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(ids.value(0), 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reopening_a_dataset_rebuilds_the_vector_index_from_the_delta_log() {
+        let dir = temp_dir("delta-log-replay");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 3),
+                false,
+            ),
+        ]));
+        let ds = Dataset::create(&dir).unwrap();
+
+        let ids = Arc::new(Int64Array::from(vec![1, 2]));
+        let item_field = Arc::new(Field::new("item", DataType::Float32, false));
+        let values = Arc::new(arrow::array::Float32Array::from(vec![
+            0.0, 0.0, 0.0, // row 0's vector
+            9.0, 9.0, 9.0, // row 1's vector
+        ]));
+        let vectors = Arc::new(arrow::array::FixedSizeListArray::new(
+            item_field, 3, values, None,
+        ));
+        let batch = RecordBatch::try_new(schema, vec![ids, vectors]).unwrap();
+
+        let mut txn = ds.begin();
+        txn.insert(batch);
+        let ds = txn.commit().unwrap();
+        drop(ds);
+
+        // Force a real replay from disk, not an in-memory shortcut — this is
+        // the crash-recovery-equivalent test for the index (a fresh Dataset
+        // struct, same process, but the index cache is definitely rebuilt from
+        // the delta-log file, not carried over).
+        let reopened = Dataset::open(&dir).unwrap();
+        let results = reopened.vector_search(&[0.0, 0.0, 0.0], 1, None).unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].row_id, 0,
+            "row 0's vector [0,0,0] is the true nearest match"
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }

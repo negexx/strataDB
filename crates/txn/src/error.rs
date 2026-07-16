@@ -16,6 +16,8 @@ pub enum TxnError {
     NotFound(PathBuf),
     #[error("row count overflowed u64: {0}")]
     TryFromInt(#[from] std::num::TryFromIntError),
+    #[error(transparent)]
+    Index(#[from] strata_index::IndexError),
 }
 
 pub type Result<T> = std::result::Result<T, TxnError>;
