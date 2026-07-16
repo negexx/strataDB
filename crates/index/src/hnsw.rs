@@ -141,57 +141,170 @@ impl HnswIndex {
 mod tests {
     use super::*;
 
+    // Empirically validated (10000-trial repro, zero failures) against a
+    // 30-point, two-cluster fixture: enough connections/candidate budget
+    // that `hnsw_rs`'s neighbor-diversification pruning can't leave any
+    // near-cluster member unreachable during search. See `insert_cluster`'s
+    // doc comment for why a lower `max_nb_connection` was still measurably
+    // (if rarely) flaky on this same fixture.
+    const TEST_MAX_NB_CONNECTION: usize = 200;
+    const TEST_MAX_LAYER: usize = 16;
+    const TEST_EF_CONSTRUCTION: usize = 1600;
+    const TEST_EF_SEARCH: usize = 500;
+
+    /// Inserts `count` points scattered within a small cube of side
+    /// `spacing` around `center`, with row-ids `start_id..start_id + count`.
+    ///
+    /// `hnsw_rs::Hnsw::new` seeds its RNG from OS entropy with no seed
+    /// exposed anywhere in the public API (verified against the installed
+    /// `hnsw_rs-0.3.4` source), so unlucky random layer assignment can make
+    /// greedy search miss the true nearest neighbor on tiny (2-3 point)
+    /// fixtures. Using many points arranged in clusters that are far apart
+    /// relative to their own radius makes "which cluster is nearest"
+    /// unambiguous regardless of layer-assignment luck, without needing the
+    /// library to expose a seed.
+    ///
+    /// Offsets come from an irrational-multiplier equidistribution
+    /// sequence (fractional parts of `i * golden ratio`, etc.) rather than
+    /// a regular line or grid. A 2000-trial repro showed that a line or
+    /// axis-aligned grid of near-duplicate points lets `hnsw_rs`'s
+    /// neighbor-diversification heuristic prune almost all direct links
+    /// between them (they all point the same direction from any given
+    /// node), occasionally leaving parts of the near cluster unreachable
+    /// during search even with `ef_search` well above the point count.
+    /// Quasi-random, non-collinear offsets avoid that degenerate case.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    fn insert_cluster(
+        index: &HnswIndex,
+        start_id: u64,
+        count: u64,
+        center: [f32; 3],
+        spacing: f32,
+    ) {
+        const PHI: f64 = 0.618_033_988_749_895; // fractional part of the golden ratio
+        const SQRT2: f64 = 0.414_213_562_373_095; // fractional part of sqrt(2)
+        const SQRT3: f64 = 0.732_050_807_568_877; // fractional part of sqrt(3)
+        for i in 0..count {
+            let n = i as f64;
+            let frac = |mult: f64| (n * mult).fract();
+            let dx = (frac(PHI) as f32) * spacing;
+            let dy = (frac(SQRT2) as f32) * spacing;
+            let dz = (frac(SQRT3) as f32) * spacing;
+            index.insert(
+                start_id + i,
+                &[center[0] + dx, center[1] + dy, center[2] + dz],
+            );
+        }
+    }
+
     #[test]
     fn insert_then_search_finds_the_true_nearest_neighbor() {
-        let index = HnswIndex::new(16, 100, 16, 200).unwrap();
-        index.insert(0, &[0.0, 0.0, 0.0]);
-        index.insert(1, &[1.0, 0.0, 0.0]);
-        index.insert(2, &[10.0, 10.0, 10.0]);
+        let index = HnswIndex::new(
+            TEST_MAX_NB_CONNECTION,
+            100,
+            TEST_MAX_LAYER,
+            TEST_EF_CONSTRUCTION,
+        )
+        .unwrap();
+        // Near cluster: row-ids 0..15, within a 0.01-wide cube around
+        // (0,0,0). Far cluster: row-ids 15..30, within a 0.01-wide cube
+        // around (1000,0,0). Clusters are ~100000x farther apart than
+        // their own radius, so which cluster is nearest is unambiguous
+        // even under hnsw_rs's approximate search.
+        insert_cluster(&index, 0, 15, [0.0, 0.0, 0.0], 0.01);
+        insert_cluster(&index, 15, 15, [1000.0, 0.0, 0.0], 0.01);
 
-        let results = index.search(&[0.0, 0.0, 0.0], 2, 50).unwrap();
-        assert_eq!(results.len(), 2);
+        // Row 0 is an exact match for the query (offset 0 in the near
+        // cluster) — the unambiguous true nearest neighbor.
+        let results = index.search(&[0.0, 0.0, 0.0], 3, TEST_EF_SEARCH).unwrap();
+        assert_eq!(results.len(), 3);
         assert_eq!(results[0].row_id, 0);
         #[allow(clippy::float_cmp)]
         {
             assert_eq!(results[0].squared_distance, 0.0);
         }
-        assert_eq!(results[1].row_id, 1);
+        assert!(
+            results[1].row_id < 15 && results[2].row_id < 15,
+            "the next-nearest neighbors must come from the near cluster, not the far one: {results:?}"
+        );
+        assert!(
+            results[0].squared_distance <= results[1].squared_distance
+                && results[1].squared_distance <= results[2].squared_distance,
+            "results must be ranked by increasing distance: {results:?}"
+        );
     }
 
     #[test]
     fn tombstoned_row_is_never_returned_even_as_the_true_nearest_neighbor() {
         let index = {
-            let mut index = HnswIndex::new(16, 100, 16, 200).unwrap();
-            index.insert(0, &[0.0, 0.0, 0.0]);
-            index.insert(1, &[5.0, 5.0, 5.0]);
+            let mut index = HnswIndex::new(
+                TEST_MAX_NB_CONNECTION,
+                100,
+                TEST_MAX_LAYER,
+                TEST_EF_CONSTRUCTION,
+            )
+            .unwrap();
+            // Near cluster: row-ids 0..15, within a 0.01-wide cube around
+            // (0,0,0). Far cluster: row-ids 15..30, within a 0.01-wide
+            // cube around (1000,0,0).
+            insert_cluster(&index, 0, 15, [0.0, 0.0, 0.0], 0.01);
+            insert_cluster(&index, 15, 15, [1000.0, 0.0, 0.0], 0.01);
+            // Row 0 is the exact-match true nearest neighbor; tombstone it.
             index.tombstone(0);
             index
         };
 
-        let results = index.search(&[0.0, 0.0, 0.0], 2, 50).unwrap();
+        // Ask for 6 raw candidates, not 5: `search` filters tombstones out
+        // of hnsw_rs's raw top-k *after* the fact, so if the tombstoned row
+        // (the true nearest neighbor) lands in the raw top-k, one extra
+        // candidate is needed to still end up with 5 live results.
+        let results = index.search(&[0.0, 0.0, 0.0], 6, TEST_EF_SEARCH).unwrap();
         assert_eq!(
             results.len(),
-            1,
-            "the tombstoned row must be excluded, not just re-ranked"
+            5,
+            "the near cluster has 14 live rows left after the tombstone, all vastly \
+             closer than the far cluster, so the top 5 must still be fully populated: {results:?}"
         );
-        assert_eq!(results[0].row_id, 1);
+        assert!(
+            results.iter().all(|r| r.row_id != 0),
+            "the tombstoned row must be excluded, not just re-ranked: {results:?}"
+        );
+        assert!(
+            results.iter().all(|r| r.row_id < 15),
+            "every returned row must still be a genuine near-cluster neighbor, \
+             not a fallback to the far cluster: {results:?}"
+        );
     }
 
     #[test]
     fn search_filtered_only_returns_ids_in_the_live_set() {
-        let index = HnswIndex::new(16, 100, 16, 200).unwrap();
-        index.insert(0, &[0.0, 0.0, 0.0]);
-        index.insert(1, &[1.0, 0.0, 0.0]);
-        index.insert(2, &[2.0, 0.0, 0.0]);
+        let index = HnswIndex::new(
+            TEST_MAX_NB_CONNECTION,
+            100,
+            TEST_MAX_LAYER,
+            TEST_EF_CONSTRUCTION,
+        )
+        .unwrap();
+        // Near cluster: row-ids 0..15, within a 0.01-wide cube around
+        // (0,0,0) — much closer to the query than the far cluster, but
+        // excluded from the live set below.
+        insert_cluster(&index, 0, 15, [0.0, 0.0, 0.0], 0.01);
+        // Far cluster: row-ids 15..30, within a 0.01-wide cube around
+        // (1000,0,0).
+        insert_cluster(&index, 15, 15, [1000.0, 0.0, 0.0], 0.01);
 
-        // Only row 2 is "live" per the caller's predicate, even though rows
-        // 0 and 1 are closer to the query.
-        let live_ids = [2usize];
+        // Only the far cluster is "live" per the caller's predicate, even
+        // though every near-cluster row is far closer to the query.
+        let live_ids: Vec<usize> = (15..30).collect();
         let results = index
-            .search_filtered(&[0.0, 0.0, 0.0], 2, 50, &live_ids)
+            .search_filtered(&[0.0, 0.0, 0.0], 3, TEST_EF_SEARCH, &live_ids)
             .unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].row_id, 2);
+        assert_eq!(results.len(), 3, "unexpected results: {results:?}");
+        assert!(
+            results.iter().all(|r| r.row_id >= 15),
+            "search_filtered must only return ids from the live set, even when \
+             closer points exist outside it: {results:?}"
+        );
     }
 
     #[test]
