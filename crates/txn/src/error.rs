@@ -18,6 +18,10 @@ pub enum TxnError {
     TryFromInt(#[from] std::num::TryFromIntError),
     #[error(transparent)]
     Index(#[from] strata_index::IndexError),
+    #[error(
+        "row {row_id}'s vector contains a non-finite component (NaN or Infinity) — cannot be committed"
+    )]
+    NonFiniteVectorComponent { row_id: u64 },
 }
 
 pub type Result<T> = std::result::Result<T, TxnError>;

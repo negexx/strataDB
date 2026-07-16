@@ -284,9 +284,16 @@ impl Transaction {
     ///
     /// # Errors
     ///
-    /// Returns an error if any pending batch fails to dictionary-encode
-    /// (see `strata_storage::encode_batch`) or write durably, or if the
-    /// manifest commit's atomic rename fails.
+    /// Returns [`TxnError::NonFiniteVectorComponent`] if any pending batch's
+    /// vector column contains a `NaN`/`Infinity` component — checked, and
+    /// rejected, before any file for that batch is written to disk. Also
+    /// returns an error if any pending batch fails to dictionary-encode (see
+    /// `strata_storage::encode_batch`) or write durably, if rebuilding the
+    /// vector index from the (already-written) delta-log history fails, or
+    /// if the manifest commit's atomic rename fails. The index rebuild runs
+    /// before the manifest commit, so any of these failures leaves the
+    /// manifest unadvanced — the new data/delta-log files are orphaned on
+    /// disk but never made visible, the same as an interrupted crash.
     pub fn commit(self) -> Result<Dataset> {
         let mut manifest = self.base_manifest;
         let new_version = manifest.version + 1;
@@ -302,6 +309,13 @@ impl Transaction {
 
             let num_rows = u64::try_from(batch.num_rows())?;
             let row_id_base = manifest.next_row_id;
+
+            // Extracts (and validates — rejects non-finite vector
+            // components) this batch's delta-log entries before anything is
+            // written to disk for it. A batch that fails validation here
+            // must leave no trace: no data file, no delta-log file, and
+            // manifest.next_row_id must not have been advanced yet either.
+            let deltas = build_delta_entries(batch, row_id_base)?;
             manifest.next_row_id += num_rows;
             let with_row_id = append_row_id_column(batch, row_id_base, num_rows)?;
 
@@ -309,7 +323,6 @@ impl Transaction {
             let file_name = format!("{new_version:020}-{i}.arrow");
             write_batch(&data_dir.join(&file_name), &encoded)?;
 
-            let deltas = build_delta_entries(batch, row_id_base)?;
             let delta_file_name = format!("{new_version:020}-{i}.deltalog");
             write_delta_log(&data_dir.join(&delta_file_name), &deltas)?;
 
@@ -329,14 +342,20 @@ impl Transaction {
         // these files visible to a future reader.
         strata_storage::sync_dir(&data_dir)?;
 
-        commit_manifest(&self.dir, &manifest)?;
-
-        // Rebuilt from the just-committed manifest's full delta-log history
-        // (the same path `Dataset::open` uses), not carried over from the
-        // base `Dataset` the transaction started from — this is what
-        // guarantees the returned `Dataset`'s index can never diverge from
-        // what a fresh `open()` of the same directory would produce.
+        // Rebuilt from `manifest`'s full delta-log history (the same path
+        // `Dataset::open` uses), not carried over from the base `Dataset`
+        // the transaction started from — this is what guarantees the
+        // returned `Dataset`'s index can never diverge from what a fresh
+        // `open()` of the same directory would produce. Deliberately runs
+        // *before* `commit_manifest`: every file it reads is already
+        // durably written and fsynced above, so nothing here depends on the
+        // manifest CAS having happened yet, and if the rebuild fails, the
+        // manifest must never advance — otherwise a caller sees `Err` from
+        // `commit()` while the write is already durably visible to any
+        // future `Dataset::open`, with no way to undo it.
         let index = replay_index(&self.dir, &manifest)?;
+
+        commit_manifest(&self.dir, &manifest)?;
 
         Ok(Dataset {
             dir: self.dir,
@@ -418,10 +437,20 @@ fn replay_index(dir: &Path, manifest: &Manifest) -> Result<HnswIndex> {
 /// produces no entries — that's not an error, unlike a `"vector"` column
 /// present with the wrong type, which is.
 ///
+/// Also rejects any row whose vector contains a non-finite (`NaN`/`Infinity`)
+/// component: the delta log is serialized as JSON (`serde_json`), which
+/// silently encodes non-finite `f32`s as `null` and then fails to parse them
+/// back — letting one through here would durably commit a row that
+/// permanently breaks every future `replay_index` (including the very one
+/// `Transaction::commit` runs on its own return path). Must run before any
+/// file for this batch is written to disk — see the call site in
+/// `Transaction::commit`.
+///
 /// # Errors
 ///
 /// Returns an error if `batch` has a `"vector"` column that isn't a
-/// `FixedSizeList<Float32>`.
+/// `FixedSizeList<Float32>`, or if any row's vector contains a non-finite
+/// component.
 fn build_delta_entries(batch: &RecordBatch, row_id_base: u64) -> Result<Vec<DeltaEntry>> {
     let Ok(vec_idx) = batch.schema_ref().index_of("vector") else {
         return Ok(Vec::new());
@@ -447,8 +476,12 @@ fn build_delta_entries(batch: &RecordBatch, row_id_base: u64) -> Result<Vec<Delt
                 "vector column's inner type must be Float32".to_string(),
             ))
         })?;
+        let row_id = row_id_base + u64::try_from(i)?;
+        if row.values().iter().any(|component| !component.is_finite()) {
+            return Err(TxnError::NonFiniteVectorComponent { row_id });
+        }
         entries.push(DeltaEntry::Insert {
-            row_id: row_id_base + u64::try_from(i)?,
+            row_id,
             vector: row.values().to_vec(),
         });
     }
@@ -982,6 +1015,134 @@ mod tests {
         assert_eq!(
             results[0].row_id, 0,
             "row 0's vector [0,0,0] is the true nearest match"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn committing_a_batch_with_a_non_finite_vector_component_is_rejected_cleanly() {
+        // Regression test for the Phase 4 final-review finding: a
+        // non-finite (NaN/Infinity) vector component used to durably
+        // commit — serde_json silently encodes it as JSON `null` — and
+        // then permanently brick the dataset, since every future
+        // replay_index (including Dataset::open) would fail to parse that
+        // `null` back into an f32. Must now be rejected upfront, before any
+        // file for the offending batch is written to disk, leaving no
+        // trace: no manifest advance, no orphaned-but-referenced files.
+        let dir = temp_dir("non-finite-vector-rejected");
+        let ds = Dataset::create(&dir).unwrap();
+
+        let batch = vector_batch(vec![1, 2], vec![[0.0, 0.0, 0.0], [f32::NAN, 1.0, 1.0]]);
+        let mut txn = ds.begin();
+        txn.insert(batch);
+        let result = txn.commit();
+
+        match result {
+            Err(TxnError::NonFiniteVectorComponent { row_id }) => {
+                assert_eq!(row_id, 1, "row-id 1 (the second row) carries the NaN");
+            }
+            Err(other) => {
+                panic!("expected NonFiniteVectorComponent, got a different error: {other}")
+            }
+            Ok(_) => panic!("commit of a NaN vector component must not succeed"),
+        }
+
+        // The rejected commit must have left no trace: the manifest never
+        // advanced, and the dataset still opens and scans cleanly
+        // afterward — not a permanently bricked dataset.
+        let reopened = Dataset::open(&dir).unwrap();
+        assert_eq!(reopened.current_version(), 0);
+        assert!(reopened.data_files().is_empty());
+
+        let scanned = reopened.scan(&vector_test_schema()).unwrap();
+        assert_eq!(scanned.num_rows(), 0);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn row_ids_stay_disjoint_across_multiple_pending_batches_in_one_transaction() {
+        let dir = temp_dir("row-id-multi-batch-txn");
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let ds = Dataset::create(&dir).unwrap();
+
+        let first = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![10, 20]))],
+        )
+        .unwrap();
+        let second =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![30, 40, 50]))])
+                .unwrap();
+
+        let mut txn = ds.begin();
+        txn.insert(first);
+        txn.insert(second);
+        let ds = txn.commit().unwrap();
+
+        let data_dir = ds.data_dir();
+        let first_on_disk = read_batch(&data_dir.join(&ds.data_files()[0].name)).unwrap();
+        let second_on_disk = read_batch(&data_dir.join(&ds.data_files()[1].name)).unwrap();
+
+        let row_id_col = |batch: &RecordBatch| -> Vec<u64> {
+            let idx = batch.schema_ref().index_of(ROW_ID_COLUMN).unwrap();
+            let arr = batch
+                .column(idx)
+                .as_any()
+                .downcast_ref::<arrow::array::UInt64Array>()
+                .unwrap();
+            (0..arr.len()).map(|i| arr.value(i)).collect()
+        };
+
+        assert_eq!(row_id_col(&first_on_disk), vec![0, 1]);
+        assert_eq!(row_id_col(&second_on_disk), vec![2, 3, 4]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn vector_search_with_predicate_skips_pruned_files() {
+        use strata_query::Predicate;
+        use strata_storage::Value;
+
+        // Mirrors explain_reports_skipped_files_by_range's fixture shape
+        // (two commits with disjoint id ranges, so should_scan_file prunes
+        // one file entirely for an id=2 predicate), but with a vector
+        // column so this also exercises row_ids_matching's file-pruning
+        // branch on the vector_search path, not just explain().
+        let dir = temp_dir("vector-search-file-pruning");
+        let ds = Dataset::create(&dir).unwrap();
+
+        let low = vector_batch(vec![1, 1], vec![[0.0, 0.0, 0.0], [0.01, 0.01, 0.01]]);
+        let mut txn = ds.begin();
+        txn.insert(low);
+        let ds = txn.commit().unwrap();
+
+        let high = vector_batch(
+            vec![2, 2],
+            vec![[1000.0, 1000.0, 1000.0], [1000.01, 1000.01, 1000.01]],
+        );
+        let mut txn = ds.begin();
+        txn.insert(high);
+        let ds = txn.commit().unwrap();
+
+        // Sanity: the id=1 file's stats don't overlap id=2's, so explain()
+        // must confirm one file is prunable for this predicate — otherwise
+        // this test wouldn't actually exercise the pruning branch.
+        let predicate = Predicate::Eq("id".to_string(), Value::Int64(2));
+        let explain = ds.explain(&predicate);
+        assert_eq!(explain.scanned.len(), 1);
+        assert_eq!(explain.skipped.len(), 1);
+
+        let results = ds
+            .vector_search(&[1000.0, 1000.0, 1000.0], 2, Some(&predicate))
+            .unwrap();
+
+        assert_eq!(results.len(), 2, "unexpected results: {results:?}");
+        assert!(
+            results.iter().all(|r| r.row_id >= 2),
+            "only the surviving (id=2) file's rows may be considered: {results:?}"
         );
 
         std::fs::remove_dir_all(&dir).ok();

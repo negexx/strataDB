@@ -120,3 +120,7 @@ Follows Phase 2's established `check_correctness`-before-timing pattern (`bench/
 - IVF-PQ or any second index type (project-wide non-goal, `.claude/docs/architecture.md`)
 - Distributed/multi-node index sharding (project-wide non-goal)
 - A `Dataset::get_by_row_id` convenience lookup (not needed until a caller profile shows it matters)
+
+## 12. Known limitations
+
+`Transaction::commit()` currently rebuilds the entire `HnswIndex` via full delta-log replay (`replay_index`) on every commit, not an incremental insert of just the new commit's vectors, because `HnswIndex` isn't `Clone` and `Transaction` doesn't hold the base `Dataset`'s index. This makes commit cost O(total historical inserts) rather than O(commit size), contradicting this spec's own §10 cost model (which describes the O(commit size) cost as the delta log's whole point). Accepted for Phase 4 — no commit-throughput SLA exists yet, and it doesn't affect Task 7's benchmark (§6), which measures `vector_search`, not commit cost — but must be revisited before Phase 5/6 introduce real concurrent-commit throughput expectations. A proper fix likely means sharing the index via `Arc` with real snapshot-isolation design work (does an already-open `Dataset` handle see a concurrently-committed transaction's new vectors immediately, or only after its own next `open`?) — that decision belongs to Phase 5/6's design, not a quick patch here.
