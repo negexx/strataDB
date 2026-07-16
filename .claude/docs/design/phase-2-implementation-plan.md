@@ -714,10 +714,10 @@ members = [
 Add to `[workspace.dependencies]`:
 
 ```toml
-criterion = "0.7"
+criterion = "0.8"
 ```
 
-**Before using this version number:** verify `criterion`'s current major version is still `0.7` at implementation time the same way every other new dependency in this codebase has been checked (`https://crates.io/crates/criterion` or a WebSearch) — do not assume it's still current without checking, per this project's own established practice (Rust toolchain audit ADR 0004/0005).
+(Verified current as of this plan's writing: 0.8.2, released 2026-02-04, supports the last three stable Rust minor releases — well within this project's MSRV floor. If significant time has passed since this plan was written, re-verify at `https://crates.io/crates/criterion` before trusting this version — do not assume it's still current, per this project's own established practice, ADR 0004/0005.)
 
 `bench/Cargo.toml`:
 
