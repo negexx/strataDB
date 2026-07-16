@@ -76,8 +76,46 @@ Adapted from Lance's on-disk layout, since Lance is explicitly named as the stor
 ## 7. Open questions for Phase 1 (not blocking, but flag before implementing)
 
 - Exact on-disk encoding of the row-id → conflict-set mapping used during §3.2's walk (in-memory ring buffer of recent commits, à la FDB's 5-second resolver window, is the likely shape — needs a retention-window decision: how far back must a live transaction be able to look?).
-- Exact wire format of the vector-index delta-log entries referenced in §6's manifest (depends on `crates/index/`'s real implementation, which doesn't exist yet — see `.claude/rules/vector-index.md`).
-- Whether the row-id conflict-set and the manifest's data-file list need to be stored together or can be derived from each other at commit-check time — an implementation detail that doesn't change this spec's guarantees either way.
+- ~~Exact wire format of the vector-index delta-log entries referenced in §6's manifest~~ — resolved by §8, added ahead of Phase 4.
+- ~~Whether the row-id conflict-set and the manifest's data-file list need to be stored together or can be derived from each other~~ — resolved by §8: row-id is now a defined, first-class concept (a `next_row_id` counter alongside `version` in the manifest), not an implementation detail deferred to commit-check time.
+
+## 8. Row-ID definition and lifecycle (added ahead of Phase 4)
+
+**Status:** added via `llm-council` review before Phase 4 (Vector Index) implementation — see `.superpowers/council/council-transcript-20260716-174711.md` for the full deliberation. §4 already presumed a "row-id (or a stable primary-key-derived id)" existed for conflict detection; this section supplies the definition §4 deferred, driven by Phase 4's more immediate need to key HNSW insertions by something stable.
+
+**Definition.** A row-id is a **logical identity**, not a physical location or user data. Every row, from the moment it is inserted until it is deleted (not merely superseded by an update), has exactly one row-id for its entire lifetime:
+
+- A `u64`, assigned monotonically at commit time from a `next_row_id: u64` counter stored in the manifest alongside `version`.
+- Global across the dataset's entire history — never reset, never reused, even after the row it names is later deleted.
+- Independent of any user-supplied column data (rejected: reusing a user `id` column — see the council transcript's Contrarian/First-Principles analysis on why this is a category error, not a shortcut).
+
+**Assignment timing and atomicity.** The counter is claimed as part of §3 step 4 (the atomic manifest CAS), not as a separate operation before or after it. A commit writing N rows atomically: (a) claims the contiguous range `[next_row_id, next_row_id + N)` for its rows, (b) advances `next_row_id` by N, and (c) swaps the manifest pointer — all as one CAS, the same choke point every commit already serializes through per §3. This adds no new contention.
+
+If the CAS fails and the transaction retries per §3 step 5, the row-ids provisionally claimed by the failed attempt are discarded, never reused — a fresh range is claimed on the successful retry. Row-ids are therefore monotonically increasing in successful-commit order but may have gaps; **gaps are safe, reuse is forbidden** (a reused row-id could collide with a still-live row's HNSW graph entry and silently corrupt search results — exactly the failure mode this project's flagship correctness claim exists to rule out). This mirrors how `Manifest.version` already behaves on abort. Per `.claude/rules/concurrency-txn-layer.md`, the counter-bump-plus-CAS step needs a `loom` interleaving test proving it is genuinely atomic under concurrent commit attempts before Phase 6 lands — not deferred, since Phase 4 is where this code is first written.
+
+**Provisional ids within one transaction.** A transaction buffers rows locally before `commit()` and does not know their final row-ids until the commit's CAS succeeds (the base could shift if another commit lands first). While buffered, each row has a transaction-local, zero-based provisional index (0, 1, 2, ... in insertion order within that transaction). At commit, once the real base is claimed, provisional index `i` resolves to real row-id `claimed_base + i`. Any future in-transaction self-reference to "the row I just inserted" resolves through this offset mapping, never through a value read back from disk mid-transaction.
+
+**UPDATE semantics (not yet implemented, but must not be precluded).** Strata's API today (Phases 1-4) is insert/scan/filter/search only — there is no UPDATE. When one is added (Phase 5/6 territory), it is defined as: the row-id is preserved; physically it is a tombstone of the row-id's previous vector-index entry plus a fresh row insert carrying the *same* row-id and new values. The row-id is never reassigned by an UPDATE — this is the concrete meaning of "row-id is logical identity." `Dataset::scan`'s existing visibility rule (§2) already determines which of a row-id's physical versions across commits is current for a given manifest version; no new mechanism is needed.
+
+**DELETE semantics (not yet implemented, but must not be precluded).** A DELETE is a tombstone entry for the row's row-id with no successor insert. The row-id is retired permanently — never reassigned, even after Phase 8 compaction reclaims the physical bytes.
+
+**Vector-index delta-log entry shape** (resolves the wire-format question from §7, and the "vector-index delta-log entries belonging to this version" reference in §6): a delta-log entry is one of:
+
+```
+Insert    { row_id: u64, vector: Vec<f32> }   // row_id's embedding enters the graph for the first time
+Tombstone { row_id: u64 }                     // row_id's current graph entry is logically removed
+          // (used for DELETE, and as the first half of an UPDATE's tombstone-then-insert pair)
+```
+
+Each commit's delta-log entries are written to their own append-only file, mirroring `crates/storage`'s per-commit data files, and referenced from the manifest for that version. The exact byte-level encoding (bincode vs. a small custom binary layout) is Phase 4 implementation detail, not a spec-level decision — the tagged-enum-keyed-by-row-id shape above is.
+
+**Recovery / graph reconstruction.** `Dataset::open` (or the first vector-search call) replays every committed delta-log entry, across all committed versions up to the current manifest version, in commit order, into a fresh in-memory `hnsw_rs::Hnsw`: `Insert` entries call `hnsw.insert((&vector, row_id_as_usize))`; `Tombstone` entries are recorded in an in-memory tombstone set. Per `hnsw_rs`'s no-in-place-mutation constraint (confirmed against the installed `hnsw_rs-0.3.4` source — there is no node-removal API), a tombstoned row's graph node physically remains until Phase 8 compaction rebuilds the graph from only-live rows; until then, tombstoned row-ids are filtered out of search results at query time via the same `FilterT` mechanism used for predicate-filtered ANN (a tombstone-membership check composed with any caller-supplied predicate filter).
+
+**HNSW label space (`u64` row-id vs. `usize` graph label).** `hnsw_rs::Hnsw::insert` takes a plain `usize` id. Strata's row-id is `u64`. On the 64-bit platforms this project builds and tests for (no 32-bit target exists in CI), `usize` is 64 bits and the row-id passes through directly via a checked `u64::try_from`/`usize::try_from` conversion at the two call sites (`insert`, and reading `Neighbour::get_origin_id()` back) — no separate mapping table is needed. If a 32-bit target is ever added, this conversion becomes fallible there and must return a typed error, never silently truncate; the checked conversion already makes this the default behavior, so no change is needed when that day comes, only a decision about what the error should do.
+
+**Conflict-detection key (Phase 5/6 forward reference).** Row-id as defined here — global, monotonic, logical, permanent — is exactly the identifier §4 already presumed existed for row-level conflict detection. No change to §4 is needed; this section supplies the definition §4 left open.
+
+**Tombstone GC — explicitly deferred, not designed here.** Reclaiming a tombstoned row's physical storage (columnar bytes) and HNSW graph node is Phase 8 compaction's responsibility, not Phase 4-6's. Phase 4-6 code must not assume a tombstoned row is ever physically removed before compaction runs: `scan`, `search`, and (later) conflict detection must all treat a tombstoned row-id as dead regardless of whether its bytes are still on disk.
 
 ---
 
