@@ -10,6 +10,9 @@ use arrow::compute::filter_record_batch;
 use arrow::compute::kernels::cmp::eq;
 use arrow::error::ArrowError;
 
+pub mod group_by;
+pub use group_by::{AggFunc, group_by};
+
 /// Returns the rows of `batch` where `column` equals `value`.
 ///
 /// # Errors

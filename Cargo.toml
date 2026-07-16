@@ -7,6 +7,7 @@ members = [
     "crates/query",
     "crates/bindings",
     "crates/cli",
+    "bench",
 ]
 
 [workspace.package]
@@ -16,6 +17,7 @@ rust-version = "1.90"
 
 [workspace.dependencies]
 arrow = "58"
+criterion = "0.8"
 hnsw_rs = "0.3"
 pyo3 = { version = "0.29", features = ["extension-module"] }
 serde = { version = "1", features = ["derive"] }

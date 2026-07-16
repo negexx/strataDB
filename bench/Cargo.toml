@@ -1,0 +1,20 @@
+[package]
+name = "strata-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+arrow.workspace = true
+strata-query = { path = "../crates/query" }
+
+[dev-dependencies]
+criterion = { workspace = true, features = ["html_reports"] }
+
+[[bench]]
+name = "group_by_bench"
+harness = false
