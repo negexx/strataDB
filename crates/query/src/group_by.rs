@@ -19,6 +19,13 @@ pub enum AggFunc {
     Avg,
 }
 
+/// The result of an aggregation, preserving type information end-to-end.
+#[derive(Debug, Clone, Copy)]
+enum AggValue {
+    Int(i64),
+    Float(f64),
+}
+
 /// One row's running aggregate state for a single `(column, AggFunc)` pair.
 #[derive(Debug, Clone, Copy)]
 enum Accumulator {
@@ -53,18 +60,19 @@ impl Accumulator {
         }
     }
 
-    fn finish(self) -> f64 {
+    fn finish(self) -> AggValue {
         match self {
             Self::Count(n) => {
-                #[allow(clippy::cast_precision_loss)]
-                let n = n as f64;
-                n
+                // Counts cannot realistically exceed i64::MAX in an in-memory batch.
+                #[allow(clippy::cast_possible_wrap)]
+                let n = n as i64;
+                AggValue::Int(n)
             }
-            Self::Sum(s) | Self::Min(s) | Self::Max(s) => s,
+            Self::Sum(s) | Self::Min(s) | Self::Max(s) => AggValue::Float(s),
             Self::Avg { sum, count } => {
                 #[allow(clippy::cast_precision_loss)]
                 let count = count as f64;
-                sum / count
+                AggValue::Float(sum / count)
             }
         }
     }
@@ -169,7 +177,7 @@ fn build_result_batch(
     let borrowed_keys: Vec<_> = owned_keys.iter().map(OwnedRow::row).collect();
     let group_columns = converter.convert_rows(borrowed_keys)?;
 
-    let mut agg_columns: Vec<Vec<f64>> = vec![Vec::with_capacity(groups.len()); aggs.len()];
+    let mut agg_columns: Vec<Vec<AggValue>> = vec![Vec::with_capacity(groups.len()); aggs.len()];
     for key in &owned_keys {
         let accs = &groups[key];
         for (col, acc) in agg_columns.iter_mut().zip(accs) {
@@ -190,8 +198,15 @@ fn build_result_batch(
                 DataType::Int64,
                 false,
             ));
-            #[allow(clippy::cast_possible_truncation)]
-            let counts: Vec<i64> = values.iter().map(|v| *v as i64).collect();
+            let counts: Vec<i64> = values
+                .iter()
+                .map(|v| match v {
+                    AggValue::Int(n) => *n,
+                    AggValue::Float(_) => {
+                        unreachable!("Count aggregation should produce Int, not Float")
+                    }
+                })
+                .collect();
             columns.push(Arc::new(Int64Array::from(counts)));
         } else {
             fields.push(Field::new(
@@ -199,7 +214,16 @@ fn build_result_batch(
                 DataType::Float64,
                 false,
             ));
-            columns.push(Arc::new(Float64Array::from(values)));
+            let floats: Vec<f64> = values
+                .iter()
+                .map(|v| match v {
+                    AggValue::Float(f) => *f,
+                    AggValue::Int(_) => {
+                        unreachable!("Non-Count aggregation should produce Float, not Int")
+                    }
+                })
+                .collect();
+            columns.push(Arc::new(Float64Array::from(floats)));
         }
     }
 
