@@ -201,43 +201,52 @@ fn build_result_batch(
         .collect();
     let mut columns: Vec<ArrayRef> = group_columns;
     for ((name, func), values) in aggs.iter().zip(agg_columns) {
-        if matches!(func, AggFunc::Count) {
-            fields.push(Field::new(
-                format!("{name}_{func:?}").to_lowercase(),
-                DataType::Int64,
-                false,
-            ));
-            let counts: Vec<i64> = values
-                .iter()
-                .map(|v| match v {
-                    AggValue::Int(n) => *n,
-                    AggValue::Float(_) => {
-                        unreachable!("Count aggregation should produce Int, not Float")
-                    }
-                })
-                .collect();
-            columns.push(Arc::new(Int64Array::from(counts)));
-        } else {
-            fields.push(Field::new(
-                format!("{name}_{func:?}").to_lowercase(),
-                DataType::Float64,
-                false,
-            ));
-            let floats: Vec<f64> = values
-                .iter()
-                .map(|v| match v {
-                    AggValue::Float(f) => *f,
-                    AggValue::Int(_) => {
-                        unreachable!("Non-Count aggregation should produce Float, not Int")
-                    }
-                })
-                .collect();
-            columns.push(Arc::new(Float64Array::from(floats)));
-        }
+        let (field, array) = finish_agg_column(values, name, *func);
+        fields.push(field);
+        columns.push(array);
     }
 
     let schema = Arc::new(Schema::new(fields));
     RecordBatch::try_new(schema, columns)
+}
+
+/// Converts one aggregate column's finished values into an Arrow field +
+/// array, per [`AggFunc`]: `Count` produces `Int64`, every other `AggFunc`
+/// produces `Float64` — both `unreachable!()` arms below hold because
+/// `Accumulator::finish()` guarantees that mapping.
+fn finish_agg_column(values: Vec<AggValue>, name: &str, func: AggFunc) -> (Field, ArrayRef) {
+    let field_name = format!("{name}_{func:?}").to_lowercase();
+    if matches!(func, AggFunc::Count) {
+        let counts: Vec<i64> = values
+            .into_iter()
+            .map(|v| match v {
+                AggValue::Int(n) => n,
+                // Accumulator::finish()'s Count arm guarantees this.
+                AggValue::Float(_) => {
+                    unreachable!("Count aggregation should produce Int, not Float")
+                }
+            })
+            .collect();
+        (
+            Field::new(field_name, DataType::Int64, false),
+            Arc::new(Int64Array::from(counts)),
+        )
+    } else {
+        let floats: Vec<f64> = values
+            .into_iter()
+            .map(|v| match v {
+                AggValue::Float(f) => f,
+                // Accumulator::finish()'s non-Count arms guarantee this.
+                AggValue::Int(_) => {
+                    unreachable!("Non-Count aggregation should produce Float, not Int")
+                }
+            })
+            .collect();
+        (
+            Field::new(field_name, DataType::Float64, false),
+            Arc::new(Float64Array::from(floats)),
+        )
+    }
 }
 
 #[cfg(test)]
