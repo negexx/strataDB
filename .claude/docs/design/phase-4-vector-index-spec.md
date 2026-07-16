@@ -11,23 +11,32 @@
 A thin wrapper around `hnsw_rs::prelude::Hnsw<f32, DistL2>` (squared L2 — matching `brute_force_search`'s existing distance semantics from Phase 1, so recall@10 is an apples-to-apples comparison against the same metric):
 
 ```rust
+pub struct VectorMatch {
+    pub row_id: u64,
+    pub squared_distance: f32,
+}
+
 pub struct HnswIndex {
     hnsw: Hnsw<'static, f32, DistL2>,
     tombstones: HashSet<u64>,  // row-ids logically removed; graph nodes remain until Phase 8 compaction
 }
 
 impl HnswIndex {
-    pub fn new(max_nb_connection: usize, ef_construction: usize, max_elements: usize) -> Self;
+    pub fn new(max_nb_connection: usize, max_elements: usize, max_layer: usize, ef_construction: usize) -> Result<Self, IndexError>;
     pub fn insert(&self, row_id: u64, vector: &[f32]);
     pub fn tombstone(&mut self, row_id: u64);
-    pub fn search(&self, query: &[f32], k: usize, ef_search: usize) -> Vec<Neighbour>;
-    pub fn search_filtered(&self, query: &[f32], k: usize, ef_search: usize, live_ids: &[usize]) -> Vec<Neighbour>;
+    pub fn search(&self, query: &[f32], k: usize, ef_search: usize) -> Vec<VectorMatch>;
+    pub fn search_filtered(&self, query: &[f32], k: usize, ef_search: usize, live_ids: &[usize]) -> Vec<VectorMatch>;
 }
 ```
 
+`VectorMatch` is a distinct type from Phase 1's `brute_force::Neighbour` — deliberately, not an oversight. `Neighbour.row_index` means "position within the specific array passed to that call"; `VectorMatch.row_id` means the persistent, global row-id (§8 of the Phase 0 spec). Reusing `Neighbour` for both would let a caller silently misinterpret a global identity as a local array position (or vice versa) depending on which search path produced it — reusing the name is the actual footgun here, not the extra type.
+
 `insert`/`tombstone` are the two operations the delta-log replay (§2) drives — `HnswIndex` itself has no file I/O and no manifest awareness; it is a pure in-memory index, matching `hnsw_rs`'s own scope. `search`/`search_filtered` both apply the tombstone set as an implicit filter (a tombstoned row-id is never returned, whether or not a caller-supplied predicate is present) — `search_filtered`'s `live_ids` parameter is the *predicate*-matching set; tombstones are subtracted from it before the call reaches `hnsw_rs`, so `hnsw_rs`'s `FilterT` only ever sees genuinely live, predicate-matching ids.
 
-`max_nb_connection`, `ef_construction` defaults are tuned via the benchmark in §6, not guessed, per `.claude/rules/vector-index.md`. `max_elements` is sized from the dataset's current row count at `Dataset::open` time (§2), with headroom for the session's inserts — `hnsw_rs`'s `Hnsw::new` takes this as a fixed capacity hint, not a hard cap enforced elsewhere.
+`new`'s parameter order matches `hnsw_rs::Hnsw::new(max_nb_connection, max_elements, max_layer, ef_construction, dist)` exactly (verified against the installed `hnsw_rs-0.3.4` source — `max_elements` is the second parameter, not the third, and the crate does not re-export a builder that would make this order self-documenting at the call site). `new` returns `Result`, not `Self`, because `hnsw_rs::Hnsw::new` calls `std::process::exit(1)` — not a panic, an unconditional, uncatchable process termination — when `max_nb_connection > 256`. `HnswIndex::new` must validate this bound itself and return a typed `IndexError` before ever reaching the library call, or a bad config kills the whole process instead of surfacing as a normal error.
+
+`max_nb_connection`, `ef_construction` defaults are tuned via the benchmark in §6, not guessed, per `.claude/rules/vector-index.md`. `max_elements` is sized from the dataset's current row count at `Dataset::open` time (§2), with headroom for the session's inserts — confirmed against the installed source that this is purely a `Vec::with_capacity` hint per graph layer (`PointIndexation::new`), not a hard cap: exceeding it costs a reallocation, never panics or silently drops data.
 
 ## 2. Delta log integration (`crates/txn`)
 
@@ -43,14 +52,14 @@ pub fn vector_search(
     query: &[f32],
     k: usize,
     predicate: Option<&Predicate>,
-) -> Result<Vec<Neighbour>>
+) -> Result<Vec<VectorMatch>>
 ```
 
 Without a predicate: `self.index.search(query, k, EF_SEARCH_DEFAULT)`.
 
-With a predicate: resolve the predicate-matching row-id set via `scan_with_predicate` (Phase 3, already returns exactly the rows a predicate matches — this reuses that path rather than re-implementing row-level filtering inside the index layer), extract their row-ids, sort them (needed for `hnsw_rs`'s built-in `impl FilterT for Vec<usize>`, which binary-searches), widen `ef_search` per §4, then `self.index.search_filtered(query, k, ef_widened, &live_ids)`.
+With a predicate: resolve the predicate-matching row-id set (an internal helper reading each surviving file's raw on-disk batch — which already carries the hidden `_row_id` column written at commit time per §2's write path — and applying `strata_query::filter` to it directly, rather than going through the public `scan_with_predicate`, whose caller-supplied logical schema never includes `_row_id` and would drop it), sort the resulting ids (needed for `hnsw_rs`'s built-in `impl FilterT for Vec<usize>`, which binary-searches), widen `ef_search` per §4, then `self.index.search_filtered(query, k, ef_widened, &live_ids)`.
 
-`Neighbour` (re-exported from `crates/index`, same shape Phase 1's `brute_force_search` already returns — `row_id` via `get_origin_id()`, distance via `get_distance()`) is returned as-is; `Dataset` does not translate row-ids back to user-facing column values — that's the caller's job (`scan` + a row-id lookup, or a future `Dataset::get_by_row_id` if profiling shows this path matters — not built now, YAGNI).
+`VectorMatch` (§1) is returned as-is; `Dataset` does not translate row-ids back to user-facing column values — that's the caller's job (`scan` + a row-id lookup, or a future `Dataset::get_by_row_id` if profiling shows this path matters — not built now, YAGNI).
 
 ## 4. Filtered-ANN `ef` widening
 
@@ -89,7 +98,7 @@ Follows Phase 2's established `check_correctness`-before-timing pattern (`bench/
 
 ## 8. Error handling
 
-`vector_search` returns `Result<Vec<Neighbour>, TxnError>` — errors propagate from `scan_with_predicate` (predicate column doesn't exist, type mismatch) when a predicate is supplied; the index-only path (`HnswIndex::search`) does not itself fail except on a dimension mismatch between `query` and the indexed vectors, checked upfront the same way `brute_force_search` already does (Phase 1's dimension-mismatch fix) rather than silently truncating.
+`vector_search` returns `Result<Vec<VectorMatch>, TxnError>` — errors propagate from the row-id resolution helper (predicate column doesn't exist, type mismatch — same errors `filter`/`scan_with_predicate` already surface) when a predicate is supplied; the index-only path (`HnswIndex::search`) does not itself fail except on a dimension mismatch between `query` and the indexed vectors, checked upfront the same way `brute_force_search` already does (Phase 1's dimension-mismatch fix) rather than silently truncating.
 
 ## 9. Testing
 
