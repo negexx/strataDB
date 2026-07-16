@@ -6,5 +6,5 @@
 pub mod dataset;
 pub mod error;
 
-pub use dataset::{Dataset, Transaction};
+pub use dataset::{Dataset, ROW_ID_COLUMN, Transaction};
 pub use error::{Result, TxnError};

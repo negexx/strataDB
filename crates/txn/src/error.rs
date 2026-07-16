@@ -14,6 +14,8 @@ pub enum TxnError {
     AlreadyExists(PathBuf),
     #[error("no dataset found at {0} — call Dataset::create first")]
     NotFound(PathBuf),
+    #[error("row count overflowed u64: {0}")]
+    TryFromInt(#[from] std::num::TryFromIntError),
 }
 
 pub type Result<T> = std::result::Result<T, TxnError>;

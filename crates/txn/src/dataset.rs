@@ -9,15 +9,23 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, RecordBatch};
+use arrow::array::{ArrayRef, RecordBatch, UInt64Array};
 use arrow::compute::{cast, concat_batches};
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use strata_query::{Predicate, filter, should_scan_file};
 use strata_storage::{
     DataFileEntry, Manifest, commit_manifest, compute_stats, read_batch, read_current, write_batch,
 };
 
 use crate::error::{Result, TxnError};
+
+/// The hidden internal row-id column every committed batch carries
+/// alongside its logical columns. Exported so callers that need it back
+/// (e.g. the CLI's `search` subcommand, Task 6) can request it through the
+/// existing `scan`/`scan_with_predicate` API by including it in their own
+/// schema, rather than needing a bespoke lookup method. See
+/// `.claude/docs/design/phase-0-transaction-and-format-spec.md` §8.
+pub const ROW_ID_COLUMN: &str = "_row_id";
 
 pub struct Dataset {
     dir: PathBuf,
@@ -217,11 +225,18 @@ impl Transaction {
         std::fs::create_dir_all(&data_dir)?;
 
         for (i, batch) in self.pending.iter().enumerate() {
-            // Stats computed on the original, pre-encoding batch — see
+            // Stats computed on the original, pre-encoding, pre-row-id batch — see
             // .claude/docs/design/phase-3-query-refinement-spec.md §1 for why
-            // (logical values, no dictionary-decode step needed later).
+            // (logical values, no dictionary-decode step needed later; _row_id is
+            // an internal column, not a user column subject to file-pruning stats).
             let stats = compute_stats(batch);
-            let encoded = strata_storage::encode_batch(batch)?;
+
+            let num_rows = u64::try_from(batch.num_rows())?;
+            let row_id_base = manifest.next_row_id;
+            manifest.next_row_id += num_rows;
+            let with_row_id = append_row_id_column(batch, row_id_base, num_rows)?;
+
+            let encoded = strata_storage::encode_batch(&with_row_id)?;
             let file_name = format!("{new_version:020}-{i}.arrow");
             write_batch(&data_dir.join(&file_name), &encoded)?;
             manifest.data_files.push(DataFileEntry {
@@ -266,6 +281,33 @@ fn cast_batch_to_schema(batch: &RecordBatch, schema: &SchemaRef) -> Result<Recor
         })
         .collect();
     Ok(RecordBatch::try_new(Arc::clone(schema), columns?)?)
+}
+
+/// Appends a `_row_id: UInt64` column to `batch`, assigning
+/// `row_id_base..row_id_base + num_rows` in row order. This is what makes
+/// every committed row addressable by a stable, global identity — see
+/// `.claude/docs/design/phase-0-transaction-and-format-spec.md` §8.
+fn append_row_id_column(
+    batch: &RecordBatch,
+    row_id_base: u64,
+    num_rows: u64,
+) -> Result<RecordBatch> {
+    let row_ids: Vec<u64> = (0..num_rows).map(|i| row_id_base + i).collect();
+    let row_id_array: ArrayRef = Arc::new(UInt64Array::from(row_ids));
+
+    let mut fields: Vec<Field> = batch
+        .schema_ref()
+        .fields()
+        .iter()
+        .map(|f| f.as_ref().clone())
+        .collect();
+    fields.push(Field::new(ROW_ID_COLUMN, DataType::UInt64, false));
+
+    let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
+    columns.push(row_id_array);
+
+    let schema = Arc::new(Schema::new(fields));
+    Ok(RecordBatch::try_new(schema, columns)?)
 }
 
 #[cfg(test)]
@@ -476,6 +518,71 @@ mod tests {
             1,
             "the [100,102] file must be skipped"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn row_ids_are_assigned_sequentially_and_monotonically_across_commits() {
+        let dir = temp_dir("row-id-sequential");
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let ds = Dataset::create(&dir).unwrap();
+
+        let first = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![10, 20, 30]))],
+        )
+        .unwrap();
+        let mut txn = ds.begin();
+        txn.insert(first);
+        let ds = txn.commit().unwrap();
+
+        let second =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![40, 50]))]).unwrap();
+        let mut txn = ds.begin();
+        txn.insert(second);
+        let ds = txn.commit().unwrap();
+
+        let data_dir = ds.data_dir();
+        let first_on_disk = read_batch(&data_dir.join(&ds.data_files()[0].name)).unwrap();
+        let second_on_disk = read_batch(&data_dir.join(&ds.data_files()[1].name)).unwrap();
+
+        let row_id_col = |batch: &RecordBatch| -> Vec<u64> {
+            let idx = batch.schema_ref().index_of(ROW_ID_COLUMN).unwrap();
+            let arr = batch
+                .column(idx)
+                .as_any()
+                .downcast_ref::<arrow::array::UInt64Array>()
+                .unwrap();
+            (0..arr.len()).map(|i| arr.value(i)).collect()
+        };
+
+        assert_eq!(row_id_col(&first_on_disk), vec![0, 1, 2]);
+        assert_eq!(row_id_col(&second_on_disk), vec![3, 4]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn row_id_column_never_leaks_into_scan_output() {
+        let dir = temp_dir("row-id-hidden");
+        let schema = test_schema(); // just "id", no _row_id
+        let ds = Dataset::create(&dir).unwrap();
+
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1, 2]))])
+                .unwrap();
+        let mut txn = ds.begin();
+        txn.insert(batch);
+        let ds = txn.commit().unwrap();
+
+        let scanned = ds.scan(&schema).unwrap();
+        assert_eq!(
+            scanned.schema_ref().fields().len(),
+            1,
+            "_row_id must not appear in scan() output when the caller's schema doesn't ask for it"
+        );
+        assert!(scanned.schema_ref().index_of(ROW_ID_COLUMN).is_err());
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

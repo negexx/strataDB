@@ -37,6 +37,10 @@ pub struct Manifest {
     pub version: u64,
     /// Accumulated across every committed version so far.
     pub data_files: Vec<DataFileEntry>,
+    /// The row-id to assign to the next inserted row, dataset-wide. Never
+    /// resets, never reused — see
+    /// `.claude/docs/design/phase-0-transaction-and-format-spec.md` §8.
+    pub next_row_id: u64,
 }
 
 impl Manifest {
@@ -45,6 +49,7 @@ impl Manifest {
         Self {
             version: 0,
             data_files: Vec::new(),
+            next_row_id: 0,
         }
     }
 }
@@ -166,6 +171,7 @@ mod tests {
                 name: "a.arrow".to_string(),
                 stats: HashMap::new(),
             }],
+            next_row_id: 0,
         };
         commit_manifest(&dir, &m0).unwrap();
         let m1 = Manifest {
@@ -180,6 +186,7 @@ mod tests {
                     stats: HashMap::new(),
                 },
             ],
+            next_row_id: 0,
         };
         commit_manifest(&dir, &m1).unwrap();
 
@@ -200,6 +207,7 @@ mod tests {
                 name: "a.arrow".to_string(),
                 stats: HashMap::new(),
             }],
+            next_row_id: 0,
         };
         commit_manifest(&dir, &m0).unwrap();
 
@@ -273,6 +281,7 @@ mod tests {
                 name: "data.arrow".to_string(),
                 stats,
             }],
+            next_row_id: 0,
         };
 
         commit_manifest(&dir, &m0).unwrap();
