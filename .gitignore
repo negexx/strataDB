@@ -25,3 +25,7 @@ __pycache__/
 .vscode/
 .idea/
 .DS_Store
+
+# Downloaded benchmark datasets (bench/Task 7) — large, fetched on demand
+# via a documented curl step, not committed.
+/bench/data/

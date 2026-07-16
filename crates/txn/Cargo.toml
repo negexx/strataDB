@@ -12,6 +12,4 @@ arrow.workspace = true
 thiserror.workspace = true
 strata-storage = { path = "../storage" }
 strata-query = { path = "../query" }
-
-[dev-dependencies]
 strata-index = { path = "../index" }

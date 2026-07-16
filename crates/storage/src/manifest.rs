@@ -30,6 +30,10 @@ pub struct DataFileEntry {
     /// Column name -> stats. Absent key means "no stats for this column in
     /// this file" (non-orderable type, or all-null) — never a wrong entry.
     pub stats: HashMap<String, ColumnStats>,
+    /// Relative to the dataset's `data/` directory. This commit's vector-
+    /// index delta-log entries — see
+    /// `.claude/docs/design/phase-4-vector-index-spec.md` §2.
+    pub delta_log: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -37,6 +41,10 @@ pub struct Manifest {
     pub version: u64,
     /// Accumulated across every committed version so far.
     pub data_files: Vec<DataFileEntry>,
+    /// The row-id to assign to the next inserted row, dataset-wide. Never
+    /// resets, never reused — see
+    /// `.claude/docs/design/phase-0-transaction-and-format-spec.md` §8.
+    pub next_row_id: u64,
 }
 
 impl Manifest {
@@ -45,6 +53,7 @@ impl Manifest {
         Self {
             version: 0,
             data_files: Vec::new(),
+            next_row_id: 0,
         }
     }
 }
@@ -165,7 +174,9 @@ mod tests {
             data_files: vec![DataFileEntry {
                 name: "a.arrow".to_string(),
                 stats: HashMap::new(),
+                delta_log: "d.deltalog".to_string(),
             }],
+            next_row_id: 0,
         };
         commit_manifest(&dir, &m0).unwrap();
         let m1 = Manifest {
@@ -174,12 +185,15 @@ mod tests {
                 DataFileEntry {
                     name: "a.arrow".to_string(),
                     stats: HashMap::new(),
+                    delta_log: "d.deltalog".to_string(),
                 },
                 DataFileEntry {
                     name: "b.arrow".to_string(),
                     stats: HashMap::new(),
+                    delta_log: "d.deltalog".to_string(),
                 },
             ],
+            next_row_id: 0,
         };
         commit_manifest(&dir, &m1).unwrap();
 
@@ -199,7 +213,9 @@ mod tests {
             data_files: vec![DataFileEntry {
                 name: "a.arrow".to_string(),
                 stats: HashMap::new(),
+                delta_log: "d.deltalog".to_string(),
             }],
+            next_row_id: 0,
         };
         commit_manifest(&dir, &m0).unwrap();
 
@@ -272,7 +288,9 @@ mod tests {
             data_files: vec![DataFileEntry {
                 name: "data.arrow".to_string(),
                 stats,
+                delta_log: "d.deltalog".to_string(),
             }],
+            next_row_id: 0,
         };
 
         commit_manifest(&dir, &m0).unwrap();
