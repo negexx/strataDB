@@ -31,9 +31,6 @@ pub const ROW_ID_COLUMN: &str = "_row_id";
 pub struct Dataset {
     dir: PathBuf,
     manifest: Manifest,
-    // Read by `Dataset::vector_search`, landing in Task 5 (same crate, same
-    // struct) — not read anywhere yet, hence the lint suppression.
-    #[allow(dead_code)]
     index: HnswIndex,
 }
 
@@ -201,6 +198,63 @@ impl Dataset {
         Ok(filter(&scanned, predicate)?)
     }
 
+    /// Approximate nearest-neighbor search over the vector column, optionally
+    /// narrowed to rows matching `predicate`. See
+    /// `.claude/docs/design/phase-4-vector-index-spec.md` §3-4.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `predicate` is supplied and its column doesn't
+    /// exist or its value's type doesn't match the column's Arrow type
+    /// (surfaced by the same row-id resolution path `filter`/
+    /// `scan_with_predicate` already use), or if `query`'s dimensionality
+    /// doesn't match the indexed vectors'.
+    pub fn vector_search(
+        &self,
+        query: &[f32],
+        k: usize,
+        predicate: Option<&Predicate>,
+    ) -> Result<Vec<strata_index::VectorMatch>> {
+        let Some(predicate) = predicate else {
+            return Ok(self.index.search(query, k, EF_SEARCH_DEFAULT)?);
+        };
+
+        let mut live_ids = self.row_ids_matching(predicate)?;
+        live_ids.sort_unstable();
+        let ef = widen_ef(EF_SEARCH_DEFAULT, self, predicate);
+        Ok(self.index.search_filtered(query, k, ef, &live_ids)?)
+    }
+
+    /// Resolves the row-ids of every row matching `predicate`, reading each
+    /// surviving (per `should_scan_file`) file's raw on-disk batch directly —
+    /// not through the public `scan_with_predicate`, whose caller-supplied
+    /// logical schema never includes `ROW_ID_COLUMN` and would drop it (see
+    /// Task 1's note on `cast_batch_to_schema`'s positional zip).
+    fn row_ids_matching(&self, predicate: &Predicate) -> Result<Vec<usize>> {
+        let data_dir = self.data_dir();
+        let mut ids = Vec::new();
+        for entry in &self.manifest.data_files {
+            if !should_scan_file(&entry.stats, predicate) {
+                continue;
+            }
+            let batch = read_batch(&data_dir.join(&entry.name))?;
+            let matched = filter(&batch, predicate)?;
+            let row_id_idx = matched.schema_ref().index_of(ROW_ID_COLUMN)?;
+            let row_ids = matched
+                .column(row_id_idx)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| {
+                    TxnError::Arrow(arrow::error::ArrowError::CastError(format!(
+                        "{ROW_ID_COLUMN} column must be UInt64"
+                    )))
+                })?;
+            #[allow(clippy::cast_possible_truncation)]
+            ids.extend((0..row_ids.len()).map(|i| row_ids.value(i) as usize));
+        }
+        Ok(ids)
+    }
+
     #[must_use]
     pub fn begin(&self) -> Transaction {
         Transaction {
@@ -298,6 +352,28 @@ impl Transaction {
 const HNSW_MAX_NB_CONNECTION: usize = 16;
 const HNSW_MAX_LAYER: usize = 16;
 const HNSW_EF_CONSTRUCTION: usize = 200;
+const EF_SEARCH_DEFAULT: usize = 64;
+const MIN_SELECTIVITY_FLOOR: f64 = 0.01;
+const MAX_EF_SCALE: f64 = 20.0;
+
+/// Widens `base_ef` using `Dataset::explain`'s scanned/total file ratio as
+/// a coarse, file-granularity *upper bound* on selectivity — see
+/// `.claude/docs/design/phase-4-vector-index-spec.md` §4. Erring toward a
+/// wider `ef` costs search time, never correctness, so an overestimate of
+/// how many rows survive is the safe direction.
+fn widen_ef(base_ef: usize, dataset: &Dataset, predicate: &Predicate) -> usize {
+    let explain = dataset.explain(predicate);
+    #[allow(clippy::cast_precision_loss)]
+    let selectivity_upper_bound = explain.scanned.len() as f64 / explain.total_files.max(1) as f64;
+    let scale = (1.0 / selectivity_upper_bound.max(MIN_SELECTIVITY_FLOOR)).min(MAX_EF_SCALE);
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation
+    )]
+    let widened = ((base_ef as f64) * scale).round() as usize;
+    widened
+}
 
 fn new_hnsw_index(capacity: usize) -> Result<HnswIndex> {
     Ok(HnswIndex::new(
@@ -739,6 +815,76 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(ids.value(0), 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn vector_test_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 3),
+                false,
+            ),
+        ]))
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
+    fn vector_batch(ids: Vec<i64>, vectors: Vec<[f32; 3]>) -> RecordBatch {
+        let id_arr = Arc::new(Int64Array::from(ids));
+        let item_field = Arc::new(Field::new("item", DataType::Float32, false));
+        let flat: Vec<f32> = vectors.iter().flatten().copied().collect();
+        let values = Arc::new(arrow::array::Float32Array::from(flat));
+        let vec_arr = Arc::new(arrow::array::FixedSizeListArray::new(
+            item_field, 3, values, None,
+        ));
+        RecordBatch::try_new(vector_test_schema(), vec![id_arr, vec_arr]).unwrap()
+    }
+
+    #[test]
+    fn vector_search_without_predicate_finds_the_true_nearest_neighbor() {
+        let dir = temp_dir("vector-search-unfiltered");
+        let ds = Dataset::create(&dir).unwrap();
+
+        let batch = vector_batch(
+            vec![1, 2, 3],
+            vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [10.0, 10.0, 10.0]],
+        );
+        let mut txn = ds.begin();
+        txn.insert(batch);
+        let ds = txn.commit().unwrap();
+
+        let results = ds.vector_search(&[0.0, 0.0, 0.0], 1, None).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].row_id, 0); // row-id 0 is the first committed row (id=1)
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn vector_search_with_predicate_only_returns_matching_rows() {
+        use strata_query::Predicate;
+        use strata_storage::Value;
+
+        let dir = temp_dir("vector-search-filtered");
+        let ds = Dataset::create(&dir).unwrap();
+
+        // Two vectors close to the query; only id=2's row should survive the
+        // predicate `id eq 2`, even though id=1's vector is the true nearest
+        // neighbor of the query.
+        let batch = vector_batch(vec![1, 2], vec![[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]]);
+        let mut txn = ds.begin();
+        txn.insert(batch);
+        let ds = txn.commit().unwrap();
+
+        let predicate = Predicate::Eq("id".to_string(), Value::Int64(2));
+        let results = ds
+            .vector_search(&[0.0, 0.0, 0.0], 5, Some(&predicate))
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].row_id, 1); // row-id 1 is the second committed row (id=2)
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
