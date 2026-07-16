@@ -1546,6 +1546,7 @@ name = "strata-query"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "strata-storage",
 ]
 
 [[package]]

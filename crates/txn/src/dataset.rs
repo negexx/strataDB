@@ -12,13 +12,25 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, RecordBatch};
 use arrow::compute::{cast, concat_batches};
 use arrow::datatypes::SchemaRef;
-use strata_storage::{Manifest, commit_manifest, read_batch, read_current, write_batch};
+use strata_query::{Predicate, filter, should_scan_file};
+use strata_storage::{
+    DataFileEntry, Manifest, commit_manifest, compute_stats, read_batch, read_current, write_batch,
+};
 
 use crate::error::{Result, TxnError};
 
 pub struct Dataset {
     dir: PathBuf,
     manifest: Manifest,
+}
+
+/// The outcome of [`Dataset::explain`] — which files a predicate would
+/// touch, without actually reading any of their bodies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplainResult {
+    pub total_files: usize,
+    pub scanned: Vec<String>,
+    pub skipped: Vec<String>,
 }
 
 impl Dataset {
@@ -68,11 +80,11 @@ impl Dataset {
         self.dir.join("data")
     }
 
-    /// Data file names (relative to `data_dir()`) belonging to the current
+    /// Data file entries (name + per-column stats) belonging to the current
     /// version. Exposed for tests that need to inspect the raw on-disk
     /// representation directly.
     #[must_use]
-    pub fn data_files(&self) -> &[String] {
+    pub fn data_files(&self) -> &[DataFileEntry] {
         &self.manifest.data_files
     }
 
@@ -104,12 +116,66 @@ impl Dataset {
             .manifest
             .data_files
             .iter()
-            .map(|name| {
-                let batch = read_batch(&data_dir.join(name))?;
+            .map(|entry| {
+                let batch = read_batch(&data_dir.join(&entry.name))?;
                 cast_batch_to_schema(&batch, schema)
             })
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(concat_batches(schema, &batches)?)
+    }
+
+    /// Reports which committed files `predicate` would require scanning,
+    /// without opening any file body — pure introspection over stats
+    /// already loaded in the manifest. See
+    /// `.claude/docs/design/phase-3-query-refinement-spec.md` §3.
+    #[must_use]
+    pub fn explain(&self, predicate: &Predicate) -> ExplainResult {
+        let mut scanned = Vec::new();
+        let mut skipped = Vec::new();
+        for entry in &self.manifest.data_files {
+            if should_scan_file(&entry.stats, predicate) {
+                scanned.push(entry.name.clone());
+            } else {
+                skipped.push(entry.name.clone());
+            }
+        }
+        ExplainResult {
+            total_files: self.manifest.data_files.len(),
+            scanned,
+            skipped,
+        }
+    }
+
+    /// Like [`Dataset::scan`], but skips any file `predicate` provably
+    /// can't match (per [`Dataset::explain`]'s decision) and row-filters
+    /// the rest. This is the real performance path; `explain` is its
+    /// introspection twin — both call the exact same
+    /// `strata_query::should_scan_file`, so they can never disagree about
+    /// what would be skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error under the same conditions as [`Dataset::scan`],
+    /// plus if `predicate`'s column doesn't exist or its value's type
+    /// doesn't match the column's Arrow type.
+    pub fn scan_with_predicate(
+        &self,
+        schema: &SchemaRef,
+        predicate: &Predicate,
+    ) -> Result<RecordBatch> {
+        let data_dir = self.data_dir();
+        let batches = self
+            .manifest
+            .data_files
+            .iter()
+            .filter(|entry| should_scan_file(&entry.stats, predicate))
+            .map(|entry| {
+                let batch = read_batch(&data_dir.join(&entry.name))?;
+                cast_batch_to_schema(&batch, schema)
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let scanned = concat_batches(schema, &batches)?;
+        Ok(filter(&scanned, predicate)?)
     }
 
     #[must_use]
@@ -151,10 +217,17 @@ impl Transaction {
         std::fs::create_dir_all(&data_dir)?;
 
         for (i, batch) in self.pending.iter().enumerate() {
+            // Stats computed on the original, pre-encoding batch — see
+            // .claude/docs/design/phase-3-query-refinement-spec.md §1 for why
+            // (logical values, no dictionary-decode step needed later).
+            let stats = compute_stats(batch);
             let encoded = strata_storage::encode_batch(batch)?;
             let file_name = format!("{new_version:020}-{i}.arrow");
             write_batch(&data_dir.join(&file_name), &encoded)?;
-            manifest.data_files.push(file_name);
+            manifest.data_files.push(DataFileEntry {
+                name: file_name,
+                stats,
+            });
         }
         manifest.version = new_version;
 
@@ -246,7 +319,7 @@ mod tests {
 
         // Confirm the file really was dictionary-encoded, so this test
         // can't silently stop testing the regression it exists to catch.
-        let on_disk = read_batch(&ds.data_dir().join(&ds.data_files()[0])).unwrap();
+        let on_disk = read_batch(&ds.data_dir().join(&ds.data_files()[0].name)).unwrap();
         assert!(
             matches!(
                 on_disk.schema_ref().field(0).data_type(),
@@ -312,6 +385,27 @@ mod tests {
     }
 
     #[test]
+    fn commit_computes_and_stores_column_stats() {
+        let dir = temp_dir("commit-stats");
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let ds = Dataset::create(&dir).unwrap();
+
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![30, 10, 20]))])
+                .unwrap();
+        let mut txn = ds.begin();
+        txn.insert(batch);
+        let ds = txn.commit().unwrap();
+
+        let entry = &ds.data_files()[0];
+        let id_stats = entry.stats.get("id").unwrap();
+        assert_eq!(id_stats.min, strata_storage::Value::Int64(10));
+        assert_eq!(id_stats.max, strata_storage::Value::Int64(30));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn low_cardinality_column_is_dictionary_encoded_on_commit() {
         use arrow::array::StringArray;
         use arrow::datatypes::DataType;
@@ -331,12 +425,97 @@ mod tests {
         // reading the file directly proves the *durable* representation is
         // encoded, not just an in-memory artifact).
         let data_dir = ds.data_dir();
-        let file_name = &ds.data_files()[0];
+        let file_name = &ds.data_files()[0].name;
         let on_disk = strata_storage::read_batch(&data_dir.join(file_name)).unwrap();
         assert!(matches!(
             on_disk.schema_ref().field(0).data_type(),
             DataType::Dictionary(_, _)
         ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn explain_reports_skipped_files_by_range() {
+        use strata_query::Predicate;
+        use strata_storage::Value;
+
+        let dir = temp_dir("explain-skip");
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let ds = Dataset::create(&dir).unwrap();
+
+        // Two commits, disjoint id ranges -> two files with non-overlapping stats.
+        let low = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let mut txn = ds.begin();
+        txn.insert(low);
+        let ds = txn.commit().unwrap();
+
+        let high = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![100, 101, 102]))],
+        )
+        .unwrap();
+        let mut txn = ds.begin();
+        txn.insert(high);
+        let ds = txn.commit().unwrap();
+
+        let predicate = Predicate::Eq("id".to_string(), Value::Int64(2));
+        let result = ds.explain(&predicate);
+
+        assert_eq!(result.total_files, 2);
+        assert_eq!(
+            result.scanned.len(),
+            1,
+            "only the [1,3] file could match id=2"
+        );
+        assert_eq!(
+            result.skipped.len(),
+            1,
+            "the [100,102] file must be skipped"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn scan_with_predicate_returns_only_matching_rows_from_unskipped_files() {
+        use strata_query::Predicate;
+        use strata_storage::Value;
+
+        let dir = temp_dir("scan-with-predicate");
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let ds = Dataset::create(&dir).unwrap();
+
+        let low = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let mut txn = ds.begin();
+        txn.insert(low);
+        let ds = txn.commit().unwrap();
+
+        let high = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![100, 101, 102]))],
+        )
+        .unwrap();
+        let mut txn = ds.begin();
+        txn.insert(high);
+        let ds = txn.commit().unwrap();
+
+        let predicate = Predicate::Eq("id".to_string(), Value::Int64(2));
+        let result = ds.scan_with_predicate(&schema, &predicate).unwrap();
+
+        assert_eq!(result.num_rows(), 1);
+        let ids = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(ids.value(0), 2);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

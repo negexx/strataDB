@@ -9,3 +9,4 @@ workspace = true
 
 [dependencies]
 arrow.workspace = true
+strata-storage = { path = "../storage" }
