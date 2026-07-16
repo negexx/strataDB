@@ -81,6 +81,15 @@ impl Accumulator {
 /// Groups `batch` by `group_cols` and computes `aggs` per group. See
 /// `.claude/docs/design/phase-2-encodings-and-groupby-spec.md` §2.
 ///
+/// Null values in an agg column are skipped, not treated as zero. **A group
+/// whose agg column is entirely null is not yet handled specially** (flagged
+/// by the Phase 2 whole-branch review, not fixed — out of the spec's
+/// documented scope): `Min` returns `f64::INFINITY`, `Max` returns
+/// `f64::NEG_INFINITY`, and `Avg` returns `NaN` for such a group, rather
+/// than erroring or producing a null result cell. Callers should not rely on
+/// these values being meaningful; a future revision should either emit null
+/// for empty accumulations or document this as intentional.
+///
 /// # Errors
 ///
 /// Returns an [`ArrowError::InvalidArgumentError`] if `group_cols` is empty,
@@ -307,6 +316,48 @@ mod tests {
 
         assert_eq!(result.num_rows(), 3); // (east,a) (west,a) (east,b)
         assert_eq!(result.num_columns(), 4); // region, category, amount_sum, amount_max
+
+        let regions = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let categories = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let sums = result
+            .column(2)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let maxes = result
+            .column(3)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+
+        let mut got: Vec<(String, String, f64, f64)> = (0..result.num_rows())
+            .map(|i| {
+                (
+                    regions.value(i).to_string(),
+                    categories.value(i).to_string(),
+                    sums.value(i),
+                    maxes.value(i),
+                )
+            })
+            .collect();
+        got.sort_by(|a, b| (a.0.as_str(), a.1.as_str()).cmp(&(b.0.as_str(), b.1.as_str())));
+
+        assert_eq!(
+            got,
+            vec![
+                ("east".to_string(), "a".to_string(), 30.0, 20.0), // amounts 10, 20
+                ("east".to_string(), "b".to_string(), 40.0, 40.0), // amount 40
+                ("west".to_string(), "a".to_string(), 30.0, 30.0), // amount 30
+            ]
+        );
     }
 
     #[test]
