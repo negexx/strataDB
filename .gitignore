@@ -1,0 +1,27 @@
+# Claude Code
+.claude/settings.local.json
+.claude/memory/
+.claude/scheduled_tasks.lock
+
+# superpowers subagent-driven-development scratch state
+.superpowers/
+
+# Cargo / Rust build output
+/target/
+**/target/
+# Cargo.lock is intentionally committed, not ignored — this workspace
+# produces end products (a CLI binary, a cdylib for Python), and Cargo's own
+# guidance is to commit the lockfile for reproducible builds in that case.
+
+# Python (bindings dev/test env, maturin output)
+__pycache__/
+*.pyc
+.venv/
+*.so
+*.pyd
+/crates/bindings/target/wheels/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store

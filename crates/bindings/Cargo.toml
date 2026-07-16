@@ -1,0 +1,15 @@
+[package]
+name = "strata-bindings"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "strata_ext"
+crate-type = ["cdylib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+pyo3.workspace = true

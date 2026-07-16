@@ -1,0 +1,19 @@
+[package]
+name = "strata-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "strata"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+arrow.workspace = true
+strata-storage = { path = "../storage" }
+strata-txn = { path = "../txn" }
+strata-index = { path = "../index" }
+strata-query = { path = "../query" }

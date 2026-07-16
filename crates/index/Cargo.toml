@@ -1,0 +1,15 @@
+[package]
+name = "strata-index"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+arrow.workspace = true
+# Not used yet — HNSW itself is Phase 4 (see .claude/rules/vector-index.md).
+# Phase 1 uses brute-force search only. Kept declared since the choice is
+# already made (ADR 0005) and Phase 4 will need it.
+hnsw_rs.workspace = true
