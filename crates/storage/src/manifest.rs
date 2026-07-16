@@ -139,6 +139,7 @@ pub fn read_current(dataset_dir: &Path) -> Result<Option<Manifest>> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::stats::Value;
 
     fn temp_dataset_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -232,6 +233,55 @@ mod tests {
             matches!(result, Err(StorageError::CorruptManifest(_, _))),
             "expected a CorruptManifest error, got {result:?}"
         );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn commit_then_read_current_with_populated_stats() {
+        // Exercises serde round-trip of populated ColumnStats (all three Value
+        // variants: Int64, Float64, Utf8) through the actual file-based
+        // commit_manifest/read_current path — not just in-memory equality.
+        let dir = temp_dataset_dir("stats-roundtrip");
+
+        // Build stats with one entry per Value variant.
+        let mut stats = HashMap::new();
+        stats.insert(
+            "id_col".to_string(),
+            ColumnStats {
+                min: Value::Int64(100),
+                max: Value::Int64(500),
+            },
+        );
+        stats.insert(
+            "price_col".to_string(),
+            ColumnStats {
+                min: Value::Float64(9.99),
+                max: Value::Float64(99.99),
+            },
+        );
+        stats.insert(
+            "name_col".to_string(),
+            ColumnStats {
+                min: Value::Utf8("alice".to_string()),
+                max: Value::Utf8("zoe".to_string()),
+            },
+        );
+
+        let m0 = Manifest {
+            version: 0,
+            data_files: vec![DataFileEntry {
+                name: "data.arrow".to_string(),
+                stats,
+            }],
+        };
+
+        commit_manifest(&dir, &m0).unwrap();
+        let current = read_current(&dir).unwrap().unwrap();
+        assert_eq!(
+            current, m0,
+            "populated stats must round-trip correctly through commit/read"
+        );
+
         fs::remove_dir_all(&dir).ok();
     }
 }
