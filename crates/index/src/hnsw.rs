@@ -22,6 +22,10 @@ pub enum IndexError {
     MaxConnectionTooLarge(usize),
     #[error("query has {query_len} dimensions, but the index expects {expected}")]
     DimensionMismatch { query_len: usize, expected: usize },
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("delta log entry serialization error: {0}")]
+    Serde(#[from] serde_json::Error),
 }
 
 pub struct HnswIndex {
