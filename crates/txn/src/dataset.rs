@@ -861,6 +861,35 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Generates `count` points scattered within a small cube of side
+    /// `spacing` around `center`. Mirrors `crates/index/src/hnsw.rs`'s own
+    /// `insert_cluster` test helper (see commit `733579f`): `hnsw_rs`'s
+    /// `StdRng::from_os_rng()` layer-assignment RNG has no exposed seed, so
+    /// tiny (2-3 point) fixtures occasionally produce a graph shape where
+    /// greedy search misses the true nearest neighbor. Many points spread
+    /// across well-separated clusters makes "which cluster is nearest"
+    /// unambiguous regardless of layer-assignment luck. Offsets come from
+    /// an irrational-multiplier equidistribution sequence rather than a
+    /// line/grid, since collinear near-duplicate points let `hnsw_rs`'s
+    /// neighbor-diversification heuristic prune almost all direct links
+    /// between them.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    fn cluster_vectors(count: usize, center: [f32; 3], spacing: f32) -> Vec<[f32; 3]> {
+        const PHI: f64 = 0.618_033_988_749_895; // fractional part of the golden ratio
+        const SQRT2: f64 = 0.414_213_562_373_095; // fractional part of sqrt(2)
+        const SQRT3: f64 = 0.732_050_807_568_877; // fractional part of sqrt(3)
+        (0..count)
+            .map(|i| {
+                let n = i as f64;
+                let frac = |mult: f64| (n * mult).fract();
+                let dx = (frac(PHI) as f32) * spacing;
+                let dy = (frac(SQRT2) as f32) * spacing;
+                let dz = (frac(SQRT3) as f32) * spacing;
+                [center[0] + dx, center[1] + dy, center[2] + dz]
+            })
+            .collect()
+    }
+
     #[test]
     fn vector_search_with_predicate_only_returns_matching_rows() {
         use strata_query::Predicate;
@@ -869,21 +898,46 @@ mod tests {
         let dir = temp_dir("vector-search-filtered");
         let ds = Dataset::create(&dir).unwrap();
 
-        // Two vectors close to the query; only id=2's row should survive the
-        // predicate `id eq 2`, even though id=1's vector is the true nearest
-        // neighbor of the query.
-        let batch = vector_batch(vec![1, 2], vec![[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]]);
+        // Two well-separated 15-point clusters, mirroring
+        // crates/index/src/hnsw.rs's own flaky-test fix (commit 733579f):
+        // a 2-point fixture is fragile against hnsw_rs's unseeded internal
+        // RNG on tiny graphs. id=1's cluster sits at the origin (where the
+        // query point also sits, so the *unfiltered* nearest neighbors are
+        // unambiguously from this cluster); id=2's cluster sits 1000 units
+        // away. `Predicate::Eq("id", 2)` must narrow results to only the
+        // far cluster, even though every one of its points is vastly
+        // farther from the query than every point in the near cluster.
+        let near_cluster = cluster_vectors(15, [0.0, 0.0, 0.0], 0.01);
+        let far_cluster = cluster_vectors(15, [1000.0, 0.0, 0.0], 0.01);
+        let mut ids = vec![1i64; 15];
+        ids.extend(vec![2i64; 15]);
+        let mut vectors = near_cluster;
+        vectors.extend(far_cluster);
+        let batch = vector_batch(ids, vectors);
         let mut txn = ds.begin();
         txn.insert(batch);
         let ds = txn.commit().unwrap();
 
+        // Sanity check: without the predicate, the true nearest neighbors
+        // really do come from the near (non-matching) cluster — otherwise
+        // this test wouldn't prove the predicate is doing any narrowing.
+        let unfiltered = ds.vector_search(&[0.0, 0.0, 0.0], 3, None).unwrap();
+        assert_eq!(unfiltered.len(), 3);
+        assert!(
+            unfiltered.iter().all(|r| r.row_id < 15),
+            "unfiltered nearest neighbors must come from the near cluster: {unfiltered:?}"
+        );
+
         let predicate = Predicate::Eq("id".to_string(), Value::Int64(2));
         let results = ds
-            .vector_search(&[0.0, 0.0, 0.0], 5, Some(&predicate))
+            .vector_search(&[0.0, 0.0, 0.0], 3, Some(&predicate))
             .unwrap();
 
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].row_id, 1); // row-id 1 is the second committed row (id=2)
+        assert_eq!(results.len(), 3, "unexpected results: {results:?}");
+        assert!(
+            results.iter().all(|r| r.row_id >= 15),
+            "predicate must narrow results to only the far (id=2) cluster: {results:?}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
