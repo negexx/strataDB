@@ -1389,4 +1389,312 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn open_errors_with_not_found_for_a_nonexistent_dataset() {
+        let dir = temp_dir("open-missing");
+        let result = Dataset::open(&dir);
+        // `Dataset` doesn't implement `Debug` (its HNSW index can't), so
+        // only the `Err` side is printable on failure.
+        assert!(
+            matches!(result, Err(TxnError::NotFound(_))),
+            "expected NotFound, got {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn committing_a_transaction_with_zero_pending_batches_still_advances_the_version() {
+        let dir = temp_dir("empty-commit");
+        let ds = Dataset::create(&dir).unwrap();
+        let txn = ds.begin();
+        let ds = txn.commit().unwrap();
+
+        assert_eq!(
+            ds.current_version(),
+            1,
+            "an empty commit still advances the manifest version"
+        );
+        assert!(
+            ds.data_files().is_empty(),
+            "an empty commit adds no data files"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn scan_errors_cleanly_when_a_manifest_listed_file_is_missing_from_disk() {
+        let dir = temp_dir("scan-missing-file");
+        let schema = test_schema();
+        let ds = Dataset::create(&dir).unwrap();
+
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1, 2]))])
+                .unwrap();
+        let mut txn = ds.begin();
+        txn.insert(batch);
+        let ds = txn.commit().unwrap();
+
+        let data_dir = ds.data_dir();
+        std::fs::remove_file(data_dir.join(&ds.data_files()[0].name)).unwrap();
+
+        let result = ds.scan(&schema);
+        assert!(
+            result.is_err(),
+            "scan must error cleanly, not panic, when a manifest-listed file is missing"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn scan_concatenates_two_files_with_genuinely_different_physical_encodings() {
+        use arrow::array::StringArray;
+        let dir = temp_dir("mixed-encoding-scan");
+        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)]));
+        let ds = Dataset::create(&dir).unwrap();
+
+        // First commit: high-cardinality (all-distinct) -> stays plain Utf8.
+        let owned: Vec<String> = (0..20).map(|i| format!("name-{i}")).collect();
+        let high_card: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let batch1 =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(high_card))])
+                .unwrap();
+        let mut txn = ds.begin();
+        txn.insert(batch1);
+        let ds = txn.commit().unwrap();
+
+        // Second commit: low-cardinality (2 distinct values over 20 rows) ->
+        // gets dictionary-encoded.
+        let low_card: Vec<&str> = (0..20)
+            .map(|i| if i % 2 == 0 { "alice" } else { "bob" })
+            .collect();
+        let batch2 =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(low_card))])
+                .unwrap();
+        let mut txn = ds.begin();
+        txn.insert(batch2);
+        let ds = txn.commit().unwrap();
+
+        // Confirm the two files really do have different physical
+        // encodings, so this test can't silently stop testing the scenario
+        // it exists for.
+        let data_dir = ds.data_dir();
+        let file0 = read_batch(&data_dir.join(&ds.data_files()[0].name)).unwrap();
+        let file1 = read_batch(&data_dir.join(&ds.data_files()[1].name)).unwrap();
+        assert_eq!(file0.schema_ref().field(0).data_type(), &DataType::Utf8);
+        assert!(matches!(
+            file1.schema_ref().field(0).data_type(),
+            DataType::Dictionary(_, _)
+        ));
+
+        let scanned = ds.scan(&schema).unwrap();
+        assert_eq!(scanned.num_rows(), 40);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn build_delta_entries_skips_null_vector_rows_without_erroring() {
+        let ids = Arc::new(Int64Array::from(vec![1, 2]));
+        let item_field = Arc::new(Field::new("item", DataType::Float32, false));
+        let values = Arc::new(arrow::array::Float32Array::from(vec![
+            1.0, 2.0, 3.0, 0.0, 0.0, 0.0,
+        ]));
+        let null_buffer = arrow::buffer::NullBuffer::from(vec![true, false]);
+        let vectors = Arc::new(arrow::array::FixedSizeListArray::new(
+            item_field,
+            3,
+            values,
+            Some(null_buffer),
+        ));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 3),
+                true,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![ids, vectors]).unwrap();
+
+        let deltas = build_delta_entries(&batch, 0).unwrap();
+        assert_eq!(
+            deltas.len(),
+            1,
+            "the null-vector row must be skipped, not errored on"
+        );
+        match &deltas[0] {
+            DeltaEntry::Insert { row_id, .. } => assert_eq!(*row_id, 0),
+            DeltaEntry::Tombstone { .. } => panic!("expected an Insert entry"),
+        }
+    }
+
+    #[test]
+    fn build_delta_entries_errors_when_vector_column_is_not_a_fixed_size_list() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("vector", DataType::Int64, false), // wrong type
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![42])),
+            ],
+        )
+        .unwrap();
+
+        let result = build_delta_entries(&batch, 0);
+        assert!(result.is_err(), "expected an error, got {result:?}");
+    }
+
+    #[test]
+    fn build_delta_entries_errors_when_vector_inner_type_is_not_float32() {
+        let item_field = Arc::new(Field::new("item", DataType::Int32, false));
+        let values = Arc::new(arrow::array::Int32Array::from(vec![1, 2, 3]));
+        let vectors = Arc::new(arrow::array::FixedSizeListArray::new(
+            item_field, 3, values, None,
+        ));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, false)), 3),
+                false,
+            ),
+        ]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1])), vectors])
+                .unwrap();
+
+        let result = build_delta_entries(&batch, 0);
+        assert!(result.is_err(), "expected an error, got {result:?}");
+    }
+
+    #[test]
+    fn replay_index_applies_tombstone_entries_from_the_delta_log() {
+        let dir = temp_dir("tombstone-replay");
+        let ds = Dataset::create(&dir).unwrap();
+
+        let batch = vector_batch(vec![1, 2], vec![[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]]);
+        let mut txn = ds.begin();
+        txn.insert(batch);
+        let ds = txn.commit().unwrap();
+
+        // Hand-append a Tombstone entry to the just-written delta-log file,
+        // simulating what a future real DELETE path (Phase 5/6) will
+        // produce - build_delta_entries itself never emits Tombstone
+        // entries today.
+        let data_dir = ds.data_dir();
+        let delta_log_path = data_dir.join(&ds.data_files()[0].delta_log);
+        let mut entries = strata_index::read_delta_log(&delta_log_path).unwrap();
+        entries.push(DeltaEntry::Tombstone { row_id: 0 });
+        strata_index::write_delta_log(&delta_log_path, &entries).unwrap();
+
+        drop(ds);
+        let reopened = Dataset::open(&dir).unwrap();
+        let results = reopened.vector_search(&[0.0, 0.0, 0.0], 2, None).unwrap();
+
+        assert!(
+            results.iter().all(|r| r.row_id != 0),
+            "the hand-tombstoned row must be excluded after replay: {results:?}"
+        );
+        assert_eq!(
+            results.len(),
+            1,
+            "only row 1 should remain live: {results:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn commit_computes_stats_for_multiple_columns_including_utf8() {
+        let dir = temp_dir("multi-column-stats");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let ds = Dataset::create(&dir).unwrap();
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![30, 10, 20])),
+                Arc::new(arrow::array::StringArray::from(vec![
+                    "banana", "apple", "cherry",
+                ])),
+            ],
+        )
+        .unwrap();
+        let mut txn = ds.begin();
+        txn.insert(batch);
+        let ds = txn.commit().unwrap();
+
+        let entry = &ds.data_files()[0];
+        let id_stats = entry.stats.get("id").unwrap();
+        assert_eq!(id_stats.min, strata_storage::Value::Int64(10));
+        assert_eq!(id_stats.max, strata_storage::Value::Int64(30));
+
+        let name_stats = entry.stats.get("name").unwrap();
+        assert_eq!(
+            name_stats.min,
+            strata_storage::Value::Utf8("apple".to_string())
+        );
+        assert_eq!(
+            name_stats.max,
+            strata_storage::Value::Utf8("cherry".to_string())
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn explain_on_a_dataset_with_no_data_files_reports_zero_scanned_and_skipped() {
+        let dir = temp_dir("explain-empty-dataset");
+        let ds = Dataset::create(&dir).unwrap();
+
+        let predicate =
+            strata_query::Predicate::Eq("id".to_string(), strata_storage::Value::Int64(1));
+        let result = ds.explain(&predicate);
+
+        assert_eq!(result.total_files, 0);
+        assert!(result.scanned.is_empty());
+        assert!(result.skipped.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn scan_with_predicate_on_a_dataset_with_no_data_files_returns_an_empty_batch() {
+        let dir = temp_dir("scan-with-predicate-empty-dataset");
+        let schema = test_schema();
+        let ds = Dataset::create(&dir).unwrap();
+
+        let predicate =
+            strata_query::Predicate::Eq("id".to_string(), strata_storage::Value::Int64(1));
+        let result = ds.scan_with_predicate(&schema, &predicate).unwrap();
+
+        assert_eq!(result.num_rows(), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn explain_reports_every_file_skipped_when_the_predicate_matches_none() {
+        let dir = temp_dir("explain-all-pruned");
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let ds = Dataset::create(&dir).unwrap();
+
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))]).unwrap();
+        let mut txn = ds.begin();
+        txn.insert(batch);
+        let ds = txn.commit().unwrap();
+
+        let predicate =
+            strata_query::Predicate::Eq("id".to_string(), strata_storage::Value::Int64(999));
+        let result = ds.explain(&predicate);
+
+        assert_eq!(result.total_files, 1);
+        assert!(result.scanned.is_empty());
+        assert_eq!(result.skipped.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
