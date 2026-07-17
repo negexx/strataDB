@@ -24,6 +24,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 
+# NOTE: crates/index/Cargo.toml cannot use `[lints] workspace = true` like
+# every other crate here — it needs a local `unexpected_cfgs` addition for
+# its `cfg(loom)` shim, and Cargo forbids combining workspace-inherited
+# lints with any local addition in the same [lints] table. It inlines a
+# manual copy of these two tables instead (see its own Cargo.toml comment)
+# — keep that copy in sync if this section changes.
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }

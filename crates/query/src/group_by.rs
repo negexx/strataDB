@@ -580,4 +580,47 @@ mod tests {
              not re-encoded as a dictionary"
         );
     }
+
+    #[test]
+    fn group_by_accepts_a_dictionary_encoded_group_column_with_a_null_entry() {
+        use arrow::array::DictionaryArray;
+        use arrow::datatypes::Int32Type;
+
+        // Covers the composition of this fix with should_dictionary_encode's
+        // null-handling fix (crates/storage/src/encoding.rs): a nullable,
+        // dictionary-encoded column being grouped, which neither fix's own
+        // test exercised on its own.
+        let categories: DictionaryArray<Int32Type> = vec![Some("a"), None, Some("a"), Some("b")]
+            .into_iter()
+            .collect();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "category",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                true,
+            ),
+            Field::new("amount", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(categories),
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+            ],
+        )
+        .unwrap();
+
+        let result = group_by(&batch, &["category"], &[("amount", AggFunc::Sum)]).unwrap();
+        assert_eq!(result.num_rows(), 3, "expected 3 groups: a, b, and null");
+        assert_eq!(
+            result.schema_ref().field(0).data_type(),
+            &DataType::Utf8,
+            "output must stay plain-typed even for a nullable dictionary-encoded input"
+        );
+        assert_eq!(
+            result.column(0).null_count(),
+            1,
+            "the null value must form its own group, not be dropped or merged"
+        );
+    }
 }
