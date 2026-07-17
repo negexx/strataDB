@@ -13,6 +13,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use arrow::array::{Array, ArrayRef, RecordBatch, UInt64Array};
 use arrow::compute::{cast, concat_batches};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -23,6 +24,7 @@ use strata_storage::{
 };
 
 use crate::error::{Result, TxnError};
+use crate::snapshot::Snapshot;
 
 /// The hidden internal row-id column every committed batch carries
 /// alongside its logical columns. Callers can retrieve it through the
@@ -40,10 +42,10 @@ use crate::error::{Result, TxnError};
 /// `.claude/docs/design/phase-0-transaction-and-format-spec.md` §8.
 pub const ROW_ID_COLUMN: &str = "_row_id";
 
+#[derive(Clone)]
 pub struct Dataset {
     dir: PathBuf,
-    manifest: Manifest,
-    index: HnswIndex,
+    current: Arc<ArcSwap<Snapshot>>,
 }
 
 /// The single source of truth for "where does this dataset's data live,
@@ -73,11 +75,18 @@ impl Dataset {
         std::fs::create_dir_all(dir.join("data"))?;
         let manifest = Manifest::empty();
         commit_manifest(&dir, &manifest)?;
-        let index = new_hnsw_index(0)?;
+        let graph = new_hnsw_index(0)?;
+        let snapshot = Snapshot {
+            dir: dir.clone(),
+            version: manifest.version,
+            watermark: manifest.next_row_id.saturating_sub(1),
+            manifest: Arc::new(manifest),
+            graph: Arc::new(graph),
+            tombstones: Arc::new(im::HashSet::new()),
+        };
         Ok(Self {
             dir,
-            manifest,
-            index,
+            current: Arc::new(ArcSwap::new(Arc::new(snapshot))),
         })
     }
 
@@ -95,17 +104,33 @@ impl Dataset {
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self> {
         let dir = dir.into();
         let manifest = read_current(&dir)?.ok_or_else(|| TxnError::NotFound(dir.clone()))?;
-        let index = replay_index(&dir, &manifest)?;
+        let (graph, tombstones) = replay_index(&dir, &manifest)?;
+        let snapshot = Snapshot {
+            dir: dir.clone(),
+            version: manifest.version,
+            watermark: manifest.next_row_id.saturating_sub(1),
+            manifest: Arc::new(manifest),
+            graph: Arc::new(graph),
+            tombstones: Arc::new(tombstones),
+        };
         Ok(Self {
             dir,
-            manifest,
-            index,
+            current: Arc::new(ArcSwap::new(Arc::new(snapshot))),
         })
+    }
+
+    /// Returns a cheap, immutable, point-in-time view of the dataset as of
+    /// whichever version was current at the moment of this call. Holding
+    /// the returned `Snapshot` never blocks a concurrent writer, and never
+    /// observes any commit that lands after this call returns.
+    #[must_use]
+    pub fn snapshot(&self) -> Arc<Snapshot> {
+        self.current.load_full()
     }
 
     #[must_use]
     pub fn current_version(&self) -> u64 {
-        self.manifest.version
+        self.snapshot().version
     }
 
     #[must_use]
@@ -117,8 +142,8 @@ impl Dataset {
     /// version. Exposed for tests that need to inspect the raw on-disk
     /// representation directly.
     #[must_use]
-    pub fn data_files(&self) -> &[DataFileEntry] {
-        &self.manifest.data_files
+    pub fn data_files(&self) -> Vec<DataFileEntry> {
+        self.snapshot().manifest.data_files.clone()
     }
 
     #[must_use]
@@ -281,13 +306,12 @@ fn new_hnsw_index(capacity: usize) -> Result<HnswIndex> {
 /// realistic embedded dataset today; revisit if a real workload needs more.
 const MAX_REASONABLE_ROW_ID_CAPACITY: u64 = 1_000_000_000;
 
-/// Rebuilds a fresh `HnswIndex` by replaying every delta-log entry across
-/// every committed data file in `manifest`, in order. Used by both
-/// `Dataset::open` (crash recovery) and `Transaction::commit` (so a
-/// newly-committed `Dataset`'s index can never diverge from what a fresh
-/// `open()` of the same directory would produce) — see
-/// `.claude/rules/vector-index.md` ("index lives inside the same
-/// transaction boundary as row data").
+/// Rebuilds a fresh `HnswIndex` plus its tombstone set by replaying every
+/// delta-log entry across every committed data file in `manifest`, in
+/// order. Used only by [`Dataset::open`] (crash recovery / process start) —
+/// `Transaction::commit` no longer calls this; it applies only its own new
+/// delta entries directly to the already-shared graph instead (see
+/// `docs/superpowers/specs/2026-07-17-phase-5-mvcc-snapshot-isolation-design.md`).
 ///
 /// # Errors
 ///
@@ -296,10 +320,8 @@ const MAX_REASONABLE_ROW_ID_CAPACITY: u64 = 1_000_000_000;
 /// [`MAX_REASONABLE_ROW_ID_CAPACITY`], or (via [`TxnError::Index`]) if a
 /// replayed `DeltaEntry::Insert`'s vector length doesn't match the
 /// dimensionality established by the first vector ever inserted into the
-/// index — [`strata_index::IndexError::DimensionMismatch`], surfaced here
-/// so a corrupted delta-log entry can't silently desync the rebuilt index
-/// from the one that originally produced it.
-fn replay_index(dir: &Path, manifest: &Manifest) -> Result<HnswIndex> {
+/// index.
+fn replay_index(dir: &Path, manifest: &Manifest) -> Result<(HnswIndex, im::HashSet<u64>)> {
     if manifest.next_row_id > MAX_REASONABLE_ROW_ID_CAPACITY {
         return Err(TxnError::UnreasonableCapacity(
             manifest.next_row_id,
@@ -307,17 +329,20 @@ fn replay_index(dir: &Path, manifest: &Manifest) -> Result<HnswIndex> {
         ));
     }
     let capacity = usize::try_from(manifest.next_row_id).unwrap_or(usize::MAX);
-    let mut index = new_hnsw_index(capacity)?;
+    let index = new_hnsw_index(capacity)?;
+    let mut tombstones: im::HashSet<u64> = im::HashSet::new();
     let data_dir = data_subdir(dir);
     for entry in &manifest.data_files {
         for delta in read_delta_log(&safe_join(&data_dir, &entry.delta_log)?)? {
             match delta {
                 DeltaEntry::Insert { row_id, vector } => index.insert(row_id, &vector)?,
-                DeltaEntry::Tombstone { row_id } => index.tombstone(row_id),
+                DeltaEntry::Tombstone { row_id } => {
+                    tombstones.insert(row_id);
+                }
             }
         }
     }
-    Ok(index)
+    Ok((index, tombstones))
 }
 
 /// Builds one `Insert` delta-log entry per row in `batch` with a non-null
