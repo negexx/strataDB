@@ -132,6 +132,21 @@ mod tests {
     }
 
     #[test]
+    fn computes_min_max_for_a_float64_column() {
+        let schema = Arc::new(Schema::new(vec![Field::new("price", DT::Float64, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Float64Array::from(vec![9.99, 99.99, 49.5]))],
+        )
+        .unwrap();
+
+        let stats = compute_stats(&batch);
+        let price_stats = stats.get("price").unwrap();
+        assert_eq!(price_stats.min, Value::Float64(9.99));
+        assert_eq!(price_stats.max, Value::Float64(99.99));
+    }
+
+    #[test]
     fn all_null_column_gets_no_stats_entry() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DT::Int64, true)]));
         let batch = RecordBatch::try_new(
