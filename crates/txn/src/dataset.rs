@@ -15,10 +15,9 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use arrow::array::{Array, ArrayRef, RecordBatch, UInt64Array};
-use arrow::compute::{cast, concat_batches};
+use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use strata_index::{DeltaEntry, HnswIndex, read_delta_log, write_delta_log};
-use strata_query::{Predicate, filter, should_scan_file};
 use strata_storage::{
     DataFileEntry, Manifest, commit_manifest, compute_stats, read_batch, read_current, write_batch,
 };
@@ -148,10 +147,14 @@ impl Dataset {
 
     #[must_use]
     pub fn begin(&self) -> Transaction {
+        let snapshot = self.snapshot();
         Transaction {
             dir: self.dir.clone(),
-            base_manifest: self.manifest.clone(),
+            base_manifest: snapshot.manifest.as_ref().clone(),
+            graph: Arc::clone(&snapshot.graph),
+            tombstones: snapshot.tombstones.as_ref().clone(),
             pending: Vec::new(),
+            current: Arc::clone(&self.current),
         }
     }
 }
@@ -159,7 +162,10 @@ impl Dataset {
 pub struct Transaction {
     dir: PathBuf,
     base_manifest: Manifest,
+    graph: Arc<HnswIndex>,
+    tombstones: im::HashSet<u64>,
     pending: Vec<RecordBatch>,
+    current: Arc<ArcSwap<Snapshot>>,
 }
 
 impl Transaction {
@@ -170,24 +176,29 @@ impl Transaction {
         self.pending.push(batch);
     }
 
-    /// Commits per spec §3's write/durability steps (3-5) — §3.1's
-    /// read/write-set accumulation and §3.2's conflict check are both
-    /// deliberate no-ops in Phase 1 (see the module doc comment for why,
-    /// and for the §3.4 CAS caveat).
+    /// Commits per spec §3's write/durability steps (3-5). Applies only
+    /// this transaction's own new delta entries directly to the shared,
+    /// ever-growing `HnswIndex` graph (no full historical replay — see
+    /// `docs/superpowers/specs/2026-07-17-phase-5-mvcc-snapshot-isolation-design.md`),
+    /// then — only after `commit_manifest` succeeds — freezes this
+    /// transaction's tombstone accumulator and swaps in a new `Snapshot`.
+    /// Any `Dataset` handle sharing this same `ArcSwap` (including the one
+    /// this transaction was created from) observes the new state on its
+    /// next [`Dataset::snapshot`] call; nothing is mutated in place.
     ///
     /// # Errors
     ///
     /// Returns [`TxnError::NonFiniteVectorComponent`] if any pending batch's
     /// vector column contains a `NaN`/`Infinity` component — checked, and
     /// rejected, before any file for that batch is written to disk. Also
-    /// returns an error if any pending batch fails to dictionary-encode (see
-    /// `strata_storage::encode_batch`) or write durably, if rebuilding the
-    /// vector index from the (already-written) delta-log history fails, or
-    /// if the manifest commit's atomic rename fails. The index rebuild runs
-    /// before the manifest commit, so any of these failures leaves the
-    /// manifest unadvanced — the new data/delta-log files are orphaned on
-    /// disk but never made visible, the same as an interrupted crash.
-    pub fn commit(self) -> Result<Dataset> {
+    /// returns an error if any pending batch fails to dictionary-encode, if
+    /// applying this commit's new deltas to the graph fails (e.g. a
+    /// dimension mismatch), or if the manifest commit's atomic rename
+    /// fails. Delta-application runs before the manifest commit, so any of
+    /// these failures leaves the manifest unadvanced — the new data/delta-log
+    /// files are orphaned on disk but never made visible, the same as an
+    /// interrupted crash.
+    pub fn commit(self) -> Result<()> {
         let mut manifest = self.base_manifest;
         let new_version = manifest.version.checked_add(1).ok_or_else(|| {
             TxnError::ManifestOverflow(format!("version {} + 1", manifest.version))
@@ -195,37 +206,59 @@ impl Transaction {
         let data_dir = data_subdir(&self.dir);
         std::fs::create_dir_all(&data_dir)?;
 
-        Self::write_pending_batches(&self.pending, &data_dir, new_version, &mut manifest)?;
+        let deltas =
+            Self::write_pending_batches(&self.pending, &data_dir, new_version, &mut manifest)?;
         manifest.version = new_version;
 
         // Fsyncing each data file's *content* (already done inside
         // write_batch) is not sufficient — the new directory entries
         // themselves must also be fsynced, or a real power-loss crash can
         // leave a file's bytes durable while the file itself is absent.
-        // Must happen before the index rebuild/manifest commit below.
+        // Must happen before the graph update/manifest commit below.
         strata_storage::sync_dir(&data_dir)?;
 
-        // Rebuilt from `manifest`'s full delta-log history (the same path
-        // `Dataset::open` uses) — see `replay_index`'s doc comment for why
-        // this must run before `commit_manifest`.
-        let index = replay_index(&self.dir, &manifest)?;
+        // Apply only this commit's new deltas to the shared graph — the
+        // fix for the O(historical)-per-commit regression. `HnswIndex`'s
+        // graph only ever grows (hnsw_rs has no node-removal API), so
+        // extending the same Arc'd instance every commit is safe and
+        // matches what every existing/future Snapshot's Arc<HnswIndex>
+        // already points at.
+        let mut tombstones = self.tombstones;
+        for delta in &deltas {
+            match delta {
+                DeltaEntry::Insert { row_id, vector } => self.graph.insert(*row_id, vector)?,
+                DeltaEntry::Tombstone { row_id } => {
+                    tombstones.insert(*row_id);
+                }
+            }
+        }
 
         commit_manifest(&self.dir, &manifest)?;
 
-        Ok(Dataset {
+        // Only after commit_manifest succeeds does the new state become
+        // visible to future Dataset::snapshot() calls — the in-memory swap
+        // must never run ahead of the on-disk durability point.
+        let watermark = manifest.next_row_id.saturating_sub(1);
+        let version = manifest.version;
+        let snapshot = Snapshot {
             dir: self.dir,
-            manifest,
-            index,
-        })
+            version,
+            manifest: Arc::new(manifest),
+            graph: self.graph,
+            watermark,
+            tombstones: Arc::new(tombstones),
+        };
+        self.current.store(Arc::new(snapshot));
+
+        Ok(())
     }
 
     /// Writes every pending batch's data file and delta-log file to
     /// `data_dir`, assigning row-ids and advancing `manifest.next_row_id`/
-    /// `manifest.data_files` in place. Extracted from [`Transaction::commit`]
-    /// so the per-batch write step and the outer commit-protocol steps
-    /// (sync, index rebuild, manifest CAS) read as named phases rather than
-    /// one long function — see `.claude/rules/concurrency-txn-layer.md`'s
-    /// note on the commit protocol's load-bearing ordering.
+    /// `manifest.data_files` in place. Returns every `DeltaEntry` produced
+    /// across all pending batches, in order — `Transaction::commit` applies
+    /// these directly to the shared graph instead of re-reading them from
+    /// disk.
     ///
     /// # Errors
     ///
@@ -238,7 +271,8 @@ impl Transaction {
         data_dir: &Path,
         new_version: u64,
         manifest: &mut Manifest,
-    ) -> Result<()> {
+    ) -> Result<Vec<DeltaEntry>> {
+        let mut all_deltas = Vec::new();
         for (i, batch) in pending.iter().enumerate() {
             // Stats computed on the original, pre-encoding, pre-row-id batch — see
             // .claude/docs/design/phase-3-query-refinement-spec.md §1 for why
@@ -275,8 +309,9 @@ impl Transaction {
                 stats,
                 delta_log: delta_file_name,
             });
+            all_deltas.extend(deltas);
         }
-        Ok(())
+        Ok(all_deltas)
     }
 }
 
