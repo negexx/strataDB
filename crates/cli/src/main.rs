@@ -48,6 +48,17 @@ fn main() -> ExitCode {
 }
 
 fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
+    const KNOWN_COMMANDS: &[&str] = &[
+        "create",
+        "insert",
+        "scan",
+        "filter",
+        "search",
+        "inspect",
+        "explain",
+        "crash-loop",
+    ];
+
     let Some(cmd) = args.get(1) else {
         eprintln!(
             "usage: strata <create|insert|scan|filter|search|explain|inspect|crash-loop> <dir> [...]"
@@ -55,6 +66,10 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         eprintln!("  search <dir> <v0> <v1> <v2> [k] [--exact] [--filter <column> <op> <value>]");
         return Ok(());
     };
+    if !KNOWN_COMMANDS.contains(&cmd.as_str()) {
+        return Err(format!("unknown command: {cmd}").into());
+    }
+
     let dir = args.get(2).ok_or("missing <dir> argument")?;
 
     match cmd.as_str() {
@@ -292,4 +307,25 @@ fn handle_explain(dir: &str, args: &[String]) -> Result<(), Box<dyn Error>> {
         println!("  skip:  {name}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_command_errors_even_without_a_dir_argument() {
+        let args = vec!["strata".to_string(), "bogus".to_string()];
+        let result = run(&args);
+        assert!(
+            result.is_err(),
+            "an unknown command must error, not attempt to run"
+        );
+        let message = result.unwrap_err().to_string();
+        assert!(
+            message.contains("unknown command"),
+            "expected an 'unknown command' error, got: {message}"
+        );
+    }
 }
