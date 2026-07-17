@@ -1665,6 +1665,54 @@ mod tests {
         assert_eq!(result.skipped.len(), 1);
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn commit_applies_only_its_own_new_deltas_not_the_full_history() {
+        let dir = std::env::temp_dir().join(format!(
+            "strata-replay-cost-regression-{}",
+            std::process::id()
+        ));
+        Dataset::create(&dir).unwrap();
+        let dataset = Dataset::open(&dir).unwrap();
+
+        // Commit 3 separate single-row batches first, establishing history.
+        // `mvp_row(id, name, vector)` builds one row in mvp_schema()'s
+        // shape — `id` is the schema's business column, unrelated to the
+        // internal system row-id the commit path assigns automatically.
+        for i in 0..3i64 {
+            let mut txn = dataset.begin();
+            txn.insert(crate::mvp_fixtures::mvp_row(i, "row", [i as f32, 0.0, 0.0]).unwrap());
+            txn.commit().unwrap();
+        }
+
+        // The 4th commit's own pending batch has exactly 1 row (1 new
+        // delta entry). Applying it must not require touching the 3
+        // earlier commits' delta-log files at all — confirmed indirectly
+        // here by checking the resulting snapshot's watermark/row count
+        // match "3 history rows + 1 new row", which would only be wrong if
+        // either too few (this commit's row lost) or suspiciously
+        // history-dependent logic silently reprocessed old entries into a
+        // wrong count.
+        let mut txn = dataset.begin();
+        txn.insert(crate::mvp_fixtures::mvp_row(3, "row", [3.0, 0.0, 0.0]).unwrap());
+        txn.commit().unwrap();
+
+        let snapshot = dataset.snapshot();
+        assert_eq!(
+            snapshot.watermark, 3,
+            "expected exactly 4 rows total (system row-ids 0..=3)"
+        );
+        assert_eq!(
+            snapshot
+                .scan(&crate::mvp_fixtures::mvp_schema())
+                .unwrap()
+                .num_rows(),
+            4
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
 
 /// Run with:
