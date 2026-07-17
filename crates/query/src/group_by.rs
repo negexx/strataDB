@@ -147,6 +147,24 @@ pub fn group_by(
     )?;
     let rows = converter.convert_columns(&group_arrays)?;
 
+    // Downcast each non-Count agg array to Float64Array once, before the
+    // per-row loop, instead of re-downcasting on every row of every column —
+    // the concrete array type is invariant per column, only the row index
+    // changes.
+    let agg_float_arrays: Vec<Option<&Float64Array>> = agg_arrays
+        .iter()
+        .map(|(arr, func)| {
+            if matches!(func, AggFunc::Count) {
+                Ok(None)
+            } else {
+                arr.as_any()
+                    .downcast_ref::<Float64Array>()
+                    .map(Some)
+                    .ok_or_else(|| ArrowError::CastError("expected Float64 after cast".to_string()))
+            }
+        })
+        .collect::<Result<_, ArrowError>>()?;
+
     let mut groups: HashMap<OwnedRow, Vec<Accumulator>> = HashMap::new();
     for i in 0..batch.num_rows() {
         let key = rows.row(i).owned();
@@ -156,7 +174,11 @@ pub fn group_by(
                 .map(|(_, f)| Accumulator::new(*f))
                 .collect()
         });
-        for (acc, (arr, func)) in accs.iter_mut().zip(&agg_arrays) {
+        for ((acc, (arr, func)), float_arr) in accs
+            .iter_mut()
+            .zip(&agg_arrays)
+            .zip(agg_float_arrays.iter().copied())
+        {
             if arr.is_null(i) {
                 continue;
             }
@@ -164,11 +186,9 @@ pub fn group_by(
                 acc.update(0.0); // value is unused by Accumulator::Count
                 continue;
             }
-            let col = arr
-                .as_any()
-                .downcast_ref::<arrow::array::Float64Array>()
-                .ok_or_else(|| ArrowError::CastError("expected Float64 after cast".to_string()))?;
-            acc.update(col.value(i));
+            if let Some(col) = float_arr {
+                acc.update(col.value(i));
+            }
         }
     }
 
@@ -387,7 +407,7 @@ mod tests {
 
         // Count's result column is Int64, not Float64 like every other
         // AggFunc — COUNT is semantically an integer, and the reference
-        // implementation special-cases it in `build_result_batch` rather
+        // implementation special-cases it in `finish_agg_column` rather
         // than uniformly emitting Float64 for every aggregate. Checked
         // separately from the float-producing funcs below.
         let count_result = group_by(&batch, &["k"], &[("v", AggFunc::Count)]).unwrap();
