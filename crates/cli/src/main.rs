@@ -155,6 +155,31 @@ fn print_batch(batch: &RecordBatch) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Resolves each vector-search match's row-id to its display `(id,
+/// squared_distance)` pair, using a `HashMap` built once so lookup is
+/// O(n+k) rather than an O(k*n) nested scan over every row for every
+/// match. Matches whose row-id isn't found in `row_ids` (which should
+/// never happen in practice, since `matches` come from searching the same
+/// index `row_ids` was scanned from) are silently skipped, same as the
+/// original nested-loop behavior.
+fn resolve_display_rows(
+    matches: &[strata_index::VectorMatch],
+    row_ids: &arrow::array::UInt64Array,
+    ids: &Int64Array,
+) -> Vec<(i64, f32)> {
+    let row_index_by_id: std::collections::HashMap<u64, usize> = (0..row_ids.len())
+        .map(|row| (row_ids.value(row), row))
+        .collect();
+    matches
+        .iter()
+        .filter_map(|m| {
+            row_index_by_id
+                .get(&m.row_id)
+                .map(|&row| (ids.value(row), m.squared_distance))
+        })
+        .collect()
+}
+
 fn handle_search(args: &[String], dir: &str) -> Result<(), Box<dyn Error>> {
     let exact = args.iter().any(|a| a == "--exact");
     let filter_idx = args.iter().position(|a| a == "--filter");
@@ -242,17 +267,8 @@ fn handle_search(args: &[String], dir: &str) -> Result<(), Box<dyn Error>> {
         .downcast_ref::<Int64Array>()
         .ok_or("id column has wrong type")?;
 
-    for m in matches {
-        for row in 0..batch.num_rows() {
-            if row_ids.value(row) == m.row_id {
-                println!(
-                    "id={} squared_distance={}",
-                    ids.value(row),
-                    m.squared_distance
-                );
-                break;
-            }
-        }
+    for (id, squared_distance) in resolve_display_rows(&matches, row_ids, ids) {
+        println!("id={id} squared_distance={squared_distance}");
     }
     Ok(())
 }
@@ -327,5 +343,25 @@ mod tests {
             message.contains("unknown command"),
             "expected an 'unknown command' error, got: {message}"
         );
+    }
+
+    #[test]
+    fn resolve_display_rows_maps_row_ids_back_to_display_values() {
+        use arrow::array::UInt64Array;
+        let row_ids = UInt64Array::from(vec![10, 11, 12]);
+        let ids = Int64Array::from(vec![100, 200, 300]);
+        let matches = vec![
+            strata_index::VectorMatch {
+                row_id: 12,
+                squared_distance: 1.5,
+            },
+            strata_index::VectorMatch {
+                row_id: 10,
+                squared_distance: 2.5,
+            },
+        ];
+
+        let resolved = resolve_display_rows(&matches, &row_ids, &ids);
+        assert_eq!(resolved, vec![(300, 1.5), (100, 2.5)]);
     }
 }
