@@ -3,7 +3,6 @@
 //! `.claude/docs/design/phase-3-query-refinement-spec.md` §2.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow::compute::filter_record_batch;
@@ -72,15 +71,15 @@ fn compare(array: &ArrayRef, predicate: &Predicate) -> Result<BooleanArray, Arro
     match predicate.value() {
         Value::Int64(v) => {
             let scalar = Int64Array::new_scalar(*v);
-            cmp_fn(&Arc::clone(array), &scalar)
+            cmp_fn(array, &scalar)
         }
         Value::Float64(v) => {
             let scalar = Float64Array::new_scalar(*v);
-            cmp_fn(&Arc::clone(array), &scalar)
+            cmp_fn(array, &scalar)
         }
         Value::Utf8(v) => {
             let scalar = StringArray::new_scalar(v.as_str());
-            cmp_fn(&Arc::clone(array), &scalar)
+            cmp_fn(array, &scalar)
         }
     }
 }
@@ -116,6 +115,8 @@ pub fn should_scan_file(stats: &HashMap<String, ColumnStats>, predicate: &Predic
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use std::sync::Arc;
+
     use arrow::datatypes::{DataType, Field, Schema};
 
     use super::*;
