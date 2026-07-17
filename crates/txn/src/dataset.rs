@@ -198,31 +198,25 @@ impl Transaction {
     /// these failures leaves the manifest unadvanced — the new data/delta-log
     /// files are orphaned on disk but never made visible.
     ///
-    /// **Known limitation, not equivalent to a crash:** unlike an
-    /// interrupted crash (where the in-memory graph is discarded and
-    /// `Dataset::open` rebuilds it from only the committed delta-logs), a
-    /// commit that fails *after* deltas are applied to `self.graph` but
-    /// *before* `commit_manifest` succeeds leaves those vectors
-    /// permanently in the live, shared graph — `hnsw_rs` has no
-    /// node-removal API to undo the insert. Because `manifest.next_row_id`
-    /// was never advanced, the next successful commit will assign the
-    /// *same* row-ids to different vectors, inserting them into the graph
-    /// a second time under an id already in use. **This is not
-    /// permanently inert:** it only holds until that next successful
-    /// commit, which *does* advance the watermark and `next_row_id` past
-    /// the reused ids — at that point a `vector_search` can match the
-    /// orphaned, duplicate-id vector instead of (or alongside) the real
-    /// one, silently. The most plausible trigger is not rare I/O but an
-    /// ordinary application error: this transaction's pending batches
-    /// (accumulated via repeated [`Transaction::insert`] calls before one
-    /// `commit()`) having inconsistent vector dimensions across batches —
-    /// `Insert` deltas are applied to the graph in pending-batch order, so
-    /// a dimension mismatch on a *later* batch only fails after an
-    /// *earlier* batch's deltas have already mutated the shared graph.
-    /// This is a latent correctness risk to close in Phase 6 (either a
-    /// graph-rollback mechanism, or pre-validating every pending batch's
-    /// vector dimension against each other and the graph's established
-    /// dimension before mutating any of them) — not solved here.
+    /// **Formerly a known limitation, now closed:** earlier, a commit whose
+    /// pending batches had inconsistent vector dimensions across batches
+    /// could partially mutate the shared graph before failing — `Insert`
+    /// deltas were applied to the graph in pending-batch order, so a later
+    /// batch's dimension mismatch was only caught after an earlier batch's
+    /// deltas had already landed in the live, shared `HnswIndex` (which has
+    /// no node-removal API to undo an insert). [`validate_delta_dimensions`]
+    /// now runs before any delta is applied, rejecting the entire commit —
+    /// with zero graph mutation — the moment any two pending batches (or a
+    /// pending batch and the graph's already-established dimension)
+    /// disagree. `HnswIndex::insert`'s only fallible path is dimension
+    /// validation (the underlying `hnsw_rs` call itself never fails), so
+    /// this closes the practical trigger for this class of hazard
+    /// entirely, not just narrows it. A residual, more exotic concern
+    /// remains out of scope here: if a future change ever gives graph
+    /// mutation additional failure modes beyond dimension mismatch, this
+    /// same partial-mutation risk could reopen for those — revisit if
+    /// Phase 6's real conflict/CAS logic changes what "applying a delta to
+    /// the graph" can fail on.
     pub fn commit(self) -> Result<()> {
         let mut manifest = self.base_manifest;
         let new_version = manifest.version.checked_add(1).ok_or_else(|| {
@@ -248,6 +242,8 @@ impl Transaction {
         // extending the same Arc'd instance every commit is safe and
         // matches what every existing/future Snapshot's Arc<HnswIndex>
         // already points at.
+        validate_delta_dimensions(&deltas, &self.graph)?;
+
         let mut tombstones = self.tombstones;
         for delta in &deltas {
             match delta {
@@ -463,6 +459,42 @@ fn build_delta_entries(batch: &RecordBatch, row_id_base: u64) -> Result<Vec<Delt
         });
     }
     Ok(entries)
+}
+
+/// Validates that every [`DeltaEntry::Insert`] in `deltas` shares one
+/// consistent vector dimension — both against each other, and against
+/// `graph`'s already-established dimension (if any) — before any of them
+/// are applied. `HnswIndex::insert`'s only fallible path is dimension
+/// validation (the underlying `hnsw_rs` call itself never fails), so this
+/// closes the real trigger for a partial-graph-mutation-then-fail
+/// scenario: without it, `Insert` deltas are applied to the shared graph
+/// in pending-batch order, and a later batch's dimension mismatch is only
+/// caught after an earlier batch's deltas have already mutated the shared
+/// graph.
+///
+/// # Errors
+///
+/// Returns [`TxnError::Index`] wrapping an [`strata_index::IndexError::DimensionMismatch`]
+/// if any `Insert` delta's vector length disagrees with the graph's
+/// established dimension, or with an earlier delta's length in this same
+/// batch of deltas if the graph has no dimension established yet.
+fn validate_delta_dimensions(deltas: &[DeltaEntry], graph: &HnswIndex) -> Result<()> {
+    let mut expected = graph.established_dimension();
+    for delta in deltas {
+        if let DeltaEntry::Insert { vector, .. } = delta {
+            if expected == 0 {
+                expected = vector.len();
+            } else if vector.len() != expected {
+                return Err(TxnError::Index(
+                    strata_index::IndexError::DimensionMismatch {
+                        query_len: vector.len(),
+                        expected,
+                    },
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Joins `name` onto `data_dir`, rejecting any `name` whose path
@@ -1719,6 +1751,129 @@ mod tests {
                 .unwrap()
                 .num_rows(),
             4
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn commit_rejects_inconsistent_batch_dimensions_before_touching_the_shared_graph() {
+        // Regression test for the hazard the Phase 5 final whole-branch
+        // review flagged: Transaction::commit applies Insert deltas to the
+        // shared, ever-growing Arc<HnswIndex> in pending-batch order, so a
+        // later pending batch's dimension mismatch was only ever caught
+        // after an earlier batch's deltas had already mutated the shared
+        // graph -- even though commit() returns Err and the manifest never
+        // advances. See validate_delta_dimensions's doc comment.
+        let dir = temp_dir("inconsistent-batch-dimensions");
+        let ds = Dataset::create(&dir).unwrap();
+
+        // Establish a real baseline: one successful 3-d commit, via the
+        // existing mvp_fixtures shape (FixedSizeList<Float32, 3>).
+        let mut seed_txn = ds.begin();
+        seed_txn.insert(crate::mvp_fixtures::mvp_row(0, "seed", [0.0, 0.0, 0.0]).unwrap());
+        seed_txn.commit().unwrap();
+
+        let snapshot_before = ds.snapshot();
+        let version_before = snapshot_before.version;
+        let established_before = snapshot_before.graph.established_dimension();
+        assert_eq!(
+            established_before, 3,
+            "the seed commit must have established dimension 3"
+        );
+
+        // Build a second, valid 3-d batch (via mvp_fixtures) and an
+        // inconsistent 5-d batch (hand-built, since mvp_fixtures is fixed
+        // at 3 dimensions) -- the exact scenario the review flagged: Insert
+        // deltas apply to the graph in pending-batch order, so without
+        // pre-validation the 3-d batch's insert (row-id 1) would succeed
+        // before the 5-d batch's insert (row-id 2) fails.
+        let batch_3d = crate::mvp_fixtures::mvp_row(1, "still-3d", [1.0, 0.0, 0.0]).unwrap();
+
+        let schema_5d = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 5),
+                false,
+            ),
+        ]));
+        let batch_5d = RecordBatch::try_new(
+            schema_5d,
+            vec![
+                Arc::new(Int64Array::from(vec![2])),
+                Arc::new(arrow::array::FixedSizeListArray::new(
+                    Arc::new(Field::new("item", DataType::Float32, false)),
+                    5,
+                    Arc::new(arrow::array::Float32Array::from(vec![
+                        2.0, 0.0, 0.0, 0.0, 0.0,
+                    ])),
+                    None,
+                )),
+            ],
+        )
+        .unwrap();
+
+        let mut txn = ds.begin();
+        txn.insert(batch_3d);
+        txn.insert(batch_5d);
+        let result = txn.commit();
+
+        assert!(
+            result.is_err(),
+            "a transaction whose pending batches have inconsistent vector dimensions \
+             must fail at commit()"
+        );
+
+        // Sanity checks on the durable/externally-visible side of the
+        // invariant: version never advances, and established_dimension is
+        // unchanged. NEITHER of these two assertions alone actually
+        // distinguishes fixed-from-buggy in this specific scenario --
+        // established_dimension() is already 3 both before and after,
+        // with or without the fix, because the seed commit already set it
+        // to 3 and the first (still-3-d) pending batch's vector matches
+        // that already-established value either way, so it never changes
+        // what established_dimension() reads even when wrongly applied.
+        // Kept here only as baseline sanity checks, not as the regression
+        // assertion -- see below for the one that actually discriminates.
+        let snapshot_after = ds.snapshot();
+        assert_eq!(
+            snapshot_after.version, version_before,
+            "a rejected commit must not advance the visible version at all"
+        );
+        assert_eq!(
+            snapshot_after.graph.established_dimension(),
+            established_before,
+            "sanity check only -- see the row-id-1-leak assertion below for the actual \
+             regression this test exists to catch"
+        );
+
+        // The assertion that actually discriminates fixed-from-buggy:
+        // row-id 1 (the mismatched transaction's first, individually-valid
+        // 3-d batch) must never have been physically inserted into the
+        // shared HnswIndex graph. Pre-fix, its `HnswIndex::insert` call
+        // succeeds (its dimension matches the graph's already-established
+        // one) before the second batch's 5-d insert fails -- silently
+        // mutating the graph even though the whole commit is rejected.
+        // `Snapshot::vector_search` can't observe this: it filters by
+        // `is_visible` (row_id <= watermark), and row-id 1's watermark is
+        // never advanced by this rejected commit either way, so it would
+        // hide the leaked row regardless of whether the fix exists. This
+        // instead calls `HnswIndex::search` directly on
+        // `snapshot_after.graph` (the same shared `Arc<HnswIndex>` the
+        // failed commit mutated in place -- `pub(crate) graph` is
+        // reachable from this same-crate test) with an always-true
+        // visibility predicate, bypassing the watermark filter entirely to
+        // see exactly what's physically in the graph.
+        let leaked = snapshot_after
+            .graph
+            .search(&[1.0, 0.0, 0.0], 2, 200, |_| true)
+            .unwrap();
+        assert!(
+            leaked.iter().all(|m| m.row_id != 1),
+            "row-id 1 must never have been inserted into the shared graph -- a rejected \
+             commit must apply zero of its deltas, not just the ones that come after the \
+             first failure: {leaked:?}"
         );
 
         std::fs::remove_dir_all(&dir).ok();
