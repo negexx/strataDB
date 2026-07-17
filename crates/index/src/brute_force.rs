@@ -122,4 +122,24 @@ mod tests {
         let results = brute_force_search(&vectors, &[0.0, 0.0, 0.0], 0).unwrap();
         assert!(results.is_empty());
     }
+
+    #[test]
+    fn brute_force_search_errors_when_vector_child_is_not_float32() {
+        let item_field = Arc::new(Field::new("item", DataType::Int32, false));
+        let values = Arc::new(arrow::array::Int32Array::from(vec![1, 2, 3]));
+        let vectors = FixedSizeListArray::new(item_field, 3, values, None);
+
+        let result = brute_force_search(&vectors, &[0.0, 0.0, 0.0], 1);
+        assert!(
+            matches!(result, Err(ArrowError::CastError(_))),
+            "expected a CastError, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn brute_force_search_on_an_empty_vectors_array_returns_no_results() {
+        let vectors = make_vectors(&[]);
+        let results = brute_force_search(&vectors, &[0.0, 0.0, 0.0], 3).unwrap();
+        assert!(results.is_empty());
+    }
 }
