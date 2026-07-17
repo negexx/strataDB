@@ -58,6 +58,7 @@ pub fn should_scan_file(stats: &HashMap<String, strata_storage::ColumnStats>, pr
 Returns `true` if the file *could* contain a matching row, `false` only when the predicate's value range provably can't overlap the file's `[min, max]` for that column. Fails open to "always scan" in every ambiguous case, never a false skip:
 - The predicate's column isn't a key in `stats` at all — either because the column is genuinely absent from the schema (in which case the later row-level `filter()` call will error, matching `filter_eq`'s existing unknown-column behavior — pruning fails open, filtering fails closed) or because that column had no orderable values to compute stats from (see below).
 - A column with no non-null values in a given file gets no `ColumnStats` entry for that file at all (stats are computed over non-null values only) — same fail-open default applies, since there's no meaningful `[min, max]` to compare against.
+- The predicate's `Value` variant doesn't match the column's stats' `Value` variant (e.g. a `Utf8` predicate against a column whose stats are `Int64`) — fails open rather than trusting derived `PartialOrd`'s cross-variant, declaration-order comparison, which compares by enum discriminant order, not value semantics.
 
 Fully unit-testable against synthetic `HashMap<String, ColumnStats>` values — no `Dataset`, no files, no I/O.
 
