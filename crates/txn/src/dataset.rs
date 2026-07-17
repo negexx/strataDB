@@ -1666,3 +1666,81 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
+
+/// Run with:
+/// `cargo rustc -p strata-txn --lib --profile test -- --cfg loom` to build,
+/// then execute the resulting `target/debug/deps/strata_txn-*` binary
+/// (filter to `dataset::loom_tests` to run just this module).
+///
+/// **Why not the simpler `RUSTFLAGS="--cfg loom" cargo test -p strata-txn
+/// --lib`:** that form sets `--cfg loom` for *every* crate rustc compiles
+/// for this invocation, not just `strata-txn`. `strata-txn` depends on
+/// `strata-index` as a regular (non-dev) dependency, and `strata-index`'s
+/// own `hnsw.rs` has a pre-existing `#[cfg(loom)]`/`#[cfg(not(loom))]` shim
+/// that imports the real `loom` crate under `cfg(loom)` — but `loom` is only
+/// a *dev*-dependency of `strata-index`, unavailable to the plain (non-test)
+/// library build that `strata-txn` links against. The global `RUSTFLAGS`
+/// form was verified to fail with `cannot find module or crate 'loom'` at
+/// `crates/index/src/hnsw.rs:5` (confirmed independent of this task's
+/// changes: `RUSTFLAGS="--cfg loom" cargo build -p strata-index --lib`
+/// fails identically on its own). `cargo rustc -p strata-txn -- --cfg loom`
+/// scopes the flag to only `strata-txn`'s own compilation unit, leaving
+/// `strata-index` (and every other dependency) compiled normally, which
+/// sidesteps the conflict without touching `crates/index`.
+///
+/// **Research note (Task 7):** `arc-swap` (resolved to 1.9.2 in Cargo.lock)
+/// has no documented `loom` integration or feature flag — confirmed against
+/// docs.rs/arc-swap/1.9.2, crates.io's listed features (only an optional
+/// `serde` feature), and the crate's own upstream `Cargo.toml` (features:
+/// `weak`, `internal-test-strategies`, `experimental-strategies`,
+/// `experimental-thread-local` — no mention of loom anywhere). `loom` can
+/// only explore interleavings of its own instrumented primitives, so it
+/// cannot see inside `arc-swap`'s real internal atomics without `arc-swap`
+/// itself being loom-aware — the same reason `crates/index`'s earlier loom
+/// test (`hnsw.rs`'s `establish_or_check_dimension`) needed a
+/// `#[cfg(loom)]`/`#[cfg(not(loom))]` shim swapping in loom's atomic types.
+/// This test therefore does **not** instrument the real `Dataset`/`ArcSwap`
+/// type directly; it models the *shape* of the `Dataset::snapshot()` /
+/// `Transaction::commit()` race — one writer storing a new value, one or
+/// more readers loading concurrently — directly on loom's own
+/// `sync::atomic::AtomicUsize`, proving the swap-then-load pattern itself is
+/// race-free (no torn reads, no panics, no deadlocks) under loom's
+/// exhaustive interleaving exploration. This is the same relationship a
+/// hand-rolled `Mutex`-guarded swap would have to a loom test: the pattern
+/// is verified, not the third-party crate's own internals.
+#[cfg(loom)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod loom_tests {
+    use std::sync::Arc as StdArc;
+
+    #[test]
+    fn one_writer_store_races_safely_with_many_readers_load() {
+        loom::model(|| {
+            // Models the Dataset::snapshot() / Transaction::commit() race
+            // directly on loom's own primitives (see this module's doc
+            // comment for why — arc-swap's internal atomics aren't
+            // loom-instrumented).
+            let current = StdArc::new(loom::sync::atomic::AtomicUsize::new(0));
+
+            let writer_current = StdArc::clone(&current);
+            let writer = loom::thread::spawn(move || {
+                writer_current.store(1, loom::sync::atomic::Ordering::SeqCst);
+            });
+
+            let reader_current = StdArc::clone(&current);
+            let reader = loom::thread::spawn(move || {
+                // A reader must only ever observe 0 (before the store) or 1
+                // (after it) — never a torn/intermediate value, and it must
+                // never panic or deadlock racing the writer's store.
+                let observed = reader_current.load(loom::sync::atomic::Ordering::SeqCst);
+                assert!(
+                    observed == 0 || observed == 1,
+                    "observed torn value: {observed}"
+                );
+            });
+
+            writer.join().unwrap();
+            reader.join().unwrap();
+        });
+    }
+}

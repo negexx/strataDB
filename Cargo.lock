@@ -1870,6 +1870,7 @@ dependencies = [
  "arc-swap",
  "arrow",
  "im",
+ "loom",
  "strata-index",
  "strata-query",
  "strata-storage",
