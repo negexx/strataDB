@@ -464,4 +464,118 @@ mod tests {
         let result = group_by(&batch, &["category"], &[("category", AggFunc::Count)]).unwrap();
         assert_eq!(result.num_rows(), 2); // "a" and "b"
     }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn null_values_are_skipped_and_an_all_null_group_yields_the_documented_sentinels() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Utf8, false),
+            Field::new("v", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["x", "x", "y"])),
+                Arc::new(Int64Array::from(vec![Some(10), None, None])), // group x: 10, null; group y: null
+            ],
+        )
+        .unwrap();
+
+        let result = group_by(
+            &batch,
+            &["k"],
+            &[("v", AggFunc::Sum), ("v", AggFunc::Count)],
+        )
+        .unwrap();
+        let keys = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let sums = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let counts = result
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+
+        let mut got: Vec<(String, f64, i64)> = (0..result.num_rows())
+            .map(|i| (keys.value(i).to_string(), sums.value(i), counts.value(i)))
+            .collect();
+        // f64 isn't Ord, so sort by the (unique) group key rather than the
+        // whole tuple.
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+
+        assert_eq!(
+            got,
+            vec![
+                ("x".to_string(), 10.0, 1), // null skipped: sum=10, count=1
+                ("y".to_string(), 0.0, 0),  // all-null group: Sum's identity is 0.0, Count is 0
+            ]
+        );
+    }
+
+    #[test]
+    fn group_by_on_a_zero_row_batch_returns_a_zero_row_result() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("category", DataType::Utf8, false),
+            Field::new("amount", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(Vec::<&str>::new())),
+                Arc::new(Int64Array::from(Vec::<i64>::new())),
+            ],
+        )
+        .unwrap();
+
+        let result = group_by(&batch, &["category"], &[("amount", AggFunc::Sum)]).unwrap();
+        assert_eq!(result.num_rows(), 0);
+    }
+
+    #[test]
+    #[ignore = "tracks a real group_by Dictionary-column bug found while adding test coverage \
+                (audit-remediation Batch 3 Task 6, 2026-07-17): build_result_batch's Field \
+                construction (see the `fields` build in build_result_batch) reuses the *original* \
+                group array's data type — Dictionary(Int32, Utf8) for a dictionary-encoded column \
+                — as the output schema's field type, but RowConverter::convert_rows decodes the \
+                row-format representation back into the dictionary's plain value type (Utf8), not \
+                the dictionary-encoded type. RecordBatch::try_new then rejects the mismatch with \
+                'column types must match schema types, expected Dictionary(Int32, Utf8) but found \
+                Utf8 at column index 0'. Not fixed here: group_by would need to either re-encode \
+                convert_rows' output back into the original group column's data type per-column, \
+                or advertise plain (non-dictionary) output types for group columns regardless of \
+                input encoding — a real design decision outside this test-only batch's scope. \
+                Re-enable once group_by's Dictionary-column handling is fixed."]
+    fn group_by_accepts_a_dictionary_encoded_group_column() {
+        use arrow::array::{DictionaryArray, StringArray as SA};
+        use arrow::datatypes::Int32Type;
+
+        let categories: DictionaryArray<Int32Type> = vec!["a", "b", "a", "a"].into_iter().collect();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "category",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                false,
+            ),
+            Field::new("amount", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(categories),
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+            ],
+        )
+        .unwrap();
+
+        let result = group_by(&batch, &["category"], &[("amount", AggFunc::Sum)]).unwrap();
+        assert_eq!(result.num_rows(), 2, "expected 2 groups: a and b");
+        let _ = SA::from(vec!["unused"]); // keep the SA import meaningful if unused elsewhere
+    }
 }
