@@ -40,6 +40,30 @@ pub struct HnswIndex {
     dimension: AtomicUsize,
 }
 
+/// Atomically establishes the vector dimension on the first call (via
+/// `compare_exchange`), or validates `len` against the already-established
+/// dimension on every subsequent call — including the losing side of a
+/// concurrent race to be "first", which must validate against whichever
+/// length actually won, never silently succeed with a different one.
+///
+/// # Errors
+///
+/// Returns [`IndexError::DimensionMismatch`] if `len` doesn't match the
+/// dimension this call just established or a prior call already established.
+fn establish_or_check_dimension(dimension: &AtomicUsize, len: usize) -> Result<(), IndexError> {
+    dimension
+        .compare_exchange(0, len, Ordering::SeqCst, Ordering::SeqCst)
+        .ok();
+    let established = dimension.load(Ordering::SeqCst);
+    if established != 0 && len != established {
+        return Err(IndexError::DimensionMismatch {
+            query_len: len,
+            expected: established,
+        });
+    }
+    Ok(())
+}
+
 impl HnswIndex {
     /// # Errors
     ///
@@ -83,10 +107,7 @@ impl HnswIndex {
     /// and would otherwise silently zip-truncate to the shorter vector,
     /// producing a wrong distance instead of an error.
     pub fn insert(&self, row_id: u64, vector: &[f32]) -> Result<(), IndexError> {
-        self.dimension
-            .compare_exchange(0, vector.len(), Ordering::SeqCst, Ordering::SeqCst)
-            .ok(); // only the first insert sets it; later calls leave it as-is
-        self.check_dimension(vector)?;
+        establish_or_check_dimension(&self.dimension, vector.len())?;
         #[allow(clippy::cast_possible_truncation)]
         let id = row_id as usize;
         self.hnsw.insert((vector, id));
