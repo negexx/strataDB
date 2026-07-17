@@ -351,4 +351,68 @@ mod tests {
             &Predicate::Eq("id".to_string(), Value::Utf8("x".to_string()))
         ));
     }
+
+    #[test]
+    fn filter_eq_on_float64_column() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "price",
+            DataType::Float64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow::array::Float64Array::from(vec![
+                9.99, 19.99, 29.99,
+            ]))],
+        )
+        .unwrap();
+
+        let result = filter(
+            &batch,
+            &Predicate::Eq("price".to_string(), Value::Float64(19.99)),
+        )
+        .unwrap();
+        assert_eq!(result.num_rows(), 1);
+    }
+
+    #[test]
+    fn should_scan_file_prunes_on_utf8_range() {
+        let mut stats = HashMap::new();
+        stats.insert(
+            "name".to_string(),
+            ColumnStats {
+                min: Value::Utf8("apple".to_string()),
+                max: Value::Utf8("mango".to_string()),
+            },
+        );
+        // "zebra" can't be in ["apple", "mango"] lexicographically.
+        assert!(!should_scan_file(
+            &stats,
+            &Predicate::Eq("name".to_string(), Value::Utf8("zebra".to_string()))
+        ));
+        assert!(should_scan_file(
+            &stats,
+            &Predicate::Eq("name".to_string(), Value::Utf8("banana".to_string()))
+        ));
+    }
+
+    #[test]
+    fn should_scan_file_prunes_on_float64_range() {
+        let mut stats = HashMap::new();
+        stats.insert(
+            "price".to_string(),
+            ColumnStats {
+                min: Value::Float64(10.0),
+                max: Value::Float64(20.0),
+            },
+        );
+        assert!(!should_scan_file(
+            &stats,
+            &Predicate::Lt("price".to_string(), Value::Float64(10.0))
+        ));
+        assert!(should_scan_file(
+            &stats,
+            &Predicate::Lt("price".to_string(), Value::Float64(15.0))
+        ));
+    }
 }
