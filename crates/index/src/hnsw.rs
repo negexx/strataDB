@@ -114,6 +114,18 @@ impl HnswIndex {
         Ok(())
     }
 
+    /// The vector dimension established by the first-ever [`Self::insert`]
+    /// call, or `0` if no vector has been inserted yet. Read-only — never
+    /// establishes a dimension itself, unlike `insert`'s internal
+    /// `establish_or_check_dimension` call. Exposed so callers (e.g.
+    /// `crates/txn`'s `Transaction::commit`) can pre-validate a batch of
+    /// pending inserts' dimensions against this index *before* applying
+    /// any of them, rather than discovering a mismatch mid-application.
+    #[must_use]
+    pub fn established_dimension(&self) -> usize {
+        self.dimension.load(Ordering::SeqCst)
+    }
+
     /// # Errors
     ///
     /// Returns [`IndexError::DimensionMismatch`] if `query`'s length
@@ -558,6 +570,19 @@ mod tests {
                 expected: 3
             })
         ));
+    }
+
+    #[test]
+    fn established_dimension_is_zero_before_any_insert() {
+        let index = HnswIndex::new(16, 100, 16, 200).unwrap();
+        assert_eq!(index.established_dimension(), 0);
+    }
+
+    #[test]
+    fn established_dimension_reflects_the_first_inserted_vectors_length() {
+        let index = HnswIndex::new(16, 100, 16, 200).unwrap();
+        index.insert(0, &[0.0, 0.0, 0.0]).unwrap();
+        assert_eq!(index.established_dimension(), 3);
     }
 }
 
