@@ -55,9 +55,29 @@ fn should_dictionary_encode(column: &ArrayRef) -> Result<bool> {
     }
     let converter = RowConverter::new(vec![SortField::new(column.data_type().clone())])?;
     let rows = converter.convert_columns(std::slice::from_ref(column))?;
-    let distinct: HashSet<_> = rows.into_iter().map(|row| row.owned()).collect();
+
     #[allow(clippy::cast_precision_loss)]
-    let ratio = distinct.len() as f64 / column.len() as f64;
+    let len = column.len() as f64;
+    // Once the running distinct count reaches this many, the ratio can only
+    // ever be >= DICTIONARY_ENCODING_THRESHOLD (distinct count never
+    // decreases as more rows are added) — bail out without owning/hashing
+    // the remaining rows, instead of always materializing the full column.
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation
+    )]
+    let bail_out_at = (DICTIONARY_ENCODING_THRESHOLD * len).ceil() as usize;
+
+    let mut distinct: HashSet<_> = HashSet::new();
+    for row in &rows {
+        distinct.insert(row.owned());
+        if distinct.len() >= bail_out_at {
+            return Ok(false);
+        }
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let ratio = distinct.len() as f64 / len;
     Ok(ratio < DICTIONARY_ENCODING_THRESHOLD)
 }
 
