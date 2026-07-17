@@ -118,6 +118,30 @@ impl Dataset {
         &self.manifest.data_files
     }
 
+    /// Iterates `self.manifest.data_files`, keeping only entries
+    /// `should_scan_file` says could match `predicate` (or every entry, if
+    /// `predicate` is `None`), reads and joins each surviving file's path
+    /// via [`safe_join`], and applies `process` to each raw batch. Shared
+    /// by [`Dataset::scan`], [`Dataset::scan_with_predicate`], and
+    /// [`Dataset::row_ids_matching`] — previously each re-implemented this
+    /// same "iterate -> prune -> read -> process" skeleton independently.
+    fn read_surviving_files<T>(
+        &self,
+        predicate: Option<&Predicate>,
+        mut process: impl FnMut(RecordBatch) -> Result<T>,
+    ) -> Result<Vec<T>> {
+        let data_dir = self.data_dir();
+        self.manifest
+            .data_files
+            .iter()
+            .filter(|entry| predicate.is_none_or(|p| should_scan_file(&entry.stats, p)))
+            .map(|entry| {
+                let batch = read_batch(&safe_join(&data_dir, &entry.name)?)?;
+                process(batch)
+            })
+            .collect()
+    }
+
     /// Reads every committed row as a single `RecordBatch`, cast back to
     /// `schema` — the caller's logical schema, not necessarily the physical
     /// on-disk representation. Phase 1 has no per-fragment scan pushdown —
@@ -141,16 +165,8 @@ impl Dataset {
     /// column can't be cast to `schema`'s corresponding field type, or if
     /// the cast batches can't be concatenated against `schema`.
     pub fn scan(&self, schema: &SchemaRef) -> Result<RecordBatch> {
-        let data_dir = self.data_dir();
-        let batches = self
-            .manifest
-            .data_files
-            .iter()
-            .map(|entry| {
-                let batch = read_batch(&safe_join(&data_dir, &entry.name)?)?;
-                cast_batch_to_schema(&batch, schema)
-            })
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let batches =
+            self.read_surviving_files(None, |batch| cast_batch_to_schema(&batch, schema))?;
         Ok(concat_batches(schema, &batches)?)
     }
 
@@ -193,19 +209,11 @@ impl Dataset {
         schema: &SchemaRef,
         predicate: &Predicate,
     ) -> Result<RecordBatch> {
-        let data_dir = self.data_dir();
-        let batches = self
-            .manifest
-            .data_files
-            .iter()
-            .filter(|entry| should_scan_file(&entry.stats, predicate))
-            .map(|entry| {
-                let batch = read_batch(&safe_join(&data_dir, &entry.name)?)?;
-                cast_batch_to_schema(&batch, schema)
-            })
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        let scanned = concat_batches(schema, &batches)?;
-        Ok(filter(&scanned, predicate)?)
+        let batches = self.read_surviving_files(Some(predicate), |batch| {
+            let cast = cast_batch_to_schema(&batch, schema)?;
+            Ok(filter(&cast, predicate)?)
+        })?;
+        Ok(concat_batches(schema, &batches)?)
     }
 
     /// Approximate nearest-neighbor search over the vector column, optionally
@@ -241,13 +249,7 @@ impl Dataset {
     /// logical schema never includes `ROW_ID_COLUMN` and would drop it (see
     /// Task 1's note on `cast_batch_to_schema`'s positional zip).
     fn row_ids_matching(&self, predicate: &Predicate) -> Result<Vec<usize>> {
-        let data_dir = self.data_dir();
-        let mut ids = Vec::new();
-        for entry in &self.manifest.data_files {
-            if !should_scan_file(&entry.stats, predicate) {
-                continue;
-            }
-            let batch = read_batch(&safe_join(&data_dir, &entry.name)?)?;
+        let per_file_ids = self.read_surviving_files(Some(predicate), |batch| {
             let matched = filter(&batch, predicate)?;
             let row_id_idx = matched.schema_ref().index_of(ROW_ID_COLUMN)?;
             let row_ids = matched
@@ -260,9 +262,12 @@ impl Dataset {
                     )))
                 })?;
             #[allow(clippy::cast_possible_truncation)]
-            ids.extend((0..row_ids.len()).map(|i| row_ids.value(i) as usize));
-        }
-        Ok(ids)
+            let ids: Vec<usize> = (0..row_ids.len())
+                .map(|i| row_ids.value(i) as usize)
+                .collect();
+            Ok(ids)
+        })?;
+        Ok(per_file_ids.into_iter().flatten().collect())
     }
 
     #[must_use]
