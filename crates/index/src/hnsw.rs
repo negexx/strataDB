@@ -220,7 +220,7 @@ impl HnswIndex {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
@@ -560,5 +560,57 @@ mod tests {
                 expected: 3
             })
         ));
+    }
+}
+
+/// Run with: `RUSTFLAGS="--cfg loom" cargo test -p strata-index --lib`
+#[cfg(loom)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod loom_tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_first_inserts_race_safely_on_dimension() {
+        loom::model(|| {
+            let dimension = loom::sync::Arc::new(AtomicUsize::new(0));
+            let d1 = loom::sync::Arc::clone(&dimension);
+            let d2 = loom::sync::Arc::clone(&dimension);
+
+            let t1 = loom::thread::spawn(move || establish_or_check_dimension(&d1, 3));
+            let t2 = loom::thread::spawn(move || establish_or_check_dimension(&d2, 2));
+
+            let r1 = t1.join().unwrap();
+            let r2 = t2.join().unwrap();
+
+            // Exactly one of the two racing "first" calls wins and
+            // establishes the dimension; the other must observe a
+            // DimensionMismatch against whichever length actually won —
+            // never silently succeed with a different length, never leave
+            // `dimension` at an intermediate/torn value.
+            let established = dimension.load(Ordering::SeqCst);
+            match established {
+                3 => {
+                    assert!(r1.is_ok());
+                    assert!(matches!(
+                        r2,
+                        Err(IndexError::DimensionMismatch {
+                            query_len: 2,
+                            expected: 3
+                        })
+                    ));
+                }
+                2 => {
+                    assert!(r2.is_ok());
+                    assert!(matches!(
+                        r1,
+                        Err(IndexError::DimensionMismatch {
+                            query_len: 3,
+                            expected: 2
+                        })
+                    ));
+                }
+                other => panic!("dimension must be established as 2 or 3, got {other}"),
+            }
+        });
     }
 }
