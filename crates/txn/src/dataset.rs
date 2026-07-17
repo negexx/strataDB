@@ -46,22 +46,13 @@ pub struct Dataset {
     index: HnswIndex,
 }
 
-/// The outcome of [`Dataset::explain`] — which files a predicate would
-/// touch, without actually reading any of their bodies.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExplainResult {
-    pub total_files: usize,
-    pub scanned: Vec<String>,
-    pub skipped: Vec<String>,
-}
-
 /// The single source of truth for "where does this dataset's data live,
 /// relative to its root directory" — used by `Dataset::data_dir`,
 /// `Transaction::commit`, and `replay_index`, which each need it from a
 /// different type/context (a `&Dataset`, a `Transaction`, and a bare
 /// `&Path` respectively) and previously each hardcoded `dir.join("data")`
 /// independently.
-fn data_subdir(dir: &Path) -> PathBuf {
+pub(crate) fn data_subdir(dir: &Path) -> PathBuf {
     dir.join("data")
 }
 
@@ -128,160 +119,6 @@ impl Dataset {
     #[must_use]
     pub fn data_files(&self) -> &[DataFileEntry] {
         &self.manifest.data_files
-    }
-
-    /// Iterates `self.manifest.data_files`, keeping only entries
-    /// `should_scan_file` says could match `predicate` (or every entry, if
-    /// `predicate` is `None`), reads and joins each surviving file's path
-    /// via [`safe_join`], and applies `process` to each raw batch. Shared
-    /// by [`Dataset::scan`], [`Dataset::scan_with_predicate`], and
-    /// [`Dataset::row_ids_matching`] — previously each re-implemented this
-    /// same "iterate -> prune -> read -> process" skeleton independently.
-    fn read_surviving_files<T>(
-        &self,
-        predicate: Option<&Predicate>,
-        mut process: impl FnMut(RecordBatch) -> Result<T>,
-    ) -> Result<Vec<T>> {
-        let data_dir = self.data_dir();
-        self.manifest
-            .data_files
-            .iter()
-            .filter(|entry| predicate.is_none_or(|p| should_scan_file(&entry.stats, p)))
-            .map(|entry| {
-                let batch = read_batch(&safe_join(&data_dir, &entry.name)?)?;
-                process(batch)
-            })
-            .collect()
-    }
-
-    /// Reads every committed row as a single `RecordBatch`, cast back to
-    /// `schema` — the caller's logical schema, not necessarily the physical
-    /// on-disk representation. For predicate-pushdown pruning (skipping
-    /// whole files a predicate provably can't match), see
-    /// [`Dataset::scan_with_predicate`] and [`Dataset::explain`] below —
-    /// this method always reads every committed file.
-    ///
-    /// Each committed file's columns are cast to `schema`'s types before
-    /// concatenation. This is required, not optional: `encode_batch`
-    /// (`crates/storage::encoding`) dictionary-encodes low-cardinality
-    /// columns independently per commit, based on that commit's own data —
-    /// so two files belonging to the same logical column can legitimately
-    /// have different physical types (e.g. one `Utf8`, another
-    /// `Dictionary(Int32, Utf8)`), and `concat_batches` requires every
-    /// batch to match a single schema exactly. Casting on read is what lets
-    /// `scan`'s logical contract stay stable regardless of any file's
-    /// physical encoding.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if any committed data file fails to read, if a
-    /// column can't be cast to `schema`'s corresponding field type, or if
-    /// the cast batches can't be concatenated against `schema`.
-    pub fn scan(&self, schema: &SchemaRef) -> Result<RecordBatch> {
-        let batches =
-            self.read_surviving_files(None, |batch| cast_batch_to_schema(&batch, schema))?;
-        Ok(concat_batches(schema, &batches)?)
-    }
-
-    /// Reports which committed files `predicate` would require scanning,
-    /// without opening any file body — pure introspection over stats
-    /// already loaded in the manifest. See
-    /// `.claude/docs/design/phase-3-query-refinement-spec.md` §3.
-    #[must_use]
-    pub fn explain(&self, predicate: &Predicate) -> ExplainResult {
-        let mut scanned = Vec::new();
-        let mut skipped = Vec::new();
-        for entry in &self.manifest.data_files {
-            if should_scan_file(&entry.stats, predicate) {
-                scanned.push(entry.name.clone());
-            } else {
-                skipped.push(entry.name.clone());
-            }
-        }
-        ExplainResult {
-            total_files: self.manifest.data_files.len(),
-            scanned,
-            skipped,
-        }
-    }
-
-    /// Like [`Dataset::scan`], but skips any file `predicate` provably
-    /// can't match (per [`Dataset::explain`]'s decision) and row-filters
-    /// the rest. This is the real performance path; `explain` is its
-    /// introspection twin — both call the exact same
-    /// `strata_query::should_scan_file`, so they can never disagree about
-    /// what would be skipped.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error under the same conditions as [`Dataset::scan`],
-    /// plus if `predicate`'s column doesn't exist or its value's type
-    /// doesn't match the column's Arrow type.
-    pub fn scan_with_predicate(
-        &self,
-        schema: &SchemaRef,
-        predicate: &Predicate,
-    ) -> Result<RecordBatch> {
-        let batches = self.read_surviving_files(Some(predicate), |batch| {
-            let cast = cast_batch_to_schema(&batch, schema)?;
-            Ok(filter(&cast, predicate)?)
-        })?;
-        Ok(concat_batches(schema, &batches)?)
-    }
-
-    /// Approximate nearest-neighbor search over the vector column, optionally
-    /// narrowed to rows matching `predicate`. See
-    /// `.claude/docs/design/phase-4-vector-index-spec.md` §3-4.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `predicate` is supplied and its column doesn't
-    /// exist or its value's type doesn't match the column's Arrow type
-    /// (surfaced by the same row-id resolution path `filter`/
-    /// `scan_with_predicate` already use), or if `query`'s dimensionality
-    /// doesn't match the indexed vectors'.
-    pub fn vector_search(
-        &self,
-        query: &[f32],
-        k: usize,
-        predicate: Option<&Predicate>,
-    ) -> Result<Vec<strata_index::VectorMatch>> {
-        let Some(predicate) = predicate else {
-            return Ok(self.index.search(query, k, EF_SEARCH_DEFAULT)?);
-        };
-
-        let mut live_ids = self.row_ids_matching(predicate)?;
-        live_ids.sort_unstable();
-        let ef = widen_ef(EF_SEARCH_DEFAULT, self, predicate);
-        Ok(self.index.search_filtered(query, k, ef, &live_ids)?)
-    }
-
-    /// Resolves the row-ids of every row matching `predicate`, reading each
-    /// surviving (per `should_scan_file`) file's raw on-disk batch directly —
-    /// not through the public `scan_with_predicate`, which requires the
-    /// caller to supply a schema matching `ROW_ID_COLUMN`'s precondition
-    /// (see its doc comment above) rather than guaranteeing row-ids are
-    /// always retrievable.
-    fn row_ids_matching(&self, predicate: &Predicate) -> Result<Vec<usize>> {
-        let per_file_ids = self.read_surviving_files(Some(predicate), |batch| {
-            let matched = filter(&batch, predicate)?;
-            let row_id_idx = matched.schema_ref().index_of(ROW_ID_COLUMN)?;
-            let row_ids = matched
-                .column(row_id_idx)
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .ok_or_else(|| {
-                    TxnError::Arrow(arrow::error::ArrowError::CastError(format!(
-                        "{ROW_ID_COLUMN} column must be UInt64"
-                    )))
-                })?;
-            #[allow(clippy::cast_possible_truncation)]
-            let ids: Vec<usize> = (0..row_ids.len())
-                .map(|i| row_ids.value(i) as usize)
-                .collect();
-            Ok(ids)
-        })?;
-        Ok(per_file_ids.into_iter().flatten().collect())
     }
 
     #[must_use]
@@ -424,28 +261,6 @@ impl Transaction {
 const HNSW_MAX_NB_CONNECTION: usize = 16;
 const HNSW_MAX_LAYER: usize = 16;
 const HNSW_EF_CONSTRUCTION: usize = 200;
-const EF_SEARCH_DEFAULT: usize = 32;
-const MIN_SELECTIVITY_FLOOR: f64 = 0.01;
-const MAX_EF_SCALE: f64 = 20.0;
-
-/// Widens `base_ef` using `Dataset::explain`'s scanned/total file ratio as
-/// a coarse, file-granularity *upper bound* on selectivity — see
-/// `.claude/docs/design/phase-4-vector-index-spec.md` §4. Erring toward a
-/// wider `ef` costs search time, never correctness, so an overestimate of
-/// how many rows survive is the safe direction.
-fn widen_ef(base_ef: usize, dataset: &Dataset, predicate: &Predicate) -> usize {
-    let explain = dataset.explain(predicate);
-    #[allow(clippy::cast_precision_loss)]
-    let selectivity_upper_bound = explain.scanned.len() as f64 / explain.total_files.max(1) as f64;
-    let scale = (1.0 / selectivity_upper_bound.max(MIN_SELECTIVITY_FLOOR)).min(MAX_EF_SCALE);
-    #[allow(
-        clippy::cast_precision_loss,
-        clippy::cast_sign_loss,
-        clippy::cast_possible_truncation
-    )]
-    let widened = ((base_ef as f64) * scale).round() as usize;
-    widened
-}
 
 fn new_hnsw_index(capacity: usize) -> Result<HnswIndex> {
     Ok(HnswIndex::new(
@@ -573,7 +388,7 @@ fn build_delta_entries(batch: &RecordBatch, row_id_base: u64) -> Result<Vec<Delt
 /// `DataFileEntry.name`/`.delta_log` are documented as "relative to the
 /// dataset's data/ directory" (`crates/storage/src/manifest.rs`) — this is
 /// what actually enforces that contract instead of merely documenting it.
-fn safe_join(data_dir: &Path, name: &str) -> Result<PathBuf> {
+pub(crate) fn safe_join(data_dir: &Path, name: &str) -> Result<PathBuf> {
     let candidate = Path::new(name);
     let all_normal = candidate
         .components()
@@ -586,8 +401,8 @@ fn safe_join(data_dir: &Path, name: &str) -> Result<PathBuf> {
 
 /// Casts every column of `batch` to the corresponding field type in
 /// `schema`, leaving already-matching columns untouched (a cheap `Arc`
-/// clone, not a copy). See [`Dataset::scan`]'s doc comment for why this is
-/// necessary rather than a defensive nicety.
+/// clone, not a copy). See [`crate::snapshot::Snapshot::scan`]'s doc comment
+/// for why this is necessary rather than a defensive nicety.
 ///
 /// Every committed file physically carries a trailing hidden
 /// [`ROW_ID_COLUMN`] (see `append_row_id_column`). It only counts toward
@@ -604,7 +419,7 @@ fn safe_join(data_dir: &Path, name: &str) -> Result<PathBuf> {
 /// Returns [`TxnError::SchemaMismatch`] if `schema`'s field count doesn't
 /// match `batch`'s logical column count, or an Arrow error if a column
 /// can't be cast to its corresponding field's type.
-fn cast_batch_to_schema(batch: &RecordBatch, schema: &SchemaRef) -> Result<RecordBatch> {
+pub(crate) fn cast_batch_to_schema(batch: &RecordBatch, schema: &SchemaRef) -> Result<RecordBatch> {
     let physical = batch.num_columns();
     let hidden_row_id = batch.schema_ref().index_of(ROW_ID_COLUMN).is_ok()
         && schema.index_of(ROW_ID_COLUMN).is_err();
