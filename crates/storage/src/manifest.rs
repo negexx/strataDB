@@ -302,4 +302,43 @@ mod tests {
 
         fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn read_current_skips_a_manifest_suffixed_file_with_a_non_numeric_stem() {
+        let dir = temp_dataset_dir("garbage-stem");
+        let versions = versions_dir(&dir);
+        fs::create_dir_all(&versions).unwrap();
+        let mut garbage = File::create(versions.join("not-a-number.manifest")).unwrap();
+        garbage.write_all(b"{}").unwrap();
+
+        // No real manifest exists at all - the garbage-stemmed file must be
+        // silently skipped, not picked as current and not erroring.
+        let current = read_current(&dir).unwrap();
+        assert!(
+            current.is_none(),
+            "a garbage-stemmed *.manifest file must never be treated as current"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_current_is_none_when_versions_dir_has_only_a_leftover_tmp_file() {
+        // Simulates a crash during the *very first* commit, before any
+        // version was ever successfully renamed into place - unlike
+        // leftover_tmp_file_is_never_picked_up_as_current, `best` must stay
+        // None all the way through, not just fall back to an earlier real
+        // version.
+        let dir = temp_dataset_dir("only-tmp-file");
+        let versions = versions_dir(&dir);
+        fs::create_dir_all(&versions).unwrap();
+        let mut tmp = File::create(versions.join(".tmp-0")).unwrap();
+        tmp.write_all(b"{ incomplete json").unwrap();
+
+        let current = read_current(&dir).unwrap();
+        assert!(
+            current.is_none(),
+            "a versions/ directory containing only a leftover .tmp file must read as fresh, not current"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
 }
