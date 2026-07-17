@@ -22,6 +22,45 @@ pub enum TxnError {
         "row {row_id}'s vector contains a non-finite component (NaN or Infinity) — cannot be committed"
     )]
     NonFiniteVectorComponent { row_id: u64 },
+    #[error("manifest arithmetic would overflow: {0}")]
+    ManifestOverflow(String),
+    #[error(
+        "manifest declares an unreasonably large row-id capacity ({0}); maximum allowed is {1}"
+    )]
+    UnreasonableCapacity(u64, u64),
+    #[error("manifest references an unsafe file path: {0:?}")]
+    UnsafeManifestPath(String),
+    #[error("schema mismatch casting a data file: expected {expected} columns, found {actual}")]
+    SchemaMismatch { expected: usize, actual: usize },
 }
 
 pub type Result<T> = std::result::Result<T, TxnError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_error_variants_format_with_their_context() {
+        assert_eq!(
+            TxnError::ManifestOverflow("next_row_id".to_string()).to_string(),
+            "manifest arithmetic would overflow: next_row_id"
+        );
+        assert_eq!(
+            TxnError::UnreasonableCapacity(5_000_000_000, 1_000_000_000).to_string(),
+            "manifest declares an unreasonably large row-id capacity (5000000000); maximum allowed is 1000000000"
+        );
+        assert_eq!(
+            TxnError::UnsafeManifestPath("../escape".to_string()).to_string(),
+            "manifest references an unsafe file path: \"../escape\""
+        );
+        assert_eq!(
+            TxnError::SchemaMismatch {
+                expected: 3,
+                actual: 2
+            }
+            .to_string(),
+            "schema mismatch casting a data file: expected 3 columns, found 2"
+        );
+    }
+}
