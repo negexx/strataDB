@@ -296,7 +296,9 @@ impl Transaction {
     /// disk but never made visible, the same as an interrupted crash.
     pub fn commit(self) -> Result<Dataset> {
         let mut manifest = self.base_manifest;
-        let new_version = manifest.version + 1;
+        let new_version = manifest.version.checked_add(1).ok_or_else(|| {
+            TxnError::ManifestOverflow(format!("version {} + 1", manifest.version))
+        })?;
         let data_dir = self.dir.join("data");
         std::fs::create_dir_all(&data_dir)?;
 
@@ -316,7 +318,12 @@ impl Transaction {
             // must leave no trace: no data file, no delta-log file, and
             // manifest.next_row_id must not have been advanced yet either.
             let deltas = build_delta_entries(batch, row_id_base)?;
-            manifest.next_row_id += num_rows;
+            manifest.next_row_id = manifest.next_row_id.checked_add(num_rows).ok_or_else(|| {
+                TxnError::ManifestOverflow(format!(
+                    "next_row_id {} + {num_rows}",
+                    manifest.next_row_id
+                ))
+            })?;
             let with_row_id = append_row_id_column(batch, row_id_base, num_rows)?;
 
             let encoded = strata_storage::encode_batch(&with_row_id)?;
@@ -476,7 +483,9 @@ fn build_delta_entries(batch: &RecordBatch, row_id_base: u64) -> Result<Vec<Delt
                 "vector column's inner type must be Float32".to_string(),
             ))
         })?;
-        let row_id = row_id_base + u64::try_from(i)?;
+        let row_id = row_id_base.checked_add(u64::try_from(i)?).ok_or_else(|| {
+            TxnError::ManifestOverflow(format!("row_id_base {row_id_base} + {i}"))
+        })?;
         if row.values().iter().any(|component| !component.is_finite()) {
             return Err(TxnError::NonFiniteVectorComponent { row_id });
         }
@@ -669,6 +678,46 @@ mod tests {
         assert_eq!(id_stats.min, strata_storage::Value::Int64(10));
         assert_eq!(id_stats.max, strata_storage::Value::Int64(30));
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // NOTE (Batch 1, Task 2): the plan also specifies a sibling test,
+    // `commit_errors_instead_of_overflowing_when_next_row_id_would_wrap`,
+    // crafting a hostile manifest with `next_row_id: u64::MAX - 1`. It cannot
+    // pass yet: `Dataset::open` -> `replay_index` passes `next_row_id`
+    // straight to `hnsw_rs::Hnsw::new` as a pre-allocation capacity, which
+    // panics ("capacity overflow") before `commit` ever runs. Deliberately
+    // deferred to the task that guards manifest capacity at open
+    // (`TxnError::UnreasonableCapacity`) — see the Task 2 report.
+
+    #[test]
+    fn commit_errors_instead_of_overflowing_when_version_would_wrap() {
+        let dir = temp_dir("version-overflow");
+        // Craft a manifest whose version sits at u64::MAX, bypassing the
+        // normal create/commit path (which could never reach this value in
+        // practice) to simulate a hostile/corrupted manifest.
+        let hostile = Manifest {
+            version: u64::MAX,
+            data_files: Vec::new(),
+            next_row_id: 0,
+        };
+        strata_storage::commit_manifest(&dir, &hostile).unwrap();
+        let ds = Dataset::open(&dir).unwrap();
+
+        let schema = test_schema();
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1]))]).unwrap();
+        let mut txn = ds.begin();
+        txn.insert(batch);
+        let result = txn.commit();
+
+        // `Dataset` doesn't implement `Debug` (its HNSW index can't), so
+        // only the `Err` side is printable on failure.
+        assert!(
+            matches!(&result, Err(TxnError::ManifestOverflow(_))),
+            "expected ManifestOverflow, got {:?}",
+            result.err()
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
