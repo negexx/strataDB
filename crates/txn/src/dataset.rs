@@ -410,6 +410,16 @@ fn new_hnsw_index(capacity: usize) -> Result<HnswIndex> {
     )?)
 }
 
+/// Sane ceiling for a manifest's `next_row_id` before it's used to size an
+/// eager HNSW allocation. `hnsw_rs::Hnsw::new`'s `max_elements` parameter
+/// drives a `Vec::with_capacity` sized proportionally to it (verified
+/// against the installed `hnsw_rs-0.3.4` source) — an unvalidated,
+/// manifest-controlled value near `u64::MAX` would attempt an
+/// unreasonably large allocation on open of a corrupted/hostile dataset
+/// instead of returning a typed error. One billion rows is far beyond any
+/// realistic embedded dataset today; revisit if a real workload needs more.
+const MAX_REASONABLE_ROW_ID_CAPACITY: u64 = 1_000_000_000;
+
 /// Rebuilds a fresh `HnswIndex` by replaying every delta-log entry across
 /// every committed data file in `manifest`, in order. Used by both
 /// `Dataset::open` (crash recovery) and `Transaction::commit` (so a
@@ -421,8 +431,15 @@ fn new_hnsw_index(capacity: usize) -> Result<HnswIndex> {
 /// # Errors
 ///
 /// Returns an error if any delta-log file listed in `manifest` fails to
-/// read or parse.
+/// read or parse, or if `manifest.next_row_id` exceeds
+/// [`MAX_REASONABLE_ROW_ID_CAPACITY`].
 fn replay_index(dir: &Path, manifest: &Manifest) -> Result<HnswIndex> {
+    if manifest.next_row_id > MAX_REASONABLE_ROW_ID_CAPACITY {
+        return Err(TxnError::UnreasonableCapacity(
+            manifest.next_row_id,
+            MAX_REASONABLE_ROW_ID_CAPACITY,
+        ));
+    }
     let capacity = usize::try_from(manifest.next_row_id).unwrap_or(usize::MAX);
     let mut index = new_hnsw_index(capacity)?;
     let data_dir = dir.join("data");
@@ -681,14 +698,39 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // NOTE (Batch 1, Task 2): the plan also specifies a sibling test,
+    // NOTE (Batch 1, Task 2): the plan also specified a sibling test,
     // `commit_errors_instead_of_overflowing_when_next_row_id_would_wrap`,
-    // crafting a hostile manifest with `next_row_id: u64::MAX - 1`. It cannot
-    // pass yet: `Dataset::open` -> `replay_index` passes `next_row_id`
-    // straight to `hnsw_rs::Hnsw::new` as a pre-allocation capacity, which
-    // panics ("capacity overflow") before `commit` ever runs. Deliberately
-    // deferred to the task that guards manifest capacity at open
-    // (`TxnError::UnreasonableCapacity`) — see the Task 2 report.
+    // crafting a hostile manifest with `next_row_id: u64::MAX - 1`. Task 2
+    // deferred it because `Dataset::open` -> `replay_index` panicked
+    // ("capacity overflow") on such a manifest before `commit` ever ran.
+    // Resolved by Batch 1, Task 4: `replay_index` now rejects any manifest
+    // whose `next_row_id` exceeds `MAX_REASONABLE_ROW_ID_CAPACITY` with a
+    // typed `TxnError::UnreasonableCapacity` at open — covered by
+    // `open_errors_instead_of_attempting_a_huge_allocation_on_an_unreasonable_next_row_id`
+    // below. The capacity ceiling makes a near-`u64::MAX` `next_row_id`
+    // unreachable through `open`, so the originally-specified commit-time
+    // wrap test is intentionally subsumed by the open-time guard test.
+
+    #[test]
+    fn open_errors_instead_of_attempting_a_huge_allocation_on_an_unreasonable_next_row_id() {
+        let dir = temp_dir("unreasonable-capacity");
+        let hostile = Manifest {
+            version: 0,
+            data_files: Vec::new(),
+            next_row_id: u64::MAX,
+        };
+        strata_storage::commit_manifest(&dir, &hostile).unwrap();
+
+        let result = Dataset::open(&dir);
+        // `Dataset` doesn't implement `Debug` (its HNSW index can't), so
+        // only the `Err` side is printable on failure.
+        assert!(
+            matches!(result, Err(TxnError::UnreasonableCapacity(_, _))),
+            "expected UnreasonableCapacity, got {:?}",
+            result.err()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn commit_errors_instead_of_overflowing_when_version_would_wrap() {
