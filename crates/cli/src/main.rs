@@ -64,12 +64,14 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
             let ds = strata_txn::Dataset::open(dir)?;
             let mut txn = ds.begin();
             txn.insert(strata_txn::mvp_fixtures::mvp_row(id, name, [v0, v1, v2])?);
-            let ds = txn.commit()?;
+            txn.commit()?;
             println!("committed version {}", ds.current_version());
         }
         "scan" => {
             let ds = strata_txn::Dataset::open(dir)?;
-            let batch = ds.scan(&strata_txn::mvp_fixtures::mvp_schema())?;
+            let batch = ds
+                .snapshot()
+                .scan(&strata_txn::mvp_fixtures::mvp_schema())?;
             println!(
                 "{} rows at version {}",
                 batch.num_rows(),
@@ -80,7 +82,9 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         "filter" => {
             let name = args.get(3).ok_or("missing <name>")?;
             let ds = strata_txn::Dataset::open(dir)?;
-            let batch = ds.scan(&strata_txn::mvp_fixtures::mvp_schema())?;
+            let batch = ds
+                .snapshot()
+                .scan(&strata_txn::mvp_fixtures::mvp_schema())?;
             let filtered = strata_query::filter_eq(&batch, "name", name)?;
             println!("{} matching rows", filtered.num_rows());
             print_batch(&filtered)?;
@@ -88,7 +92,9 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         "search" => handle_search(args, dir)?,
         "inspect" => {
             let ds = strata_txn::Dataset::open(dir)?;
-            let batch = ds.scan(&strata_txn::mvp_fixtures::mvp_schema())?;
+            let batch = ds
+                .snapshot()
+                .scan(&strata_txn::mvp_fixtures::mvp_schema())?;
             println!(
                 "version={} row_count={}",
                 ds.current_version(),
@@ -100,7 +106,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         }
         "crash-loop" => {
             let n: usize = args.get(3).ok_or("missing <num_commits>")?.parse()?;
-            let mut ds = strata_txn::Dataset::open(dir)?;
+            let ds = strata_txn::Dataset::open(dir)?;
             for i in 0..n {
                 let mut txn = ds.begin();
                 #[allow(clippy::cast_precision_loss)]
@@ -109,7 +115,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
                     "loop",
                     [i as f32, 0.0, 0.0],
                 )?);
-                ds = txn.commit()?;
+                txn.commit()?;
                 println!("committed {}", ds.current_version());
                 std::io::stdout().flush()?;
             }
@@ -196,7 +202,9 @@ fn handle_search(args: &[String], dir: &str) -> Result<(), Box<dyn Error>> {
     let ds = strata_txn::Dataset::open(dir)?;
 
     if exact {
-        let batch = ds.scan(&strata_txn::mvp_fixtures::mvp_schema())?;
+        let batch = ds
+            .snapshot()
+            .scan(&strata_txn::mvp_fixtures::mvp_schema())?;
         let vec_idx = batch.schema_ref().index_of("vector")?;
         let vectors = batch
             .column(vec_idx)
@@ -218,7 +226,11 @@ fn handle_search(args: &[String], dir: &str) -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    let matches = ds.vector_search(&[v0, v1, v2], k, predicate.as_ref())?;
+    // Both reads below share a single snapshot, so the vector-search matches
+    // and the row-id-to-display-column translation come from exactly the
+    // same committed state.
+    let snapshot = ds.snapshot();
+    let matches = snapshot.vector_search(&[v0, v1, v2], k, predicate.as_ref())?;
 
     // Scan once, requesting the hidden row-id column back, to translate
     // vector_search's row-ids into the user-facing id/name columns for
@@ -236,7 +248,7 @@ fn handle_search(args: &[String], dir: &str) -> Result<(), Box<dyn Error>> {
         false,
     ));
     let display_schema = Arc::new(Schema::new(display_fields));
-    let batch = ds.scan(&display_schema)?;
+    let batch = snapshot.scan(&display_schema)?;
     let row_id_idx = batch.schema_ref().index_of(strata_txn::ROW_ID_COLUMN)?;
     let row_ids = batch
         .column(row_id_idx)
@@ -279,7 +291,7 @@ fn handle_explain(dir: &str, args: &[String]) -> Result<(), Box<dyn Error>> {
     let predicate = parse_predicate(column, op, value)?;
 
     let ds = strata_txn::Dataset::open(dir)?;
-    let result = ds.explain(&predicate);
+    let result = ds.snapshot().explain(&predicate);
     println!(
         "total_files={} scanned={} skipped={} predicate={predicate:?}",
         result.total_files,
@@ -419,7 +431,10 @@ mod tests {
         .unwrap();
 
         let ds = strata_txn::Dataset::open(&dir_str).unwrap();
-        let scanned = ds.scan(&strata_txn::mvp_fixtures::mvp_schema()).unwrap();
+        let scanned = ds
+            .snapshot()
+            .scan(&strata_txn::mvp_fixtures::mvp_schema())
+            .unwrap();
         assert_eq!(
             scanned.num_rows(),
             2,

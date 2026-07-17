@@ -29,11 +29,11 @@ fn mvp_checklist_steps_1_through_5() {
     .unwrap();
     let mut txn = ds.begin();
     txn.insert(batch.clone());
-    let ds = txn.commit().unwrap();
+    txn.commit().unwrap();
     assert_eq!(ds.current_version(), 1);
 
     // 3. Read the data back via a full scan.
-    let scanned = ds.scan(&mvp_schema()).unwrap();
+    let scanned = ds.snapshot().scan(&mvp_schema()).unwrap();
     assert_eq!(scanned.num_rows(), 3);
     assert_eq!(scanned, batch);
 
