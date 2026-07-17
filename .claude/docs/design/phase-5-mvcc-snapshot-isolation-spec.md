@@ -8,7 +8,7 @@
 
 ## 12. Known limitations
 
-Carried forward from `phase-4-vector-index-spec.md §12`, plus one new Phase-5-specific item:
+Carried forward from `phase-4-vector-index-spec.md` (the no-removal constraint is described in its §1 `HnswIndex` struct comment and §11 non-goals, not its own §12, which covers a different limitation — the O(historical)-per-commit replay cost this phase fixes), plus one new Phase-5-specific item:
 
 - `hnsw_rs` has no node-removal API — a tombstoned row's graph node is never physically reclaimed until Phase 8 compaction rebuilds the graph from only-live rows. Phase 5 does not change this.
 - **New:** a `Snapshot` stays alive for exactly as long as any reader holds a clone of it (ordinary `Arc` refcounting). A pathological long-lived reader holding an old `Snapshot` indefinitely pins that version's `Arc<Manifest>` — and therefore the data/delta-log files it references — from ever being reclaimed by Phase 8 compaction, whenever that lands. No enforcement (max-snapshot-age, warnings) exists yet; this is an open question for Phase 8's design, not solved here.
