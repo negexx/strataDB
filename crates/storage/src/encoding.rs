@@ -53,11 +53,15 @@ fn should_dictionary_encode(column: &ArrayRef) -> Result<bool> {
     if column.is_empty() {
         return Ok(false);
     }
+    let non_null_count = column.len() - column.null_count();
+    if non_null_count == 0 {
+        return Ok(false);
+    }
     let converter = RowConverter::new(vec![SortField::new(column.data_type().clone())])?;
     let rows = converter.convert_columns(std::slice::from_ref(column))?;
 
     #[allow(clippy::cast_precision_loss)]
-    let len = column.len() as f64;
+    let non_null_len = non_null_count as f64;
     // Once the running distinct count reaches this many, the ratio can only
     // ever be >= DICTIONARY_ENCODING_THRESHOLD (distinct count never
     // decreases as more rows are added) — bail out without owning/hashing
@@ -67,17 +71,25 @@ fn should_dictionary_encode(column: &ArrayRef) -> Result<bool> {
         clippy::cast_sign_loss,
         clippy::cast_possible_truncation
     )]
-    let bail_out_at = (DICTIONARY_ENCODING_THRESHOLD * len).ceil() as usize;
+    let bail_out_at = (DICTIONARY_ENCODING_THRESHOLD * non_null_len).ceil() as usize;
 
     let mut distinct: HashSet<_> = HashSet::new();
-    for row in &rows {
+    for (i, row) in (&rows).into_iter().enumerate() {
+        // Nulls are tracked via Arrow's null buffer, not as dictionary
+        // entries — matching real Parquet, which excludes nulls from
+        // dictionary cardinality entirely. Counting a null as "one more
+        // distinct value" would make an otherwise low-cardinality nullable
+        // column look artificially high-cardinality.
+        if column.is_null(i) {
+            continue;
+        }
         distinct.insert(row.owned());
         if distinct.len() >= bail_out_at {
             return Ok(false);
         }
     }
     #[allow(clippy::cast_precision_loss)]
-    let ratio = distinct.len() as f64 / len;
+    let ratio = distinct.len() as f64 / non_null_len;
     Ok(ratio < DICTIONARY_ENCODING_THRESHOLD)
 }
 
@@ -177,6 +189,18 @@ mod tests {
     }
 
     #[test]
+    fn all_null_column_is_left_unencoded_without_panicking() {
+        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
+        let values: Vec<Option<&str>> = vec![None, None, None];
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(values))]).unwrap();
+
+        let encoded = encode_batch(&batch).unwrap();
+        assert_eq!(encoded.schema_ref().field(0).data_type(), &DataType::Utf8);
+        assert_eq!(encoded.column(0).null_count(), 3);
+    }
+
+    #[test]
     fn column_exactly_at_the_threshold_ratio_is_left_unencoded() {
         // 40 distinct values over 100 rows = ratio 0.4, exactly at
         // DICTIONARY_ENCODING_THRESHOLD. The comparison is strict (`<`), so
@@ -215,18 +239,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "tracks a real should_dictionary_encode bug found while adding test coverage \
-                (audit-remediation Batch 3 Task 3, 2026-07-17): nulls count as their own \
-                distinct RowConverter bucket, so a column with 1 null in 4 rows and only 1 \
-                distinct non-null value computes ratio 2/4=0.5 (>= the 0.4 threshold) and is \
-                left un-encoded, even though it is intuitively low-cardinality. Contradicts \
-                this module's own doc comment claiming behavior 'in the range real columnar \
-                engines (Parquet) default to' - Parquet excludes nulls from dictionary \
-                cardinality entirely. Not fixed here: whether nulls should be excluded from \
-                the ratio's numerator only, or from both numerator and denominator, is a real \
-                design decision outside this audit's original 127 findings and this batch's \
-                test-only scope. Re-enable once that decision is made and should_dictionary_encode \
-                is updated to match."]
     fn nullable_low_cardinality_column_preserves_nulls_through_encoding() {
         let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
         let values = vec![Some("alice"), None, Some("alice"), Some("alice")];
