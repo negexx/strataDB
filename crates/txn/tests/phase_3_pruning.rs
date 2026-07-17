@@ -68,3 +68,46 @@ fn explain_skips_files_whose_stats_cannot_match_and_scans_only_the_rest() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn explain_and_scan_with_predicate_agree_on_a_range_predicate_not_just_equality() {
+    let dir = std::env::temp_dir().join(format!("strata-phase3-range-{}", std::process::id()));
+    let ds = Dataset::create(&dir).unwrap();
+
+    let mut txn = ds.begin();
+    txn.insert(batch(vec![1, 2, 3]));
+    let ds = txn.commit().unwrap();
+
+    let mut txn = ds.begin();
+    txn.insert(batch(vec![50, 51, 52]));
+    let ds = txn.commit().unwrap();
+
+    let mut txn = ds.begin();
+    txn.insert(batch(vec![100, 101, 102]));
+    let ds = txn.commit().unwrap();
+
+    // Gt(id, 60): only the [100,102] file can possibly satisfy this.
+    let predicate = Predicate::Gt("id".to_string(), Value::Int64(60));
+    let result = ds.explain(&predicate);
+
+    assert_eq!(result.total_files, 3);
+    assert_eq!(
+        result.scanned.len(),
+        1,
+        "only the [100,102] file could match id>60"
+    );
+    assert_eq!(result.skipped.len(), 2);
+
+    let filtered = ds.scan_with_predicate(&schema(), &predicate).unwrap();
+    assert_eq!(filtered.num_rows(), 3);
+    let ids = filtered
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let mut got: Vec<i64> = (0..filtered.num_rows()).map(|i| ids.value(i)).collect();
+    got.sort_unstable();
+    assert_eq!(got, vec![100, 101, 102]);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
