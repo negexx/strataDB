@@ -137,7 +137,7 @@ impl Dataset {
             .data_files
             .iter()
             .map(|entry| {
-                let batch = read_batch(&data_dir.join(&entry.name))?;
+                let batch = read_batch(&safe_join(&data_dir, &entry.name)?)?;
                 cast_batch_to_schema(&batch, schema)
             })
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -190,7 +190,7 @@ impl Dataset {
             .iter()
             .filter(|entry| should_scan_file(&entry.stats, predicate))
             .map(|entry| {
-                let batch = read_batch(&data_dir.join(&entry.name))?;
+                let batch = read_batch(&safe_join(&data_dir, &entry.name)?)?;
                 cast_batch_to_schema(&batch, schema)
             })
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -237,7 +237,7 @@ impl Dataset {
             if !should_scan_file(&entry.stats, predicate) {
                 continue;
             }
-            let batch = read_batch(&data_dir.join(&entry.name))?;
+            let batch = read_batch(&safe_join(&data_dir, &entry.name)?)?;
             let matched = filter(&batch, predicate)?;
             let row_id_idx = matched.schema_ref().index_of(ROW_ID_COLUMN)?;
             let row_ids = matched
@@ -444,7 +444,7 @@ fn replay_index(dir: &Path, manifest: &Manifest) -> Result<HnswIndex> {
     let mut index = new_hnsw_index(capacity)?;
     let data_dir = dir.join("data");
     for entry in &manifest.data_files {
-        for delta in read_delta_log(&data_dir.join(&entry.delta_log))? {
+        for delta in read_delta_log(&safe_join(&data_dir, &entry.delta_log)?)? {
             match delta {
                 DeltaEntry::Insert { row_id, vector } => index.insert(row_id, &vector)?,
                 DeltaEntry::Tombstone { row_id } => index.tombstone(row_id),
@@ -512,6 +512,25 @@ fn build_delta_entries(batch: &RecordBatch, row_id_base: u64) -> Result<Vec<Delt
         });
     }
     Ok(entries)
+}
+
+/// Joins `name` onto `data_dir`, rejecting any `name` whose path
+/// components aren't all bare filename segments (`Component::Normal`) — a
+/// `name` containing `..` or an absolute path (which `Path::join` would
+/// otherwise resolve/replace unchecked) must never let a corrupted/hostile
+/// manifest read a file outside the dataset's own `data/` directory.
+/// `DataFileEntry.name`/`.delta_log` are documented as "relative to the
+/// dataset's data/ directory" (`crates/storage/src/manifest.rs`) — this is
+/// what actually enforces that contract instead of merely documenting it.
+fn safe_join(data_dir: &Path, name: &str) -> Result<PathBuf> {
+    let candidate = Path::new(name);
+    let all_normal = candidate
+        .components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)));
+    if !all_normal {
+        return Err(TxnError::UnsafeManifestPath(name.to_string()));
+    }
+    Ok(data_dir.join(candidate))
 }
 
 /// Casts every column of `batch` to the corresponding field type in
@@ -1189,6 +1208,40 @@ mod tests {
         assert_eq!(row_id_col(&first_on_disk), vec![0, 1]);
         assert_eq!(row_id_col(&second_on_disk), vec![2, 3, 4]);
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn scan_errors_instead_of_traversing_outside_data_dir_on_an_unsafe_manifest_entry() {
+        let dir = temp_dir("path-traversal");
+        Dataset::create(&dir).unwrap();
+
+        // Simulate a hostile manifest: hand-craft a DataFileEntry whose name
+        // tries to escape data/ via a parent-directory component. No real
+        // commit can ever produce this - file names are always generated
+        // internally - so this is only reachable via a corrupted/hand-edited
+        // manifest, which is exactly the threat model this guards against.
+        let hostile = Manifest {
+            version: 1,
+            data_files: vec![DataFileEntry {
+                name: "../../etc/passwd".to_string(),
+                stats: std::collections::HashMap::new(),
+                delta_log: "d.deltalog".to_string(),
+            }],
+            next_row_id: 0,
+        };
+        strata_storage::commit_manifest(&dir, &hostile).unwrap();
+        // The delta log must exist (empty is fine — it replays to zero
+        // entries) or Dataset::open's replay_index fails on a plain
+        // missing-file I/O error before scan ever sees the hostile name.
+        std::fs::write(dir.join("data").join("d.deltalog"), "").unwrap();
+        let ds = Dataset::open(&dir).unwrap();
+
+        let result = ds.scan(&test_schema());
+        assert!(
+            matches!(result, Err(TxnError::UnsafeManifestPath(_))),
+            "expected UnsafeManifestPath, got {result:?}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
