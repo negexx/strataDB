@@ -302,6 +302,34 @@ fn an_old_snapshots_vector_search_never_leaks_a_later_commits_rows() {
          object the old snapshot's Arc<HnswIndex> points at: {old_results_again:?}"
     );
 
+    // The two checks above query near the origin, where the far cluster
+    // (100,000 units away) is never a plausible nearest-neighbor candidate
+    // regardless of whether the watermark filter works — so they can't
+    // actually distinguish "isolation enforced" from "isolation broken."
+    // This is the check that can: query old_snapshot AT the far cluster's
+    // own center. If the watermark filter were silently disabled, the far
+    // cluster's rows are genuinely nearest here and WOULD be returned. With
+    // the filter correctly enforced, old_snapshot must fall back to the
+    // near cluster instead — proving is_visible is doing real
+    // (unfavorable-geometry) work, not merely reflecting cluster distance.
+    let old_results_at_far_center = old_snapshot.vector_search(&far_center, K, None).unwrap();
+    assert_eq!(
+        old_results_at_far_center.len(),
+        K,
+        "an old snapshot querying AT the far cluster's own center must still fall back to \
+         returning {K} near-cluster rows (the far cluster is invisible to it): \
+         {old_results_at_far_center:?}"
+    );
+    assert!(
+        old_results_at_far_center
+            .iter()
+            .all(|r| r.row_id < CLUSTER_SIZE as u64),
+        "an old snapshot querying AT the far cluster's own center must NEVER return a \
+         far-cluster row (row_id >= {CLUSTER_SIZE}), even though those rows are the genuine \
+         nearest neighbors there — if this fails, the watermark filter is not actually being \
+         applied: {old_results_at_far_center:?}"
+    );
+
     // A freshly-taken snapshot, in contrast, must see the far cluster: query
     // near the far cluster's own center and confirm only far-cluster rows
     // (row_id >= CLUSTER_SIZE) come back.
