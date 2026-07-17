@@ -1584,15 +1584,27 @@ mod tests {
 
     #[test]
     fn replay_index_applies_tombstone_entries_from_the_delta_log() {
+        // Well-separated clusters, not a 2-point fixture - hnsw_rs's
+        // unseeded layer-assignment RNG has repeatedly made tiny (2-3
+        // point) fixtures flaky elsewhere in this file and in
+        // crates/index/src/hnsw.rs's own tests (see cluster_vectors'/
+        // insert_cluster's doc comments); the same precaution applies here.
         let dir = temp_dir("tombstone-replay");
         let ds = Dataset::create(&dir).unwrap();
 
-        let batch = vector_batch(vec![1, 2], vec![[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]]);
+        let near_cluster = cluster_vectors(15, [0.0, 0.0, 0.0], 0.01);
+        let far_cluster = cluster_vectors(15, [1000.0, 0.0, 0.0], 0.01);
+        let mut ids = vec![1i64; 15];
+        ids.extend(vec![2i64; 15]);
+        let mut vectors = near_cluster;
+        vectors.extend(far_cluster);
+        let batch = vector_batch(ids, vectors);
         let mut txn = ds.begin();
         txn.insert(batch);
         let ds = txn.commit().unwrap();
 
-        // Hand-append a Tombstone entry to the just-written delta-log file,
+        // Hand-append a Tombstone entry for row 0 (the exact-match nearest
+        // neighbor in the near cluster) to the just-written delta-log file,
         // simulating what a future real DELETE path (Phase 5/6) will
         // produce - build_delta_entries itself never emits Tombstone
         // entries today.
@@ -1604,16 +1616,27 @@ mod tests {
 
         drop(ds);
         let reopened = Dataset::open(&dir).unwrap();
-        let results = reopened.vector_search(&[0.0, 0.0, 0.0], 2, None).unwrap();
+        // k=3, matching this file's other vector_search tests against the
+        // same cluster shape (e.g. vector_search_with_predicate_only_returns_matching_rows) -
+        // production HNSW defaults (EF_SEARCH_DEFAULT=32, not the much
+        // wider tuned constants crates/index/src/hnsw.rs's own unit tests
+        // use) don't reliably surface a larger k against this fixture.
+        let results = reopened.vector_search(&[0.0, 0.0, 0.0], 3, None).unwrap();
 
+        assert_eq!(
+            results.len(),
+            3,
+            "the near cluster has 14 live rows left after the tombstone, all vastly \
+             closer than the far cluster, so the top 3 must still be fully populated: {results:?}"
+        );
         assert!(
             results.iter().all(|r| r.row_id != 0),
             "the hand-tombstoned row must be excluded after replay: {results:?}"
         );
-        assert_eq!(
-            results.len(),
-            1,
-            "only row 1 should remain live: {results:?}"
+        assert!(
+            results.iter().all(|r| r.row_id < 15),
+            "every returned row must still be a genuine near-cluster neighbor, \
+             not a fallback to the far cluster: {results:?}"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
