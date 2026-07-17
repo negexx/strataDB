@@ -1,8 +1,9 @@
-//! Brute-force nearest-neighbor search. No HNSW yet — that's Phase 4, see
-//! `.claude/rules/vector-index.md`. This exists so Phase 1's MVP checklist
-//! ("run a brute-force nearest-neighbor search on the vector column,
-//! correctly") has a real, correct implementation to build the rest of the
-//! vertical slice against.
+//! Brute-force nearest-neighbor search. HNSW (Phase 4) lives in
+//! `crates/index/src/hnsw.rs`; this brute-force path remains the
+//! exact-result reference implementation, and is still what Phase 1's MVP
+//! checklist ("run a brute-force nearest-neighbor search on the vector
+//! column, correctly") and the CLI's `search --exact` flag use. See
+//! `.claude/rules/vector-index.md`.
 
 use arrow::array::{Array, FixedSizeListArray, Float32Array};
 use arrow::error::ArrowError;
