@@ -4,8 +4,24 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
-[lints]
-workspace = true
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+# `loom` is this crate's only consumer of a `#[cfg(loom)]` gate (see the
+# `loom_tests` module at the end of src/dataset.rs) — without this, rustc's
+# `unexpected_cfgs` lint (warn-by-default since 1.80) flags `loom` as an
+# unrecognized cfg name, since nothing else declares it. This can't instead
+# be expressed via `[lints] workspace = true` (as this crate did before)
+# because Cargo forbids combining workspace-inherited lints with any
+# additional local keys in the same [lints] table — so the workspace's
+# clippy/rust lints are duplicated here rather than inherited, matching
+# `crates/index/Cargo.toml`'s identical workaround for the same reason.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
 
 [dependencies]
 arrow.workspace = true
@@ -13,3 +29,8 @@ thiserror.workspace = true
 strata-storage = { path = "../storage" }
 strata-query = { path = "../query" }
 strata-index = { path = "../index" }
+arc-swap = "1"
+im = "15"
+
+[dev-dependencies]
+loom = "0.7"

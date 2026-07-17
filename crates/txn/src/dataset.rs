@@ -13,16 +13,17 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use arrow::array::{Array, ArrayRef, RecordBatch, UInt64Array};
-use arrow::compute::{cast, concat_batches};
+use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use strata_index::{DeltaEntry, HnswIndex, read_delta_log, write_delta_log};
-use strata_query::{Predicate, filter, should_scan_file};
 use strata_storage::{
-    DataFileEntry, Manifest, commit_manifest, compute_stats, read_batch, read_current, write_batch,
+    DataFileEntry, Manifest, commit_manifest, compute_stats, read_current, write_batch,
 };
 
 use crate::error::{Result, TxnError};
+use crate::snapshot::Snapshot;
 
 /// The hidden internal row-id column every committed batch carries
 /// alongside its logical columns. Callers can retrieve it through the
@@ -40,19 +41,10 @@ use crate::error::{Result, TxnError};
 /// `.claude/docs/design/phase-0-transaction-and-format-spec.md` §8.
 pub const ROW_ID_COLUMN: &str = "_row_id";
 
+#[derive(Clone)]
 pub struct Dataset {
     dir: PathBuf,
-    manifest: Manifest,
-    index: HnswIndex,
-}
-
-/// The outcome of [`Dataset::explain`] — which files a predicate would
-/// touch, without actually reading any of their bodies.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExplainResult {
-    pub total_files: usize,
-    pub scanned: Vec<String>,
-    pub skipped: Vec<String>,
+    current: Arc<ArcSwap<Snapshot>>,
 }
 
 /// The single source of truth for "where does this dataset's data live,
@@ -61,7 +53,7 @@ pub struct ExplainResult {
 /// different type/context (a `&Dataset`, a `Transaction`, and a bare
 /// `&Path` respectively) and previously each hardcoded `dir.join("data")`
 /// independently.
-fn data_subdir(dir: &Path) -> PathBuf {
+pub(crate) fn data_subdir(dir: &Path) -> PathBuf {
     dir.join("data")
 }
 
@@ -82,11 +74,18 @@ impl Dataset {
         std::fs::create_dir_all(dir.join("data"))?;
         let manifest = Manifest::empty();
         commit_manifest(&dir, &manifest)?;
-        let index = new_hnsw_index(0)?;
+        let graph = new_hnsw_index(0)?;
+        let snapshot = Snapshot {
+            dir: dir.clone(),
+            version: manifest.version,
+            watermark: manifest.next_row_id.saturating_sub(1),
+            manifest: Arc::new(manifest),
+            graph: Arc::new(graph),
+            tombstones: Arc::new(im::HashSet::new()),
+        };
         Ok(Self {
             dir,
-            manifest,
-            index,
+            current: Arc::new(ArcSwap::new(Arc::new(snapshot))),
         })
     }
 
@@ -104,17 +103,33 @@ impl Dataset {
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self> {
         let dir = dir.into();
         let manifest = read_current(&dir)?.ok_or_else(|| TxnError::NotFound(dir.clone()))?;
-        let index = replay_index(&dir, &manifest)?;
+        let (graph, tombstones) = replay_index(&dir, &manifest)?;
+        let snapshot = Snapshot {
+            dir: dir.clone(),
+            version: manifest.version,
+            watermark: manifest.next_row_id.saturating_sub(1),
+            manifest: Arc::new(manifest),
+            graph: Arc::new(graph),
+            tombstones: Arc::new(tombstones),
+        };
         Ok(Self {
             dir,
-            manifest,
-            index,
+            current: Arc::new(ArcSwap::new(Arc::new(snapshot))),
         })
+    }
+
+    /// Returns a cheap, immutable, point-in-time view of the dataset as of
+    /// whichever version was current at the moment of this call. Holding
+    /// the returned `Snapshot` never blocks a concurrent writer, and never
+    /// observes any commit that lands after this call returns.
+    #[must_use]
+    pub fn snapshot(&self) -> Arc<Snapshot> {
+        self.current.load_full()
     }
 
     #[must_use]
     pub fn current_version(&self) -> u64 {
-        self.manifest.version
+        self.snapshot().version
     }
 
     #[must_use]
@@ -126,170 +141,20 @@ impl Dataset {
     /// version. Exposed for tests that need to inspect the raw on-disk
     /// representation directly.
     #[must_use]
-    pub fn data_files(&self) -> &[DataFileEntry] {
-        &self.manifest.data_files
-    }
-
-    /// Iterates `self.manifest.data_files`, keeping only entries
-    /// `should_scan_file` says could match `predicate` (or every entry, if
-    /// `predicate` is `None`), reads and joins each surviving file's path
-    /// via [`safe_join`], and applies `process` to each raw batch. Shared
-    /// by [`Dataset::scan`], [`Dataset::scan_with_predicate`], and
-    /// [`Dataset::row_ids_matching`] — previously each re-implemented this
-    /// same "iterate -> prune -> read -> process" skeleton independently.
-    fn read_surviving_files<T>(
-        &self,
-        predicate: Option<&Predicate>,
-        mut process: impl FnMut(RecordBatch) -> Result<T>,
-    ) -> Result<Vec<T>> {
-        let data_dir = self.data_dir();
-        self.manifest
-            .data_files
-            .iter()
-            .filter(|entry| predicate.is_none_or(|p| should_scan_file(&entry.stats, p)))
-            .map(|entry| {
-                let batch = read_batch(&safe_join(&data_dir, &entry.name)?)?;
-                process(batch)
-            })
-            .collect()
-    }
-
-    /// Reads every committed row as a single `RecordBatch`, cast back to
-    /// `schema` — the caller's logical schema, not necessarily the physical
-    /// on-disk representation. For predicate-pushdown pruning (skipping
-    /// whole files a predicate provably can't match), see
-    /// [`Dataset::scan_with_predicate`] and [`Dataset::explain`] below —
-    /// this method always reads every committed file.
-    ///
-    /// Each committed file's columns are cast to `schema`'s types before
-    /// concatenation. This is required, not optional: `encode_batch`
-    /// (`crates/storage::encoding`) dictionary-encodes low-cardinality
-    /// columns independently per commit, based on that commit's own data —
-    /// so two files belonging to the same logical column can legitimately
-    /// have different physical types (e.g. one `Utf8`, another
-    /// `Dictionary(Int32, Utf8)`), and `concat_batches` requires every
-    /// batch to match a single schema exactly. Casting on read is what lets
-    /// `scan`'s logical contract stay stable regardless of any file's
-    /// physical encoding.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if any committed data file fails to read, if a
-    /// column can't be cast to `schema`'s corresponding field type, or if
-    /// the cast batches can't be concatenated against `schema`.
-    pub fn scan(&self, schema: &SchemaRef) -> Result<RecordBatch> {
-        let batches =
-            self.read_surviving_files(None, |batch| cast_batch_to_schema(&batch, schema))?;
-        Ok(concat_batches(schema, &batches)?)
-    }
-
-    /// Reports which committed files `predicate` would require scanning,
-    /// without opening any file body — pure introspection over stats
-    /// already loaded in the manifest. See
-    /// `.claude/docs/design/phase-3-query-refinement-spec.md` §3.
-    #[must_use]
-    pub fn explain(&self, predicate: &Predicate) -> ExplainResult {
-        let mut scanned = Vec::new();
-        let mut skipped = Vec::new();
-        for entry in &self.manifest.data_files {
-            if should_scan_file(&entry.stats, predicate) {
-                scanned.push(entry.name.clone());
-            } else {
-                skipped.push(entry.name.clone());
-            }
-        }
-        ExplainResult {
-            total_files: self.manifest.data_files.len(),
-            scanned,
-            skipped,
-        }
-    }
-
-    /// Like [`Dataset::scan`], but skips any file `predicate` provably
-    /// can't match (per [`Dataset::explain`]'s decision) and row-filters
-    /// the rest. This is the real performance path; `explain` is its
-    /// introspection twin — both call the exact same
-    /// `strata_query::should_scan_file`, so they can never disagree about
-    /// what would be skipped.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error under the same conditions as [`Dataset::scan`],
-    /// plus if `predicate`'s column doesn't exist or its value's type
-    /// doesn't match the column's Arrow type.
-    pub fn scan_with_predicate(
-        &self,
-        schema: &SchemaRef,
-        predicate: &Predicate,
-    ) -> Result<RecordBatch> {
-        let batches = self.read_surviving_files(Some(predicate), |batch| {
-            let cast = cast_batch_to_schema(&batch, schema)?;
-            Ok(filter(&cast, predicate)?)
-        })?;
-        Ok(concat_batches(schema, &batches)?)
-    }
-
-    /// Approximate nearest-neighbor search over the vector column, optionally
-    /// narrowed to rows matching `predicate`. See
-    /// `.claude/docs/design/phase-4-vector-index-spec.md` §3-4.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `predicate` is supplied and its column doesn't
-    /// exist or its value's type doesn't match the column's Arrow type
-    /// (surfaced by the same row-id resolution path `filter`/
-    /// `scan_with_predicate` already use), or if `query`'s dimensionality
-    /// doesn't match the indexed vectors'.
-    pub fn vector_search(
-        &self,
-        query: &[f32],
-        k: usize,
-        predicate: Option<&Predicate>,
-    ) -> Result<Vec<strata_index::VectorMatch>> {
-        let Some(predicate) = predicate else {
-            return Ok(self.index.search(query, k, EF_SEARCH_DEFAULT)?);
-        };
-
-        let mut live_ids = self.row_ids_matching(predicate)?;
-        live_ids.sort_unstable();
-        let ef = widen_ef(EF_SEARCH_DEFAULT, self, predicate);
-        Ok(self.index.search_filtered(query, k, ef, &live_ids)?)
-    }
-
-    /// Resolves the row-ids of every row matching `predicate`, reading each
-    /// surviving (per `should_scan_file`) file's raw on-disk batch directly —
-    /// not through the public `scan_with_predicate`, which requires the
-    /// caller to supply a schema matching `ROW_ID_COLUMN`'s precondition
-    /// (see its doc comment above) rather than guaranteeing row-ids are
-    /// always retrievable.
-    fn row_ids_matching(&self, predicate: &Predicate) -> Result<Vec<usize>> {
-        let per_file_ids = self.read_surviving_files(Some(predicate), |batch| {
-            let matched = filter(&batch, predicate)?;
-            let row_id_idx = matched.schema_ref().index_of(ROW_ID_COLUMN)?;
-            let row_ids = matched
-                .column(row_id_idx)
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .ok_or_else(|| {
-                    TxnError::Arrow(arrow::error::ArrowError::CastError(format!(
-                        "{ROW_ID_COLUMN} column must be UInt64"
-                    )))
-                })?;
-            #[allow(clippy::cast_possible_truncation)]
-            let ids: Vec<usize> = (0..row_ids.len())
-                .map(|i| row_ids.value(i) as usize)
-                .collect();
-            Ok(ids)
-        })?;
-        Ok(per_file_ids.into_iter().flatten().collect())
+    pub fn data_files(&self) -> Vec<DataFileEntry> {
+        self.snapshot().manifest.data_files.clone()
     }
 
     #[must_use]
     pub fn begin(&self) -> Transaction {
+        let snapshot = self.snapshot();
         Transaction {
             dir: self.dir.clone(),
-            base_manifest: self.manifest.clone(),
+            base_manifest: snapshot.manifest.as_ref().clone(),
+            graph: Arc::clone(&snapshot.graph),
+            tombstones: snapshot.tombstones.as_ref().clone(),
             pending: Vec::new(),
+            current: Arc::clone(&self.current),
         }
     }
 }
@@ -297,7 +162,10 @@ impl Dataset {
 pub struct Transaction {
     dir: PathBuf,
     base_manifest: Manifest,
+    graph: Arc<HnswIndex>,
+    tombstones: im::HashSet<u64>,
     pending: Vec<RecordBatch>,
+    current: Arc<ArcSwap<Snapshot>>,
 }
 
 impl Transaction {
@@ -308,24 +176,48 @@ impl Transaction {
         self.pending.push(batch);
     }
 
-    /// Commits per spec §3's write/durability steps (3-5) — §3.1's
-    /// read/write-set accumulation and §3.2's conflict check are both
-    /// deliberate no-ops in Phase 1 (see the module doc comment for why,
-    /// and for the §3.4 CAS caveat).
+    /// Commits per spec §3's write/durability steps (3-5). Applies only
+    /// this transaction's own new delta entries directly to the shared,
+    /// ever-growing `HnswIndex` graph (no full historical replay — see
+    /// `docs/superpowers/specs/2026-07-17-phase-5-mvcc-snapshot-isolation-design.md`),
+    /// then — only after `commit_manifest` succeeds — freezes this
+    /// transaction's tombstone accumulator and swaps in a new `Snapshot`.
+    /// Any `Dataset` handle sharing this same `ArcSwap` (including the one
+    /// this transaction was created from) observes the new state on its
+    /// next [`Dataset::snapshot`] call; nothing is mutated in place.
     ///
     /// # Errors
     ///
     /// Returns [`TxnError::NonFiniteVectorComponent`] if any pending batch's
     /// vector column contains a `NaN`/`Infinity` component — checked, and
     /// rejected, before any file for that batch is written to disk. Also
-    /// returns an error if any pending batch fails to dictionary-encode (see
-    /// `strata_storage::encode_batch`) or write durably, if rebuilding the
-    /// vector index from the (already-written) delta-log history fails, or
-    /// if the manifest commit's atomic rename fails. The index rebuild runs
-    /// before the manifest commit, so any of these failures leaves the
-    /// manifest unadvanced — the new data/delta-log files are orphaned on
-    /// disk but never made visible, the same as an interrupted crash.
-    pub fn commit(self) -> Result<Dataset> {
+    /// returns an error if any pending batch fails to dictionary-encode, if
+    /// applying this commit's new deltas to the graph fails (e.g. a
+    /// dimension mismatch), or if the manifest commit's atomic rename
+    /// fails. Delta-application runs before the manifest commit, so any of
+    /// these failures leaves the manifest unadvanced — the new data/delta-log
+    /// files are orphaned on disk but never made visible.
+    ///
+    /// **Formerly a known limitation, now closed:** earlier, a commit whose
+    /// pending batches had inconsistent vector dimensions across batches
+    /// could partially mutate the shared graph before failing — `Insert`
+    /// deltas were applied to the graph in pending-batch order, so a later
+    /// batch's dimension mismatch was only caught after an earlier batch's
+    /// deltas had already landed in the live, shared `HnswIndex` (which has
+    /// no node-removal API to undo an insert). [`validate_delta_dimensions`]
+    /// now runs before any delta is applied, rejecting the entire commit —
+    /// with zero graph mutation — the moment any two pending batches (or a
+    /// pending batch and the graph's already-established dimension)
+    /// disagree. `HnswIndex::insert`'s only fallible path is dimension
+    /// validation (the underlying `hnsw_rs` call itself never fails), so
+    /// this closes the practical trigger for this class of hazard
+    /// entirely, not just narrows it. A residual, more exotic concern
+    /// remains out of scope here: if a future change ever gives graph
+    /// mutation additional failure modes beyond dimension mismatch, this
+    /// same partial-mutation risk could reopen for those — revisit if
+    /// Phase 6's real conflict/CAS logic changes what "applying a delta to
+    /// the graph" can fail on.
+    pub fn commit(self) -> Result<()> {
         let mut manifest = self.base_manifest;
         let new_version = manifest.version.checked_add(1).ok_or_else(|| {
             TxnError::ManifestOverflow(format!("version {} + 1", manifest.version))
@@ -333,37 +225,61 @@ impl Transaction {
         let data_dir = data_subdir(&self.dir);
         std::fs::create_dir_all(&data_dir)?;
 
-        Self::write_pending_batches(&self.pending, &data_dir, new_version, &mut manifest)?;
+        let deltas =
+            Self::write_pending_batches(&self.pending, &data_dir, new_version, &mut manifest)?;
         manifest.version = new_version;
 
         // Fsyncing each data file's *content* (already done inside
         // write_batch) is not sufficient — the new directory entries
         // themselves must also be fsynced, or a real power-loss crash can
         // leave a file's bytes durable while the file itself is absent.
-        // Must happen before the index rebuild/manifest commit below.
+        // Must happen before the graph update/manifest commit below.
         strata_storage::sync_dir(&data_dir)?;
 
-        // Rebuilt from `manifest`'s full delta-log history (the same path
-        // `Dataset::open` uses) — see `replay_index`'s doc comment for why
-        // this must run before `commit_manifest`.
-        let index = replay_index(&self.dir, &manifest)?;
+        // Apply only this commit's new deltas to the shared graph — the
+        // fix for the O(historical)-per-commit regression. `HnswIndex`'s
+        // graph only ever grows (hnsw_rs has no node-removal API), so
+        // extending the same Arc'd instance every commit is safe and
+        // matches what every existing/future Snapshot's Arc<HnswIndex>
+        // already points at.
+        validate_delta_dimensions(&deltas, &self.graph)?;
+
+        let mut tombstones = self.tombstones;
+        for delta in &deltas {
+            match delta {
+                DeltaEntry::Insert { row_id, vector } => self.graph.insert(*row_id, vector)?,
+                DeltaEntry::Tombstone { row_id } => {
+                    tombstones.insert(*row_id);
+                }
+            }
+        }
 
         commit_manifest(&self.dir, &manifest)?;
 
-        Ok(Dataset {
+        // Only after commit_manifest succeeds does the new state become
+        // visible to future Dataset::snapshot() calls — the in-memory swap
+        // must never run ahead of the on-disk durability point.
+        let watermark = manifest.next_row_id.saturating_sub(1);
+        let version = manifest.version;
+        let snapshot = Snapshot {
             dir: self.dir,
-            manifest,
-            index,
-        })
+            version,
+            manifest: Arc::new(manifest),
+            graph: self.graph,
+            watermark,
+            tombstones: Arc::new(tombstones),
+        };
+        self.current.store(Arc::new(snapshot));
+
+        Ok(())
     }
 
     /// Writes every pending batch's data file and delta-log file to
     /// `data_dir`, assigning row-ids and advancing `manifest.next_row_id`/
-    /// `manifest.data_files` in place. Extracted from [`Transaction::commit`]
-    /// so the per-batch write step and the outer commit-protocol steps
-    /// (sync, index rebuild, manifest CAS) read as named phases rather than
-    /// one long function — see `.claude/rules/concurrency-txn-layer.md`'s
-    /// note on the commit protocol's load-bearing ordering.
+    /// `manifest.data_files` in place. Returns every `DeltaEntry` produced
+    /// across all pending batches, in order — `Transaction::commit` applies
+    /// these directly to the shared graph instead of re-reading them from
+    /// disk.
     ///
     /// # Errors
     ///
@@ -376,7 +292,8 @@ impl Transaction {
         data_dir: &Path,
         new_version: u64,
         manifest: &mut Manifest,
-    ) -> Result<()> {
+    ) -> Result<Vec<DeltaEntry>> {
+        let mut all_deltas = Vec::new();
         for (i, batch) in pending.iter().enumerate() {
             // Stats computed on the original, pre-encoding, pre-row-id batch — see
             // .claude/docs/design/phase-3-query-refinement-spec.md §1 for why
@@ -413,8 +330,9 @@ impl Transaction {
                 stats,
                 delta_log: delta_file_name,
             });
+            all_deltas.extend(deltas);
         }
-        Ok(())
+        Ok(all_deltas)
     }
 }
 
@@ -424,28 +342,6 @@ impl Transaction {
 const HNSW_MAX_NB_CONNECTION: usize = 16;
 const HNSW_MAX_LAYER: usize = 16;
 const HNSW_EF_CONSTRUCTION: usize = 200;
-const EF_SEARCH_DEFAULT: usize = 32;
-const MIN_SELECTIVITY_FLOOR: f64 = 0.01;
-const MAX_EF_SCALE: f64 = 20.0;
-
-/// Widens `base_ef` using `Dataset::explain`'s scanned/total file ratio as
-/// a coarse, file-granularity *upper bound* on selectivity — see
-/// `.claude/docs/design/phase-4-vector-index-spec.md` §4. Erring toward a
-/// wider `ef` costs search time, never correctness, so an overestimate of
-/// how many rows survive is the safe direction.
-fn widen_ef(base_ef: usize, dataset: &Dataset, predicate: &Predicate) -> usize {
-    let explain = dataset.explain(predicate);
-    #[allow(clippy::cast_precision_loss)]
-    let selectivity_upper_bound = explain.scanned.len() as f64 / explain.total_files.max(1) as f64;
-    let scale = (1.0 / selectivity_upper_bound.max(MIN_SELECTIVITY_FLOOR)).min(MAX_EF_SCALE);
-    #[allow(
-        clippy::cast_precision_loss,
-        clippy::cast_sign_loss,
-        clippy::cast_possible_truncation
-    )]
-    let widened = ((base_ef as f64) * scale).round() as usize;
-    widened
-}
 
 fn new_hnsw_index(capacity: usize) -> Result<HnswIndex> {
     Ok(HnswIndex::new(
@@ -466,13 +362,12 @@ fn new_hnsw_index(capacity: usize) -> Result<HnswIndex> {
 /// realistic embedded dataset today; revisit if a real workload needs more.
 const MAX_REASONABLE_ROW_ID_CAPACITY: u64 = 1_000_000_000;
 
-/// Rebuilds a fresh `HnswIndex` by replaying every delta-log entry across
-/// every committed data file in `manifest`, in order. Used by both
-/// `Dataset::open` (crash recovery) and `Transaction::commit` (so a
-/// newly-committed `Dataset`'s index can never diverge from what a fresh
-/// `open()` of the same directory would produce) — see
-/// `.claude/rules/vector-index.md` ("index lives inside the same
-/// transaction boundary as row data").
+/// Rebuilds a fresh `HnswIndex` plus its tombstone set by replaying every
+/// delta-log entry across every committed data file in `manifest`, in
+/// order. Used only by [`Dataset::open`] (crash recovery / process start) —
+/// `Transaction::commit` no longer calls this; it applies only its own new
+/// delta entries directly to the already-shared graph instead (see
+/// `docs/superpowers/specs/2026-07-17-phase-5-mvcc-snapshot-isolation-design.md`).
 ///
 /// # Errors
 ///
@@ -481,10 +376,8 @@ const MAX_REASONABLE_ROW_ID_CAPACITY: u64 = 1_000_000_000;
 /// [`MAX_REASONABLE_ROW_ID_CAPACITY`], or (via [`TxnError::Index`]) if a
 /// replayed `DeltaEntry::Insert`'s vector length doesn't match the
 /// dimensionality established by the first vector ever inserted into the
-/// index — [`strata_index::IndexError::DimensionMismatch`], surfaced here
-/// so a corrupted delta-log entry can't silently desync the rebuilt index
-/// from the one that originally produced it.
-fn replay_index(dir: &Path, manifest: &Manifest) -> Result<HnswIndex> {
+/// index.
+fn replay_index(dir: &Path, manifest: &Manifest) -> Result<(HnswIndex, im::HashSet<u64>)> {
     if manifest.next_row_id > MAX_REASONABLE_ROW_ID_CAPACITY {
         return Err(TxnError::UnreasonableCapacity(
             manifest.next_row_id,
@@ -492,17 +385,20 @@ fn replay_index(dir: &Path, manifest: &Manifest) -> Result<HnswIndex> {
         ));
     }
     let capacity = usize::try_from(manifest.next_row_id).unwrap_or(usize::MAX);
-    let mut index = new_hnsw_index(capacity)?;
+    let index = new_hnsw_index(capacity)?;
+    let mut tombstones: im::HashSet<u64> = im::HashSet::new();
     let data_dir = data_subdir(dir);
     for entry in &manifest.data_files {
         for delta in read_delta_log(&safe_join(&data_dir, &entry.delta_log)?)? {
             match delta {
                 DeltaEntry::Insert { row_id, vector } => index.insert(row_id, &vector)?,
-                DeltaEntry::Tombstone { row_id } => index.tombstone(row_id),
+                DeltaEntry::Tombstone { row_id } => {
+                    tombstones.insert(row_id);
+                }
             }
         }
     }
-    Ok(index)
+    Ok((index, tombstones))
 }
 
 /// Builds one `Insert` delta-log entry per row in `batch` with a non-null
@@ -565,6 +461,42 @@ fn build_delta_entries(batch: &RecordBatch, row_id_base: u64) -> Result<Vec<Delt
     Ok(entries)
 }
 
+/// Validates that every [`DeltaEntry::Insert`] in `deltas` shares one
+/// consistent vector dimension — both against each other, and against
+/// `graph`'s already-established dimension (if any) — before any of them
+/// are applied. `HnswIndex::insert`'s only fallible path is dimension
+/// validation (the underlying `hnsw_rs` call itself never fails), so this
+/// closes the real trigger for a partial-graph-mutation-then-fail
+/// scenario: without it, `Insert` deltas are applied to the shared graph
+/// in pending-batch order, and a later batch's dimension mismatch is only
+/// caught after an earlier batch's deltas have already mutated the shared
+/// graph.
+///
+/// # Errors
+///
+/// Returns [`TxnError::Index`] wrapping an [`strata_index::IndexError::DimensionMismatch`]
+/// if any `Insert` delta's vector length disagrees with the graph's
+/// established dimension, or with an earlier delta's length in this same
+/// batch of deltas if the graph has no dimension established yet.
+fn validate_delta_dimensions(deltas: &[DeltaEntry], graph: &HnswIndex) -> Result<()> {
+    let mut expected = graph.established_dimension();
+    for delta in deltas {
+        if let DeltaEntry::Insert { vector, .. } = delta {
+            if expected == 0 {
+                expected = vector.len();
+            } else if vector.len() != expected {
+                return Err(TxnError::Index(
+                    strata_index::IndexError::DimensionMismatch {
+                        query_len: vector.len(),
+                        expected,
+                    },
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Joins `name` onto `data_dir`, rejecting any `name` whose path
 /// components aren't all bare filename segments (`Component::Normal`) — a
 /// `name` containing `..` or an absolute path (which `Path::join` would
@@ -573,7 +505,7 @@ fn build_delta_entries(batch: &RecordBatch, row_id_base: u64) -> Result<Vec<Delt
 /// `DataFileEntry.name`/`.delta_log` are documented as "relative to the
 /// dataset's data/ directory" (`crates/storage/src/manifest.rs`) — this is
 /// what actually enforces that contract instead of merely documenting it.
-fn safe_join(data_dir: &Path, name: &str) -> Result<PathBuf> {
+pub(crate) fn safe_join(data_dir: &Path, name: &str) -> Result<PathBuf> {
     let candidate = Path::new(name);
     let all_normal = candidate
         .components()
@@ -586,8 +518,8 @@ fn safe_join(data_dir: &Path, name: &str) -> Result<PathBuf> {
 
 /// Casts every column of `batch` to the corresponding field type in
 /// `schema`, leaving already-matching columns untouched (a cheap `Arc`
-/// clone, not a copy). See [`Dataset::scan`]'s doc comment for why this is
-/// necessary rather than a defensive nicety.
+/// clone, not a copy). See [`crate::snapshot::Snapshot::scan`]'s doc comment
+/// for why this is necessary rather than a defensive nicety.
 ///
 /// Every committed file physically carries a trailing hidden
 /// [`ROW_ID_COLUMN`] (see `append_row_id_column`). It only counts toward
@@ -604,7 +536,7 @@ fn safe_join(data_dir: &Path, name: &str) -> Result<PathBuf> {
 /// Returns [`TxnError::SchemaMismatch`] if `schema`'s field count doesn't
 /// match `batch`'s logical column count, or an Arrow error if a column
 /// can't be cast to its corresponding field's type.
-fn cast_batch_to_schema(batch: &RecordBatch, schema: &SchemaRef) -> Result<RecordBatch> {
+pub(crate) fn cast_batch_to_schema(batch: &RecordBatch, schema: &SchemaRef) -> Result<RecordBatch> {
     let physical = batch.num_columns();
     let hidden_row_id = batch.schema_ref().index_of(ROW_ID_COLUMN).is_ok()
         && schema.index_of(ROW_ID_COLUMN).is_err();
@@ -668,6 +600,7 @@ mod tests {
 
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
+    use strata_storage::read_batch;
 
     use super::*;
 
@@ -708,7 +641,7 @@ mod tests {
         .unwrap();
         let mut txn = ds.begin();
         txn.insert(batch);
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
 
         // Confirm the file really was dictionary-encoded, so this test
         // can't silently stop testing the regression it exists to catch.
@@ -721,7 +654,7 @@ mod tests {
             "test data must actually trigger dictionary encoding to be a valid regression test"
         );
 
-        let scanned = ds.scan(&schema).unwrap();
+        let scanned = ds.snapshot().scan(&schema).unwrap();
         assert_eq!(scanned.schema_ref().field(0).data_type(), &DataType::Utf8);
         let scanned_names = scanned
             .column(0)
@@ -760,10 +693,10 @@ mod tests {
         .unwrap();
         let mut txn = ds.begin();
         txn.insert(batch.clone());
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
 
         assert_eq!(ds.current_version(), 1);
-        let scanned = ds.scan(&schema).unwrap();
+        let scanned = ds.snapshot().scan(&schema).unwrap();
         assert_eq!(scanned, batch);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -788,7 +721,7 @@ mod tests {
                 .unwrap();
         let mut txn = ds.begin();
         txn.insert(batch);
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
 
         let entry = &ds.data_files()[0];
         let id_stats = entry.stats.get("id").unwrap();
@@ -876,7 +809,7 @@ mod tests {
         let batch = RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(names))]).unwrap();
         let mut txn = ds.begin();
         txn.insert(batch);
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
 
         // Read the raw written file back directly (bypassing Dataset::scan's
         // concat_batches, which would already show us the encoded type, but
@@ -909,7 +842,7 @@ mod tests {
         .unwrap();
         let mut txn = ds.begin();
         txn.insert(low);
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
 
         let high = RecordBatch::try_new(
             schema,
@@ -918,10 +851,10 @@ mod tests {
         .unwrap();
         let mut txn = ds.begin();
         txn.insert(high);
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
 
         let predicate = Predicate::Eq("id".to_string(), Value::Int64(2));
-        let result = ds.explain(&predicate);
+        let result = ds.snapshot().explain(&predicate);
 
         assert_eq!(result.total_files, 2);
         assert_eq!(
@@ -962,13 +895,13 @@ mod tests {
         .unwrap();
         let mut txn = ds.begin();
         txn.insert(first);
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
 
         let second =
             RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![40, 50]))]).unwrap();
         let mut txn = ds.begin();
         txn.insert(second);
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
 
         let data_dir = ds.data_dir();
         let first_on_disk = read_batch(&data_dir.join(&ds.data_files()[0].name)).unwrap();
@@ -1001,9 +934,9 @@ mod tests {
                 .unwrap();
         let mut txn = ds.begin();
         txn.insert(batch);
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
 
-        let scanned = ds.scan(&schema).unwrap();
+        let scanned = ds.snapshot().scan(&schema).unwrap();
         assert_eq!(
             scanned.schema_ref().fields().len(),
             1,
@@ -1030,7 +963,7 @@ mod tests {
         .unwrap();
         let mut txn = ds.begin();
         txn.insert(low);
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
 
         let high = RecordBatch::try_new(
             schema.clone(),
@@ -1039,10 +972,13 @@ mod tests {
         .unwrap();
         let mut txn = ds.begin();
         txn.insert(high);
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
 
         let predicate = Predicate::Eq("id".to_string(), Value::Int64(2));
-        let result = ds.scan_with_predicate(&schema, &predicate).unwrap();
+        let result = ds
+            .snapshot()
+            .scan_with_predicate(&schema, &predicate)
+            .unwrap();
 
         assert_eq!(result.num_rows(), 1);
         let ids = result
@@ -1088,9 +1024,12 @@ mod tests {
         );
         let mut txn = ds.begin();
         txn.insert(batch);
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
 
-        let results = ds.vector_search(&[0.0, 0.0, 0.0], 1, None).unwrap();
+        let results = ds
+            .snapshot()
+            .vector_search(&[0.0, 0.0, 0.0], 1, None)
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].row_id, 0); // row-id 0 is the first committed row (id=1)
 
@@ -1152,12 +1091,15 @@ mod tests {
         let batch = vector_batch(ids, vectors);
         let mut txn = ds.begin();
         txn.insert(batch);
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
 
         // Sanity check: without the predicate, the true nearest neighbors
         // really do come from the near (non-matching) cluster — otherwise
         // this test wouldn't prove the predicate is doing any narrowing.
-        let unfiltered = ds.vector_search(&[0.0, 0.0, 0.0], 3, None).unwrap();
+        // Both reads below share a single snapshot, so they observe exactly
+        // the same committed state.
+        let snapshot = ds.snapshot();
+        let unfiltered = snapshot.vector_search(&[0.0, 0.0, 0.0], 3, None).unwrap();
         assert_eq!(unfiltered.len(), 3);
         assert!(
             unfiltered.iter().all(|r| r.row_id < 15),
@@ -1165,7 +1107,7 @@ mod tests {
         );
 
         let predicate = Predicate::Eq("id".to_string(), Value::Int64(2));
-        let results = ds
+        let results = snapshot
             .vector_search(&[0.0, 0.0, 0.0], 3, Some(&predicate))
             .unwrap();
 
@@ -1204,7 +1146,7 @@ mod tests {
 
         let mut txn = ds.begin();
         txn.insert(batch);
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
         drop(ds);
 
         // Force a real replay from disk, not an in-memory shortcut — this is
@@ -1212,7 +1154,10 @@ mod tests {
         // struct, same process, but the index cache is definitely rebuilt from
         // the delta-log file, not carried over).
         let reopened = Dataset::open(&dir).unwrap();
-        let results = reopened.vector_search(&[0.0, 0.0, 0.0], 1, None).unwrap();
+        let results = reopened
+            .snapshot()
+            .vector_search(&[0.0, 0.0, 0.0], 1, None)
+            .unwrap();
 
         assert_eq!(results.len(), 1);
         assert_eq!(
@@ -1248,7 +1193,7 @@ mod tests {
             Err(other) => {
                 panic!("expected NonFiniteVectorComponent, got a different error: {other}")
             }
-            Ok(_) => panic!("commit of a NaN vector component must not succeed"),
+            Ok(()) => panic!("commit of a NaN vector component must not succeed"),
         }
 
         // The rejected commit must have left no trace: the manifest never
@@ -1258,7 +1203,7 @@ mod tests {
         assert_eq!(reopened.current_version(), 0);
         assert!(reopened.data_files().is_empty());
 
-        let scanned = reopened.scan(&vector_test_schema()).unwrap();
+        let scanned = reopened.snapshot().scan(&vector_test_schema()).unwrap();
         assert_eq!(scanned.num_rows(), 0);
 
         std::fs::remove_dir_all(&dir).ok();
@@ -1282,7 +1227,7 @@ mod tests {
         let mut txn = ds.begin();
         txn.insert(first);
         txn.insert(second);
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
 
         let data_dir = ds.data_dir();
         let first_on_disk = read_batch(&data_dir.join(&ds.data_files()[0].name)).unwrap();
@@ -1330,7 +1275,7 @@ mod tests {
         std::fs::write(dir.join("data").join("d.deltalog"), "").unwrap();
         let ds = Dataset::open(&dir).unwrap();
 
-        let result = ds.scan(&test_schema());
+        let result = ds.snapshot().scan(&test_schema());
         assert!(
             matches!(result, Err(TxnError::UnsafeManifestPath(_))),
             "expected UnsafeManifestPath, got {result:?}"
@@ -1351,7 +1296,7 @@ mod tests {
         .unwrap();
         let mut txn = ds.begin();
         txn.insert(batch);
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
 
         // Caller asks to scan with a schema declaring 2 columns, but the
         // committed file only has 1 logical column ("id" — the trailing
@@ -1362,7 +1307,7 @@ mod tests {
             Field::new("id", DataType::Int64, false),
             Field::new("extra", DataType::Utf8, false),
         ]));
-        let result = ds.scan(&mismatched_schema);
+        let result = ds.snapshot().scan(&mismatched_schema);
         assert!(
             matches!(
                 result,
@@ -1392,7 +1337,7 @@ mod tests {
         let low = vector_batch(vec![1, 1], vec![[0.0, 0.0, 0.0], [0.01, 0.01, 0.01]]);
         let mut txn = ds.begin();
         txn.insert(low);
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
 
         let high = vector_batch(
             vec![2, 2],
@@ -1400,17 +1345,20 @@ mod tests {
         );
         let mut txn = ds.begin();
         txn.insert(high);
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
 
         // Sanity: the id=1 file's stats don't overlap id=2's, so explain()
         // must confirm one file is prunable for this predicate — otherwise
-        // this test wouldn't actually exercise the pruning branch.
+        // this test wouldn't actually exercise the pruning branch. Both reads
+        // below share a single snapshot, so they observe exactly the same
+        // committed state.
         let predicate = Predicate::Eq("id".to_string(), Value::Int64(2));
-        let explain = ds.explain(&predicate);
+        let snapshot = ds.snapshot();
+        let explain = snapshot.explain(&predicate);
         assert_eq!(explain.scanned.len(), 1);
         assert_eq!(explain.skipped.len(), 1);
 
-        let results = ds
+        let results = snapshot
             .vector_search(&[1000.0, 1000.0, 1000.0], 2, Some(&predicate))
             .unwrap();
 
@@ -1441,7 +1389,7 @@ mod tests {
         let dir = temp_dir("empty-commit");
         let ds = Dataset::create(&dir).unwrap();
         let txn = ds.begin();
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
 
         assert_eq!(
             ds.current_version(),
@@ -1466,12 +1414,12 @@ mod tests {
                 .unwrap();
         let mut txn = ds.begin();
         txn.insert(batch);
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
 
         let data_dir = ds.data_dir();
         std::fs::remove_file(data_dir.join(&ds.data_files()[0].name)).unwrap();
 
-        let result = ds.scan(&schema);
+        let result = ds.snapshot().scan(&schema);
         assert!(
             result.is_err(),
             "scan must error cleanly, not panic, when a manifest-listed file is missing"
@@ -1494,7 +1442,7 @@ mod tests {
                 .unwrap();
         let mut txn = ds.begin();
         txn.insert(batch1);
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
 
         // Second commit: low-cardinality (2 distinct values over 20 rows) ->
         // gets dictionary-encoded.
@@ -1506,7 +1454,7 @@ mod tests {
                 .unwrap();
         let mut txn = ds.begin();
         txn.insert(batch2);
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
 
         // Confirm the two files really do have different physical
         // encodings, so this test can't silently stop testing the scenario
@@ -1520,7 +1468,7 @@ mod tests {
             DataType::Dictionary(_, _)
         ));
 
-        let scanned = ds.scan(&schema).unwrap();
+        let scanned = ds.snapshot().scan(&schema).unwrap();
         assert_eq!(scanned.num_rows(), 40);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1622,7 +1570,7 @@ mod tests {
         let batch = vector_batch(ids, vectors);
         let mut txn = ds.begin();
         txn.insert(batch);
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
 
         // Hand-append a Tombstone entry for row 0 (the exact-match nearest
         // neighbor in the near cluster) to the just-written delta-log file,
@@ -1642,7 +1590,10 @@ mod tests {
         // production HNSW defaults (EF_SEARCH_DEFAULT=32, not the much
         // wider tuned constants crates/index/src/hnsw.rs's own unit tests
         // use) don't reliably surface a larger k against this fixture.
-        let results = reopened.vector_search(&[0.0, 0.0, 0.0], 3, None).unwrap();
+        let results = reopened
+            .snapshot()
+            .vector_search(&[0.0, 0.0, 0.0], 3, None)
+            .unwrap();
 
         assert_eq!(
             results.len(),
@@ -1683,7 +1634,7 @@ mod tests {
         .unwrap();
         let mut txn = ds.begin();
         txn.insert(batch);
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
 
         let entry = &ds.data_files()[0];
         let id_stats = entry.stats.get("id").unwrap();
@@ -1710,7 +1661,7 @@ mod tests {
 
         let predicate =
             strata_query::Predicate::Eq("id".to_string(), strata_storage::Value::Int64(1));
-        let result = ds.explain(&predicate);
+        let result = ds.snapshot().explain(&predicate);
 
         assert_eq!(result.total_files, 0);
         assert!(result.scanned.is_empty());
@@ -1726,7 +1677,10 @@ mod tests {
 
         let predicate =
             strata_query::Predicate::Eq("id".to_string(), strata_storage::Value::Int64(1));
-        let result = ds.scan_with_predicate(&schema, &predicate).unwrap();
+        let result = ds
+            .snapshot()
+            .scan_with_predicate(&schema, &predicate)
+            .unwrap();
 
         assert_eq!(result.num_rows(), 0);
         std::fs::remove_dir_all(&dir).ok();
@@ -1742,15 +1696,264 @@ mod tests {
             RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))]).unwrap();
         let mut txn = ds.begin();
         txn.insert(batch);
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
 
         let predicate =
             strata_query::Predicate::Eq("id".to_string(), strata_storage::Value::Int64(999));
-        let result = ds.explain(&predicate);
+        let result = ds.snapshot().explain(&predicate);
 
         assert_eq!(result.total_files, 1);
         assert!(result.scanned.is_empty());
         assert_eq!(result.skipped.len(), 1);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn commit_applies_only_its_own_new_deltas_not_the_full_history() {
+        let dir = std::env::temp_dir().join(format!(
+            "strata-replay-cost-regression-{}",
+            std::process::id()
+        ));
+        Dataset::create(&dir).unwrap();
+        let dataset = Dataset::open(&dir).unwrap();
+
+        // Commit 3 separate single-row batches first, establishing history.
+        // `mvp_row(id, name, vector)` builds one row in mvp_schema()'s
+        // shape — `id` is the schema's business column, unrelated to the
+        // internal system row-id the commit path assigns automatically.
+        for i in 0..3i64 {
+            let mut txn = dataset.begin();
+            txn.insert(crate::mvp_fixtures::mvp_row(i, "row", [i as f32, 0.0, 0.0]).unwrap());
+            txn.commit().unwrap();
+        }
+
+        // The 4th commit's own pending batch has exactly 1 row (1 new
+        // delta entry). Applying it must not require touching the 3
+        // earlier commits' delta-log files at all — confirmed indirectly
+        // here by checking the resulting snapshot's watermark/row count
+        // match "3 history rows + 1 new row", which would only be wrong if
+        // either too few (this commit's row lost) or suspiciously
+        // history-dependent logic silently reprocessed old entries into a
+        // wrong count.
+        let mut txn = dataset.begin();
+        txn.insert(crate::mvp_fixtures::mvp_row(3, "row", [3.0, 0.0, 0.0]).unwrap());
+        txn.commit().unwrap();
+
+        let snapshot = dataset.snapshot();
+        assert_eq!(
+            snapshot.watermark, 3,
+            "expected exactly 4 rows total (system row-ids 0..=3)"
+        );
+        assert_eq!(
+            snapshot
+                .scan(&crate::mvp_fixtures::mvp_schema())
+                .unwrap()
+                .num_rows(),
+            4
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn commit_rejects_inconsistent_batch_dimensions_before_touching_the_shared_graph() {
+        // Regression test for the hazard the Phase 5 final whole-branch
+        // review flagged: Transaction::commit applies Insert deltas to the
+        // shared, ever-growing Arc<HnswIndex> in pending-batch order, so a
+        // later pending batch's dimension mismatch was only ever caught
+        // after an earlier batch's deltas had already mutated the shared
+        // graph -- even though commit() returns Err and the manifest never
+        // advances. See validate_delta_dimensions's doc comment.
+        let dir = temp_dir("inconsistent-batch-dimensions");
+        let ds = Dataset::create(&dir).unwrap();
+
+        // Establish a real baseline: one successful 3-d commit, via the
+        // existing mvp_fixtures shape (FixedSizeList<Float32, 3>).
+        let mut seed_txn = ds.begin();
+        seed_txn.insert(crate::mvp_fixtures::mvp_row(0, "seed", [0.0, 0.0, 0.0]).unwrap());
+        seed_txn.commit().unwrap();
+
+        let snapshot_before = ds.snapshot();
+        let version_before = snapshot_before.version;
+        let established_before = snapshot_before.graph.established_dimension();
+        assert_eq!(
+            established_before, 3,
+            "the seed commit must have established dimension 3"
+        );
+
+        // Build a second, valid 3-d batch (via mvp_fixtures) and an
+        // inconsistent 5-d batch (hand-built, since mvp_fixtures is fixed
+        // at 3 dimensions) -- the exact scenario the review flagged: Insert
+        // deltas apply to the graph in pending-batch order, so without
+        // pre-validation the 3-d batch's insert (row-id 1) would succeed
+        // before the 5-d batch's insert (row-id 2) fails.
+        let batch_3d = crate::mvp_fixtures::mvp_row(1, "still-3d", [1.0, 0.0, 0.0]).unwrap();
+
+        let schema_5d = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 5),
+                false,
+            ),
+        ]));
+        let batch_5d = RecordBatch::try_new(
+            schema_5d,
+            vec![
+                Arc::new(Int64Array::from(vec![2])),
+                Arc::new(arrow::array::FixedSizeListArray::new(
+                    Arc::new(Field::new("item", DataType::Float32, false)),
+                    5,
+                    Arc::new(arrow::array::Float32Array::from(vec![
+                        2.0, 0.0, 0.0, 0.0, 0.0,
+                    ])),
+                    None,
+                )),
+            ],
+        )
+        .unwrap();
+
+        let mut txn = ds.begin();
+        txn.insert(batch_3d);
+        txn.insert(batch_5d);
+        let result = txn.commit();
+
+        assert!(
+            result.is_err(),
+            "a transaction whose pending batches have inconsistent vector dimensions \
+             must fail at commit()"
+        );
+
+        // Sanity checks on the durable/externally-visible side of the
+        // invariant: version never advances, and established_dimension is
+        // unchanged. NEITHER of these two assertions alone actually
+        // distinguishes fixed-from-buggy in this specific scenario --
+        // established_dimension() is already 3 both before and after,
+        // with or without the fix, because the seed commit already set it
+        // to 3 and the first (still-3-d) pending batch's vector matches
+        // that already-established value either way, so it never changes
+        // what established_dimension() reads even when wrongly applied.
+        // Kept here only as baseline sanity checks, not as the regression
+        // assertion -- see below for the one that actually discriminates.
+        let snapshot_after = ds.snapshot();
+        assert_eq!(
+            snapshot_after.version, version_before,
+            "a rejected commit must not advance the visible version at all"
+        );
+        assert_eq!(
+            snapshot_after.graph.established_dimension(),
+            established_before,
+            "sanity check only -- see the row-id-1-leak assertion below for the actual \
+             regression this test exists to catch"
+        );
+
+        // The assertion that actually discriminates fixed-from-buggy:
+        // row-id 1 (the mismatched transaction's first, individually-valid
+        // 3-d batch) must never have been physically inserted into the
+        // shared HnswIndex graph. Pre-fix, its `HnswIndex::insert` call
+        // succeeds (its dimension matches the graph's already-established
+        // one) before the second batch's 5-d insert fails -- silently
+        // mutating the graph even though the whole commit is rejected.
+        // `Snapshot::vector_search` can't observe this: it filters by
+        // `is_visible` (row_id <= watermark), and row-id 1's watermark is
+        // never advanced by this rejected commit either way, so it would
+        // hide the leaked row regardless of whether the fix exists. This
+        // instead calls `HnswIndex::search` directly on
+        // `snapshot_after.graph` (the same shared `Arc<HnswIndex>` the
+        // failed commit mutated in place -- `pub(crate) graph` is
+        // reachable from this same-crate test) with an always-true
+        // visibility predicate, bypassing the watermark filter entirely to
+        // see exactly what's physically in the graph.
+        let leaked = snapshot_after
+            .graph
+            .search(&[1.0, 0.0, 0.0], 2, 200, |_| true)
+            .unwrap();
+        assert!(
+            leaked.iter().all(|m| m.row_id != 1),
+            "row-id 1 must never have been inserted into the shared graph -- a rejected \
+             commit must apply zero of its deltas, not just the ones that come after the \
+             first failure: {leaked:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+/// Run with:
+/// `cargo rustc -p strata-txn --lib --profile test -- --cfg loom` to build,
+/// then execute the resulting `target/debug/deps/strata_txn-*` binary
+/// (filter to `dataset::loom_tests` to run just this module).
+///
+/// **Why not the simpler `RUSTFLAGS="--cfg loom" cargo test -p strata-txn
+/// --lib`:** that form sets `--cfg loom` for *every* crate rustc compiles
+/// for this invocation, not just `strata-txn`. `strata-txn` depends on
+/// `strata-index` as a regular (non-dev) dependency, and `strata-index`'s
+/// own `hnsw.rs` has a pre-existing `#[cfg(loom)]`/`#[cfg(not(loom))]` shim
+/// that imports the real `loom` crate under `cfg(loom)` — but `loom` is only
+/// a *dev*-dependency of `strata-index`, unavailable to the plain (non-test)
+/// library build that `strata-txn` links against. The global `RUSTFLAGS`
+/// form was verified to fail with `cannot find module or crate 'loom'` at
+/// `crates/index/src/hnsw.rs:5` (confirmed independent of this task's
+/// changes: `RUSTFLAGS="--cfg loom" cargo build -p strata-index --lib`
+/// fails identically on its own). `cargo rustc -p strata-txn -- --cfg loom`
+/// scopes the flag to only `strata-txn`'s own compilation unit, leaving
+/// `strata-index` (and every other dependency) compiled normally, which
+/// sidesteps the conflict without touching `crates/index`.
+///
+/// **Research note (Task 7):** `arc-swap` (resolved to 1.9.2 in Cargo.lock)
+/// has no documented `loom` integration or feature flag — confirmed against
+/// docs.rs/arc-swap/1.9.2, crates.io's listed features (only an optional
+/// `serde` feature), and the crate's own upstream `Cargo.toml` (features:
+/// `weak`, `internal-test-strategies`, `experimental-strategies`,
+/// `experimental-thread-local` — no mention of loom anywhere). `loom` can
+/// only explore interleavings of its own instrumented primitives, so it
+/// cannot see inside `arc-swap`'s real internal atomics without `arc-swap`
+/// itself being loom-aware — the same reason `crates/index`'s earlier loom
+/// test (`hnsw.rs`'s `establish_or_check_dimension`) needed a
+/// `#[cfg(loom)]`/`#[cfg(not(loom))]` shim swapping in loom's atomic types.
+/// This test therefore does **not** instrument the real `Dataset`/`ArcSwap`
+/// type directly; it models the *shape* of the `Dataset::snapshot()` /
+/// `Transaction::commit()` race — one writer storing a new value, one or
+/// more readers loading concurrently — directly on loom's own
+/// `sync::atomic::AtomicUsize`, proving the swap-then-load pattern itself is
+/// race-free (no torn reads, no panics, no deadlocks) under loom's
+/// exhaustive interleaving exploration. This is the same relationship a
+/// hand-rolled `Mutex`-guarded swap would have to a loom test: the pattern
+/// is verified, not the third-party crate's own internals.
+#[cfg(loom)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod loom_tests {
+    use std::sync::Arc as StdArc;
+
+    #[test]
+    fn one_writer_store_races_safely_with_many_readers_load() {
+        loom::model(|| {
+            // Models the Dataset::snapshot() / Transaction::commit() race
+            // directly on loom's own primitives (see this module's doc
+            // comment for why — arc-swap's internal atomics aren't
+            // loom-instrumented).
+            let current = StdArc::new(loom::sync::atomic::AtomicUsize::new(0));
+
+            let writer_current = StdArc::clone(&current);
+            let writer = loom::thread::spawn(move || {
+                writer_current.store(1, loom::sync::atomic::Ordering::SeqCst);
+            });
+
+            let reader_current = StdArc::clone(&current);
+            let reader = loom::thread::spawn(move || {
+                // A reader must only ever observe 0 (before the store) or 1
+                // (after it) — never a torn/intermediate value, and it must
+                // never panic or deadlock racing the writer's store.
+                let observed = reader_current.load(loom::sync::atomic::Ordering::SeqCst);
+                assert!(
+                    observed == 0 || observed == 1,
+                    "observed torn value: {observed}"
+                );
+            });
+
+            writer.join().unwrap();
+            reader.join().unwrap();
+        });
     }
 }

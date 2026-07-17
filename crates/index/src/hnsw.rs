@@ -1,8 +1,6 @@
 //! HNSW vector index wrapper. See `.claude/rules/vector-index.md` and
 //! `.claude/docs/design/phase-4-vector-index-spec.md` §1.
 
-use std::collections::HashSet;
-
 #[cfg(loom)]
 use loom::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(not(loom))]
@@ -40,7 +38,6 @@ pub enum IndexError {
 
 pub struct HnswIndex {
     hnsw: Hnsw<'static, f32, DistL2>,
-    tombstones: HashSet<u64>,
     dimension: AtomicUsize,
 }
 
@@ -94,7 +91,6 @@ impl HnswIndex {
                 ef_construction,
                 DistL2 {},
             ),
-            tombstones: HashSet::new(),
             dimension: AtomicUsize::new(0),
         })
     }
@@ -118,8 +114,16 @@ impl HnswIndex {
         Ok(())
     }
 
-    pub fn tombstone(&mut self, row_id: u64) {
-        self.tombstones.insert(row_id);
+    /// The vector dimension established by the first-ever [`Self::insert`]
+    /// call, or `0` if no vector has been inserted yet. Read-only — never
+    /// establishes a dimension itself, unlike `insert`'s internal
+    /// `establish_or_check_dimension` call. Exposed so callers (e.g.
+    /// `crates/txn`'s `Transaction::commit`) can pre-validate a batch of
+    /// pending inserts' dimensions against this index *before* applying
+    /// any of them, rather than discovering a mismatch mid-application.
+    #[must_use]
+    pub fn established_dimension(&self) -> usize {
+        self.dimension.load(Ordering::SeqCst)
     }
 
     /// # Errors
@@ -133,14 +137,17 @@ impl HnswIndex {
         query: &[f32],
         k: usize,
         ef_search: usize,
+        is_visible: impl Fn(u64) -> bool,
     ) -> Result<Vec<VectorMatch>, IndexError> {
         self.check_dimension(query)?;
-        // Tombstone exclusion is pushed into hnsw_rs's own `FilterT`
+        // Visibility (tombstone exclusion, and — as of Phase 5 — snapshot
+        // watermark filtering) is pushed into hnsw_rs's own `FilterT`
         // mechanism, not applied as a post-filter on an already-capped
-        // top-k, so a tombstoned candidate can't silently shrink the
+        // top-k, so an invisible candidate can't silently shrink the
         // result set below `k` — see
-        // `.claude/docs/design/phase-4-vector-index-spec.md` §1.
-        let filter = self.not_tombstoned_filter();
+        // `.claude/docs/design/phase-4-vector-index-spec.md` §1 and
+        // `docs/superpowers/specs/2026-07-17-phase-5-mvcc-snapshot-isolation-design.md`.
+        let filter = move |id: &hnsw_rs::prelude::DataId| is_visible(Self::to_row_id(*id));
         let raw = self
             .hnsw
             .search_filter(query, k, ef_search, Some(&filter as &dyn FilterT));
@@ -156,6 +163,7 @@ impl HnswIndex {
         k: usize,
         ef_search: usize,
         live_ids: &[usize],
+        is_visible: impl Fn(u64) -> bool,
     ) -> Result<Vec<VectorMatch>, IndexError> {
         self.check_dimension(query)?;
         // live_ids is caller-supplied and expected sorted (binary-searched
@@ -163,13 +171,12 @@ impl HnswIndex {
         // this right.
         let mut live_ids = live_ids.to_vec();
         live_ids.sort_unstable();
-        let tombstones = &self.tombstones;
-        // Membership in `live_ids` and tombstone-exclusion are composed
-        // into a single `FilterT` predicate, so both are applied during
+        // Membership in `live_ids` and visibility are composed into a
+        // single `FilterT` predicate, so both are applied during
         // hnsw_rs's own traversal/candidate-heap construction rather than
         // as a post-filter on an already-capped top-k.
         let filter = move |id: &hnsw_rs::prelude::DataId| {
-            live_ids.binary_search(id).is_ok() && !tombstones.contains(&Self::to_row_id(*id))
+            live_ids.binary_search(id).is_ok() && is_visible(Self::to_row_id(*id))
         };
         let raw = self
             .hnsw
@@ -186,10 +193,6 @@ impl HnswIndex {
             });
         }
         Ok(())
-    }
-
-    fn not_tombstoned_filter(&self) -> impl Fn(&hnsw_rs::prelude::DataId) -> bool + '_ {
-        move |id: &hnsw_rs::prelude::DataId| !self.tombstones.contains(&Self::to_row_id(*id))
     }
 
     #[allow(clippy::cast_possible_truncation)]
@@ -223,6 +226,8 @@ impl HnswIndex {
 #[cfg(all(test, not(loom)))]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
 
     // Empirically validated (10000-trial repro, zero failures) against a
@@ -302,7 +307,9 @@ mod tests {
 
         // Row 0 is an exact match for the query (offset 0 in the near
         // cluster) — the unambiguous true nearest neighbor.
-        let results = index.search(&[0.0, 0.0, 0.0], 3, TEST_EF_SEARCH).unwrap();
+        let results = index
+            .search(&[0.0, 0.0, 0.0], 3, TEST_EF_SEARCH, |_| true)
+            .unwrap();
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].row_id, 0);
         #[allow(clippy::float_cmp)]
@@ -321,40 +328,42 @@ mod tests {
     }
 
     #[test]
-    fn tombstoned_row_is_never_returned_even_as_the_true_nearest_neighbor() {
-        let index = {
-            let mut index = HnswIndex::new(
-                TEST_MAX_NB_CONNECTION,
-                100,
-                TEST_MAX_LAYER,
-                TEST_EF_CONSTRUCTION,
-            )
-            .unwrap();
-            // Near cluster: row-ids 0..15, within a 0.01-wide cube around
-            // (0,0,0). Far cluster: row-ids 15..30, within a 0.01-wide
-            // cube around (1000,0,0).
-            insert_cluster(&index, 0, 15, [0.0, 0.0, 0.0], 0.01);
-            insert_cluster(&index, 15, 15, [1000.0, 0.0, 0.0], 0.01);
-            // Row 0 is the exact-match true nearest neighbor; tombstone it.
-            index.tombstone(0);
-            index
-        };
+    fn invisible_row_is_never_returned_even_as_the_true_nearest_neighbor() {
+        let index = HnswIndex::new(
+            TEST_MAX_NB_CONNECTION,
+            100,
+            TEST_MAX_LAYER,
+            TEST_EF_CONSTRUCTION,
+        )
+        .unwrap();
+        // Near cluster: row-ids 0..15, within a 0.01-wide cube around
+        // (0,0,0). Far cluster: row-ids 15..30, within a 0.01-wide
+        // cube around (1000,0,0).
+        insert_cluster(&index, 0, 15, [0.0, 0.0, 0.0], 0.01);
+        insert_cluster(&index, 15, 15, [1000.0, 0.0, 0.0], 0.01);
+        // Row 0 is the exact-match true nearest neighbor; mark it invisible
+        // (the caller-side equivalent of tombstoning it).
+        let invisible: HashSet<u64> = HashSet::from([0]);
 
-        // Tombstone exclusion happens inside hnsw_rs's own traversal-level
-        // filter now (not a Rust-side post-filter on an already-capped
-        // top-k), so asking for exactly 5 candidates is enough to get 5
-        // live results even though the true nearest neighbor is
-        // tombstoned — no "ask for one extra" compensation needed.
-        let results = index.search(&[0.0, 0.0, 0.0], 5, TEST_EF_SEARCH).unwrap();
+        // Visibility exclusion happens inside hnsw_rs's own traversal-level
+        // filter (not a Rust-side post-filter on an already-capped top-k),
+        // so asking for exactly 5 candidates is enough to get 5 live
+        // results even though the true nearest neighbor is invisible — no
+        // "ask for one extra" compensation needed.
+        let results = index
+            .search(&[0.0, 0.0, 0.0], 5, TEST_EF_SEARCH, |id| {
+                !invisible.contains(&id)
+            })
+            .unwrap();
         assert_eq!(
             results.len(),
             5,
-            "the near cluster has 14 live rows left after the tombstone, all vastly \
+            "the near cluster has 14 live rows left after excluding row 0, all vastly \
              closer than the far cluster, so the top 5 must still be fully populated: {results:?}"
         );
         assert!(
             results.iter().all(|r| r.row_id != 0),
-            "the tombstoned row must be excluded, not just re-ranked: {results:?}"
+            "the invisible row must be excluded, not just re-ranked: {results:?}"
         );
         assert!(
             results.iter().all(|r| r.row_id < 15),
@@ -364,45 +373,45 @@ mod tests {
     }
 
     #[test]
-    fn tombstone_of_the_single_nearest_neighbor_still_returns_k_live_results_for_small_k() {
-        let index = {
-            let mut index = HnswIndex::new(
-                TEST_MAX_NB_CONNECTION,
-                100,
-                TEST_MAX_LAYER,
-                TEST_EF_CONSTRUCTION,
-            )
-            .unwrap();
-            // Near cluster: row-ids 0..15, within a 0.01-wide cube around
-            // (0,0,0). Far cluster: row-ids 15..30, within a 0.01-wide
-            // cube around (1000,0,0).
-            insert_cluster(&index, 0, 15, [0.0, 0.0, 0.0], 0.01);
-            insert_cluster(&index, 15, 15, [1000.0, 0.0, 0.0], 0.01);
-            // Row 0 is the exact-match true nearest neighbor; tombstone
-            // it. Under the old design, `hnsw_rs`'s unfiltered
-            // `Hnsw::search(query, 1, ef)` would return exactly one raw
-            // candidate — row 0, the unambiguous nearest — and
-            // post-filtering it out afterward would leave *zero* results
-            // even though 14 live near-cluster rows exist. Pushing the
-            // tombstone into hnsw_rs's own traversal-level filter (via
-            // `search_filter`) means row 0 is never considered a
-            // candidate in the first place, so the true next-nearest
-            // *live* neighbor is found instead.
-            index.tombstone(0);
-            index
-        };
+    fn invisibility_of_the_single_nearest_neighbor_still_returns_k_live_results_for_small_k() {
+        let index = HnswIndex::new(
+            TEST_MAX_NB_CONNECTION,
+            100,
+            TEST_MAX_LAYER,
+            TEST_EF_CONSTRUCTION,
+        )
+        .unwrap();
+        // Near cluster: row-ids 0..15, within a 0.01-wide cube around
+        // (0,0,0). Far cluster: row-ids 15..30, within a 0.01-wide
+        // cube around (1000,0,0).
+        insert_cluster(&index, 0, 15, [0.0, 0.0, 0.0], 0.01);
+        insert_cluster(&index, 15, 15, [1000.0, 0.0, 0.0], 0.01);
+        // Row 0 is the exact-match true nearest neighbor; mark it
+        // invisible. Under the old design, `hnsw_rs`'s unfiltered
+        // `Hnsw::search(query, 1, ef)` would return exactly one raw
+        // candidate — row 0, the unambiguous nearest — and post-filtering
+        // it out afterward would leave *zero* results even though 14 live
+        // near-cluster rows exist. Pushing the exclusion into hnsw_rs's own
+        // traversal-level filter (via `search_filter`) means row 0 is never
+        // considered a candidate in the first place, so the true
+        // next-nearest *live* neighbor is found instead.
+        let invisible: HashSet<u64> = HashSet::from([0]);
 
-        let results = index.search(&[0.0, 0.0, 0.0], 1, TEST_EF_SEARCH).unwrap();
+        let results = index
+            .search(&[0.0, 0.0, 0.0], 1, TEST_EF_SEARCH, |id| {
+                !invisible.contains(&id)
+            })
+            .unwrap();
         assert_eq!(
             results.len(),
             1,
-            "a tombstoned true-nearest-neighbor must not shrink the result \
+            "an invisible true-nearest-neighbor must not shrink the result \
              count below k when enough live candidates exist deeper in the \
              graph: {results:?}"
         );
         assert_ne!(
             results[0].row_id, 0,
-            "the tombstoned row must never be returned: {results:?}"
+            "the invisible row must never be returned: {results:?}"
         );
         assert!(
             results[0].row_id < 15,
@@ -432,7 +441,7 @@ mod tests {
         // though every near-cluster row is far closer to the query.
         let live_ids: Vec<usize> = (15..30).collect();
         let results = index
-            .search_filtered(&[0.0, 0.0, 0.0], 3, TEST_EF_SEARCH, &live_ids)
+            .search_filtered(&[0.0, 0.0, 0.0], 3, TEST_EF_SEARCH, &live_ids, |_| true)
             .unwrap();
         assert_eq!(results.len(), 3, "unexpected results: {results:?}");
         assert!(
@@ -443,45 +452,44 @@ mod tests {
     }
 
     #[test]
-    fn search_filtered_excludes_tombstones_even_for_the_single_nearest_live_id() {
-        let index = {
-            let mut index = HnswIndex::new(
-                TEST_MAX_NB_CONNECTION,
-                100,
-                TEST_MAX_LAYER,
-                TEST_EF_CONSTRUCTION,
-            )
-            .unwrap();
-            // Near cluster: row-ids 0..15, within a 0.01-wide cube around
-            // (0,0,0). Far cluster: row-ids 15..30, within a 0.01-wide
-            // cube around (1000,0,0).
-            insert_cluster(&index, 0, 15, [0.0, 0.0, 0.0], 0.01);
-            insert_cluster(&index, 15, 15, [1000.0, 0.0, 0.0], 0.01);
-            // Row 0 is the exact-match true nearest neighbor among the
-            // near-cluster live set; tombstone it. Tombstone-exclusion is
-            // composed into the same `FilterT` predicate as the
-            // `live_ids` membership check, so both are applied during
-            // hnsw_rs's own traversal — not as a Rust-side post-filter
-            // that could silently return fewer than k live results.
-            index.tombstone(0);
-            index
-        };
+    fn search_filtered_excludes_invisible_rows_even_for_the_single_nearest_live_id() {
+        let index = HnswIndex::new(
+            TEST_MAX_NB_CONNECTION,
+            100,
+            TEST_MAX_LAYER,
+            TEST_EF_CONSTRUCTION,
+        )
+        .unwrap();
+        // Near cluster: row-ids 0..15, within a 0.01-wide cube around
+        // (0,0,0). Far cluster: row-ids 15..30, within a 0.01-wide
+        // cube around (1000,0,0).
+        insert_cluster(&index, 0, 15, [0.0, 0.0, 0.0], 0.01);
+        insert_cluster(&index, 15, 15, [1000.0, 0.0, 0.0], 0.01);
+        // Row 0 is the exact-match true nearest neighbor among the
+        // near-cluster live set; mark it invisible. Visibility exclusion
+        // is composed into the same `FilterT` predicate as the `live_ids`
+        // membership check, so both are applied during hnsw_rs's own
+        // traversal — not as a Rust-side post-filter that could silently
+        // return fewer than k live results.
+        let invisible: HashSet<u64> = HashSet::from([0]);
 
         // Every near-cluster row is "live" per the caller's predicate;
-        // only the tombstone should exclude row 0.
+        // only the invisibility marker should exclude row 0.
         let live_ids: Vec<usize> = (0..15).collect();
         let results = index
-            .search_filtered(&[0.0, 0.0, 0.0], 1, TEST_EF_SEARCH, &live_ids)
+            .search_filtered(&[0.0, 0.0, 0.0], 1, TEST_EF_SEARCH, &live_ids, |id| {
+                !invisible.contains(&id)
+            })
             .unwrap();
         assert_eq!(
             results.len(),
             1,
-            "a tombstoned true-nearest live id must not shrink the result \
+            "an invisible true-nearest live id must not shrink the result \
              count below k when enough other live candidates exist: {results:?}"
         );
         assert_ne!(
             results[0].row_id, 0,
-            "the tombstoned row must never be returned, even though it is \
+            "the invisible row must never be returned, even though it is \
              in the live set: {results:?}"
         );
         assert!(
@@ -510,7 +518,9 @@ mod tests {
         .unwrap();
         index.insert(0, &[0.0, 0.0, 0.0]).unwrap();
 
-        let results = index.search(&[3.0, 4.0, 0.0], 1, TEST_EF_SEARCH).unwrap();
+        let results = index
+            .search(&[3.0, 4.0, 0.0], 1, TEST_EF_SEARCH, |_| true)
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].row_id, 0);
         #[allow(clippy::float_cmp)]
@@ -537,7 +547,7 @@ mod tests {
         let index = HnswIndex::new(16, 100, 16, 200).unwrap();
         index.insert(0, &[0.0, 0.0, 0.0]).unwrap();
 
-        let result = index.search(&[0.0, 0.0], 1, 50);
+        let result = index.search(&[0.0, 0.0], 1, 50, |_| true);
         assert!(matches!(
             result,
             Err(IndexError::DimensionMismatch {
@@ -560,6 +570,19 @@ mod tests {
                 expected: 3
             })
         ));
+    }
+
+    #[test]
+    fn established_dimension_is_zero_before_any_insert() {
+        let index = HnswIndex::new(16, 100, 16, 200).unwrap();
+        assert_eq!(index.established_dimension(), 0);
+    }
+
+    #[test]
+    fn established_dimension_reflects_the_first_inserted_vectors_length() {
+        let index = HnswIndex::new(16, 100, 16, 200).unwrap();
+        index.insert(0, &[0.0, 0.0, 0.0]).unwrap();
+        assert_eq!(index.established_dimension(), 3);
     }
 }
 
