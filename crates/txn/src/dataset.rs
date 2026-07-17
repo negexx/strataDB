@@ -196,8 +196,23 @@ impl Transaction {
     /// dimension mismatch), or if the manifest commit's atomic rename
     /// fails. Delta-application runs before the manifest commit, so any of
     /// these failures leaves the manifest unadvanced — the new data/delta-log
-    /// files are orphaned on disk but never made visible, the same as an
-    /// interrupted crash.
+    /// files are orphaned on disk but never made visible.
+    ///
+    /// **Known limitation, not equivalent to a crash:** unlike an
+    /// interrupted crash (where the in-memory graph is discarded and
+    /// `Dataset::open` rebuilds it from only the committed delta-logs), a
+    /// commit that fails *after* deltas are applied to `self.graph` but
+    /// *before* `commit_manifest` succeeds leaves those vectors
+    /// permanently in the live, shared graph — `hnsw_rs` has no
+    /// node-removal API to undo the insert. Because `manifest.next_row_id`
+    /// was never advanced, the next successful commit will assign the
+    /// *same* row-ids to different vectors, inserting them into the graph
+    /// a second time under an id already in use. This is inert as long as
+    /// this failed commit's own watermark never advances (visibility is
+    /// watermark-gated, so the orphaned entry is never reachable through
+    /// any `Snapshot`) — but it is a latent correctness risk once Phase 6
+    /// introduces real conflict/CAS logic on top of this shared-graph
+    /// model, and should be revisited there, not silently inherited.
     pub fn commit(self) -> Result<()> {
         let mut manifest = self.base_manifest;
         let new_version = manifest.version.checked_add(1).ok_or_else(|| {
