@@ -1,10 +1,14 @@
 //! Single-writer transaction path for Phase 1's vertical slice. Implements
-//! the commit protocol from
-//! `.claude/docs/design/phase-0-transaction-and-format-spec.md` §3, minus
-//! §3.2's conflict check — Phase 1 has exactly one writer, so there is
-//! nothing to conflict with yet. See `.claude/rules/concurrency-txn-layer.md`
-//! before adding real conflict detection here; this API is shaped so Phase 6
-//! can slot it in without a rewrite, but it is not implemented yet.
+//! spec §3's write/durability steps (3-5) — Phase 1 has exactly one writer,
+//! so §3.1's read/write-set accumulation and §3.2's conflict check are both
+//! deliberate no-ops, and §3.4's "atomic CAS of the manifest pointer" is
+//! implemented here as an unconditional versioned-file rename
+//! (`strata_storage::commit_manifest`), not a real compare-and-swap — two
+//! concurrent writers would last-writer-win silently rather than fail. Both
+//! are acceptable only because there is exactly one writer today. See
+//! `.claude/rules/concurrency-txn-layer.md` before adding real conflict
+//! detection or a real CAS here; this API is shaped so Phase 6 can slot
+//! both in without a rewrite, but neither is implemented yet.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -21,10 +25,18 @@ use strata_storage::{
 use crate::error::{Result, TxnError};
 
 /// The hidden internal row-id column every committed batch carries
-/// alongside its logical columns. Exported so callers that need it back
-/// (e.g. the CLI's `search` subcommand, Task 6) can request it through the
-/// existing `scan`/`scan_with_predicate` API by including it in their own
-/// schema, rather than needing a bespoke lookup method. See
+/// alongside its logical columns. Callers can retrieve it through the
+/// public `scan`/`scan_with_predicate` API, but only under one precondition:
+/// the caller's schema must list every physical column in the same order
+/// data was inserted in, with `ROW_ID_COLUMN` appended last (see the CLI's
+/// `handle_search`, which does exactly this). A schema that omits, reorders,
+/// or partially includes columns will not retrieve row-ids correctly — as
+/// of the `cast_batch_to_schema` column-count check, a mismatched column
+/// count now returns a typed `TxnError::SchemaMismatch` instead of silently
+/// producing wrong data, but column *order* is still the caller's
+/// responsibility. `row_ids_matching` (below) sidesteps this precondition
+/// entirely by reading each file's raw physical batch directly rather than
+/// going through the public schema-based API. See
 /// `.claude/docs/design/phase-0-transaction-and-format-spec.md` §8.
 pub const ROW_ID_COLUMN: &str = "_row_id";
 
@@ -144,9 +156,10 @@ impl Dataset {
 
     /// Reads every committed row as a single `RecordBatch`, cast back to
     /// `schema` — the caller's logical schema, not necessarily the physical
-    /// on-disk representation. Phase 1 has no per-fragment scan pushdown —
-    /// see `crates/query` and Phase 2/3 of the roadmap for real vectorized
-    /// scan.
+    /// on-disk representation. For predicate-pushdown pruning (skipping
+    /// whole files a predicate provably can't match), see
+    /// [`Dataset::scan_with_predicate`] and [`Dataset::explain`] below —
+    /// this method always reads every committed file.
     ///
     /// Each committed file's columns are cast to `schema`'s types before
     /// concatenation. This is required, not optional: `encode_batch`
@@ -245,9 +258,10 @@ impl Dataset {
 
     /// Resolves the row-ids of every row matching `predicate`, reading each
     /// surviving (per `should_scan_file`) file's raw on-disk batch directly —
-    /// not through the public `scan_with_predicate`, whose caller-supplied
-    /// logical schema never includes `ROW_ID_COLUMN` and would drop it (see
-    /// Task 1's note on `cast_batch_to_schema`'s positional zip).
+    /// not through the public `scan_with_predicate`, which requires the
+    /// caller to supply a schema matching `ROW_ID_COLUMN`'s precondition
+    /// (see its doc comment above) rather than guaranteeing row-ids are
+    /// always retrievable.
     fn row_ids_matching(&self, predicate: &Predicate) -> Result<Vec<usize>> {
         let per_file_ids = self.read_surviving_files(Some(predicate), |batch| {
             let matched = filter(&batch, predicate)?;
@@ -294,8 +308,10 @@ impl Transaction {
         self.pending.push(batch);
     }
 
-    /// Commits per spec §3, steps 3-5 (step 2's conflict check is a
-    /// deliberate no-op in Phase 1 — see the module doc comment).
+    /// Commits per spec §3's write/durability steps (3-5) — §3.1's
+    /// read/write-set accumulation and §3.2's conflict check are both
+    /// deliberate no-ops in Phase 1 (see the module doc comment for why,
+    /// and for the §3.4 CAS caveat).
     ///
     /// # Errors
     ///
@@ -461,8 +477,13 @@ const MAX_REASONABLE_ROW_ID_CAPACITY: u64 = 1_000_000_000;
 /// # Errors
 ///
 /// Returns an error if any delta-log file listed in `manifest` fails to
-/// read or parse, or if `manifest.next_row_id` exceeds
-/// [`MAX_REASONABLE_ROW_ID_CAPACITY`].
+/// read or parse, if `manifest.next_row_id` exceeds
+/// [`MAX_REASONABLE_ROW_ID_CAPACITY`], or (via [`TxnError::Index`]) if a
+/// replayed `DeltaEntry::Insert`'s vector length doesn't match the
+/// dimensionality established by the first vector ever inserted into the
+/// index — [`strata_index::IndexError::DimensionMismatch`], surfaced here
+/// so a corrupted delta-log entry can't silently desync the rebuilt index
+/// from the one that originally produced it.
 fn replay_index(dir: &Path, manifest: &Manifest) -> Result<HnswIndex> {
     if manifest.next_row_id > MAX_REASONABLE_ROW_ID_CAPACITY {
         return Err(TxnError::UnreasonableCapacity(
