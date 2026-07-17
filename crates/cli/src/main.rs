@@ -1,9 +1,9 @@
 //! `strata` CLI — dataset/manifest inspection, and the Phase 1 MVP checklist
 //! surface. `crash-loop` exists specifically to be killed mid-write by
-//! `crates/txn/tests/mvp_checklist.rs`'s crash-recovery test (checklist step
-//! 6): it commits one row at a time, printing (and flushing) "committed N"
-//! after each success, so an external harness can kill it deterministically
-//! partway through and verify recovery.
+//! `crates/cli/tests/mvp_checklist_6_crash_recovery.rs`'s crash-recovery
+//! test (checklist step 6): it commits one row at a time, printing (and
+//! flushing) "committed N" after each success, so an external harness can
+//! kill it deterministically partway through and verify recovery.
 
 use std::env;
 use std::error::Error;
