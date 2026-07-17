@@ -54,6 +54,11 @@ fn explain_skips_files_whose_stats_cannot_match_and_scans_only_the_rest() {
         2,
         "the [1,3] and [100,102] files must both be skipped"
     );
+    assert!(
+        result.scanned[0].contains("00000000000000000002"),
+        "the scanned file must be the second commit (the [50,52] one): {:?}",
+        result.scanned
+    );
 
     // scan_with_predicate must return exactly the one matching row, proving
     // the skip decision and the actual filtered result agree.

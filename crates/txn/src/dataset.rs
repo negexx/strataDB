@@ -913,6 +913,18 @@ mod tests {
             1,
             "the [100,102] file must be skipped"
         );
+        let low_file_name = ds.data_files()[0].name.clone();
+        let high_file_name = ds.data_files()[1].name.clone();
+        assert_eq!(
+            result.scanned,
+            vec![low_file_name],
+            "the [1,3] file must be the one actually named in scanned, not just counted"
+        );
+        assert_eq!(
+            result.skipped,
+            vec![high_file_name],
+            "the [100,102] file must be the one actually named in skipped, not just counted"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

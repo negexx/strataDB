@@ -6,7 +6,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use arrow::array::FixedSizeListArray;
+use arrow::array::{FixedSizeListArray, Int64Array};
 
 use strata_txn::Dataset;
 use strata_txn::mvp_fixtures::{mvp_batch, mvp_schema};
@@ -40,6 +40,20 @@ fn mvp_checklist_steps_1_through_5() {
     // 4. Filter by an equality predicate on the string column.
     let filtered = strata_query::filter_eq(&scanned, "name", "alice").unwrap();
     assert_eq!(filtered.num_rows(), 2);
+    let filtered_ids = filtered
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let mut got: Vec<i64> = (0..filtered.num_rows())
+        .map(|i| filtered_ids.value(i))
+        .collect();
+    got.sort_unstable();
+    assert_eq!(
+        got,
+        vec![1, 3],
+        "must be exactly the two 'alice' rows (ids 1 and 3), not just any 2 rows"
+    );
 
     // 5. Run a brute-force nearest-neighbor search on the vector column,
     //    correctly.
