@@ -170,6 +170,45 @@ impl Snapshot {
     /// `.claude/docs/design/phase-4-vector-index-spec.md` §3-4 and the
     /// Phase 5 design doc.
     ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use arrow::array::{Float32Array, Int64Array, RecordBatch};
+    /// use arrow::datatypes::{DataType, Field, Schema};
+    /// use strata_txn::Dataset;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let dir = std::env::temp_dir()
+    ///     .join(format!("strata-doctest-vector-search-{}", std::process::id()));
+    /// let dataset = Dataset::create(&dir)?;
+    ///
+    /// let schema = Arc::new(Schema::new(vec![
+    ///     Field::new("id", DataType::Int64, false),
+    ///     Field::new(
+    ///         "vector",
+    ///         DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 3),
+    ///         false,
+    ///     ),
+    /// ]));
+    /// let ids = Arc::new(Int64Array::from(vec![1, 2]));
+    /// let item_field = Arc::new(Field::new("item", DataType::Float32, false));
+    /// let values = Arc::new(Float32Array::from(vec![0.0, 0.0, 0.0, 9.0, 9.0, 9.0]));
+    /// let vectors = Arc::new(arrow::array::FixedSizeListArray::new(item_field, 3, values, None));
+    /// let batch = RecordBatch::try_new(schema, vec![ids, vectors])?;
+    ///
+    /// let mut txn = dataset.begin();
+    /// txn.insert(batch);
+    /// txn.commit()?;
+    ///
+    /// let results = dataset.snapshot().vector_search(&[0.0, 0.0, 0.0], 1, None)?;
+    /// assert_eq!(results.len(), 1);
+    /// assert_eq!(results[0].row_id, 0); // row-id 0 is the true nearest match
+    /// # std::fs::remove_dir_all(&dir).ok();
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns an error if `predicate` is supplied and its column doesn't
