@@ -29,19 +29,22 @@ fn explain_skips_files_whose_stats_cannot_match_and_scans_only_the_rest() {
     // Three commits, three disjoint id ranges -> three files.
     let mut txn = ds.begin();
     txn.insert(batch(vec![1, 2, 3]));
-    let ds = txn.commit().unwrap();
+    txn.commit().unwrap();
 
     let mut txn = ds.begin();
     txn.insert(batch(vec![50, 51, 52]));
-    let ds = txn.commit().unwrap();
+    txn.commit().unwrap();
 
     let mut txn = ds.begin();
     txn.insert(batch(vec![100, 101, 102]));
-    let ds = txn.commit().unwrap();
+    txn.commit().unwrap();
 
-    // A predicate that can only match the middle file's range.
+    // A predicate that can only match the middle file's range. Both reads
+    // below share a single snapshot, so they observe exactly the same
+    // committed state.
     let predicate = Predicate::Eq("id".to_string(), Value::Int64(51));
-    let result = ds.explain(&predicate);
+    let snapshot = ds.snapshot();
+    let result = snapshot.explain(&predicate);
 
     assert_eq!(result.total_files, 3);
     assert_eq!(
@@ -62,7 +65,7 @@ fn explain_skips_files_whose_stats_cannot_match_and_scans_only_the_rest() {
 
     // scan_with_predicate must return exactly the one matching row, proving
     // the skip decision and the actual filtered result agree.
-    let filtered = ds.scan_with_predicate(&schema(), &predicate).unwrap();
+    let filtered = snapshot.scan_with_predicate(&schema(), &predicate).unwrap();
     assert_eq!(filtered.num_rows(), 1);
     let ids = filtered
         .column(0)
@@ -81,19 +84,22 @@ fn explain_and_scan_with_predicate_agree_on_a_range_predicate_not_just_equality(
 
     let mut txn = ds.begin();
     txn.insert(batch(vec![1, 2, 3]));
-    let ds = txn.commit().unwrap();
+    txn.commit().unwrap();
 
     let mut txn = ds.begin();
     txn.insert(batch(vec![50, 51, 52]));
-    let ds = txn.commit().unwrap();
+    txn.commit().unwrap();
 
     let mut txn = ds.begin();
     txn.insert(batch(vec![100, 101, 102]));
-    let ds = txn.commit().unwrap();
+    txn.commit().unwrap();
 
-    // Gt(id, 60): only the [100,102] file can possibly satisfy this.
+    // Gt(id, 60): only the [100,102] file can possibly satisfy this. Both
+    // reads below share a single snapshot, so they observe exactly the same
+    // committed state.
     let predicate = Predicate::Gt("id".to_string(), Value::Int64(60));
-    let result = ds.explain(&predicate);
+    let snapshot = ds.snapshot();
+    let result = snapshot.explain(&predicate);
 
     assert_eq!(result.total_files, 3);
     assert_eq!(
@@ -103,7 +109,7 @@ fn explain_and_scan_with_predicate_agree_on_a_range_predicate_not_just_equality(
     );
     assert_eq!(result.skipped.len(), 2);
 
-    let filtered = ds.scan_with_predicate(&schema(), &predicate).unwrap();
+    let filtered = snapshot.scan_with_predicate(&schema(), &predicate).unwrap();
     assert_eq!(filtered.num_rows(), 3);
     let ids = filtered
         .column(0)

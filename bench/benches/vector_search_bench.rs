@@ -112,7 +112,8 @@ fn build_dataset(dir: &Path, rows: &[(Vec<f32>, i64)]) -> Dataset {
 
     let mut txn = ds.begin();
     txn.insert(batch);
-    txn.commit().unwrap()
+    txn.commit().unwrap();
+    ds
 }
 
 /// Ground truth via brute force, and the correctness gate: HNSW's
@@ -143,6 +144,9 @@ fn check_recall(ds: &Dataset, rows: &[(Vec<f32>, i64)], queries: &[Vec<f32>]) ->
         .downcast_ref::<FixedSizeListArray>()
         .unwrap();
 
+    // One snapshot shared across every query in this recall check, since
+    // they're all reading the same immutable, already-built dataset.
+    let snapshot = ds.snapshot();
     let mut hits = 0usize;
     for query in queries {
         let exact: std::collections::HashSet<usize> = brute_force_search(vectors, query, RECALL_K)
@@ -150,7 +154,7 @@ fn check_recall(ds: &Dataset, rows: &[(Vec<f32>, i64)], queries: &[Vec<f32>]) ->
             .into_iter()
             .map(|n| n.row_index)
             .collect();
-        let approx: std::collections::HashSet<u64> = ds
+        let approx: std::collections::HashSet<u64> = snapshot
             .vector_search(query, RECALL_K, None)
             .unwrap()
             .into_iter()
@@ -194,11 +198,17 @@ fn bench_vector_search(c: &mut Criterion) {
         "recall@{RECALL_K} = {recall:.4} is too low to trust the QPS numbers below it"
     );
 
+    // One snapshot shared across both benchmark closures below — neither
+    // times snapshot acquisition itself, only vector_search, and both read
+    // the same never-mutated dataset.
+    let snapshot = ds.snapshot();
+
     let mut group = c.benchmark_group("vector_search");
     group.bench_function("unfiltered_top_10", |b| {
         b.iter(|| {
             let query = &queries[0];
-            ds.vector_search(std::hint::black_box(query), RECALL_K, None)
+            snapshot
+                .vector_search(std::hint::black_box(query), RECALL_K, None)
                 .unwrap()
         });
     });
@@ -207,7 +217,8 @@ fn bench_vector_search(c: &mut Criterion) {
     group.bench_function("filtered_top_10_one_of_ten_categories", |b| {
         b.iter(|| {
             let query = &queries[0];
-            ds.vector_search(std::hint::black_box(query), RECALL_K, Some(&predicate))
+            snapshot
+                .vector_search(std::hint::black_box(query), RECALL_K, Some(&predicate))
                 .unwrap()
         });
     });

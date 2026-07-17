@@ -19,7 +19,7 @@ use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use strata_index::{DeltaEntry, HnswIndex, read_delta_log, write_delta_log};
 use strata_storage::{
-    DataFileEntry, Manifest, commit_manifest, compute_stats, read_batch, read_current, write_batch,
+    DataFileEntry, Manifest, commit_manifest, compute_stats, read_current, write_batch,
 };
 
 use crate::error::{Result, TxnError};
@@ -558,6 +558,7 @@ mod tests {
 
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
+    use strata_storage::read_batch;
 
     use super::*;
 
@@ -598,7 +599,7 @@ mod tests {
         .unwrap();
         let mut txn = ds.begin();
         txn.insert(batch);
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
 
         // Confirm the file really was dictionary-encoded, so this test
         // can't silently stop testing the regression it exists to catch.
@@ -611,7 +612,7 @@ mod tests {
             "test data must actually trigger dictionary encoding to be a valid regression test"
         );
 
-        let scanned = ds.scan(&schema).unwrap();
+        let scanned = ds.snapshot().scan(&schema).unwrap();
         assert_eq!(scanned.schema_ref().field(0).data_type(), &DataType::Utf8);
         let scanned_names = scanned
             .column(0)
@@ -650,10 +651,10 @@ mod tests {
         .unwrap();
         let mut txn = ds.begin();
         txn.insert(batch.clone());
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
 
         assert_eq!(ds.current_version(), 1);
-        let scanned = ds.scan(&schema).unwrap();
+        let scanned = ds.snapshot().scan(&schema).unwrap();
         assert_eq!(scanned, batch);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -678,7 +679,7 @@ mod tests {
                 .unwrap();
         let mut txn = ds.begin();
         txn.insert(batch);
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
 
         let entry = &ds.data_files()[0];
         let id_stats = entry.stats.get("id").unwrap();
@@ -766,7 +767,7 @@ mod tests {
         let batch = RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(names))]).unwrap();
         let mut txn = ds.begin();
         txn.insert(batch);
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
 
         // Read the raw written file back directly (bypassing Dataset::scan's
         // concat_batches, which would already show us the encoded type, but
@@ -799,7 +800,7 @@ mod tests {
         .unwrap();
         let mut txn = ds.begin();
         txn.insert(low);
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
 
         let high = RecordBatch::try_new(
             schema,
@@ -808,10 +809,10 @@ mod tests {
         .unwrap();
         let mut txn = ds.begin();
         txn.insert(high);
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
 
         let predicate = Predicate::Eq("id".to_string(), Value::Int64(2));
-        let result = ds.explain(&predicate);
+        let result = ds.snapshot().explain(&predicate);
 
         assert_eq!(result.total_files, 2);
         assert_eq!(
@@ -852,13 +853,13 @@ mod tests {
         .unwrap();
         let mut txn = ds.begin();
         txn.insert(first);
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
 
         let second =
             RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![40, 50]))]).unwrap();
         let mut txn = ds.begin();
         txn.insert(second);
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
 
         let data_dir = ds.data_dir();
         let first_on_disk = read_batch(&data_dir.join(&ds.data_files()[0].name)).unwrap();
@@ -891,9 +892,9 @@ mod tests {
                 .unwrap();
         let mut txn = ds.begin();
         txn.insert(batch);
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
 
-        let scanned = ds.scan(&schema).unwrap();
+        let scanned = ds.snapshot().scan(&schema).unwrap();
         assert_eq!(
             scanned.schema_ref().fields().len(),
             1,
@@ -920,7 +921,7 @@ mod tests {
         .unwrap();
         let mut txn = ds.begin();
         txn.insert(low);
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
 
         let high = RecordBatch::try_new(
             schema.clone(),
@@ -929,10 +930,13 @@ mod tests {
         .unwrap();
         let mut txn = ds.begin();
         txn.insert(high);
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
 
         let predicate = Predicate::Eq("id".to_string(), Value::Int64(2));
-        let result = ds.scan_with_predicate(&schema, &predicate).unwrap();
+        let result = ds
+            .snapshot()
+            .scan_with_predicate(&schema, &predicate)
+            .unwrap();
 
         assert_eq!(result.num_rows(), 1);
         let ids = result
@@ -978,9 +982,12 @@ mod tests {
         );
         let mut txn = ds.begin();
         txn.insert(batch);
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
 
-        let results = ds.vector_search(&[0.0, 0.0, 0.0], 1, None).unwrap();
+        let results = ds
+            .snapshot()
+            .vector_search(&[0.0, 0.0, 0.0], 1, None)
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].row_id, 0); // row-id 0 is the first committed row (id=1)
 
@@ -1042,12 +1049,15 @@ mod tests {
         let batch = vector_batch(ids, vectors);
         let mut txn = ds.begin();
         txn.insert(batch);
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
 
         // Sanity check: without the predicate, the true nearest neighbors
         // really do come from the near (non-matching) cluster — otherwise
         // this test wouldn't prove the predicate is doing any narrowing.
-        let unfiltered = ds.vector_search(&[0.0, 0.0, 0.0], 3, None).unwrap();
+        // Both reads below share a single snapshot, so they observe exactly
+        // the same committed state.
+        let snapshot = ds.snapshot();
+        let unfiltered = snapshot.vector_search(&[0.0, 0.0, 0.0], 3, None).unwrap();
         assert_eq!(unfiltered.len(), 3);
         assert!(
             unfiltered.iter().all(|r| r.row_id < 15),
@@ -1055,7 +1065,7 @@ mod tests {
         );
 
         let predicate = Predicate::Eq("id".to_string(), Value::Int64(2));
-        let results = ds
+        let results = snapshot
             .vector_search(&[0.0, 0.0, 0.0], 3, Some(&predicate))
             .unwrap();
 
@@ -1094,7 +1104,7 @@ mod tests {
 
         let mut txn = ds.begin();
         txn.insert(batch);
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
         drop(ds);
 
         // Force a real replay from disk, not an in-memory shortcut — this is
@@ -1102,7 +1112,10 @@ mod tests {
         // struct, same process, but the index cache is definitely rebuilt from
         // the delta-log file, not carried over).
         let reopened = Dataset::open(&dir).unwrap();
-        let results = reopened.vector_search(&[0.0, 0.0, 0.0], 1, None).unwrap();
+        let results = reopened
+            .snapshot()
+            .vector_search(&[0.0, 0.0, 0.0], 1, None)
+            .unwrap();
 
         assert_eq!(results.len(), 1);
         assert_eq!(
@@ -1138,7 +1151,7 @@ mod tests {
             Err(other) => {
                 panic!("expected NonFiniteVectorComponent, got a different error: {other}")
             }
-            Ok(_) => panic!("commit of a NaN vector component must not succeed"),
+            Ok(()) => panic!("commit of a NaN vector component must not succeed"),
         }
 
         // The rejected commit must have left no trace: the manifest never
@@ -1148,7 +1161,7 @@ mod tests {
         assert_eq!(reopened.current_version(), 0);
         assert!(reopened.data_files().is_empty());
 
-        let scanned = reopened.scan(&vector_test_schema()).unwrap();
+        let scanned = reopened.snapshot().scan(&vector_test_schema()).unwrap();
         assert_eq!(scanned.num_rows(), 0);
 
         std::fs::remove_dir_all(&dir).ok();
@@ -1172,7 +1185,7 @@ mod tests {
         let mut txn = ds.begin();
         txn.insert(first);
         txn.insert(second);
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
 
         let data_dir = ds.data_dir();
         let first_on_disk = read_batch(&data_dir.join(&ds.data_files()[0].name)).unwrap();
@@ -1220,7 +1233,7 @@ mod tests {
         std::fs::write(dir.join("data").join("d.deltalog"), "").unwrap();
         let ds = Dataset::open(&dir).unwrap();
 
-        let result = ds.scan(&test_schema());
+        let result = ds.snapshot().scan(&test_schema());
         assert!(
             matches!(result, Err(TxnError::UnsafeManifestPath(_))),
             "expected UnsafeManifestPath, got {result:?}"
@@ -1241,7 +1254,7 @@ mod tests {
         .unwrap();
         let mut txn = ds.begin();
         txn.insert(batch);
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
 
         // Caller asks to scan with a schema declaring 2 columns, but the
         // committed file only has 1 logical column ("id" — the trailing
@@ -1252,7 +1265,7 @@ mod tests {
             Field::new("id", DataType::Int64, false),
             Field::new("extra", DataType::Utf8, false),
         ]));
-        let result = ds.scan(&mismatched_schema);
+        let result = ds.snapshot().scan(&mismatched_schema);
         assert!(
             matches!(
                 result,
@@ -1282,7 +1295,7 @@ mod tests {
         let low = vector_batch(vec![1, 1], vec![[0.0, 0.0, 0.0], [0.01, 0.01, 0.01]]);
         let mut txn = ds.begin();
         txn.insert(low);
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
 
         let high = vector_batch(
             vec![2, 2],
@@ -1290,17 +1303,20 @@ mod tests {
         );
         let mut txn = ds.begin();
         txn.insert(high);
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
 
         // Sanity: the id=1 file's stats don't overlap id=2's, so explain()
         // must confirm one file is prunable for this predicate — otherwise
-        // this test wouldn't actually exercise the pruning branch.
+        // this test wouldn't actually exercise the pruning branch. Both reads
+        // below share a single snapshot, so they observe exactly the same
+        // committed state.
         let predicate = Predicate::Eq("id".to_string(), Value::Int64(2));
-        let explain = ds.explain(&predicate);
+        let snapshot = ds.snapshot();
+        let explain = snapshot.explain(&predicate);
         assert_eq!(explain.scanned.len(), 1);
         assert_eq!(explain.skipped.len(), 1);
 
-        let results = ds
+        let results = snapshot
             .vector_search(&[1000.0, 1000.0, 1000.0], 2, Some(&predicate))
             .unwrap();
 
@@ -1331,7 +1347,7 @@ mod tests {
         let dir = temp_dir("empty-commit");
         let ds = Dataset::create(&dir).unwrap();
         let txn = ds.begin();
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
 
         assert_eq!(
             ds.current_version(),
@@ -1356,12 +1372,12 @@ mod tests {
                 .unwrap();
         let mut txn = ds.begin();
         txn.insert(batch);
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
 
         let data_dir = ds.data_dir();
         std::fs::remove_file(data_dir.join(&ds.data_files()[0].name)).unwrap();
 
-        let result = ds.scan(&schema);
+        let result = ds.snapshot().scan(&schema);
         assert!(
             result.is_err(),
             "scan must error cleanly, not panic, when a manifest-listed file is missing"
@@ -1384,7 +1400,7 @@ mod tests {
                 .unwrap();
         let mut txn = ds.begin();
         txn.insert(batch1);
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
 
         // Second commit: low-cardinality (2 distinct values over 20 rows) ->
         // gets dictionary-encoded.
@@ -1396,7 +1412,7 @@ mod tests {
                 .unwrap();
         let mut txn = ds.begin();
         txn.insert(batch2);
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
 
         // Confirm the two files really do have different physical
         // encodings, so this test can't silently stop testing the scenario
@@ -1410,7 +1426,7 @@ mod tests {
             DataType::Dictionary(_, _)
         ));
 
-        let scanned = ds.scan(&schema).unwrap();
+        let scanned = ds.snapshot().scan(&schema).unwrap();
         assert_eq!(scanned.num_rows(), 40);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1512,7 +1528,7 @@ mod tests {
         let batch = vector_batch(ids, vectors);
         let mut txn = ds.begin();
         txn.insert(batch);
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
 
         // Hand-append a Tombstone entry for row 0 (the exact-match nearest
         // neighbor in the near cluster) to the just-written delta-log file,
@@ -1532,7 +1548,10 @@ mod tests {
         // production HNSW defaults (EF_SEARCH_DEFAULT=32, not the much
         // wider tuned constants crates/index/src/hnsw.rs's own unit tests
         // use) don't reliably surface a larger k against this fixture.
-        let results = reopened.vector_search(&[0.0, 0.0, 0.0], 3, None).unwrap();
+        let results = reopened
+            .snapshot()
+            .vector_search(&[0.0, 0.0, 0.0], 3, None)
+            .unwrap();
 
         assert_eq!(
             results.len(),
@@ -1573,7 +1592,7 @@ mod tests {
         .unwrap();
         let mut txn = ds.begin();
         txn.insert(batch);
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
 
         let entry = &ds.data_files()[0];
         let id_stats = entry.stats.get("id").unwrap();
@@ -1600,7 +1619,7 @@ mod tests {
 
         let predicate =
             strata_query::Predicate::Eq("id".to_string(), strata_storage::Value::Int64(1));
-        let result = ds.explain(&predicate);
+        let result = ds.snapshot().explain(&predicate);
 
         assert_eq!(result.total_files, 0);
         assert!(result.scanned.is_empty());
@@ -1616,7 +1635,10 @@ mod tests {
 
         let predicate =
             strata_query::Predicate::Eq("id".to_string(), strata_storage::Value::Int64(1));
-        let result = ds.scan_with_predicate(&schema, &predicate).unwrap();
+        let result = ds
+            .snapshot()
+            .scan_with_predicate(&schema, &predicate)
+            .unwrap();
 
         assert_eq!(result.num_rows(), 0);
         std::fs::remove_dir_all(&dir).ok();
@@ -1632,11 +1654,11 @@ mod tests {
             RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))]).unwrap();
         let mut txn = ds.begin();
         txn.insert(batch);
-        let ds = txn.commit().unwrap();
+        txn.commit().unwrap();
 
         let predicate =
             strata_query::Predicate::Eq("id".to_string(), strata_storage::Value::Int64(999));
-        let result = ds.explain(&predicate);
+        let result = ds.snapshot().explain(&predicate);
 
         assert_eq!(result.total_files, 1);
         assert!(result.scanned.is_empty());
