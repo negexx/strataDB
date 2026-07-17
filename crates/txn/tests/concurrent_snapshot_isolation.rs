@@ -49,14 +49,23 @@ fn a_snapshot_never_gains_or_loses_rows_after_it_was_taken() {
     // Reader threads: each repeatedly takes a fresh snapshot, then re-scans
     // that SAME snapshot several times before moving on, checking that the
     // row count never changes across those repeated reads of one snapshot.
+    // Each thread returns how many outer iterations it actually ran, so a
+    // reader scheduled entirely after the writer finishes (which would
+    // otherwise run zero iterations and vacuously "pass") is caught below
+    // instead of silently contributing no assertions.
     let readers: Vec<_> = (0..4)
         .map(|_| {
             let reader_dataset = writer_dataset.clone();
             let reader_stop = Arc::clone(&stop);
             std::thread::spawn(move || {
+                let mut iterations = 0u32;
                 while !reader_stop.load(Ordering::SeqCst) {
                     let snapshot = reader_dataset.snapshot();
                     let first_count = snapshot.scan(&mvp_schema()).unwrap().num_rows();
+                    assert!(
+                        first_count >= 1,
+                        "even the earliest snapshot must see at least the seed row"
+                    );
                     for _ in 0..5 {
                         let again_count = snapshot.scan(&mvp_schema()).unwrap().num_rows();
                         assert_eq!(
@@ -66,14 +75,21 @@ fn a_snapshot_never_gains_or_loses_rows_after_it_was_taken() {
                              rows concurrently"
                         );
                     }
+                    iterations += 1;
                 }
+                iterations
             })
         })
         .collect();
 
     writer.join().unwrap();
     for reader in readers {
-        reader.join().unwrap();
+        let iterations = reader.join().unwrap();
+        assert!(
+            iterations >= 1,
+            "every reader thread must run at least one real iteration against a live \
+             snapshot — a reader that ran zero would vacuously pass without checking anything"
+        );
     }
 
     // Final sanity check: after the writer finishes, a fresh snapshot sees
