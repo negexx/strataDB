@@ -49,8 +49,14 @@ pub fn brute_force_search(
             squared_distance: squared_l2(row.values(), query),
         });
     }
-    scored.sort_by(|a, b| a.squared_distance.total_cmp(&b.squared_distance));
+    // Partial selection (O(n)) instead of a full sort (O(n log n)): only the
+    // k closest rows need to end up in order, not the whole scored Vec.
+    let k = k.min(scored.len());
+    if k < scored.len() {
+        scored.select_nth_unstable_by(k, |a, b| a.squared_distance.total_cmp(&b.squared_distance));
+    }
     scored.truncate(k);
+    scored.sort_by(|a, b| a.squared_distance.total_cmp(&b.squared_distance));
     Ok(scored)
 }
 
@@ -99,5 +105,21 @@ mod tests {
             matches!(result, Err(ArrowError::InvalidArgumentError(_))),
             "expected a dimension-mismatch error, got {result:?}"
         );
+    }
+
+    #[test]
+    fn brute_force_search_returns_everything_when_k_exceeds_row_count() {
+        let vectors = make_vectors(&[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]);
+        let results = brute_force_search(&vectors, &[0.0, 0.0, 0.0], 10).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].row_index, 0);
+        assert_eq!(results[1].row_index, 1);
+    }
+
+    #[test]
+    fn brute_force_search_returns_nothing_when_k_is_zero() {
+        let vectors = make_vectors(&[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]);
+        let results = brute_force_search(&vectors, &[0.0, 0.0, 0.0], 0).unwrap();
+        assert!(results.is_empty());
     }
 }
