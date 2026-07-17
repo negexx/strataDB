@@ -43,6 +43,16 @@ pub struct ExplainResult {
     pub skipped: Vec<String>,
 }
 
+/// The single source of truth for "where does this dataset's data live,
+/// relative to its root directory" — used by `Dataset::data_dir`,
+/// `Transaction::commit`, and `replay_index`, which each need it from a
+/// different type/context (a `&Dataset`, a `Transaction`, and a bare
+/// `&Path` respectively) and previously each hardcoded `dir.join("data")`
+/// independently.
+fn data_subdir(dir: &Path) -> PathBuf {
+    dir.join("data")
+}
+
 impl Dataset {
     /// Creates a brand-new, empty dataset at `dir`. Errors if one already
     /// exists there.
@@ -97,7 +107,7 @@ impl Dataset {
 
     #[must_use]
     pub fn data_dir(&self) -> PathBuf {
-        self.dir.join("data")
+        data_subdir(&self.dir)
     }
 
     /// Data file entries (name + per-column stats) belonging to the current
@@ -299,10 +309,54 @@ impl Transaction {
         let new_version = manifest.version.checked_add(1).ok_or_else(|| {
             TxnError::ManifestOverflow(format!("version {} + 1", manifest.version))
         })?;
-        let data_dir = self.dir.join("data");
+        let data_dir = data_subdir(&self.dir);
         std::fs::create_dir_all(&data_dir)?;
 
-        for (i, batch) in self.pending.iter().enumerate() {
+        Self::write_pending_batches(&self.pending, &data_dir, new_version, &mut manifest)?;
+        manifest.version = new_version;
+
+        // Fsyncing each data file's *content* (already done inside
+        // write_batch) is not sufficient — the new directory entries
+        // themselves must also be fsynced, or a real power-loss crash can
+        // leave a file's bytes durable while the file itself is absent.
+        // Must happen before the index rebuild/manifest commit below.
+        strata_storage::sync_dir(&data_dir)?;
+
+        // Rebuilt from `manifest`'s full delta-log history (the same path
+        // `Dataset::open` uses) — see `replay_index`'s doc comment for why
+        // this must run before `commit_manifest`.
+        let index = replay_index(&self.dir, &manifest)?;
+
+        commit_manifest(&self.dir, &manifest)?;
+
+        Ok(Dataset {
+            dir: self.dir,
+            manifest,
+            index,
+        })
+    }
+
+    /// Writes every pending batch's data file and delta-log file to
+    /// `data_dir`, assigning row-ids and advancing `manifest.next_row_id`/
+    /// `manifest.data_files` in place. Extracted from [`Transaction::commit`]
+    /// so the per-batch write step and the outer commit-protocol steps
+    /// (sync, index rebuild, manifest CAS) read as named phases rather than
+    /// one long function — see `.claude/rules/concurrency-txn-layer.md`'s
+    /// note on the commit protocol's load-bearing ordering.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error under the same conditions as [`Transaction::commit`]'s
+    /// own doc comment (dictionary-encoding failure, non-finite vector
+    /// component, I/O failure writing a data/delta-log file, or a
+    /// [`TxnError::ManifestOverflow`] if row-id assignment would overflow).
+    fn write_pending_batches(
+        pending: &[RecordBatch],
+        data_dir: &Path,
+        new_version: u64,
+        manifest: &mut Manifest,
+    ) -> Result<()> {
+        for (i, batch) in pending.iter().enumerate() {
             // Stats computed on the original, pre-encoding, pre-row-id batch — see
             // .claude/docs/design/phase-3-query-refinement-spec.md §1 for why
             // (logical values, no dictionary-decode step needed later; _row_id is
@@ -339,36 +393,7 @@ impl Transaction {
                 delta_log: delta_file_name,
             });
         }
-        manifest.version = new_version;
-
-        // Fsyncing each data file's *content* (already done inside
-        // write_batch) is not sufficient — the new directory entries
-        // themselves must also be fsynced, or a real power-loss crash can
-        // leave a file's bytes durable while the file itself is absent.
-        // Must happen before the manifest commit below, which is what makes
-        // these files visible to a future reader.
-        strata_storage::sync_dir(&data_dir)?;
-
-        // Rebuilt from `manifest`'s full delta-log history (the same path
-        // `Dataset::open` uses), not carried over from the base `Dataset`
-        // the transaction started from — this is what guarantees the
-        // returned `Dataset`'s index can never diverge from what a fresh
-        // `open()` of the same directory would produce. Deliberately runs
-        // *before* `commit_manifest`: every file it reads is already
-        // durably written and fsynced above, so nothing here depends on the
-        // manifest CAS having happened yet, and if the rebuild fails, the
-        // manifest must never advance — otherwise a caller sees `Err` from
-        // `commit()` while the write is already durably visible to any
-        // future `Dataset::open`, with no way to undo it.
-        let index = replay_index(&self.dir, &manifest)?;
-
-        commit_manifest(&self.dir, &manifest)?;
-
-        Ok(Dataset {
-            dir: self.dir,
-            manifest,
-            index,
-        })
+        Ok(())
     }
 }
 
@@ -442,7 +467,7 @@ fn replay_index(dir: &Path, manifest: &Manifest) -> Result<HnswIndex> {
     }
     let capacity = usize::try_from(manifest.next_row_id).unwrap_or(usize::MAX);
     let mut index = new_hnsw_index(capacity)?;
-    let data_dir = dir.join("data");
+    let data_dir = data_subdir(dir);
     for entry in &manifest.data_files {
         for delta in read_delta_log(&safe_join(&data_dir, &entry.delta_log)?)? {
             match delta {
