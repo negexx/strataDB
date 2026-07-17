@@ -2,6 +2,17 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+/// # Examples
+///
+/// ```
+/// use strata_txn::TxnError;
+///
+/// let err = TxnError::SchemaMismatch { expected: 3, actual: 2 };
+/// assert_eq!(
+///     err.to_string(),
+///     "schema mismatch casting a data file: expected 3 columns, found 2"
+/// );
+/// ```
 #[derive(Debug, Error)]
 pub enum TxnError {
     #[error("I/O error: {0}")]
