@@ -170,6 +170,45 @@ impl Snapshot {
     /// `.claude/docs/design/phase-4-vector-index-spec.md` §3-4 and the
     /// Phase 5 design doc.
     ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use arrow::array::{Float32Array, Int64Array, RecordBatch};
+    /// use arrow::datatypes::{DataType, Field, Schema};
+    /// use strata_txn::Dataset;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let dir = std::env::temp_dir()
+    ///     .join(format!("strata-doctest-vector-search-{}", std::process::id()));
+    /// let dataset = Dataset::create(&dir)?;
+    ///
+    /// let schema = Arc::new(Schema::new(vec![
+    ///     Field::new("id", DataType::Int64, false),
+    ///     Field::new(
+    ///         "vector",
+    ///         DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 3),
+    ///         false,
+    ///     ),
+    /// ]));
+    /// let ids = Arc::new(Int64Array::from(vec![1, 2]));
+    /// let item_field = Arc::new(Field::new("item", DataType::Float32, false));
+    /// let values = Arc::new(Float32Array::from(vec![0.0, 0.0, 0.0, 9.0, 9.0, 9.0]));
+    /// let vectors = Arc::new(arrow::array::FixedSizeListArray::new(item_field, 3, values, None));
+    /// let batch = RecordBatch::try_new(schema, vec![ids, vectors])?;
+    ///
+    /// let mut txn = dataset.begin();
+    /// txn.insert(batch);
+    /// txn.commit()?;
+    ///
+    /// let results = dataset.snapshot().vector_search(&[0.0, 0.0, 0.0], 1, None)?;
+    /// assert_eq!(results.len(), 1);
+    /// assert_eq!(results[0].row_id, 0); // row-id 0 is the true nearest match
+    /// # std::fs::remove_dir_all(&dir).ok();
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns an error if `predicate` is supplied and its column doesn't
@@ -224,6 +263,8 @@ impl Snapshot {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use strata_index::{EfConstruction, MaxConnections, MaxElements, MaxLayers};
+
     use super::*;
 
     fn test_snapshot(watermark: u64, tombstoned: &[u64]) -> Snapshot {
@@ -231,7 +272,15 @@ mod tests {
             dir: PathBuf::from("unused-in-these-tests"),
             version: 1,
             manifest: Arc::new(Manifest::empty()),
-            graph: Arc::new(HnswIndex::new(16, 100, 16, 200).unwrap()),
+            graph: Arc::new(
+                HnswIndex::new(
+                    MaxConnections(16),
+                    MaxElements(100),
+                    MaxLayers(16),
+                    EfConstruction(200),
+                )
+                .unwrap(),
+            ),
             watermark,
             tombstones: Arc::new(tombstoned.iter().copied().collect()),
         }

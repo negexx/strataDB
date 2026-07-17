@@ -2,6 +2,18 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+/// # Examples
+///
+/// ```
+/// use std::path::PathBuf;
+/// use strata_storage::StorageError;
+///
+/// let err = StorageError::EmptyDataFile(PathBuf::from("data/0001.arrow"));
+/// assert_eq!(
+///     err.to_string(),
+///     "data file at data/0001.arrow contains no record batch"
+/// );
+/// ```
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error("I/O error: {0}")]

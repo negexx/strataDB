@@ -7,6 +7,7 @@ pub mod error;
 pub mod manifest;
 pub mod stats;
 
+pub use arrow;
 pub use datafile::{read_batch, sync_dir, write_batch};
 pub use encoding::encode_batch;
 pub use error::{Result, StorageError};

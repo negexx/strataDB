@@ -24,6 +24,17 @@ pub struct VectorMatch {
     pub squared_distance: f32,
 }
 
+/// # Examples
+///
+/// ```
+/// use strata_index::IndexError;
+///
+/// let err = IndexError::MaxConnectionTooLarge(300);
+/// assert_eq!(
+///     err.to_string(),
+///     "max_nb_connection must be <= 256 (hnsw_rs hard limit), got 300"
+/// );
+/// ```
 #[derive(Debug, thiserror::Error)]
 pub enum IndexError {
     #[error("max_nb_connection must be <= 256 (hnsw_rs hard limit), got {0}")]
@@ -35,6 +46,28 @@ pub enum IndexError {
     #[error("delta log entry serialization error: {0}")]
     Serde(#[from] serde_json::Error),
 }
+
+/// Maximum number of bidirectional links per node per layer (`hnsw_rs`'s
+/// `max_nb_connection`) — hard-capped at 256 by the underlying library, see
+/// [`HnswIndex::new`]'s doc comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaxConnections(pub usize);
+
+/// Expected/reserved capacity for the graph's internal allocation
+/// (`hnsw_rs`'s `max_elements`) — a sizing hint, not a hard cap on how many
+/// vectors can be inserted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaxElements(pub usize);
+
+/// Maximum number of layers in the graph's hierarchy (`hnsw_rs`'s
+/// `max_layer`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaxLayers(pub usize);
+
+/// Candidate-list size used while building the graph (`hnsw_rs`'s
+/// `ef_construction`) — higher values trade insert time for graph quality.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EfConstruction(pub usize);
 
 pub struct HnswIndex {
     hnsw: Hnsw<'static, f32, DistL2>,
@@ -66,6 +99,25 @@ fn establish_or_check_dimension(dimension: &AtomicUsize, len: usize) -> Result<(
 }
 
 impl HnswIndex {
+    /// # Examples
+    ///
+    /// ```
+    /// use strata_index::{EfConstruction, HnswIndex, MaxConnections, MaxElements, MaxLayers};
+    ///
+    /// let index = HnswIndex::new(
+    ///     MaxConnections(16),
+    ///     MaxElements(100),
+    ///     MaxLayers(16),
+    ///     EfConstruction(200),
+    /// )?;
+    /// index.insert(0, &[0.0, 0.0, 0.0])?;
+    ///
+    /// let results = index.search(&[0.0, 0.0, 0.0], 1, 50, |_| true)?;
+    /// assert_eq!(results.len(), 1);
+    /// assert_eq!(results[0].row_id, 0);
+    /// # Ok::<(), strata_index::IndexError>(())
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns [`IndexError::MaxConnectionTooLarge`] if `max_nb_connection`
@@ -75,26 +127,39 @@ impl HnswIndex {
     /// `hnsw_rs-0.3.4` source. This function must never let a bad
     /// caller-supplied value reach that call.
     pub fn new(
-        max_nb_connection: usize,
-        max_elements: usize,
-        max_layer: usize,
-        ef_construction: usize,
+        max_nb_connection: MaxConnections,
+        max_elements: MaxElements,
+        max_layer: MaxLayers,
+        ef_construction: EfConstruction,
     ) -> Result<Self, IndexError> {
-        if max_nb_connection > 256 {
-            return Err(IndexError::MaxConnectionTooLarge(max_nb_connection));
+        if max_nb_connection.0 > 256 {
+            return Err(IndexError::MaxConnectionTooLarge(max_nb_connection.0));
         }
         Ok(Self {
             hnsw: Hnsw::new(
-                max_nb_connection,
-                max_elements,
-                max_layer,
-                ef_construction,
+                max_nb_connection.0,
+                max_elements.0,
+                max_layer.0,
+                ef_construction.0,
                 DistL2 {},
             ),
             dimension: AtomicUsize::new(0),
         })
     }
 
+    /// # Examples
+    ///
+    /// ```
+    /// use strata_index::{EfConstruction, HnswIndex, MaxConnections, MaxElements, MaxLayers};
+    ///
+    /// let index = HnswIndex::new(
+    ///     MaxConnections(16), MaxElements(100), MaxLayers(16), EfConstruction(200),
+    /// )?;
+    /// index.insert(0, &[1.0, 2.0, 3.0])?;
+    /// assert_eq!(index.established_dimension(), 3);
+    /// # Ok::<(), strata_index::IndexError>(())
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns [`IndexError::DimensionMismatch`] if `vector`'s length
@@ -126,6 +191,22 @@ impl HnswIndex {
         self.dimension.load(Ordering::SeqCst)
     }
 
+    /// # Examples
+    ///
+    /// ```
+    /// use strata_index::{EfConstruction, HnswIndex, MaxConnections, MaxElements, MaxLayers};
+    ///
+    /// let index = HnswIndex::new(
+    ///     MaxConnections(16), MaxElements(100), MaxLayers(16), EfConstruction(200),
+    /// )?;
+    /// index.insert(0, &[0.0, 0.0, 0.0])?;
+    /// index.insert(1, &[10.0, 10.0, 10.0])?;
+    ///
+    /// let results = index.search(&[0.0, 0.0, 0.0], 1, 50, |_| true)?;
+    /// assert_eq!(results[0].row_id, 0);
+    /// # Ok::<(), strata_index::IndexError>(())
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns [`IndexError::DimensionMismatch`] if `query`'s length
@@ -291,10 +372,10 @@ mod tests {
     #[test]
     fn insert_then_search_finds_the_true_nearest_neighbor() {
         let index = HnswIndex::new(
-            TEST_MAX_NB_CONNECTION,
-            100,
-            TEST_MAX_LAYER,
-            TEST_EF_CONSTRUCTION,
+            MaxConnections(TEST_MAX_NB_CONNECTION),
+            MaxElements(100),
+            MaxLayers(TEST_MAX_LAYER),
+            EfConstruction(TEST_EF_CONSTRUCTION),
         )
         .unwrap();
         // Near cluster: row-ids 0..15, within a 0.01-wide cube around
@@ -330,10 +411,10 @@ mod tests {
     #[test]
     fn invisible_row_is_never_returned_even_as_the_true_nearest_neighbor() {
         let index = HnswIndex::new(
-            TEST_MAX_NB_CONNECTION,
-            100,
-            TEST_MAX_LAYER,
-            TEST_EF_CONSTRUCTION,
+            MaxConnections(TEST_MAX_NB_CONNECTION),
+            MaxElements(100),
+            MaxLayers(TEST_MAX_LAYER),
+            EfConstruction(TEST_EF_CONSTRUCTION),
         )
         .unwrap();
         // Near cluster: row-ids 0..15, within a 0.01-wide cube around
@@ -375,10 +456,10 @@ mod tests {
     #[test]
     fn invisibility_of_the_single_nearest_neighbor_still_returns_k_live_results_for_small_k() {
         let index = HnswIndex::new(
-            TEST_MAX_NB_CONNECTION,
-            100,
-            TEST_MAX_LAYER,
-            TEST_EF_CONSTRUCTION,
+            MaxConnections(TEST_MAX_NB_CONNECTION),
+            MaxElements(100),
+            MaxLayers(TEST_MAX_LAYER),
+            EfConstruction(TEST_EF_CONSTRUCTION),
         )
         .unwrap();
         // Near cluster: row-ids 0..15, within a 0.01-wide cube around
@@ -423,10 +504,10 @@ mod tests {
     #[test]
     fn search_filtered_only_returns_ids_in_the_live_set() {
         let index = HnswIndex::new(
-            TEST_MAX_NB_CONNECTION,
-            100,
-            TEST_MAX_LAYER,
-            TEST_EF_CONSTRUCTION,
+            MaxConnections(TEST_MAX_NB_CONNECTION),
+            MaxElements(100),
+            MaxLayers(TEST_MAX_LAYER),
+            EfConstruction(TEST_EF_CONSTRUCTION),
         )
         .unwrap();
         // Near cluster: row-ids 0..15, within a 0.01-wide cube around
@@ -454,10 +535,10 @@ mod tests {
     #[test]
     fn search_filtered_excludes_invisible_rows_even_for_the_single_nearest_live_id() {
         let index = HnswIndex::new(
-            TEST_MAX_NB_CONNECTION,
-            100,
-            TEST_MAX_LAYER,
-            TEST_EF_CONSTRUCTION,
+            MaxConnections(TEST_MAX_NB_CONNECTION),
+            MaxElements(100),
+            MaxLayers(TEST_MAX_LAYER),
+            EfConstruction(TEST_EF_CONSTRUCTION),
         )
         .unwrap();
         // Near cluster: row-ids 0..15, within a 0.01-wide cube around
@@ -510,10 +591,10 @@ mod tests {
         // values are different enough that a `sqrt` vs. no-`sqrt` bug
         // can't accidentally pass.
         let index = HnswIndex::new(
-            TEST_MAX_NB_CONNECTION,
-            100,
-            TEST_MAX_LAYER,
-            TEST_EF_CONSTRUCTION,
+            MaxConnections(TEST_MAX_NB_CONNECTION),
+            MaxElements(100),
+            MaxLayers(TEST_MAX_LAYER),
+            EfConstruction(TEST_EF_CONSTRUCTION),
         )
         .unwrap();
         index.insert(0, &[0.0, 0.0, 0.0]).unwrap();
@@ -535,7 +616,12 @@ mod tests {
 
     #[test]
     fn new_rejects_max_nb_connection_above_256() {
-        let result = HnswIndex::new(257, 100, 16, 200);
+        let result = HnswIndex::new(
+            MaxConnections(257),
+            MaxElements(100),
+            MaxLayers(16),
+            EfConstruction(200),
+        );
         assert!(matches!(
             result,
             Err(IndexError::MaxConnectionTooLarge(257))
@@ -544,7 +630,13 @@ mod tests {
 
     #[test]
     fn search_errors_on_dimension_mismatch() {
-        let index = HnswIndex::new(16, 100, 16, 200).unwrap();
+        let index = HnswIndex::new(
+            MaxConnections(16),
+            MaxElements(100),
+            MaxLayers(16),
+            EfConstruction(200),
+        )
+        .unwrap();
         index.insert(0, &[0.0, 0.0, 0.0]).unwrap();
 
         let result = index.search(&[0.0, 0.0], 1, 50, |_| true);
@@ -559,7 +651,13 @@ mod tests {
 
     #[test]
     fn insert_errors_on_dimension_mismatch_with_previously_inserted_vectors() {
-        let index = HnswIndex::new(16, 100, 16, 200).unwrap();
+        let index = HnswIndex::new(
+            MaxConnections(16),
+            MaxElements(100),
+            MaxLayers(16),
+            EfConstruction(200),
+        )
+        .unwrap();
         index.insert(0, &[0.0, 0.0, 0.0]).unwrap();
 
         let result = index.insert(1, &[0.0, 0.0]);
@@ -574,13 +672,25 @@ mod tests {
 
     #[test]
     fn established_dimension_is_zero_before_any_insert() {
-        let index = HnswIndex::new(16, 100, 16, 200).unwrap();
+        let index = HnswIndex::new(
+            MaxConnections(16),
+            MaxElements(100),
+            MaxLayers(16),
+            EfConstruction(200),
+        )
+        .unwrap();
         assert_eq!(index.established_dimension(), 0);
     }
 
     #[test]
     fn established_dimension_reflects_the_first_inserted_vectors_length() {
-        let index = HnswIndex::new(16, 100, 16, 200).unwrap();
+        let index = HnswIndex::new(
+            MaxConnections(16),
+            MaxElements(100),
+            MaxLayers(16),
+            EfConstruction(200),
+        )
+        .unwrap();
         index.insert(0, &[0.0, 0.0, 0.0]).unwrap();
         assert_eq!(index.established_dimension(), 3);
     }

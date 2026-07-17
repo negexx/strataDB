@@ -17,7 +17,10 @@ use arc_swap::ArcSwap;
 use arrow::array::{Array, ArrayRef, RecordBatch, UInt64Array};
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use strata_index::{DeltaEntry, HnswIndex, read_delta_log, write_delta_log};
+use strata_index::{
+    DeltaEntry, EfConstruction, HnswIndex, MaxConnections, MaxElements, MaxLayers, read_delta_log,
+    write_delta_log,
+};
 use strata_storage::{
     DataFileEntry, Manifest, commit_manifest, compute_stats, read_current, write_batch,
 };
@@ -61,6 +64,32 @@ impl Dataset {
     /// Creates a brand-new, empty dataset at `dir`. Errors if one already
     /// exists there.
     ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use arrow::array::{Int64Array, RecordBatch};
+    /// use arrow::datatypes::{DataType, Field, Schema};
+    /// use strata_txn::Dataset;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let dir = std::env::temp_dir()
+    ///     .join(format!("strata-doctest-create-{}", std::process::id()));
+    /// let dataset = Dataset::create(&dir)?;
+    ///
+    /// let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    /// let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))])?;
+    ///
+    /// let mut txn = dataset.begin();
+    /// txn.insert(batch);
+    /// txn.commit()?;
+    ///
+    /// assert_eq!(dataset.current_version(), 1);
+    /// # std::fs::remove_dir_all(&dir).ok();
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns [`TxnError::AlreadyExists`] if a dataset already exists at
@@ -95,6 +124,23 @@ impl Dataset {
     /// `strata_storage::manifest`), so a process killed mid-commit leaves
     /// this returning the *previous* version, never a torn one — the Phase 1
     /// MVP checklist's kill-9 test exercises exactly this.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use strata_txn::Dataset;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let dir = std::env::temp_dir()
+    ///     .join(format!("strata-doctest-open-{}", std::process::id()));
+    /// Dataset::create(&dir)?; // must exist first — `open` errors on a missing dataset
+    ///
+    /// let reopened = Dataset::open(&dir)?;
+    /// assert_eq!(reopened.current_version(), 0);
+    /// # std::fs::remove_dir_all(&dir).ok();
+    /// # Ok(())
+    /// # }
+    /// ```
     ///
     /// # Errors
     ///
@@ -169,6 +215,34 @@ pub struct Transaction {
 }
 
 impl Transaction {
+    /// # Examples
+    ///
+    /// Buffered rows are invisible to every reader — including this same
+    /// `Dataset` — until [`Transaction::commit`] succeeds:
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use arrow::array::{Int64Array, RecordBatch};
+    /// use arrow::datatypes::{DataType, Field, Schema};
+    /// use strata_txn::Dataset;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let dir = std::env::temp_dir()
+    ///     .join(format!("strata-doctest-insert-{}", std::process::id()));
+    /// let dataset = Dataset::create(&dir)?;
+    /// let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    /// let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1]))])?;
+    ///
+    /// let mut txn = dataset.begin();
+    /// txn.insert(batch);
+    /// assert_eq!(dataset.current_version(), 0, "not visible until commit");
+    /// txn.commit()?;
+    /// assert_eq!(dataset.current_version(), 1);
+    /// # std::fs::remove_dir_all(&dir).ok();
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
     /// Buffers a batch of rows for this transaction. Nothing is visible to
     /// any other reader — including a fresh `Dataset::open` in another
     /// process — until [`Transaction::commit`] succeeds. See spec §2.
@@ -185,6 +259,31 @@ impl Transaction {
     /// Any `Dataset` handle sharing this same `ArcSwap` (including the one
     /// this transaction was created from) observes the new state on its
     /// next [`Dataset::snapshot`] call; nothing is mutated in place.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use arrow::array::{Int64Array, RecordBatch};
+    /// use arrow::datatypes::{DataType, Field, Schema};
+    /// use strata_txn::Dataset;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let dir = std::env::temp_dir()
+    ///     .join(format!("strata-doctest-commit-{}", std::process::id()));
+    /// let dataset = Dataset::create(&dir)?;
+    /// let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    /// let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2]))])?;
+    ///
+    /// let mut txn = dataset.begin();
+    /// txn.insert(batch);
+    /// txn.commit()?; // durable and visible to every reader from this point on
+    ///
+    /// assert_eq!(dataset.data_files().len(), 1);
+    /// # std::fs::remove_dir_all(&dir).ok();
+    /// # Ok(())
+    /// # }
+    /// ```
     ///
     /// # Errors
     ///
@@ -345,10 +444,10 @@ const HNSW_EF_CONSTRUCTION: usize = 200;
 
 fn new_hnsw_index(capacity: usize) -> Result<HnswIndex> {
     Ok(HnswIndex::new(
-        HNSW_MAX_NB_CONNECTION,
-        capacity.max(1),
-        HNSW_MAX_LAYER,
-        HNSW_EF_CONSTRUCTION,
+        MaxConnections(HNSW_MAX_NB_CONNECTION),
+        MaxElements(capacity.max(1)),
+        MaxLayers(HNSW_MAX_LAYER),
+        EfConstruction(HNSW_EF_CONSTRUCTION),
     )?)
 }
 
