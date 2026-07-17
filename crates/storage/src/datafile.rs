@@ -1,8 +1,12 @@
-//! Row data files. Phase 1 uses Arrow's own IPC file format directly rather
-//! than a hand-rolled encoding — the custom column-chunk/dictionary/RLE
-//! format described in `.claude/docs/design/phase-0-transaction-and-format-spec.md`
-//! §6 is real "Phase 2: Real encodings" work, not part of the MVP vertical
-//! slice (see the roadmap in `.claude/docs/architecture.md`).
+//! Row data files. Uses Arrow's own IPC file format directly rather than a
+//! hand-rolled encoding. Dictionary encoding (Phase 2, `crate::encoding`)
+//! runs upstream of this module, before `write_batch` is ever called — the
+//! files this module reads/writes may carry `Dictionary`-typed columns, but
+//! this module itself has no encoding-specific logic. Strata's own custom
+//! column-chunk/RLE format (`.claude/docs/design/phase-0-transaction-and-format-spec.md`
+//! §6) remains a later, possibly-unnecessary decision — see
+//! `.claude/docs/design/phase-2-encodings-and-groupby-spec.md`'s
+//! "Alternatives considered" section.
 
 use std::fs::File;
 use std::path::Path;
