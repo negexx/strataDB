@@ -161,4 +161,75 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn empty_column_is_left_unencoded() {
+        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(Vec::<&str>::new()))],
+        )
+        .unwrap();
+
+        let encoded = encode_batch(&batch).unwrap();
+        assert_eq!(encoded.schema_ref().field(0).data_type(), &DataType::Utf8);
+        assert_eq!(encoded.num_rows(), 0);
+    }
+
+    #[test]
+    fn column_exactly_at_the_threshold_ratio_is_left_unencoded() {
+        // 40 distinct values over 100 rows = ratio 0.4, exactly at
+        // DICTIONARY_ENCODING_THRESHOLD. The comparison is strict (`<`), so
+        // this must NOT be encoded.
+        let names: Vec<String> = (0..100).map(|i| format!("v{}", i % 40)).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(names))]).unwrap();
+
+        let encoded = encode_batch(&batch).unwrap();
+        assert_eq!(
+            encoded.schema_ref().field(0).data_type(),
+            &DataType::Utf8,
+            "ratio exactly at the threshold must not be encoded"
+        );
+    }
+
+    #[test]
+    fn low_cardinality_numeric_column_gets_dictionary_encoded() {
+        // 100 rows, 2 distinct Int64 values - the encode path has so far
+        // only ever been exercised with Utf8 columns.
+        let ids: Vec<i64> = (0..100).map(|i| i % 2).collect();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "flag",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(ids))]).unwrap();
+
+        let encoded = encode_batch(&batch).unwrap();
+        let encoded_type = encoded.schema_ref().field(0).data_type();
+        assert!(
+            matches!(encoded_type, DataType::Dictionary(_, _)),
+            "expected a Dictionary type, got {encoded_type:?}"
+        );
+    }
+
+    #[test]
+    fn nullable_low_cardinality_column_preserves_nulls_through_encoding() {
+        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
+        let values = vec![Some("alice"), None, Some("alice"), Some("alice")];
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(values))]).unwrap();
+
+        let encoded = encode_batch(&batch).unwrap();
+        assert!(matches!(
+            encoded.schema_ref().field(0).data_type(),
+            DataType::Dictionary(_, _)
+        ));
+        assert_eq!(
+            encoded.column(0).null_count(),
+            1,
+            "the null value must survive the cast to Dictionary"
+        );
+    }
 }
