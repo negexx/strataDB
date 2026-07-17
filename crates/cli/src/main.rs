@@ -294,27 +294,15 @@ fn handle_explain(dir: &str, args: &[String]) -> Result<(), Box<dyn Error>> {
     let column = args.get(3).ok_or("missing <column>")?;
     let op = args.get(4).ok_or("missing <op: eq|lt|lteq|gt|gteq>")?;
     let value: i64 = args.get(5).ok_or("missing <value>")?.parse()?;
-    let predicate = match op.as_str() {
-        "eq" => strata_query::Predicate::Eq(column.clone(), strata_storage::Value::Int64(value)),
-        "lt" => strata_query::Predicate::Lt(column.clone(), strata_storage::Value::Int64(value)),
-        "lteq" => {
-            strata_query::Predicate::LtEq(column.clone(), strata_storage::Value::Int64(value))
-        }
-        "gt" => strata_query::Predicate::Gt(column.clone(), strata_storage::Value::Int64(value)),
-        "gteq" => {
-            strata_query::Predicate::GtEq(column.clone(), strata_storage::Value::Int64(value))
-        }
-        other => {
-            return Err(format!("unknown op: {other} (expected eq|lt|lteq|gt|gteq)").into());
-        }
-    };
+    let predicate = parse_predicate(column, op, value)?;
+
     let ds = strata_txn::Dataset::open(dir)?;
     let result = ds.explain(&predicate);
     println!(
-        "total_files={} scanned={} skipped={}",
+        "total_files={} scanned={} skipped={} predicate={predicate:?}",
         result.total_files,
         result.scanned.len(),
-        result.skipped.len()
+        result.skipped.len(),
     );
     for name in &result.scanned {
         println!("  scan:  {name}");
@@ -363,5 +351,58 @@ mod tests {
 
         let resolved = resolve_display_rows(&matches, &row_ids, &ids);
         assert_eq!(resolved, vec![(300, 1.5), (100, 2.5)]);
+    }
+
+    #[test]
+    fn parse_predicate_builds_each_operator_variant() {
+        use strata_query::Predicate;
+        use strata_storage::Value;
+
+        assert_eq!(
+            parse_predicate("id", "eq", 5).unwrap(),
+            Predicate::Eq("id".to_string(), Value::Int64(5))
+        );
+        assert_eq!(
+            parse_predicate("id", "lt", 5).unwrap(),
+            Predicate::Lt("id".to_string(), Value::Int64(5))
+        );
+        assert_eq!(
+            parse_predicate("id", "lteq", 5).unwrap(),
+            Predicate::LtEq("id".to_string(), Value::Int64(5))
+        );
+        assert_eq!(
+            parse_predicate("id", "gt", 5).unwrap(),
+            Predicate::Gt("id".to_string(), Value::Int64(5))
+        );
+        assert_eq!(
+            parse_predicate("id", "gteq", 5).unwrap(),
+            Predicate::GtEq("id".to_string(), Value::Int64(5))
+        );
+        assert!(parse_predicate("id", "bogus", 5).is_err());
+    }
+
+    #[test]
+    fn handle_explain_runs_end_to_end_against_a_real_dataset() {
+        let dir =
+            std::env::temp_dir().join(format!("strata-cli-explain-test-{}", std::process::id()));
+        let dir_str = dir.to_str().unwrap().to_string();
+        strata_txn::Dataset::create(&dir_str).unwrap();
+        let ds = strata_txn::Dataset::open(&dir_str).unwrap();
+        let mut txn = ds.begin();
+        txn.insert(make_row(1, "alice", [1.0, 2.0, 3.0]).unwrap());
+        txn.commit().unwrap();
+
+        let args = vec![
+            "strata".to_string(),
+            "explain".to_string(),
+            dir_str.clone(),
+            "id".to_string(),
+            "eq".to_string(),
+            "1".to_string(),
+        ];
+        let result = handle_explain(&dir_str, &args);
+        assert!(result.is_ok(), "handle_explain failed: {result:?}");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
