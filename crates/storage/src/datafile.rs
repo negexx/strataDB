@@ -95,4 +95,37 @@ mod tests {
         assert_eq!(batch, read_back);
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn read_batch_errors_on_an_ipc_file_with_zero_record_batches() {
+        let dir =
+            std::env::temp_dir().join(format!("strata-datafile-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("empty.arrow");
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let file = std::fs::File::create(&path).unwrap();
+        let mut writer = arrow::ipc::writer::FileWriter::try_new(file, &schema).unwrap();
+        writer.finish().unwrap(); // no batches written, just the header/footer
+
+        let result = read_batch(&path);
+        assert!(
+            matches!(result, Err(StorageError::EmptyDataFile(_))),
+            "expected EmptyDataFile, got {result:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_batch_errors_on_a_non_ipc_file() {
+        let dir =
+            std::env::temp_dir().join(format!("strata-datafile-garbage-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("garbage.arrow");
+        std::fs::write(&path, b"not an arrow ipc file").unwrap();
+
+        let result = read_batch(&path);
+        assert!(result.is_err(), "expected an error, got {result:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
