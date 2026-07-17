@@ -2,6 +2,10 @@
 //! `.claude/docs/design/phase-4-vector-index-spec.md` §1.
 
 use std::collections::HashSet;
+
+#[cfg(loom)]
+use loom::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(not(loom))]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use hnsw_rs::prelude::{DistL2, FilterT, Hnsw};
