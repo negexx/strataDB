@@ -192,11 +192,10 @@ pub fn group_by(
         }
     }
 
-    build_result_batch(&group_arrays, group_cols, aggs, &converter, &groups)
+    build_result_batch(group_cols, aggs, &converter, &groups)
 }
 
 fn build_result_batch(
-    group_arrays: &[ArrayRef],
     group_cols: &[&str],
     aggs: &[(&str, AggFunc)],
     converter: &RowConverter,
@@ -214,9 +213,20 @@ fn build_result_batch(
         }
     }
 
+    // The output field's type comes from `group_columns` — the array
+    // RowConverter::convert_rows actually produced — not from the original
+    // (possibly dictionary-encoded) input array. convert_rows decodes
+    // dictionary-encoded row keys back to the dictionary's plain value
+    // type, so using the original array's data type here would build a
+    // schema RecordBatch::try_new then rejects as a type mismatch. This
+    // also means GROUP BY output on a dictionary-encoded column is
+    // plain-typed (e.g. Utf8, not Dictionary(Int32, Utf8)) — matching how
+    // most aggregation engines behave, since GROUP BY output rows are
+    // already deduplicated and re-encoding them as a dictionary buys
+    // nothing.
     let mut fields: Vec<Field> = group_cols
         .iter()
-        .zip(group_arrays)
+        .zip(&group_columns)
         .map(|(name, arr)| Field::new(*name, arr.data_type().clone(), true))
         .collect();
     let mut columns: Vec<ArrayRef> = group_columns;
@@ -539,21 +549,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "tracks a real group_by Dictionary-column bug found while adding test coverage \
-                (audit-remediation Batch 3 Task 6, 2026-07-17): build_result_batch's Field \
-                construction (see the `fields` build in build_result_batch) reuses the *original* \
-                group array's data type — Dictionary(Int32, Utf8) for a dictionary-encoded column \
-                — as the output schema's field type, but RowConverter::convert_rows decodes the \
-                row-format representation back into the dictionary's plain value type (Utf8), not \
-                the dictionary-encoded type. RecordBatch::try_new then rejects the mismatch with \
-                'column types must match schema types, expected Dictionary(Int32, Utf8) but found \
-                Utf8 at column index 0'. Not fixed here: group_by would need to either re-encode \
-                convert_rows' output back into the original group column's data type per-column, \
-                or advertise plain (non-dictionary) output types for group columns regardless of \
-                input encoding — a real design decision outside this test-only batch's scope. \
-                Re-enable once group_by's Dictionary-column handling is fixed."]
     fn group_by_accepts_a_dictionary_encoded_group_column() {
-        use arrow::array::{DictionaryArray, StringArray as SA};
+        use arrow::array::DictionaryArray;
         use arrow::datatypes::Int32Type;
 
         let categories: DictionaryArray<Int32Type> = vec!["a", "b", "a", "a"].into_iter().collect();
@@ -576,6 +573,11 @@ mod tests {
 
         let result = group_by(&batch, &["category"], &[("amount", AggFunc::Sum)]).unwrap();
         assert_eq!(result.num_rows(), 2, "expected 2 groups: a and b");
-        let _ = SA::from(vec!["unused"]); // keep the SA import meaningful if unused elsewhere
+        assert_eq!(
+            result.schema_ref().field(0).data_type(),
+            &DataType::Utf8,
+            "GROUP BY output for a dictionary-encoded input column must be plain-typed, \
+             not re-encoded as a dictionary"
+        );
     }
 }
