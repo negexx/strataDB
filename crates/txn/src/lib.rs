@@ -5,6 +5,7 @@
 
 pub mod dataset;
 pub mod error;
+pub mod mvp_fixtures;
 
 pub use dataset::{Dataset, ROW_ID_COLUMN, Transaction};
 pub use error::{Result, TxnError};
