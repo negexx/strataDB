@@ -537,7 +537,37 @@ fn safe_join(data_dir: &Path, name: &str) -> Result<PathBuf> {
 /// `schema`, leaving already-matching columns untouched (a cheap `Arc`
 /// clone, not a copy). See [`Dataset::scan`]'s doc comment for why this is
 /// necessary rather than a defensive nicety.
+///
+/// Every committed file physically carries a trailing hidden
+/// [`ROW_ID_COLUMN`] (see `append_row_id_column`). It only counts toward
+/// the batch's *logical* width when the caller's `schema` explicitly
+/// requests it (as the CLI's `search` subcommand does) — otherwise the
+/// positional zip below deliberately drops it. Any other width
+/// disagreement is an error: without the up-front check, `Iterator::zip`
+/// would silently truncate to the shorter side — dropping real columns, or
+/// worse, pairing the hidden row-id column with a caller field and casting
+/// row-ids into the caller's data.
+///
+/// # Errors
+///
+/// Returns [`TxnError::SchemaMismatch`] if `schema`'s field count doesn't
+/// match `batch`'s logical column count, or an Arrow error if a column
+/// can't be cast to its corresponding field's type.
 fn cast_batch_to_schema(batch: &RecordBatch, schema: &SchemaRef) -> Result<RecordBatch> {
+    let physical = batch.num_columns();
+    let hidden_row_id = batch.schema_ref().index_of(ROW_ID_COLUMN).is_ok()
+        && schema.index_of(ROW_ID_COLUMN).is_err();
+    let logical = if hidden_row_id {
+        physical.saturating_sub(1)
+    } else {
+        physical
+    };
+    if logical != schema.fields().len() {
+        return Err(TxnError::SchemaMismatch {
+            expected: schema.fields().len(),
+            actual: logical,
+        });
+    }
     let columns: std::result::Result<Vec<ArrayRef>, arrow::error::ArrowError> = batch
         .columns()
         .iter()
@@ -1241,6 +1271,44 @@ mod tests {
         assert!(
             matches!(result, Err(TxnError::UnsafeManifestPath(_))),
             "expected UnsafeManifestPath, got {result:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn scan_errors_on_column_count_mismatch_between_physical_file_and_caller_schema() {
+        let dir = temp_dir("schema-mismatch");
+        let write_schema = test_schema(); // single "id" column
+        let ds = Dataset::create(&dir).unwrap();
+
+        let batch = RecordBatch::try_new(
+            write_schema,
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let mut txn = ds.begin();
+        txn.insert(batch);
+        let ds = txn.commit().unwrap();
+
+        // Caller asks to scan with a schema declaring 2 columns, but the
+        // committed file only has 1 logical column ("id" — the trailing
+        // hidden _row_id doesn't count unless the caller requests it) -
+        // must error, not silently zip/truncate or, worse, cast the hidden
+        // row-id column into the caller's "extra" field.
+        let mismatched_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("extra", DataType::Utf8, false),
+        ]));
+        let result = ds.scan(&mismatched_schema);
+        assert!(
+            matches!(
+                result,
+                Err(TxnError::SchemaMismatch {
+                    expected: 2,
+                    actual: 1
+                })
+            ),
+            "expected SchemaMismatch, got {result:?}"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
