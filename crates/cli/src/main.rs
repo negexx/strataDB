@@ -387,4 +387,69 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn insert_scan_and_filter_subcommands_round_trip_through_the_cli() {
+        let dir =
+            std::env::temp_dir().join(format!("strata-cli-subcommands-{}", std::process::id()));
+        let dir_str = dir.to_str().unwrap().to_string();
+
+        run(&["strata".to_string(), "create".to_string(), dir_str.clone()]).unwrap();
+        run(&[
+            "strata".to_string(),
+            "insert".to_string(),
+            dir_str.clone(),
+            "1".to_string(),
+            "alice".to_string(),
+            "1.0".to_string(),
+            "2.0".to_string(),
+            "3.0".to_string(),
+        ])
+        .unwrap();
+        run(&[
+            "strata".to_string(),
+            "insert".to_string(),
+            dir_str.clone(),
+            "2".to_string(),
+            "bob".to_string(),
+            "4.0".to_string(),
+            "5.0".to_string(),
+            "6.0".to_string(),
+        ])
+        .unwrap();
+
+        let ds = strata_txn::Dataset::open(&dir_str).unwrap();
+        let scanned = ds.scan(&strata_txn::mvp_fixtures::mvp_schema()).unwrap();
+        assert_eq!(
+            scanned.num_rows(),
+            2,
+            "both inserted rows must be visible to scan"
+        );
+
+        // `scan`/`filter` themselves just print - confirm they run without
+        // erroring against the dataset the two inserts above produced.
+        assert!(run(&["strata".to_string(), "scan".to_string(), dir_str.clone()]).is_ok());
+        assert!(
+            run(&[
+                "strata".to_string(),
+                "filter".to_string(),
+                dir_str.clone(),
+                "alice".to_string(),
+            ])
+            .is_ok()
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn missing_subcommand_prints_usage_and_returns_success() {
+        // Pins down the currently-implicit behavior: no subcommand at all
+        // is treated as a usage message, not an error (exit code SUCCESS).
+        let result = run(&["strata".to_string()]);
+        assert!(
+            result.is_ok(),
+            "a bare `strata` invocation with no subcommand must not error"
+        );
+    }
 }
