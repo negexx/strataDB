@@ -71,13 +71,26 @@ impl HnswIndex {
         })
     }
 
-    pub fn insert(&self, row_id: u64, vector: &[f32]) {
+    /// # Errors
+    ///
+    /// Returns [`IndexError::DimensionMismatch`] if `vector`'s length
+    /// doesn't match the dimensionality of the first vector ever inserted.
+    /// Checked upfront so a corrupted delta-log entry with a wrong-length
+    /// vector can never reach `hnsw_rs`'s underlying distance function,
+    /// which does not itself validate vector lengths for `f32`/`DistL2` —
+    /// verified against the installed `anndists-0.1.5` source, where the
+    /// dedicated `impl Distance<f32> for DistL2` has no length assertion
+    /// and would otherwise silently zip-truncate to the shorter vector,
+    /// producing a wrong distance instead of an error.
+    pub fn insert(&self, row_id: u64, vector: &[f32]) -> Result<(), IndexError> {
         self.dimension
             .compare_exchange(0, vector.len(), Ordering::SeqCst, Ordering::SeqCst)
             .ok(); // only the first insert sets it; later calls leave it as-is
+        self.check_dimension(vector)?;
         #[allow(clippy::cast_possible_truncation)]
         let id = row_id as usize;
         self.hnsw.insert((vector, id));
+        Ok(())
     }
 
     pub fn tombstone(&mut self, row_id: u64) {
@@ -236,10 +249,12 @@ mod tests {
             let dx = (frac(PHI) as f32) * spacing;
             let dy = (frac(SQRT2) as f32) * spacing;
             let dz = (frac(SQRT3) as f32) * spacing;
-            index.insert(
-                start_id + i,
-                &[center[0] + dx, center[1] + dy, center[2] + dz],
-            );
+            index
+                .insert(
+                    start_id + i,
+                    &[center[0] + dx, center[1] + dy, center[2] + dz],
+                )
+                .unwrap();
         }
     }
 
@@ -468,7 +483,7 @@ mod tests {
             TEST_EF_CONSTRUCTION,
         )
         .unwrap();
-        index.insert(0, &[0.0, 0.0, 0.0]);
+        index.insert(0, &[0.0, 0.0, 0.0]).unwrap();
 
         let results = index.search(&[3.0, 4.0, 0.0], 1, TEST_EF_SEARCH).unwrap();
         assert_eq!(results.len(), 1);
@@ -495,9 +510,24 @@ mod tests {
     #[test]
     fn search_errors_on_dimension_mismatch() {
         let index = HnswIndex::new(16, 100, 16, 200).unwrap();
-        index.insert(0, &[0.0, 0.0, 0.0]);
+        index.insert(0, &[0.0, 0.0, 0.0]).unwrap();
 
         let result = index.search(&[0.0, 0.0], 1, 50);
+        assert!(matches!(
+            result,
+            Err(IndexError::DimensionMismatch {
+                query_len: 2,
+                expected: 3
+            })
+        ));
+    }
+
+    #[test]
+    fn insert_errors_on_dimension_mismatch_with_previously_inserted_vectors() {
+        let index = HnswIndex::new(16, 100, 16, 200).unwrap();
+        index.insert(0, &[0.0, 0.0, 0.0]).unwrap();
+
+        let result = index.insert(1, &[0.0, 0.0]);
         assert!(matches!(
             result,
             Err(IndexError::DimensionMismatch {

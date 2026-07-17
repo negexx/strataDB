@@ -429,7 +429,7 @@ fn replay_index(dir: &Path, manifest: &Manifest) -> Result<HnswIndex> {
     for entry in &manifest.data_files {
         for delta in read_delta_log(&data_dir.join(&entry.delta_log))? {
             match delta {
-                DeltaEntry::Insert { row_id, vector } => index.insert(row_id, &vector),
+                DeltaEntry::Insert { row_id, vector } => index.insert(row_id, &vector)?,
                 DeltaEntry::Tombstone { row_id } => index.tombstone(row_id),
             }
         }
