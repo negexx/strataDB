@@ -12,7 +12,7 @@
 
 - Edition 2024, workspace lints apply (`clippy::pedantic` + `clippy::all` at warn) — every public `Result`-returning function needs a `# Errors` doc section (see Phase 1's `strata-storage`/`strata-txn` for the established pattern).
 - `unwrap()`/`expect()` are `clippy::warn` — fine in `#[cfg(test)]` modules (add `#[allow(clippy::unwrap_used, clippy::expect_used)]` on the `mod tests` block, matching every existing test module in this codebase), not fine in library code.
-- **This project has no git repository yet** (deliberately — never `git init`'d). Every task below ends with "checkpoint" instead of a `git commit` step: run the verification commands, confirm green, then move to the next task. Do not add `git add`/`git commit` commands — there is nothing to commit to.
+- **Git Flow branching.** Work happens on `feature/phase-2-encodings-and-groupby`, branched from `develop`. Every task's "Checkpoint" step means: run the verification commands, confirm green, then `git add` the task's files and `git commit` with a Conventional Commits message (`feat:`/`test:`/`chore:` — see `.claude/rules/git.md` for the format this project already uses). One commit per task is the floor; commit more often within a task if it helps (e.g. a separate `test:` commit for the failing test before the `feat:` commit that makes it pass) — the skill's TDD step structure already implies this rhythm. Never commit directly to `develop` or `main`.
 - Verify any Arrow API you're not 100% certain of against the installed source before writing code that depends on it: `cargo metadata --format-version 1 | python -c "import json,sys; print([p['manifest_path'] for p in json.load(sys.stdin)['packages'] if p['name']=='<crate>'])"` gives the exact path under `~/.cargo/registry/src/`. This codebase has already been burned once (Phase 1, `hnsw_rs`) by trusting a library's own README example over its actual installed source.
 - All new public functions in `crates/storage` and `crates/query` return `Result<_, ArrowError>` (or the crate's existing error type for `crates/storage` — see Task 1) — no new error enum needed for Phase 2.
 
@@ -714,10 +714,10 @@ members = [
 Add to `[workspace.dependencies]`:
 
 ```toml
-criterion = "0.7"
+criterion = "0.8"
 ```
 
-**Before using this version number:** verify `criterion`'s current major version is still `0.7` at implementation time the same way every other new dependency in this codebase has been checked (`https://crates.io/crates/criterion` or a WebSearch) — do not assume it's still current without checking, per this project's own established practice (Rust toolchain audit ADR 0004/0005).
+(Verified current as of this plan's writing: 0.8.2, released 2026-02-04, supports the last three stable Rust minor releases — well within this project's MSRV floor. If significant time has passed since this plan was written, re-verify at `https://crates.io/crates/criterion` before trusting this version — do not assume it's still current, per this project's own established practice, ADR 0004/0005.)
 
 `bench/Cargo.toml`:
 

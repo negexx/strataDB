@@ -10,6 +10,7 @@
 //! mechanism the Phase 1 "kill -9 mid-write, restart, recover last
 //! committed version" MVP checklist item tests.
 
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -17,13 +18,33 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, StorageError};
+use crate::stats::ColumnStats;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// One committed data file's name and the per-column statistics computed
+/// for it at commit time — see
+/// `.claude/docs/design/phase-3-query-refinement-spec.md` §1.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DataFileEntry {
+    /// Relative to the dataset's `data/` directory.
+    pub name: String,
+    /// Column name -> stats. Absent key means "no stats for this column in
+    /// this file" (non-orderable type, or all-null) — never a wrong entry.
+    pub stats: HashMap<String, ColumnStats>,
+    /// Relative to the dataset's `data/` directory. This commit's vector-
+    /// index delta-log entries — see
+    /// `.claude/docs/design/phase-4-vector-index-spec.md` §2.
+    pub delta_log: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
     pub version: u64,
-    /// Data file names (relative to the dataset's `data/` directory),
-    /// accumulated across every committed version so far.
-    pub data_files: Vec<String>,
+    /// Accumulated across every committed version so far.
+    pub data_files: Vec<DataFileEntry>,
+    /// The row-id to assign to the next inserted row, dataset-wide. Never
+    /// resets, never reused — see
+    /// `.claude/docs/design/phase-0-transaction-and-format-spec.md` §8.
+    pub next_row_id: u64,
 }
 
 impl Manifest {
@@ -32,6 +53,7 @@ impl Manifest {
         Self {
             version: 0,
             data_files: Vec::new(),
+            next_row_id: 0,
         }
     }
 }
@@ -126,6 +148,7 @@ pub fn read_current(dataset_dir: &Path) -> Result<Option<Manifest>> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::stats::Value;
 
     fn temp_dataset_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -148,12 +171,29 @@ mod tests {
         let dir = temp_dataset_dir("roundtrip");
         let m0 = Manifest {
             version: 0,
-            data_files: vec!["a.arrow".to_string()],
+            data_files: vec![DataFileEntry {
+                name: "a.arrow".to_string(),
+                stats: HashMap::new(),
+                delta_log: "d.deltalog".to_string(),
+            }],
+            next_row_id: 0,
         };
         commit_manifest(&dir, &m0).unwrap();
         let m1 = Manifest {
             version: 1,
-            data_files: vec!["a.arrow".to_string(), "b.arrow".to_string()],
+            data_files: vec![
+                DataFileEntry {
+                    name: "a.arrow".to_string(),
+                    stats: HashMap::new(),
+                    delta_log: "d.deltalog".to_string(),
+                },
+                DataFileEntry {
+                    name: "b.arrow".to_string(),
+                    stats: HashMap::new(),
+                    delta_log: "d.deltalog".to_string(),
+                },
+            ],
+            next_row_id: 0,
         };
         commit_manifest(&dir, &m1).unwrap();
 
@@ -170,7 +210,12 @@ mod tests {
         let dir = temp_dataset_dir("crash-sim");
         let m0 = Manifest {
             version: 0,
-            data_files: vec!["a.arrow".to_string()],
+            data_files: vec![DataFileEntry {
+                name: "a.arrow".to_string(),
+                stats: HashMap::new(),
+                delta_log: "d.deltalog".to_string(),
+            }],
+            next_row_id: 0,
         };
         commit_manifest(&dir, &m0).unwrap();
 
@@ -203,6 +248,96 @@ mod tests {
         assert!(
             matches!(result, Err(StorageError::CorruptManifest(_, _))),
             "expected a CorruptManifest error, got {result:?}"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn commit_then_read_current_with_populated_stats() {
+        // Exercises serde round-trip of populated ColumnStats (all three Value
+        // variants: Int64, Float64, Utf8) through the actual file-based
+        // commit_manifest/read_current path — not just in-memory equality.
+        let dir = temp_dataset_dir("stats-roundtrip");
+
+        // Build stats with one entry per Value variant.
+        let mut stats = HashMap::new();
+        stats.insert(
+            "id_col".to_string(),
+            ColumnStats {
+                min: Value::Int64(100),
+                max: Value::Int64(500),
+            },
+        );
+        stats.insert(
+            "price_col".to_string(),
+            ColumnStats {
+                min: Value::Float64(9.99),
+                max: Value::Float64(99.99),
+            },
+        );
+        stats.insert(
+            "name_col".to_string(),
+            ColumnStats {
+                min: Value::Utf8("alice".to_string()),
+                max: Value::Utf8("zoe".to_string()),
+            },
+        );
+
+        let m0 = Manifest {
+            version: 0,
+            data_files: vec![DataFileEntry {
+                name: "data.arrow".to_string(),
+                stats,
+                delta_log: "d.deltalog".to_string(),
+            }],
+            next_row_id: 0,
+        };
+
+        commit_manifest(&dir, &m0).unwrap();
+        let current = read_current(&dir).unwrap().unwrap();
+        assert_eq!(
+            current, m0,
+            "populated stats must round-trip correctly through commit/read"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_current_skips_a_manifest_suffixed_file_with_a_non_numeric_stem() {
+        let dir = temp_dataset_dir("garbage-stem");
+        let versions = versions_dir(&dir);
+        fs::create_dir_all(&versions).unwrap();
+        let mut garbage = File::create(versions.join("not-a-number.manifest")).unwrap();
+        garbage.write_all(b"{}").unwrap();
+
+        // No real manifest exists at all - the garbage-stemmed file must be
+        // silently skipped, not picked as current and not erroring.
+        let current = read_current(&dir).unwrap();
+        assert!(
+            current.is_none(),
+            "a garbage-stemmed *.manifest file must never be treated as current"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_current_is_none_when_versions_dir_has_only_a_leftover_tmp_file() {
+        // Simulates a crash during the *very first* commit, before any
+        // version was ever successfully renamed into place - unlike
+        // leftover_tmp_file_is_never_picked_up_as_current, `best` must stay
+        // None all the way through, not just fall back to an earlier real
+        // version.
+        let dir = temp_dataset_dir("only-tmp-file");
+        let versions = versions_dir(&dir);
+        fs::create_dir_all(&versions).unwrap();
+        let mut tmp = File::create(versions.join(".tmp-0")).unwrap();
+        tmp.write_all(b"{ incomplete json").unwrap();
+
+        let current = read_current(&dir).unwrap();
+        assert!(
+            current.is_none(),
+            "a versions/ directory containing only a leftover .tmp file must read as fresh, not current"
         );
         fs::remove_dir_all(&dir).ok();
     }

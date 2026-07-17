@@ -4,12 +4,30 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
-[lints]
-workspace = true
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+# `loom` is this crate's only consumer of a `#[cfg(loom)]`/`#[cfg(not(loom))]`
+# shim (see src/hnsw.rs) — without this, rustc's `unexpected_cfgs` lint
+# (warn-by-default since 1.80) flags `loom` as an unrecognized cfg name,
+# since nothing else declares it. This can't instead be expressed via
+# `[lints] workspace = true` (as every other crate in this workspace does)
+# because Cargo forbids combining workspace-inherited lints with any
+# additional local keys in the same [lints] table — so the workspace's
+# clippy/rust lints are duplicated here rather than inherited.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
 
 [dependencies]
 arrow.workspace = true
-# Not used yet — HNSW itself is Phase 4 (see .claude/rules/vector-index.md).
-# Phase 1 uses brute-force search only. Kept declared since the choice is
-# already made (ADR 0005) and Phase 4 will need it.
 hnsw_rs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+loom = "0.7"

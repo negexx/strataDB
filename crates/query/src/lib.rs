@@ -1,16 +1,19 @@
-//! Expression/filter API. Phase 1 only needs a full scan (that's
-//! `strata_txn::Dataset::scan`) and an equality predicate on a string
-//! column — real vectorized scan/filter/agg and predicate pushdown are
-//! Phase 2/3 work, see `.claude/docs/architecture.md`'s roadmap.
+//! Expression/filter API. See
+//! `.claude/docs/design/phase-3-query-refinement-spec.md` for `Predicate`,
+//! the general `filter`, and file-pruning via `should_scan_file`.
 
-use std::sync::Arc;
-
-use arrow::array::{RecordBatch, StringArray};
-use arrow::compute::filter_record_batch;
-use arrow::compute::kernels::cmp::eq;
+use arrow::array::RecordBatch;
 use arrow::error::ArrowError;
 
-/// Returns the rows of `batch` where `column` equals `value`.
+pub mod group_by;
+pub mod predicate;
+pub use group_by::{AggFunc, group_by};
+pub use predicate::{Predicate, filter, should_scan_file};
+
+/// Returns the rows of `batch` where `column` equals `value`. A thin
+/// convenience wrapper over [`filter`] with [`Predicate::Eq`] — kept for
+/// existing callers (the CLI's `filter` subcommand, the Phase 1 MVP
+/// checklist test); prefer `filter` directly for new code.
 ///
 /// # Errors
 ///
@@ -21,16 +24,20 @@ pub fn filter_eq(
     column: &str,
     value: &str,
 ) -> Result<RecordBatch, ArrowError> {
-    let idx = batch.schema_ref().index_of(column)?;
-    let array = batch.column(idx);
-    let scalar = StringArray::new_scalar(value);
-    let predicate = eq(&Arc::clone(array), &scalar)?;
-    filter_record_batch(batch, &predicate)
+    filter(
+        batch,
+        &Predicate::Eq(
+            column.to_string(),
+            strata_storage::Value::Utf8(value.to_string()),
+        ),
+    )
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use std::sync::Arc;
+
     use arrow::array::{Int64Array, StringArray as StrArr};
     use arrow::datatypes::{DataType, Field, Schema};
 

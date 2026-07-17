@@ -6,38 +6,10 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::sync::Arc;
-
-use arrow::array::{FixedSizeListArray, Float32Array, Int64Array, RecordBatch, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::array::{FixedSizeListArray, Int64Array};
 
 use strata_txn::Dataset;
-
-fn mvp_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, false),
-        Field::new("name", DataType::Utf8, false),
-        Field::new(
-            "vector",
-            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 3),
-            false,
-        ),
-    ]))
-}
-
-fn batch_of(rows: &[(i64, &str, [f32; 3])]) -> RecordBatch {
-    let ids = Int64Array::from(rows.iter().map(|r| r.0).collect::<Vec<_>>());
-    let names = StringArray::from(rows.iter().map(|r| r.1.to_string()).collect::<Vec<_>>());
-    let flat: Vec<f32> = rows.iter().flat_map(|r| r.2).collect();
-    let values = Arc::new(Float32Array::from(flat));
-    let item_field = Arc::new(Field::new("item", DataType::Float32, false));
-    let vectors = FixedSizeListArray::new(item_field, 3, values, None);
-    RecordBatch::try_new(
-        mvp_schema(),
-        vec![Arc::new(ids), Arc::new(names), Arc::new(vectors)],
-    )
-    .unwrap()
-}
+use strata_txn::mvp_fixtures::{mvp_batch, mvp_schema};
 
 #[test]
 fn mvp_checklist_steps_1_through_5() {
@@ -49,11 +21,12 @@ fn mvp_checklist_steps_1_through_5() {
 
     // 2. Insert a batch of rows with a numeric column, a string column, and
     //    a fixed-length vector column.
-    let batch = batch_of(&[
+    let batch = mvp_batch(&[
         (1, "alice", [1.0, 2.0, 3.0]),
         (2, "bob", [4.0, 5.0, 6.0]),
         (3, "alice", [7.0, 8.0, 9.0]),
-    ]);
+    ])
+    .unwrap();
     let mut txn = ds.begin();
     txn.insert(batch.clone());
     let ds = txn.commit().unwrap();
@@ -67,6 +40,20 @@ fn mvp_checklist_steps_1_through_5() {
     // 4. Filter by an equality predicate on the string column.
     let filtered = strata_query::filter_eq(&scanned, "name", "alice").unwrap();
     assert_eq!(filtered.num_rows(), 2);
+    let filtered_ids = filtered
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let mut got: Vec<i64> = (0..filtered.num_rows())
+        .map(|i| filtered_ids.value(i))
+        .collect();
+    got.sort_unstable();
+    assert_eq!(
+        got,
+        vec![1, 3],
+        "must be exactly the two 'alice' rows (ids 1 and 3), not just any 2 rows"
+    );
 
     // 5. Run a brute-force nearest-neighbor search on the vector column,
     //    correctly.

@@ -7,6 +7,7 @@ members = [
     "crates/query",
     "crates/bindings",
     "crates/cli",
+    "bench",
 ]
 
 [workspace.package]
@@ -16,12 +17,19 @@ rust-version = "1.90"
 
 [workspace.dependencies]
 arrow = "58"
+criterion = "0.8"
 hnsw_rs = "0.3"
 pyo3 = { version = "0.29", features = ["extension-module"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 
+# NOTE: crates/index/Cargo.toml cannot use `[lints] workspace = true` like
+# every other crate here — it needs a local `unexpected_cfgs` addition for
+# its `cfg(loom)` shim, and Cargo forbids combining workspace-inherited
+# lints with any local addition in the same [lints] table. It inlines a
+# manual copy of these two tables instead (see its own Cargo.toml comment)
+# — keep that copy in sync if this section changes.
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }

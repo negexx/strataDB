@@ -1,8 +1,12 @@
-//! Row data files. Phase 1 uses Arrow's own IPC file format directly rather
-//! than a hand-rolled encoding — the custom column-chunk/dictionary/RLE
-//! format described in `.claude/docs/design/phase-0-transaction-and-format-spec.md`
-//! §6 is real "Phase 2: Real encodings" work, not part of the MVP vertical
-//! slice (see the roadmap in `.claude/docs/architecture.md`).
+//! Row data files. Uses Arrow's own IPC file format directly rather than a
+//! hand-rolled encoding. Dictionary encoding (Phase 2, `crate::encoding`)
+//! runs upstream of this module, before `write_batch` is ever called — the
+//! files this module reads/writes may carry `Dictionary`-typed columns, but
+//! this module itself has no encoding-specific logic. Strata's own custom
+//! column-chunk/RLE format (`.claude/docs/design/phase-0-transaction-and-format-spec.md`
+//! §6) remains a later, possibly-unnecessary decision — see
+//! `.claude/docs/design/phase-2-encodings-and-groupby-spec.md`'s
+//! "Alternatives considered" section.
 
 use std::fs::File;
 use std::path::Path;
@@ -93,6 +97,39 @@ mod tests {
         let read_back = read_batch(&path).unwrap();
 
         assert_eq!(batch, read_back);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_batch_errors_on_an_ipc_file_with_zero_record_batches() {
+        let dir =
+            std::env::temp_dir().join(format!("strata-datafile-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("empty.arrow");
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let file = std::fs::File::create(&path).unwrap();
+        let mut writer = arrow::ipc::writer::FileWriter::try_new(file, &schema).unwrap();
+        writer.finish().unwrap(); // no batches written, just the header/footer
+
+        let result = read_batch(&path);
+        assert!(
+            matches!(result, Err(StorageError::EmptyDataFile(_))),
+            "expected EmptyDataFile, got {result:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_batch_errors_on_a_non_ipc_file() {
+        let dir =
+            std::env::temp_dir().join(format!("strata-datafile-garbage-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("garbage.arrow");
+        std::fs::write(&path, b"not an arrow ipc file").unwrap();
+
+        let result = read_batch(&path);
+        assert!(result.is_err(), "expected an error, got {result:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
 }
