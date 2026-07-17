@@ -24,6 +24,17 @@ pub struct VectorMatch {
     pub squared_distance: f32,
 }
 
+/// # Examples
+///
+/// ```
+/// use strata_index::IndexError;
+///
+/// let err = IndexError::MaxConnectionTooLarge(300);
+/// assert_eq!(
+///     err.to_string(),
+///     "max_nb_connection must be <= 256 (hnsw_rs hard limit), got 300"
+/// );
+/// ```
 #[derive(Debug, thiserror::Error)]
 pub enum IndexError {
     #[error("max_nb_connection must be <= 256 (hnsw_rs hard limit), got {0}")]
@@ -88,6 +99,25 @@ fn establish_or_check_dimension(dimension: &AtomicUsize, len: usize) -> Result<(
 }
 
 impl HnswIndex {
+    /// # Examples
+    ///
+    /// ```
+    /// use strata_index::{EfConstruction, HnswIndex, MaxConnections, MaxElements, MaxLayers};
+    ///
+    /// let index = HnswIndex::new(
+    ///     MaxConnections(16),
+    ///     MaxElements(100),
+    ///     MaxLayers(16),
+    ///     EfConstruction(200),
+    /// )?;
+    /// index.insert(0, &[0.0, 0.0, 0.0])?;
+    ///
+    /// let results = index.search(&[0.0, 0.0, 0.0], 1, 50, |_| true)?;
+    /// assert_eq!(results.len(), 1);
+    /// assert_eq!(results[0].row_id, 0);
+    /// # Ok::<(), strata_index::IndexError>(())
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns [`IndexError::MaxConnectionTooLarge`] if `max_nb_connection`
@@ -117,6 +147,19 @@ impl HnswIndex {
         })
     }
 
+    /// # Examples
+    ///
+    /// ```
+    /// use strata_index::{EfConstruction, HnswIndex, MaxConnections, MaxElements, MaxLayers};
+    ///
+    /// let index = HnswIndex::new(
+    ///     MaxConnections(16), MaxElements(100), MaxLayers(16), EfConstruction(200),
+    /// )?;
+    /// index.insert(0, &[1.0, 2.0, 3.0])?;
+    /// assert_eq!(index.established_dimension(), 3);
+    /// # Ok::<(), strata_index::IndexError>(())
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns [`IndexError::DimensionMismatch`] if `vector`'s length
@@ -148,6 +191,22 @@ impl HnswIndex {
         self.dimension.load(Ordering::SeqCst)
     }
 
+    /// # Examples
+    ///
+    /// ```
+    /// use strata_index::{EfConstruction, HnswIndex, MaxConnections, MaxElements, MaxLayers};
+    ///
+    /// let index = HnswIndex::new(
+    ///     MaxConnections(16), MaxElements(100), MaxLayers(16), EfConstruction(200),
+    /// )?;
+    /// index.insert(0, &[0.0, 0.0, 0.0])?;
+    /// index.insert(1, &[10.0, 10.0, 10.0])?;
+    ///
+    /// let results = index.search(&[0.0, 0.0, 0.0], 1, 50, |_| true)?;
+    /// assert_eq!(results[0].row_id, 0);
+    /// # Ok::<(), strata_index::IndexError>(())
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns [`IndexError::DimensionMismatch`] if `query`'s length
