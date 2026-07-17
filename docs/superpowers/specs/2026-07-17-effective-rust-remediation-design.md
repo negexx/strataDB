@@ -112,7 +112,7 @@ One fuzz target, `manifest_parse`: feeds arbitrary bytes into `strata_storage::m
 **New file:** `.github/workflows/ci.yml`. Single `ubuntu-latest` job:
 
 1. Checkout
-2. Install the pinned toolchain (via `rust-toolchain.toml`, see below — no separate `actions-rs`/`dtolnay/rust-toolchain` version pin needed, it reads the file)
+2. Install the pinned toolchain via `dtolnay/rust-toolchain@master` with explicit `toolchain: "1.90"` and `components: clippy, rustfmt` inputs — the action does not read `rust-toolchain.toml` (that file only pins local `cargo`/`rustup` invocations; the GitHub Action requires the toolchain and components to be passed explicitly via `with:`, matching `rust-toolchain.toml`'s values)
 3. `cargo build --workspace`
 4. `cargo test --workspace`
 5. `cargo clippy --workspace --all-targets -- -D warnings`

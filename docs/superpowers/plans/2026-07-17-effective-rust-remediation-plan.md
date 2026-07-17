@@ -956,6 +956,9 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.90"
+          components: clippy, rustfmt
 
       - name: Build
         run: cargo build --workspace
@@ -979,7 +982,7 @@ jobs:
         run: cargo deny check bans sources advisories
 ```
 
-`dtolnay/rust-toolchain@master` with no explicit `toolchain:` input reads `rust-toolchain.toml` from the repo root automatically, so Step 1's file is what actually pins the compiler version here — the action just respects it. `cargo deny check`'s `licenses` category is deliberately omitted from the `bans sources advisories` argument list: `deny.toml`'s license allow-list is empty (an untouched `cargo deny init` template) and is already a tracked finding in the separate `audit/phase-1-2-3` dependency-lane report — silently adding `licenses` here would either fail every CI run immediately or require filling in that allow-list as an undiscussed side effect of this task.
+`dtolnay/rust-toolchain@master` does **not** read `rust-toolchain.toml` — `toolchain` is a required input with no default and the action hard-fails without it, and it only adds components passed via the `components:` input. `rust-toolchain.toml` pins local `cargo`/`rustup` invocations (which do respect it automatically); the workflow above passes `toolchain: "1.90"` and `components: clippy, rustfmt` explicitly so the Action matches what `rust-toolchain.toml` declares for local use. `cargo deny check`'s `licenses` category is deliberately omitted from the `bans sources advisories` argument list: `deny.toml`'s license allow-list is empty (an untouched `cargo deny init` template) and is already a tracked finding in the separate `audit/phase-1-2-3` dependency-lane report — silently adding `licenses` here would either fail every CI run immediately or require filling in that allow-list as an undiscussed side effect of this task.
 
 - [ ] **Step 3: Verify the toolchain pin locally**
 
