@@ -207,12 +207,22 @@ impl Transaction {
     /// node-removal API to undo the insert. Because `manifest.next_row_id`
     /// was never advanced, the next successful commit will assign the
     /// *same* row-ids to different vectors, inserting them into the graph
-    /// a second time under an id already in use. This is inert as long as
-    /// this failed commit's own watermark never advances (visibility is
-    /// watermark-gated, so the orphaned entry is never reachable through
-    /// any `Snapshot`) — but it is a latent correctness risk once Phase 6
-    /// introduces real conflict/CAS logic on top of this shared-graph
-    /// model, and should be revisited there, not silently inherited.
+    /// a second time under an id already in use. **This is not
+    /// permanently inert:** it only holds until that next successful
+    /// commit, which *does* advance the watermark and `next_row_id` past
+    /// the reused ids — at that point a `vector_search` can match the
+    /// orphaned, duplicate-id vector instead of (or alongside) the real
+    /// one, silently. The most plausible trigger is not rare I/O but an
+    /// ordinary application error: this transaction's pending batches
+    /// (accumulated via repeated [`Transaction::insert`] calls before one
+    /// `commit()`) having inconsistent vector dimensions across batches —
+    /// `Insert` deltas are applied to the graph in pending-batch order, so
+    /// a dimension mismatch on a *later* batch only fails after an
+    /// *earlier* batch's deltas have already mutated the shared graph.
+    /// This is a latent correctness risk to close in Phase 6 (either a
+    /// graph-rollback mechanism, or pre-validating every pending batch's
+    /// vector dimension against each other and the graph's established
+    /// dimension before mutating any of them) — not solved here.
     pub fn commit(self) -> Result<()> {
         let mut manifest = self.base_manifest;
         let new_version = manifest.version.checked_add(1).ok_or_else(|| {
