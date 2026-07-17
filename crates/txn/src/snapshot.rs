@@ -224,6 +224,8 @@ impl Snapshot {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use strata_index::{EfConstruction, MaxConnections, MaxElements, MaxLayers};
+
     use super::*;
 
     fn test_snapshot(watermark: u64, tombstoned: &[u64]) -> Snapshot {
@@ -231,7 +233,15 @@ mod tests {
             dir: PathBuf::from("unused-in-these-tests"),
             version: 1,
             manifest: Arc::new(Manifest::empty()),
-            graph: Arc::new(HnswIndex::new(16, 100, 16, 200).unwrap()),
+            graph: Arc::new(
+                HnswIndex::new(
+                    MaxConnections(16),
+                    MaxElements(100),
+                    MaxLayers(16),
+                    EfConstruction(200),
+                )
+                .unwrap(),
+            ),
             watermark,
             tombstones: Arc::new(tombstoned.iter().copied().collect()),
         }

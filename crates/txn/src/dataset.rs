@@ -17,7 +17,10 @@ use arc_swap::ArcSwap;
 use arrow::array::{Array, ArrayRef, RecordBatch, UInt64Array};
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use strata_index::{DeltaEntry, HnswIndex, read_delta_log, write_delta_log};
+use strata_index::{
+    DeltaEntry, EfConstruction, HnswIndex, MaxConnections, MaxElements, MaxLayers, read_delta_log,
+    write_delta_log,
+};
 use strata_storage::{
     DataFileEntry, Manifest, commit_manifest, compute_stats, read_current, write_batch,
 };
@@ -345,10 +348,10 @@ const HNSW_EF_CONSTRUCTION: usize = 200;
 
 fn new_hnsw_index(capacity: usize) -> Result<HnswIndex> {
     Ok(HnswIndex::new(
-        HNSW_MAX_NB_CONNECTION,
-        capacity.max(1),
-        HNSW_MAX_LAYER,
-        HNSW_EF_CONSTRUCTION,
+        MaxConnections(HNSW_MAX_NB_CONNECTION),
+        MaxElements(capacity.max(1)),
+        MaxLayers(HNSW_MAX_LAYER),
+        EfConstruction(HNSW_EF_CONSTRUCTION),
     )?)
 }
 
