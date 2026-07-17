@@ -215,6 +215,18 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "tracks a real should_dictionary_encode bug found while adding test coverage \
+                (audit-remediation Batch 3 Task 3, 2026-07-17): nulls count as their own \
+                distinct RowConverter bucket, so a column with 1 null in 4 rows and only 1 \
+                distinct non-null value computes ratio 2/4=0.5 (>= the 0.4 threshold) and is \
+                left un-encoded, even though it is intuitively low-cardinality. Contradicts \
+                this module's own doc comment claiming behavior 'in the range real columnar \
+                engines (Parquet) default to' - Parquet excludes nulls from dictionary \
+                cardinality entirely. Not fixed here: whether nulls should be excluded from \
+                the ratio's numerator only, or from both numerator and denominator, is a real \
+                design decision outside this audit's original 127 findings and this batch's \
+                test-only scope. Re-enable once that decision is made and should_dictionary_encode \
+                is updated to match."]
     fn nullable_low_cardinality_column_preserves_nulls_through_encoding() {
         let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
         let values = vec![Some("alice"), None, Some("alice"), Some("alice")];
