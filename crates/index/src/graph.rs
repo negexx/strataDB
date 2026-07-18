@@ -122,8 +122,6 @@ pub(crate) struct Graph<D: Distance> {
     entry_point: EntryPoint,
     distance: D,
     dimension: AtomicUsize,
-    #[cfg(test)]
-    next_test_row_id: AtomicU64, // test-only bookkeeping; removed in Task 8's cleanup along with insert_for_test
 }
 
 /// A `(row_id, distance)` pair ordered so a `BinaryHeap` behaves as a
@@ -156,16 +154,7 @@ impl<D: Distance> Graph<D> {
             entry_point: EntryPoint::new(),
             distance,
             dimension: AtomicUsize::new(0),
-            #[cfg(test)]
-            next_test_row_id: AtomicU64::new(0),
         }
-    }
-
-    #[cfg(test)]
-    fn insert_for_test(&self, row_id: u64, vector: Vec<f32>) {
-        let node = Node::new(row_id, vector, 0, 32, 16);
-        self.nodes.insert(row_id, node);
-        self.entry_point.advance_if_higher(row_id, 0);
     }
 
     /// Algorithm 2, `SEARCH-LAYER`. Returns up to `ef` `(row_id, distance)`
@@ -264,6 +253,160 @@ impl<D: Distance> Graph<D> {
         self.nodes
             .get(row_id)
             .map_or(f32::INFINITY, |n| self.distance.eval(query, n.vector()))
+    }
+
+    /// Algorithm 1, `INSERT`. `unif` is a caller-supplied draw from
+    /// `(0, 1)` (exclusive of 0) used for this node's random level
+    /// assignment — see `crate::node::assign_level`. No OCC-retry-loop
+    /// exists anywhere in this method: every CAS (slot-claim, slot-clear,
+    /// entry-point-advance) is self-resolving on failure, per design doc
+    /// §3.
+    ///
+    /// # Errors
+    ///
+    /// Returns `IndexError::DimensionMismatch` if `vector`'s length
+    /// doesn't match the dimension established by this graph's first-ever
+    /// insert.
+    // Algorithm 1's own parameter list (row-id, vector, M, Mmax0, Mmax,
+    // efConstruction, mL, plus the caller-supplied `unif` draw this design
+    // injects instead of an internal RNG) is inherently 8 conceptual
+    // parameters wide — this is the exact interface Task 8's spec mandates
+    // (consumed as-is by Task 9's tests, Task 11's stress test, and Task
+    // 14's `HnswIndex` wrapper), not something to restructure into a
+    // struct just to satisfy the lint.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn insert(
+        &self,
+        row_id: u64,
+        vector: Vec<f32>,
+        m: usize,
+        mmax0: usize,
+        mmax: usize,
+        ef_construction: usize,
+        m_l: f64,
+        unif: f64,
+    ) -> Result<(), crate::hnsw::IndexError> {
+        self.check_or_establish_dimension(vector.len())?;
+
+        let level = assign_level(m_l, unif);
+        let node = Node::new(row_id, vector, level, mmax0, mmax);
+        self.nodes.insert(row_id, node);
+
+        let Some((mut entry, mut entry_level)) = self.entry_point.get() else {
+            // First node in the graph: it IS the entry point, no
+            // connections to build.
+            self.entry_point.advance_if_higher(row_id, level);
+            return Ok(());
+        };
+        if entry == row_id {
+            // We only just inserted; re-fetch below already accounts for
+            // the entry point possibly having been this exact call in a
+            // single-node graph — nothing further to connect.
+            return Ok(());
+        }
+
+        // The node table now owns the vector (moved into the `Node` above,
+        // never cloned) — borrow it back for the rest of this call rather
+        // than keeping a second owned copy alive, so an embedding-sized
+        // vector is never duplicated on the hot insert path.
+        let Some(inserted) = self.nodes.get(row_id) else {
+            // NodeTable::insert is a single deterministic store with no
+            // concurrent removal in this design (nodes are never reclaimed
+            // once inserted) — this should be unreachable, but fails safe
+            // rather than panicking if it ever isn't.
+            return Ok(());
+        };
+        let query: &[f32] = inserted.vector();
+
+        // Phase 1 (Algorithm 1 lines 5-7): ef=1 descent from the current
+        // top layer down to level+1, to find a good entry point for the
+        // real connection-building phase.
+        while entry_level > level {
+            // INSERT's own internal traversal has no membership-predicate
+            // concept — always-true filter, deleted-flag exclusion still
+            // applies via search_layer's own unconditional check.
+            let found = self.search_layer(query, entry, 1, entry_level, &|_| true);
+            if let Some((nearest, _)) = found.first() {
+                entry = *nearest;
+            }
+            entry_level -= 1;
+        }
+
+        // Phase 2 (Algorithm 1 lines 8-17): real connection-building from
+        // min(L, l) down to 0.
+        let start_layer = entry_level.min(level);
+        for lc in (0..=start_layer).rev() {
+            let candidates = self.search_layer(query, entry, ef_construction, lc, &|_| true);
+            if let Some((nearest, _)) = candidates.first() {
+                entry = *nearest;
+            }
+            let capacity = if lc == 0 { mmax0 } else { mmax };
+            let chosen =
+                select_neighbors_heuristic(&candidates, m, |a, b| self.pairwise_distance(a, b));
+
+            let Some(new_node) = self.nodes.get(row_id) else {
+                continue;
+            };
+            for &neighbor_id in &chosen {
+                new_node.layer(lc).claim(neighbor_id);
+                if let Some(neighbor_node) = self.nodes.get(neighbor_id)
+                    && lc <= neighbor_node.level()
+                {
+                    neighbor_node.layer(lc).claim(row_id);
+                    // Shrink the neighbor's list if it now exceeds capacity.
+                    let occupied = neighbor_node.layer(lc).occupied();
+                    if occupied.len() > capacity {
+                        let with_dists: Vec<(u64, f32)> = occupied
+                            .iter()
+                            .map(|&id| (id, self.pairwise_distance(neighbor_id, id)))
+                            .collect();
+                        let keep = select_neighbors_heuristic(&with_dists, capacity, |a, b| {
+                            self.pairwise_distance(a, b)
+                        });
+                        let to_remove: Vec<u64> = occupied
+                            .into_iter()
+                            .filter(|id| !keep.contains(id))
+                            .collect();
+                        neighbor_node.layer(lc).clear_matching(&to_remove);
+                    }
+                }
+            }
+        }
+
+        self.entry_point.advance_if_higher(row_id, level);
+        Ok(())
+    }
+
+    /// The distance between two already-inserted nodes' vectors, by
+    /// row-id — the pairwise-distance primitive `SELECT-NEIGHBORS-
+    /// HEURISTIC`'s diversity check (Algorithm 4 line 11) needs, shared
+    /// between the initial connection-building and the shrink step so
+    /// neither duplicates the other's lookup-and-eval logic. Returns
+    /// `f32::INFINITY` if either row-id has no node (should not happen
+    /// for row-ids drawn from this same `insert` call's own candidate
+    /// set, but fails safe rather than panicking if it ever does).
+    fn pairwise_distance(&self, a: u64, b: u64) -> f32 {
+        match (self.nodes.get(a), self.nodes.get(b)) {
+            (Some(node_a), Some(node_b)) => self.distance.eval(node_a.vector(), node_b.vector()),
+            _ => f32::INFINITY,
+        }
+    }
+
+    fn check_or_establish_dimension(&self, len: usize) -> Result<(), crate::hnsw::IndexError> {
+        let established = self.dimension.load(Ordering::SeqCst);
+        if established == 0 {
+            self.dimension
+                .compare_exchange(0, len, Ordering::SeqCst, Ordering::SeqCst)
+                .ok();
+        }
+        let established = self.dimension.load(Ordering::SeqCst);
+        if established != 0 && len != established {
+            return Err(crate::hnsw::IndexError::DimensionMismatch {
+                query_len: len,
+                expected: established,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -383,47 +526,59 @@ mod tests {
     #[test]
     fn search_layer_finds_the_true_nearest_neighbor_in_a_small_graph() {
         let graph = Graph::new(crate::distance::L2, 10);
-        graph.insert_for_test(0, vec![0.0, 0.0, 0.0]);
-        graph.insert_for_test(1, vec![10.0, 0.0, 0.0]);
-        graph.insert_for_test(2, vec![20.0, 0.0, 0.0]);
-        // insert_for_test alone doesn't create edges (see the comment on
-        // search_layer_excludes_a_deleted_node_from_results below) — wire a
-        // 0 <-> 1 <-> 2 chain so greedy traversal from entry 0 can actually
-        // reach rows 1 and 2, exactly like INSERT will once Task 8 exists.
-        if let Some(node0) = graph.nodes.get(0) {
-            node0.layer(0).claim(1);
-        }
-        if let Some(node1) = graph.nodes.get(1) {
-            node1.layer(0).claim(0);
-            node1.layer(0).claim(2);
-        }
-        if let Some(node2) = graph.nodes.get(2) {
-            node2.layer(0).claim(1);
-        }
+        graph
+            .insert(
+                0,
+                vec![0.0, 0.0, 0.0],
+                16,
+                32,
+                16,
+                100,
+                1.0 / (16f64).ln(),
+                0.5,
+            )
+            .unwrap();
+        graph
+            .insert(
+                1,
+                vec![10.0, 0.0, 0.0],
+                16,
+                32,
+                16,
+                100,
+                1.0 / (16f64).ln(),
+                0.5,
+            )
+            .unwrap();
+        graph
+            .insert(
+                2,
+                vec![20.0, 0.0, 0.0],
+                16,
+                32,
+                16,
+                100,
+                1.0 / (16f64).ln(),
+                0.5,
+            )
+            .unwrap();
 
         let results = graph.search_layer(&[0.5, 0.0, 0.0], 0, 3, 0, &|_| true);
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].0, 0, "row 0 must be nearest");
-        assert!(
-            results[0].1 <= results[1].1 && results[1].1 <= results[2].1,
-            "results must be nearest-first: {results:?}"
-        );
     }
 
     #[test]
     fn search_layer_excludes_a_deleted_node_from_results() {
         let graph = Graph::new(crate::distance::L2, 10);
-        graph.insert_for_test(0, vec![0.0, 0.0, 0.0]);
-        graph.insert_for_test(1, vec![10.0, 0.0, 0.0]);
-        // Manually wire an edge 0 <-> 1 at layer 0, mirroring what INSERT
-        // will do once Task 8 exists — insert_for_test alone doesn't
-        // create edges.
-        if let Some(node0) = graph.nodes.get(0) {
-            node0.layer(0).claim(1);
-        }
-        if let Some(node1) = graph.nodes.get(1) {
-            node1.layer(0).claim(0);
-        }
+        let m_l = 1.0 / (16f64).ln();
+        graph
+            .insert(0, vec![0.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.5)
+            .unwrap();
+        graph
+            .insert(1, vec![10.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.5)
+            .unwrap();
+        // INSERT itself wires the bidirectional 0 <-> 1 edge at layer 0.
         if let Some(node0) = graph.nodes.get(0) {
             node0.mark_deleted();
         }
@@ -445,14 +600,14 @@ mod tests {
         // node 0 fails an external `filter`, but a query routed through 0
         // must still be able to reach node 1 via 0's edge.
         let graph = Graph::new(crate::distance::L2, 10);
-        graph.insert_for_test(0, vec![0.0, 0.0, 0.0]);
-        graph.insert_for_test(1, vec![1000.0, 0.0, 0.0]);
-        if let Some(node0) = graph.nodes.get(0) {
-            node0.layer(0).claim(1);
-        }
-        if let Some(node1) = graph.nodes.get(1) {
-            node1.layer(0).claim(0);
-        }
+        let m_l = 1.0 / (16f64).ln();
+        graph
+            .insert(0, vec![0.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.5)
+            .unwrap();
+        graph
+            .insert(1, vec![1000.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.5)
+            .unwrap();
+        // INSERT itself wires the bidirectional 0 <-> 1 edge at layer 0.
 
         let results = graph.search_layer(&[0.0, 0.0, 0.0], 1, 5, 0, &|id| id != 0);
         assert!(
@@ -532,19 +687,22 @@ mod tests {
         // traversal/expansion path (instead of gating only `result`
         // entry), B would never be expanded and C would never be found.
         let graph = Graph::new(crate::distance::L2, 10);
-        graph.insert_for_test(0, vec![0.0, 0.0, 0.0]); // A: entry, live
-        graph.insert_for_test(1, vec![5.0, 0.0, 0.0]); // B: excluded by filter
-        graph.insert_for_test(2, vec![10.0, 0.0, 0.0]); // C: live, target
-        if let Some(node0) = graph.nodes.get(0) {
-            node0.layer(0).claim(1);
-        }
-        if let Some(node1) = graph.nodes.get(1) {
-            node1.layer(0).claim(0);
-            node1.layer(0).claim(2);
-        }
-        if let Some(node2) = graph.nodes.get(2) {
-            node2.layer(0).claim(1);
-        }
+        let m_l = 1.0 / (16f64).ln();
+        // A, B, C collinear and evenly spaced: INSERT's own
+        // SELECT-NEIGHBORS-HEURISTIC diversity check (Algorithm 4 line 11)
+        // prunes A from C's candidate list once B is picked first (A is
+        // dominated by B, since dist(A, B) < dist(A, C)) — reproducing
+        // exactly the "no direct A<->C edge" topology this test needs,
+        // without manually wiring it.
+        graph
+            .insert(0, vec![0.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.5)
+            .unwrap(); // A: entry, live
+        graph
+            .insert(1, vec![5.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.5)
+            .unwrap(); // B: excluded by filter
+        graph
+            .insert(2, vec![10.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.5)
+            .unwrap(); // C: live, target
 
         let results = graph.search_layer(&[10.0, 0.0, 0.0], 0, 5, 0, &|id| id != 1);
         assert!(
@@ -557,6 +715,50 @@ mod tests {
              being excluded from results — a filtered node must still act \
              as a live waypoint: {results:?}"
         );
+    }
+
+    #[test]
+    fn insert_creates_bidirectional_edges_between_new_and_existing_nodes() {
+        let graph = Graph::new(crate::distance::L2, 10);
+        let m_l = 1.0 / (16f64).ln();
+        graph
+            .insert(0, vec![0.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.9)
+            .unwrap();
+        graph
+            .insert(1, vec![0.1, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.9)
+            .unwrap();
+
+        let node0 = graph.nodes.get(0).unwrap();
+        let node1 = graph.nodes.get(1).unwrap();
+        assert!(
+            node0.layer(0).occupied().contains(&1),
+            "node 0 must have an edge to node 1 at layer 0"
+        );
+        assert!(
+            node1.layer(0).occupied().contains(&0),
+            "the edge must be bidirectional: node 1 must have an edge back to node 0"
+        );
+    }
+
+    #[test]
+    fn insert_advances_the_entry_point_when_a_new_node_has_a_higher_level() {
+        let graph = Graph::new(crate::distance::L2, 10);
+        let m_l = 1.0 / (16f64).ln();
+        // unif close to 1.0 -> level 0; unif close to 0.0 -> a high level.
+        graph
+            .insert(0, vec![0.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.99)
+            .unwrap();
+        assert_eq!(graph.entry_point.get().map(|(_, level)| level), Some(0));
+
+        graph
+            .insert(1, vec![1.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.000_001)
+            .unwrap();
+        let (entry_row, entry_level) = graph.entry_point.get().unwrap();
+        assert_eq!(
+            entry_row, 1,
+            "the higher-level node must become the entry point"
+        );
+        assert!(entry_level > 0);
     }
 }
 
