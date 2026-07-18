@@ -896,6 +896,77 @@ mod tests {
     }
 
     #[test]
+    fn k_nn_search_descends_through_upper_layers_to_reach_a_far_entry_points_target() {
+        // Partial coverage for a Task 9 review finding: every other test in
+        // this file pins `unif = 0.5`, which deterministically assigns
+        // level 0 to every node (`assign_level(1/ln(16), 0.5) == 0`), so
+        // `k_nn_search`'s `while level >= 1` descent loop never executes at
+        // all in any of them. This test at least forces the loop body to
+        // run (row 0's high level, from `unif` close to 0, makes
+        // `entry_level >= 1` a real assertion below, not a tautology) and
+        // proves the two-phase composition still finds the true nearest
+        // neighbor in a graph that genuinely spans multiple layers.
+        //
+        // What this test does NOT prove: that the descent loop is
+        // *necessary* for that correct result. Empirically (temporarily
+        // short-circuiting the loop to a no-op and re-running this exact
+        // test), the result stays correct even with descent disabled here
+        // -- this fixture's layer-0 topology happens to let `search_layer`'s
+        // strictly-improving greedy walk (see its `should_add` check)
+        // hill-climb from row 0 straight to the answer in a handful of
+        // hops regardless of starting layer, because every node here is
+        // forced to keep at least one edge back toward row 0 (the first
+        // node inserted always receives a bidirectional edge from the
+        // second, per `insert`'s own connection step) and the positions
+        // form a monotonic staircase toward the query. Constructing a
+        // fixture where a cold, layer-0-only greedy walk provably gets
+        // stuck in a local minimum -- and so genuinely depends on the
+        // multi-layer descent to recover -- needs either an adversarial
+        // non-monotonic local topology or a much larger, randomized graph;
+        // deferred to Task 11's concurrent stress test, which spans many
+        // levels via real random draws across many nodes and can assert
+        // recall holds from level > 0 entries at that scale.
+        let graph = Graph::new(crate::distance::L2, 20);
+        let m_l = 1.0 / (16f64).ln();
+        graph
+            .insert(0, vec![1000.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.000_001)
+            .unwrap();
+        for i in 1..=8u64 {
+            graph
+                .insert(
+                    i,
+                    vec![f32::from(i as u16) * 0.1, 0.0, 0.0],
+                    16,
+                    32,
+                    16,
+                    100,
+                    m_l,
+                    0.9,
+                )
+                .unwrap();
+        }
+        let (entry_row, entry_level) = graph.entry_point.get().unwrap();
+        assert_eq!(
+            entry_row, 0,
+            "row 0 must remain the entry point -- it is the only node with a level above 0"
+        );
+        assert!(
+            entry_level >= 1,
+            "the test graph must actually span multiple layers, or this test proves nothing: level = {entry_level}"
+        );
+
+        let results = graph.k_nn_search(&[0.4, 0.0, 0.0], 1, 1, |_| true).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].0, 4,
+            "must find the true nearest neighbor (row 4, at x=0.4) despite the \
+             entry point (row 0, at x=1000.0) being far away and only ef=1 \
+             being used at layer 0: {:?}",
+            results
+        );
+    }
+
+    #[test]
     fn delete_excludes_a_row_from_k_nn_search_results() {
         let graph = Graph::new(crate::distance::L2, 20);
         let m_l = 1.0 / (16f64).ln();

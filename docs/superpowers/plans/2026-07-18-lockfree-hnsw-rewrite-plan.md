@@ -1981,6 +1981,21 @@ git add crates/index/src/graph.rs
 git commit -m "feat(index): implement K-NN-SEARCH (Algorithm 5) and delete (tombstone-flag-only soft-delete)"
 ```
 
+**Post-review amendment (Task 9 review finding):** the 4 tests above all
+pin `unif = 0.5`, which deterministically assigns every node level 0
+(`assign_level(1/ln(16), 0.5) == 0`), so none of them ever exercise
+`k_nn_search`'s `while level >= 1` multi-layer descent loop — the code
+composing Algorithm 5's two phases was verified correct by independent
+manual trace, but the loop itself was untested. Added
+`k_nn_search_descends_through_upper_layers_to_reach_a_far_entry_points_target`
+(a level-4 entry point, verified via an explicit `entry_level >= 1`
+assertion, so the descent loop body genuinely runs), but a hand-built
+fixture that also *forces* the descent to matter (i.e. one where skipping
+it produces a wrong answer) was attempted and found genuinely difficult to
+construct deterministically — see the test's own doc comment for why, and
+see Task 11's amendment for where stronger coverage of this property is
+deferred.
+
 ---
 
 ### Task 10: Deletion correctness test (non-vacuous, per Phase 5's established lesson)
@@ -2046,6 +2061,30 @@ git commit -m "test(index): non-vacuous deletion correctness test (query at the 
 ---
 
 ### Task 11: Real-thread stress test
+
+**Post-Task-9 amendment (review finding, deferred here):** Task 9's review
+found no test proves `k_nn_search`'s multi-layer descent loop
+(`while level >= 1`) is actually *necessary* for a correct result, only
+that it executes without error (`k_nn_search_descends_through_upper_layers_to_reach_a_far_entry_points_target`
+in `graph.rs`). A hand-crafted adversarial fixture was attempted and
+abandoned as genuinely difficult to construct deterministically: a
+strictly-improving greedy walk at layer 0 alone can hill-climb through a
+monotonic or densely-connected local topology regardless of the starting
+entry point, and the first-inserted node always keeps at least one forced
+bridge edge back into the rest of the graph (per `insert`'s own connection
+step), so a synthetic 2-cluster construction can't fully isolate a "cold"
+entry point. **Before this task is considered to close that gap:** the
+`unif` draws below are currently all pinned to `0.5` (per Task 9's own
+finding, this deterministically assigns every node level 0 —
+`assign_level(1/ln(16), 0.5) == 0` — so this fixture as written *also*
+never exercises the descent loop). Use a real varied `unif` sequence (e.g.
+a seeded PRNG per Task 12/13's own likely need for one, or a fixed
+hand-picked mix of values spanning several levels) so the stress test's
+`THREADS * PER_THREAD` nodes naturally produce a real multi-layer graph,
+and confirm recall holds when querying via `k_nn_search` from an entry
+point at level > 0 — the statistical scale here (hundreds of concurrent
+inserts) is a much more realistic vehicle for catching a broken descent
+than a small hand-built fixture would be.
 
 **Files:**
 - Modify: `crates/index/src/graph.rs`
