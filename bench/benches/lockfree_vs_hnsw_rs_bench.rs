@@ -6,7 +6,7 @@
 //!
 //! Both indexes are graded against `strata_index::brute_force_search` as
 //! true ground truth, not against each other — this directly answers
-//! whether Graph's recall@k is >= hnsw_rs's, which "vs. hnsw_rs's own
+//! whether Graph's recall@k is >= `hnsw_rs`'s, which "vs. `hnsw_rs`'s own
 //! results as ground truth" alone would not (two implementations can agree
 //! with each other while both being wrong, or diverge without telling you
 //! which one is closer to correct).
