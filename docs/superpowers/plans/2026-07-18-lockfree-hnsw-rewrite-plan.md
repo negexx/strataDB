@@ -1164,6 +1164,22 @@ Add to `crates/index/src/graph.rs`'s existing `mod tests` block (create the `Gra
         graph.insert_for_test(0, vec![0.0, 0.0, 0.0]);
         graph.insert_for_test(1, vec![10.0, 0.0, 0.0]);
         graph.insert_for_test(2, vec![20.0, 0.0, 0.0]);
+        // insert_for_test only registers a node — it does NOT create edges
+        // (unlike the real INSERT algorithm, Task 8). search_layer's
+        // greedy traversal can only ever reach what's wired, so this test
+        // must wire a 0 <-> 1 <-> 2 chain by hand to exercise real
+        // multi-hop traversal, matching the same manual-wiring pattern
+        // Step 5's tests already use.
+        if let Some(node0) = graph.nodes.get(0) {
+            node0.layer(0).claim(1);
+        }
+        if let Some(node1) = graph.nodes.get(1) {
+            node1.layer(0).claim(0);
+            node1.layer(0).claim(2);
+        }
+        if let Some(node2) = graph.nodes.get(2) {
+            node2.layer(0).claim(1);
+        }
 
         let results = graph.search_layer(&[0.5, 0.0, 0.0], 0, 3, 0, &|_| true);
         assert_eq!(results.len(), 3);
@@ -1175,7 +1191,7 @@ Add to `crates/index/src/graph.rs`'s existing `mod tests` block (create the `Gra
     }
 ```
 
-`insert_for_test` is a temporary, test-only helper (added in Step 3 alongside `Graph`) that directly wires two nodes together at layer 0 without going through the not-yet-built `INSERT` algorithm (Task 8) — it exists only so `SEARCH-LAYER` can be tested in isolation before `INSERT` exists. Task 8 replaces every use of `insert_for_test` in this file's tests with the real public `insert` and deletes the helper.
+`insert_for_test` is a temporary, test-only helper (added in Step 3 alongside `Graph`) that registers a node without going through the not-yet-built `INSERT` algorithm (Task 8) — it does **not** create edges (edge-wiring is `INSERT`'s job); tests that need connectivity wire it manually via `.layer(lc).claim(...)`, matching the pattern above and Step 5's own tests. `insert_for_test` exists only so `SEARCH-LAYER` can be tested in isolation before `INSERT` exists. Task 8 replaces every use of `insert_for_test` in this file's tests with the real public `insert` and deletes the helper.
 
 - [ ] **Step 2: Run test to verify it fails**
 
