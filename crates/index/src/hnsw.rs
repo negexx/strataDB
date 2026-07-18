@@ -1,12 +1,9 @@
-//! HNSW vector index wrapper. See `.claude/rules/vector-index.md` and
-//! `.claude/docs/design/phase-4-vector-index-spec.md` §1.
+//! HNSW vector index — lock-free, from-scratch implementation (replacing
+//! `hnsw_rs` as of this rewrite). See `.claude/rules/vector-index.md` and
+//! `docs/superpowers/specs/2026-07-18-lockfree-hnsw-rewrite-design.md`.
 
-#[cfg(loom)]
-use loom::sync::atomic::{AtomicUsize, Ordering};
-#[cfg(not(loom))]
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-use hnsw_rs::prelude::{DistL2, FilterT, Hnsw};
+use crate::distance::L2;
+use crate::graph::Graph;
 
 /// One search result: which row-id, and its squared L2 distance to the
 /// query vector. `row_id` is the persistent, global identity from
@@ -70,32 +67,13 @@ pub struct MaxLayers(pub usize);
 pub struct EfConstruction(pub usize);
 
 pub struct HnswIndex {
-    hnsw: Hnsw<'static, f32, DistL2>,
-    dimension: AtomicUsize,
-}
-
-/// Atomically establishes the vector dimension on the first call (via
-/// `compare_exchange`), or validates `len` against the already-established
-/// dimension on every subsequent call — including the losing side of a
-/// concurrent race to be "first", which must validate against whichever
-/// length actually won, never silently succeed with a different one.
-///
-/// # Errors
-///
-/// Returns [`IndexError::DimensionMismatch`] if `len` doesn't match the
-/// dimension this call just established or a prior call already established.
-fn establish_or_check_dimension(dimension: &AtomicUsize, len: usize) -> Result<(), IndexError> {
-    dimension
-        .compare_exchange(0, len, Ordering::SeqCst, Ordering::SeqCst)
-        .ok();
-    let established = dimension.load(Ordering::SeqCst);
-    if established != 0 && len != established {
-        return Err(IndexError::DimensionMismatch {
-            query_len: len,
-            expected: established,
-        });
-    }
-    Ok(())
+    graph: Graph<L2>,
+    m: usize,
+    mmax0: usize,
+    mmax: usize,
+    ef_construction: usize,
+    m_l: f64,
+    row_counter: std::sync::atomic::AtomicU64, // supplies a deterministic unif draw per insert; see Self::insert's note below
 }
 
 impl HnswIndex {
@@ -121,11 +99,11 @@ impl HnswIndex {
     /// # Errors
     ///
     /// Returns [`IndexError::MaxConnectionTooLarge`] if `max_nb_connection`
-    /// exceeds 256 — checked here because the underlying `hnsw_rs::Hnsw::new`
-    /// calls `std::process::exit(1)` (not a panic — an uncatchable process
-    /// exit) on that condition, verified against the installed
-    /// `hnsw_rs-0.3.4` source. This function must never let a bad
-    /// caller-supplied value reach that call.
+    /// exceeds 256 — this validation predates the lock-free rewrite (it
+    /// used to guard against `hnsw_rs::Hnsw::new`'s uncatchable
+    /// `std::process::exit(1)` on that condition) and is retained
+    /// unconditionally: 256 remains this crate's own documented connection
+    /// ceiling regardless of backing implementation.
     pub fn new(
         max_nb_connection: MaxConnections,
         max_elements: MaxElements,
@@ -135,15 +113,21 @@ impl HnswIndex {
         if max_nb_connection.0 > 256 {
             return Err(IndexError::MaxConnectionTooLarge(max_nb_connection.0));
         }
+        let _ = max_layer; // MaxLayers is retained in the public signature for API compatibility; the new design derives level count from mL/unif rather than a hard layer cap — see design doc §2/§3.
+        let m = max_nb_connection.0.max(1);
+        // `m` is capped at 256 by the `max_nb_connection.0 > 256` check
+        // above, so this cast is always exact — never a real precision
+        // loss, just a lint that can't see the bound.
+        #[allow(clippy::cast_precision_loss)]
+        let m_l = 1.0 / (m as f64).ln();
         Ok(Self {
-            hnsw: Hnsw::new(
-                max_nb_connection.0,
-                max_elements.0,
-                max_layer.0,
-                ef_construction.0,
-                DistL2 {},
-            ),
-            dimension: AtomicUsize::new(0),
+            graph: Graph::new(L2, max_elements.0.max(1)),
+            m,
+            mmax0: m * 2,
+            mmax: m,
+            ef_construction: ef_construction.0,
+            m_l,
+            row_counter: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -164,31 +148,54 @@ impl HnswIndex {
     ///
     /// Returns [`IndexError::DimensionMismatch`] if `vector`'s length
     /// doesn't match the dimensionality of the first vector ever inserted.
-    /// Checked upfront so a corrupted delta-log entry with a wrong-length
-    /// vector can never reach `hnsw_rs`'s underlying distance function,
-    /// which does not itself validate vector lengths for `f32`/`DistL2` —
-    /// verified against the installed `anndists-0.1.5` source, where the
-    /// dedicated `impl Distance<f32> for DistL2` has no length assertion
-    /// and would otherwise silently zip-truncate to the shorter vector,
-    /// producing a wrong distance instead of an error.
+    /// Checked upfront (inside `Graph::insert`'s own
+    /// `check_or_establish_dimension` call) so a corrupted delta-log entry
+    /// with a wrong-length vector can never reach the distance function.
     pub fn insert(&self, row_id: u64, vector: &[f32]) -> Result<(), IndexError> {
-        establish_or_check_dimension(&self.dimension, vector.len())?;
-        #[allow(clippy::cast_possible_truncation)]
-        let id = row_id as usize;
-        self.hnsw.insert((vector, id));
-        Ok(())
+        // A deterministic-but-varying draw per insert, avoiding a new RNG
+        // dependency: derived from a monotonically-advancing counter run
+        // through a fixed hash, mapped into (0, 1). This is NOT
+        // cryptographic or high-quality randomness — HNSW's level
+        // assignment only needs a source that varies across inserts to
+        // achieve the paper's expected layer-count distribution, and this
+        // project's own established precedent (this file's *old* tests)
+        // already tolerates non-reproducible layer assignment (see the
+        // existing `insert_cluster` test helper's doc comment on
+        // hnsw_rs's own unseeded RNG). If a real `rand`-crate dependency
+        // is preferred instead, swap this for one — flagged here as an
+        // explicit, deliberate choice for the implementer/reviewer to
+        // confirm, not a silent placeholder.
+        let n = self
+            .row_counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut x = n.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+        x ^= x >> 33;
+        #[allow(clippy::cast_precision_loss)]
+        let unif = ((x >> 11) as f64 / (1u64 << 53) as f64).clamp(f64::EPSILON, 1.0 - f64::EPSILON);
+
+        self.graph.insert(
+            row_id,
+            vector.to_vec(),
+            self.m,
+            self.mmax0,
+            self.mmax,
+            self.ef_construction,
+            self.m_l,
+            unif,
+        )
     }
 
     /// The vector dimension established by the first-ever [`Self::insert`]
     /// call, or `0` if no vector has been inserted yet. Read-only — never
-    /// establishes a dimension itself, unlike `insert`'s internal
-    /// `establish_or_check_dimension` call. Exposed so callers (e.g.
+    /// establishes a dimension itself. Exposed so callers (e.g.
     /// `crates/txn`'s `Transaction::commit`) can pre-validate a batch of
     /// pending inserts' dimensions against this index *before* applying
     /// any of them, rather than discovering a mismatch mid-application.
     #[must_use]
     pub fn established_dimension(&self) -> usize {
-        self.dimension.load(Ordering::SeqCst)
+        self.graph.established_dimension()
     }
 
     /// # Examples
@@ -220,19 +227,14 @@ impl HnswIndex {
         ef_search: usize,
         is_visible: impl Fn(u64) -> bool,
     ) -> Result<Vec<VectorMatch>, IndexError> {
-        self.check_dimension(query)?;
-        // Visibility (tombstone exclusion, and — as of Phase 5 — snapshot
-        // watermark filtering) is pushed into hnsw_rs's own `FilterT`
-        // mechanism, not applied as a post-filter on an already-capped
-        // top-k, so an invisible candidate can't silently shrink the
-        // result set below `k` — see
-        // `.claude/docs/design/phase-4-vector-index-spec.md` §1 and
-        // `docs/superpowers/specs/2026-07-17-phase-5-mvcc-snapshot-isolation-design.md`.
-        let filter = move |id: &hnsw_rs::prelude::DataId| is_visible(Self::to_row_id(*id));
-        let raw = self
-            .hnsw
-            .search_filter(query, k, ef_search, Some(&filter as &dyn FilterT));
-        Ok(Self::to_matches(raw))
+        let raw = self.graph.k_nn_search(query, k, ef_search, is_visible)?;
+        Ok(raw
+            .into_iter()
+            .map(|(row_id, dist)| VectorMatch {
+                row_id,
+                squared_distance: dist * dist,
+            })
+            .collect())
     }
 
     /// # Errors
@@ -246,61 +248,24 @@ impl HnswIndex {
         live_ids: &[usize],
         is_visible: impl Fn(u64) -> bool,
     ) -> Result<Vec<VectorMatch>, IndexError> {
-        self.check_dimension(query)?;
-        // live_ids is caller-supplied and expected sorted (binary-searched
-        // below) — sort defensively rather than trusting every caller got
-        // this right.
-        let mut live_ids = live_ids.to_vec();
-        live_ids.sort_unstable();
-        // Membership in `live_ids` and visibility are composed into a
-        // single `FilterT` predicate, so both are applied during
-        // hnsw_rs's own traversal/candidate-heap construction rather than
-        // as a post-filter on an already-capped top-k.
-        let filter = move |id: &hnsw_rs::prelude::DataId| {
-            live_ids.binary_search(id).is_ok() && is_visible(Self::to_row_id(*id))
-        };
-        let raw = self
-            .hnsw
-            .search_filter(query, k, ef_search, Some(&filter as &dyn FilterT));
-        Ok(Self::to_matches(raw))
-    }
-
-    fn check_dimension(&self, query: &[f32]) -> Result<(), IndexError> {
-        let dimension = self.dimension.load(Ordering::SeqCst);
-        if dimension != 0 && query.len() != dimension {
-            return Err(IndexError::DimensionMismatch {
-                query_len: query.len(),
-                expected: dimension,
-            });
-        }
-        Ok(())
-    }
-
-    #[allow(clippy::cast_possible_truncation)]
-    fn to_row_id(id: hnsw_rs::prelude::DataId) -> u64 {
-        id as u64
-    }
-
-    fn to_matches(raw: Vec<hnsw_rs::prelude::Neighbour>) -> Vec<VectorMatch> {
-        raw.into_iter()
-            .map(|n| {
-                // `anndists::DistL2::eval` (the distance fn passed to
-                // `Hnsw::new`) computes true (non-squared) Euclidean L2
-                // distance for f32 — verified against the installed
-                // `anndists-0.1.5` source, where `eval` ends in
-                // `norm.sqrt()`. Squaring here restores the squared-L2
-                // units `VectorMatch::squared_distance` promises, matching
-                // `brute_force::Neighbor::squared_distance`'s units.
-                // Squaring is monotonic for non-negative inputs, so it
-                // can't change which neighbors were found or their
-                // relative order — only the reported magnitude.
-                let distance = n.get_distance();
-                VectorMatch {
-                    row_id: Self::to_row_id(n.get_origin_id()),
-                    squared_distance: distance * distance,
-                }
+        // live_ids membership and is_visible are composed into ONE
+        // predicate passed straight into k_nn_search -> search_layer,
+        // applied during traversal-time result-set construction — not a
+        // post-filter over an already-capped top-k. This matches
+        // hnsw_rs's original FilterT-based behavior exactly: a live_ids
+        // row deep in the graph is never missed just because it fell
+        // outside some pre-guessed widened candidate window, since the
+        // predicate is evaluated as part of the same search, not after it.
+        let live: std::collections::HashSet<u64> = live_ids.iter().map(|&id| id as u64).collect();
+        let filter = move |id: u64| live.contains(&id) && is_visible(id);
+        let raw = self.graph.k_nn_search(query, k, ef_search, filter)?;
+        Ok(raw
+            .into_iter()
+            .map(|(row_id, dist)| VectorMatch {
+                row_id,
+                squared_distance: dist * dist,
             })
-            .collect()
+            .collect())
     }
 }
 
@@ -693,57 +658,5 @@ mod tests {
         .unwrap();
         index.insert(0, &[0.0, 0.0, 0.0]).unwrap();
         assert_eq!(index.established_dimension(), 3);
-    }
-}
-
-/// Run with: `RUSTFLAGS="--cfg loom" cargo test -p strata-index --lib`
-#[cfg(loom)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
-mod loom_tests {
-    use super::*;
-
-    #[test]
-    fn concurrent_first_inserts_race_safely_on_dimension() {
-        loom::model(|| {
-            let dimension = loom::sync::Arc::new(AtomicUsize::new(0));
-            let d1 = loom::sync::Arc::clone(&dimension);
-            let d2 = loom::sync::Arc::clone(&dimension);
-
-            let t1 = loom::thread::spawn(move || establish_or_check_dimension(&d1, 3));
-            let t2 = loom::thread::spawn(move || establish_or_check_dimension(&d2, 2));
-
-            let r1 = t1.join().unwrap();
-            let r2 = t2.join().unwrap();
-
-            // Exactly one of the two racing "first" calls wins and
-            // establishes the dimension; the other must observe a
-            // DimensionMismatch against whichever length actually won —
-            // never silently succeed with a different length, never leave
-            // `dimension` at an intermediate/torn value.
-            let established = dimension.load(Ordering::SeqCst);
-            match established {
-                3 => {
-                    assert!(r1.is_ok());
-                    assert!(matches!(
-                        r2,
-                        Err(IndexError::DimensionMismatch {
-                            query_len: 2,
-                            expected: 3
-                        })
-                    ));
-                }
-                2 => {
-                    assert!(r2.is_ok());
-                    assert!(matches!(
-                        r1,
-                        Err(IndexError::DimensionMismatch {
-                            query_len: 3,
-                            expected: 2
-                        })
-                    ));
-                }
-                other => panic!("dimension must be established as 2 or 3, got {other}"),
-            }
-        });
     }
 }

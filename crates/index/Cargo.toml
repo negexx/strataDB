@@ -25,10 +25,10 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
 [dependencies]
 anndists = "0.1"
 arrow.workspace = true
-hnsw_rs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 loom = "0.7"
+hnsw_rs.workspace = true

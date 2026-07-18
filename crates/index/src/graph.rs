@@ -398,6 +398,14 @@ impl<D: Distance> Graph<D> {
     // thin forwarding wrapper over it) — same too-many-arguments rationale
     // as `insert` above, not something to restructure into a struct here
     // either.
+    // Not yet called from `HnswIndex` — Task 14's brief gives `HnswIndex`'s
+    // `insert` a thin per-row forwarding call to `Graph::insert` rather than
+    // `insert_batch`, to keep `HnswIndex::insert`'s own pre-existing
+    // single-row signature exactly as it was pre-rewrite. This is the
+    // `crates/txn`-facing batch entry point Task 12 built for a future
+    // batched-commit caller; exercised today only by this module's own
+    // `insert_batch_inserts_every_row` test below.
+    #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn insert_batch(
         &self,
@@ -493,10 +501,24 @@ impl<D: Distance> Graph<D> {
     /// to serve as a live traversal waypoint for other queries (Stage 1's
     /// tombstone-flag-only scope — see design doc §1/§3). A no-op if
     /// `row_id` was never inserted.
+    // Not yet called from `HnswIndex` — the pre-rewrite `HnswIndex` never
+    // had a `delete` method (soft-delete lives at `crates/txn`'s
+    // conflict-resolution layer today), and Task 14's API-preservation
+    // constraint forbids adding new public surface here. This is Stage 1's
+    // tombstone primitive for a future `crates/txn` consumer; exercised
+    // today only by this module's own tests below.
+    #[allow(dead_code)]
     pub(crate) fn delete(&self, row_id: u64) {
         if let Some(node) = self.nodes.get(row_id) {
             node.mark_deleted();
         }
+    }
+
+    /// The vector dimension established by the first-ever `insert` call, or
+    /// `0` if none yet. Read-only — never establishes a dimension itself.
+    #[must_use]
+    pub(crate) fn established_dimension(&self) -> usize {
+        self.dimension.load(Ordering::SeqCst)
     }
 
     fn check_or_establish_dimension(&self, len: usize) -> Result<(), crate::hnsw::IndexError> {
@@ -519,6 +541,12 @@ impl<D: Distance> Graph<D> {
 
 /// Algorithm 3, `SELECT-NEIGHBORS-SIMPLE`: the `m` nearest candidates,
 /// nearest-first. `candidates` need not be pre-sorted.
+// `Graph::insert` calls `select_neighbors_heuristic` (Algorithm 4)
+// exclusively, per design doc §3's choice of the heuristic over the simple
+// variant — this is kept as the paper's Algorithm 3 reference
+// implementation, covered by its own tests below, not a live production
+// code path.
+#[allow(dead_code)]
 fn select_neighbors_simple(candidates: &[(u64, f32)], m: usize) -> Vec<u64> {
     let mut sorted = candidates.to_vec();
     sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(CmpOrdering::Equal));
@@ -565,7 +593,11 @@ fn select_neighbors_heuristic(
 }
 
 #[cfg(all(test, not(loom)))]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+// `cast_precision_loss`: this module's fixtures repeatedly cast small test
+// row-ids (well under 2^24, `f32`'s exact-integer ceiling) to `f32` to build
+// vector coordinates — always exact for these values, never a real
+// precision loss, just a lint that can't see the bound.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::cast_precision_loss)]
 mod tests {
     use super::*;
 

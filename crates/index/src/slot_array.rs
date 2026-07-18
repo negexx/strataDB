@@ -26,6 +26,13 @@ impl SlotArray {
         Self { slots }
     }
 
+    // Not read by any production code path yet — `Node`'s shrink logic in
+    // `Graph::insert` compares `occupied().len()` against its own
+    // `mmax0`/`mmax` parameters rather than querying physical capacity.
+    // Kept as a natural companion accessor to `occupied()`/`claim()` below
+    // for a future consumer, and exercised by this module's own
+    // `new_array_has_no_occupied_slots` and `node.rs`'s headroom tests.
+    #[allow(dead_code)]
     pub(crate) fn capacity(&self) -> usize {
         self.slots.len()
     }

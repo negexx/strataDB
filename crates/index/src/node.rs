@@ -11,6 +11,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::slot_array::SlotArray;
 
 pub(crate) struct Node {
+    // See `row_id()`'s doc comment below — not read by any production code
+    // path yet, kept for a future consumer.
+    #[allow(dead_code)]
     row_id: u64,
     vector: Vec<f32>,
     /// One `SlotArray` per layer `0..=level`: index 0 has physical
@@ -51,6 +54,13 @@ impl Node {
         }
     }
 
+    // Not read by any production code path yet — `Graph`'s own methods key
+    // everything off the caller-supplied `row_id` parameter directly rather
+    // than reading it back off a resolved `Node`. Kept as a natural
+    // companion accessor to `vector()`/`level()`/`layer()` above for a
+    // future consumer (and exercised by this module's own
+    // `vector_and_row_id_are_preserved` test).
+    #[allow(dead_code)]
     pub(crate) fn row_id(&self) -> u64 {
         self.row_id
     }
@@ -75,6 +85,12 @@ impl Node {
         self.deleted.load(Ordering::SeqCst)
     }
 
+    // Only called from `Graph::delete`, itself not yet wired into
+    // `HnswIndex` (see `Graph::delete`'s doc comment in graph.rs) — hence
+    // the transitively-unused warning here too. Exercised today by both
+    // this module's own `mark_deleted_is_observed_by_is_deleted` test and
+    // `graph.rs`'s deletion tests.
+    #[allow(dead_code)]
     pub(crate) fn mark_deleted(&self) {
         self.deleted.store(true, Ordering::SeqCst);
     }
@@ -83,6 +99,17 @@ impl Node {
 /// Random level assignment per the paper: `l = floor(-ln(unif(0,1)) * mL)`.
 /// `mL = 1/ln(M)` is "a simple choice for the optimal mL" per the paper —
 /// callers pass `1.0 / (m as f64).ln()`.
+// The float-to-usize cast below can only ever produce a level, never a
+// negative or fractional one (see the doc comment above and `pack`'s own
+// doc comment in graph.rs, which clamps whatever this returns to
+// `LEVEL_MASK` anyway) — `floor()` already removes the fractional part, and
+// `-unif.ln() * m_l` is non-negative for `unif` in `(0, 1)` (a negative
+// natural log negated stays non-negative). `as usize` saturates rather than
+// wrapping for out-of-range floats (including the `unif == 0.0` ->
+// `f64::INFINITY` case this function's own doc comment flags as the one
+// real reachable edge case), so this is a safe, intentional cast, not a
+// silently-truncating one.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub(crate) fn assign_level(m_l: f64, unif: f64) -> usize {
     debug_assert!((0.0..1.0).contains(&unif), "unif must be in [0, 1)");
     // unif == 0.0 would make -ln(unif) infinite; callers must supply a
