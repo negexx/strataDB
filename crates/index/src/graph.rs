@@ -377,11 +377,16 @@ impl<D: Distance> Graph<D> {
         Ok(())
     }
 
-    /// Inserts every row in `rows`, sharing repeated entry-point lookups
-    /// across the whole batch instead of recomputing per row — matches
-    /// `crates/txn::Transaction::commit`'s calling pattern (many rows per
-    /// commit). `unifs[i]` supplies row `i`'s level-assignment draw;
-    /// `rows.len()` must equal `unifs.len()`.
+    /// Inserts every row in `rows`, matching `crates/txn::Transaction::commit`'s
+    /// calling pattern (many rows per commit) so callers don't need their
+    /// own per-row loop. `unifs[i]` supplies row `i`'s level-assignment
+    /// draw; `rows.len()` must equal `unifs.len()`.
+    ///
+    /// Intentionally a thin sequential loop over `insert` for Stage 1 — it
+    /// does NOT share entry-point lookups or any other state across rows;
+    /// each row pays its own full `insert` cost. Genuine cross-row
+    /// amortization (e.g. sharing a single entry-point read across the
+    /// batch) is deferred; see design doc §4.
     ///
     /// # Errors
     ///
