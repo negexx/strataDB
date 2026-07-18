@@ -2252,6 +2252,154 @@ git commit -m "feat(index): add Graph::insert_batch"
 
 ### Task 13: Recall/QPS benchmark against `hnsw_rs`
 
+**Pre-dispatch correction (this section supersedes the original draft
+below):** Step 1's own "check `bench/` first" instruction was followed
+before dispatch, since it's a real prerequisite investigation, not
+transcribable code. It found the original draft had three problems, all
+now resolved:
+
+1. **A dangling reference.** The original `crates/index/benches/...` code
+   comment said "see Task 14's note on bench-only visibility" — no such
+   note exists anywhere in Task 14 or elsewhere in this plan. `Graph`,
+   `distance::L2`, and `Graph::new`/`insert`/`k_nn_search` are all
+   currently `mod`/`pub(crate)`-private (Tasks 1-9), so the original
+   bench code could not have compiled as an external bench target
+   (benches link against the crate like an external dependency — they
+   only see `pub` items, never `pub(crate)`).
+2. **`cargo run --bin` doesn't match a `benches/` file.** Files under
+   `benches/` are Cargo bench targets, run via `cargo bench`, not
+   `cargo run --bin`.
+3. **A real existing harness was found and should be used, not
+   duplicated.** `bench/` (a workspace member crate, `strata-bench`) already
+   has `criterion` wired up (workspace dependency), an established
+   `[[bench]] ... harness = false` pattern, and a real downloaded public
+   embedding dataset (`bench/data/dbpedia-openai-100k.parquet`,
+   `text-embedding-3-small-512-embedding` column, 512-dim) already loaded
+   by `bench/benches/vector_search_bench.rs`'s `load_vectors` — a much
+   better fit for "benchmarked on a public embedding dataset" (this
+   project's own Phase 4 exit-criterion language) than a synthetic
+   hand-rolled-PRNG vector generator. `vector_search_bench.rs` also
+   establishes a correctness-gate-before-QPS pattern (`check_recall`
+   against `strata_index::brute_force_search`, `assert!(recall > 0.8)`
+   before trusting timing) that this task's bench should follow rather
+   than the original draft's ungated "just print the numbers" approach.
+   `strata_index::brute_force_search` is already `pub`, so using it as
+   TRUE ground truth for both `hnsw_rs` and `Graph` independently (rather
+   than treating `hnsw_rs`'s own results as ground truth, which the
+   original draft did) is a strictly stronger comparison: it directly
+   answers "is Graph's recall >= hnsw_rs's", not just "do the two agree
+   with each other" — two implementations can agree while both being
+   wrong, or disagree without telling you which is closer to correct.
+
+**Corrected plan:**
+
+- **Files:**
+  - Create: `bench/benches/lockfree_vs_hnsw_rs_bench.rs` (in the existing
+    `bench/` crate, matching its established `_bench.rs` naming and
+    `criterion`/`harness = false` pattern — NOT a new
+    `crates/index/benches/` directory).
+  - Modify: `crates/index/Cargo.toml` — add:
+    ```toml
+    [features]
+    internal-benchmarks = []
+    ```
+  - Modify: `crates/index/src/lib.rs` — gate `graph`/`distance` module
+    visibility on that feature (private in every normal build; `pub` only
+    when a bench opts in):
+    ```rust
+    #[cfg(feature = "internal-benchmarks")]
+    pub mod distance;
+    #[cfg(not(feature = "internal-benchmarks"))]
+    mod distance;
+    #[cfg(feature = "internal-benchmarks")]
+    pub mod graph;
+    #[cfg(not(feature = "internal-benchmarks"))]
+    mod graph;
+    ```
+    (Replacing the existing plain `mod distance;` / `mod graph;` lines.)
+  - Modify: `crates/index/src/graph.rs` — change `Graph::new`,
+    `Graph::insert`, `Graph::k_nn_search` from `pub(crate) fn` to
+    `pub fn` (harmless when the module itself stays private outside the
+    feature — Rust caps effective visibility at the containing module's;
+    this only becomes truly public when `internal-benchmarks` is also
+    enabled). Every other method on `Graph` (`delete`, `insert_batch`,
+    the private helpers) stays exactly as-is — do not widen anything not
+    listed here.
+  - Modify: `crates/index/src/distance.rs` — change `L2`'s struct
+    declaration (and its `Distance` impl block, which must match the
+    type's own visibility) from `pub(crate)` to `pub`. Leave `Cosine` and
+    `Dot` as `pub(crate)` — this bench only needs `L2`.
+  - Modify: `bench/Cargo.toml` — change the existing
+    `strata-index = { path = "../crates/index" }` line to
+    `strata-index = { path = "../crates/index", features = ["internal-benchmarks"] }`,
+    and add:
+    ```toml
+    [[bench]]
+    name = "lockfree_vs_hnsw_rs_bench"
+    harness = false
+    ```
+    `hnsw_rs` is not currently a `bench/Cargo.toml` dependency — add
+    `hnsw_rs.workspace = true` there too.
+
+- **Interfaces:**
+  - Consumes: `Graph::new`/`insert`/`k_nn_search` (Tasks 8-9, now `pub`
+    behind the feature above), `distance::L2` (Task 4, now `pub` behind
+    the same feature), `strata_index::brute_force_search` (already
+    fully `pub`, unrelated to this feature gate), `hnsw_rs` (still a
+    `crates/index` dependency until Task 14 removes it — this benchmark
+    is the reason it isn't removed before this task runs).
+  - Produces: nothing consumed by other tasks — this is the empirical
+    evidence for the "match/beat hnsw_rs" success bar, referenced in
+    Task 14's commit message.
+
+- [ ] **Step 1: Write the benchmark**
+
+  Use this exact file, verbatim:
+  `C:\Users\dagda\Downloads\nex\strataDB\.superpowers\sdd\task-13-corrected-bench.rs`
+  (copy its contents to `bench/benches/lockfree_vs_hnsw_rs_bench.rs`).
+
+- [ ] **Step 2: Apply the visibility and Cargo.toml changes**
+
+  Exactly as described in the Files section above (feature flag,
+  `lib.rs` module gating, `Graph`/`L2` visibility widening, `bench/Cargo.toml`
+  changes).
+
+- [ ] **Step 3: Confirm the rest of the workspace is unaffected**
+
+  Run `cargo build --workspace` and `cargo test -p strata-index --lib`
+  (without the `internal-benchmarks` feature — the default, every other
+  crate's build) to confirm `graph`/`distance` are still private and
+  nothing outside `strata-index` can see them by accident, and that
+  Tasks 1-12's tests still pass unchanged.
+
+- [ ] **Step 4: Run the benchmark**
+
+  Run: `cargo bench -p strata-bench --bench lockfree_vs_hnsw_rs_bench`
+  (this builds `strata-index` with `internal-benchmarks` enabled
+  automatically, since `bench/Cargo.toml` now requests that feature).
+  Expected: prints `hnsw_rs`/`Graph` recall@10 (both against real
+  brute-force ground truth), asserts the `hnsw_rs` baseline recall clears
+  0.8 before trusting the comparison, then runs criterion's QPS
+  measurement for both. Requires the dataset already downloaded per
+  `.claude/docs/design/phase-4-implementation-plan.md`'s Task 7 Step 1 —
+  if missing, run that download step first (same file
+  `vector_search_bench.rs` already depends on).
+
+- [ ] **Step 5: Commit**
+
+  ```bash
+  git add bench/benches/lockfree_vs_hnsw_rs_bench.rs bench/Cargo.toml \
+    crates/index/Cargo.toml crates/index/src/lib.rs crates/index/src/graph.rs \
+    crates/index/src/distance.rs
+  git commit -m "bench(index): recall/QPS comparison between the new lock-free Graph and hnsw_rs"
+  ```
+
+---
+
+<details>
+<summary>Original draft (superseded by the correction above — kept for
+history, do not implement this version)</summary>
+
 **Files:**
 - Create: `crates/index/benches/lockfree_vs_hnsw_rs.rs`
 - Modify: `crates/index/Cargo.toml` (add `[[bench]]` entry, `criterion` dev-dependency if not already present at the workspace level — check `bench/` directory first for an existing harness to extend)
@@ -2372,6 +2520,8 @@ Expected: prints both implementations' timings and the recall comparison. Recall
 git add crates/index/benches/lockfree_vs_hnsw_rs.rs crates/index/Cargo.toml
 git commit -m "bench(index): recall/QPS comparison between the new lock-free Graph and hnsw_rs"
 ```
+
+</details>
 
 ---
 
