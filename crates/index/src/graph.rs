@@ -267,6 +267,53 @@ impl<D: Distance> Graph<D> {
     }
 }
 
+/// Algorithm 3, `SELECT-NEIGHBORS-SIMPLE`: the `m` nearest candidates,
+/// nearest-first. `candidates` need not be pre-sorted.
+fn select_neighbors_simple(candidates: &[(u64, f32)], m: usize) -> Vec<u64> {
+    let mut sorted = candidates.to_vec();
+    sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(CmpOrdering::Equal));
+    sorted.into_iter().take(m).map(|(id, _)| id).collect()
+}
+
+/// Algorithm 4, `SELECT-NEIGHBORS-HEURISTIC`, with `extendCandidates` fixed
+/// to `false` (the paper's own default — "useful only for extremely
+/// clustered data") and `keepPrunedConnections` fixed to `false` (this
+/// design always has more true candidates available from `SEARCH-LAYER`
+/// than any single call needs, so backfilling from discarded candidates
+/// isn't necessary here the way the paper's more general setting
+/// anticipates). `pairwise_dist(a, b)` evaluates the same distance metric
+/// as `candidates`' own distances, between two candidate row-ids — needed
+/// for line 11's diversity check, which compares a candidate against
+/// *other candidates*, not just against the query.
+fn select_neighbors_heuristic(
+    candidates: &[(u64, f32)],
+    m: usize,
+    pairwise_dist: impl Fn(u64, u64) -> f32,
+) -> Vec<u64> {
+    let mut working: Vec<(u64, f32)> = candidates.to_vec();
+    working.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(CmpOrdering::Equal));
+
+    let mut result: Vec<u64> = Vec::new();
+    for (candidate_id, query_dist) in working {
+        if result.len() >= m {
+            break;
+        }
+        // Algorithm 4 line 11's diversity check: keep `candidate_id` only
+        // if it is NOT dominated — i.e. no already-picked neighbor is
+        // closer to this candidate than the candidate itself is to the
+        // query. A dominated candidate is redundant with an existing pick
+        // (same direction, no new information); a non-dominated one
+        // represents a genuinely different direction.
+        let dominated = result
+            .iter()
+            .any(|&picked| pairwise_dist(candidate_id, picked) < query_dist);
+        if !dominated {
+            result.push(candidate_id);
+        }
+    }
+    result
+}
+
 #[cfg(all(test, not(loom)))]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -415,6 +462,46 @@ mod tests {
         assert!(
             results.iter().any(|(id, _)| *id == 1),
             "the filter must not have blocked traversal through node 0 to reach node 1: {results:?}"
+        );
+    }
+
+    #[test]
+    fn select_neighbors_simple_returns_the_m_nearest() {
+        let candidates = vec![(1, 5.0), (2, 1.0), (3, 3.0), (4, 2.0)];
+        let selected = select_neighbors_simple(&candidates, 2);
+        assert_eq!(
+            selected,
+            vec![2, 4],
+            "must return the 2 nearest, in nearest-first order"
+        );
+    }
+
+    #[test]
+    fn select_neighbors_simple_returns_everything_if_m_exceeds_candidate_count() {
+        let candidates = vec![(1, 5.0), (2, 1.0)];
+        let selected = select_neighbors_simple(&candidates, 5);
+        assert_eq!(selected.len(), 2);
+    }
+
+    #[test]
+    fn select_neighbors_heuristic_prunes_a_candidate_dominated_by_an_already_picked_neighbor() {
+        // Candidate 2: dist-to-query 1.0. Candidate 3: dist-to-query 3.0,
+        // but dist(3, 2) = 0.1 — candidate 3 is nearly redundant with
+        // already-picked candidate 2, so the heuristic should skip it in
+        // favor of a more diverse pick (candidate 4) if one exists.
+        let candidates = vec![(2, 1.0), (3, 3.0), (4, 3.1)];
+        let pairwise = |a: u64, b: u64| -> f32 {
+            match (a, b) {
+                (3, 2) | (2, 3) => 0.1, // 3 is nearly redundant with 2
+                (4, 2) | (2, 4) => 5.0, // 4 is genuinely distinct from 2
+                _ => 0.0,
+            }
+        };
+        let selected = select_neighbors_heuristic(&candidates, 2, pairwise);
+        assert_eq!(
+            selected,
+            vec![2, 4],
+            "must prefer the diverse candidate (4) over the redundant one (3), unlike SIMPLE: {selected:?}"
         );
     }
 
