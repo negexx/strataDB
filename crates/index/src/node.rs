@@ -13,8 +13,21 @@ use crate::slot_array::SlotArray;
 pub(crate) struct Node {
     row_id: u64,
     vector: Vec<f32>,
-    /// One `SlotArray` per layer `0..=level`: index 0 has capacity
-    /// `mmax0`, every other index has capacity `mmax`.
+    /// One `SlotArray` per layer `0..=level`: index 0 has physical
+    /// capacity `mmax0 + 1`, every other index has physical capacity
+    /// `mmax + 1`. The `+ 1` is one slot of transient headroom above the
+    /// steady-state target (`mmax0`/`mmax`), not a change to the target
+    /// itself: `Graph::insert`'s shrink step (Algorithm 1 lines 12-16)
+    /// gathers a neighbor's occupied slots and re-runs
+    /// `SELECT-NEIGHBORS-HEURISTIC` only when `occupied.len()` exceeds the
+    /// target, then evicts the losers back down to it. Without this
+    /// headroom, a `SlotArray` sized to exactly the target can never be
+    /// observed over capacity — `claim` just fails once full — so the
+    /// shrink step was structurally unreachable dead code (Task 8 review
+    /// finding: once a node's neighbor list filled up, it could never be
+    /// improved by a later, closer candidate). See
+    /// `insert_shrinks_a_full_neighbor_list_to_keep_the_closer_candidate`
+    /// in `graph.rs` for the regression test.
     layers: Vec<SlotArray>,
     deleted: AtomicBool,
 }
@@ -28,7 +41,7 @@ impl Node {
         mmax: usize,
     ) -> Self {
         let layers = (0..=level)
-            .map(|lc| SlotArray::new(if lc == 0 { mmax0 } else { mmax }))
+            .map(|lc| SlotArray::new(if lc == 0 { mmax0 + 1 } else { mmax + 1 }))
             .collect();
         Self {
             row_id,
@@ -86,16 +99,28 @@ mod tests {
     fn new_node_participates_in_layers_zero_through_level() {
         let node = Node::new(0, vec![1.0, 2.0, 3.0], 2, 32, 16);
         assert_eq!(node.level(), 2);
-        assert_eq!(node.layer(0).capacity(), 32, "layer 0 uses mmax0");
-        assert_eq!(node.layer(1).capacity(), 16, "layer 1 uses mmax");
-        assert_eq!(node.layer(2).capacity(), 16, "layer 2 uses mmax");
+        assert_eq!(
+            node.layer(0).capacity(),
+            33,
+            "layer 0 uses mmax0 + 1 headroom slot"
+        );
+        assert_eq!(
+            node.layer(1).capacity(),
+            17,
+            "layer 1 uses mmax + 1 headroom slot"
+        );
+        assert_eq!(
+            node.layer(2).capacity(),
+            17,
+            "layer 2 uses mmax + 1 headroom slot"
+        );
     }
 
     #[test]
     fn level_zero_node_has_exactly_one_layer() {
         let node = Node::new(0, vec![1.0], 0, 32, 16);
         assert_eq!(node.level(), 0);
-        assert_eq!(node.layer(0).capacity(), 32);
+        assert_eq!(node.layer(0).capacity(), 33, "mmax0 + 1 headroom slot");
     }
 
     #[test]

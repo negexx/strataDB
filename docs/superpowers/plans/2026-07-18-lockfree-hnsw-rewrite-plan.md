@@ -602,8 +602,19 @@ use crate::slot_array::SlotArray;
 pub(crate) struct Node {
     row_id: u64,
     vector: Vec<f32>,
-    /// One `SlotArray` per layer `0..=level`: index 0 has capacity
-    /// `mmax0`, every other index has capacity `mmax`.
+    /// One `SlotArray` per layer `0..=level`: index 0 has physical
+    /// capacity `mmax0 + 1`, every other index has physical capacity
+    /// `mmax + 1`. **Post-Task-8 amendment** (review finding, fixed in the
+    /// same commit range as Task 8): the `+ 1` is one slot of transient
+    /// headroom above the steady-state target `mmax0`/`mmax`, not a
+    /// change to the target itself. Without it, a `SlotArray` sized to
+    /// exactly the target can never be observed over capacity by
+    /// `Graph::insert`'s shrink step (Algorithm 1 lines 12-16) — `claim`
+    /// just fails once full — so the shrink step was structurally
+    /// unreachable dead code (once a node's neighbor list filled up, no
+    /// later, closer candidate could ever displace a worse one). The
+    /// headroom slot lets a new edge land, the existing shrink logic
+    /// fires, and the array settles back to the target size.
     layers: Vec<SlotArray>,
     deleted: AtomicBool,
 }
@@ -611,7 +622,7 @@ pub(crate) struct Node {
 impl Node {
     pub(crate) fn new(row_id: u64, vector: Vec<f32>, level: usize, mmax0: usize, mmax: usize) -> Self {
         let layers = (0..=level)
-            .map(|lc| SlotArray::new(if lc == 0 { mmax0 } else { mmax }))
+            .map(|lc| SlotArray::new(if lc == 0 { mmax0 + 1 } else { mmax + 1 }))
             .collect();
         Self {
             row_id,
@@ -669,16 +680,18 @@ mod tests {
     fn new_node_participates_in_layers_zero_through_level() {
         let node = Node::new(0, vec![1.0, 2.0, 3.0], 2, 32, 16);
         assert_eq!(node.level(), 2);
-        assert_eq!(node.layer(0).capacity(), 32, "layer 0 uses mmax0");
-        assert_eq!(node.layer(1).capacity(), 16, "layer 1 uses mmax");
-        assert_eq!(node.layer(2).capacity(), 16, "layer 2 uses mmax");
+        // Post-Task-8 amendment: physical capacity is mmax0/mmax + 1 (one
+        // headroom slot) — see the `layers` field doc comment above.
+        assert_eq!(node.layer(0).capacity(), 33, "layer 0 uses mmax0 + 1 headroom slot");
+        assert_eq!(node.layer(1).capacity(), 17, "layer 1 uses mmax + 1 headroom slot");
+        assert_eq!(node.layer(2).capacity(), 17, "layer 2 uses mmax + 1 headroom slot");
     }
 
     #[test]
     fn level_zero_node_has_exactly_one_layer() {
         let node = Node::new(0, vec![1.0], 0, 32, 16);
         assert_eq!(node.level(), 0);
-        assert_eq!(node.layer(0).capacity(), 32);
+        assert_eq!(node.layer(0).capacity(), 33, "mmax0 + 1 headroom slot");
     }
 
     #[test]
@@ -1807,6 +1820,21 @@ Expected: PASS — every test in the file, including the three new/updated ones 
 git add crates/index/src/graph.rs
 git commit -m "feat(index): implement INSERT (Algorithm 1) — lock-free bidirectional connection-building via slot-claim/shrink"
 ```
+
+**Post-review amendment (Task 8 FULL SCRUTINY finding):** the shrink step
+above is correctly ordered but was found to be structurally unreachable —
+`SlotArray` is sized to exactly `mmax0`/`mmax` (Task 3), so `occupied.len()
+> capacity` can never be true; `claim` just fails silently once a
+neighbor's list is full. Fixed by sizing each layer's `SlotArray` at
+`mmax0 + 1`/`mmax + 1` instead (see Task 3's amended `Node::new`, above) —
+one slot of transient headroom that lets a new, better edge land before
+the (unchanged) shrink logic prunes the worse one back out. Regression
+test: `insert_shrinks_a_full_neighbor_list_to_keep_the_closer_candidate` in
+`crates/index/src/graph.rs` (verified red without the headroom, green with
+it). The reused `search_layer_traverses_through_an_excluded_node_to_reach_a_node_beyond_it`
+test (Task 6) also gained an explicit topology-precondition assertion, so
+a future regression in `select_neighbors_heuristic`'s diversity pruning
+fails loudly instead of leaving that test passing vacuously.
 
 ---
 

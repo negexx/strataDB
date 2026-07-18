@@ -704,6 +704,21 @@ mod tests {
             .insert(2, vec![10.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.5)
             .unwrap(); // C: live, target
 
+        // Hardens this test against a silent regression: it depends on
+        // SELECT-NEIGHBORS-HEURISTIC's diversity pruning to reproduce the
+        // "no direct A<->C edge" topology (see the comment above), rather
+        // than wiring it by hand. If that pruning behavior ever regressed
+        // and A<->C connected directly, the assertions below would still
+        // pass (C would just be found directly instead of via B) without
+        // ever exercising the property this test exists to prove. Assert
+        // the precondition explicitly so a regression here fails loudly.
+        assert!(
+            !graph.nodes.get(0).unwrap().layer(0).occupied().contains(&2),
+            "topology precondition violated: A must have no direct edge to \
+             C, or the traversal-through-an-excluded-node assertions below \
+             would pass vacuously"
+        );
+
         let results = graph.search_layer(&[10.0, 0.0, 0.0], 0, 5, 0, &|id| id != 1);
         assert!(
             results.iter().all(|(id, _)| *id != 1),
@@ -759,6 +774,50 @@ mod tests {
             "the higher-level node must become the entry point"
         );
         assert!(entry_level > 0);
+    }
+
+    #[test]
+    fn insert_shrinks_a_full_neighbor_list_to_keep_the_closer_candidate() {
+        // Regression test for a Task 8 review finding: with each layer's
+        // `SlotArray` sized to exactly mmax0/mmax (no headroom), `claim`
+        // fails silently once a neighbor's list is full, so the shrink
+        // step (Algorithm 1 lines 12-16) could never observe an oversized
+        // list — it was structurally unreachable dead code. `Node::new`
+        // now sizes each layer's `SlotArray` at `mmax0 + 1`/`mmax + 1`
+        // (see node.rs) so a new, closer candidate has room to land before
+        // the shrink logic prunes the worse existing edge back out.
+        //
+        // m = mmax0 = mmax = 1 throughout, so every node keeps exactly one
+        // layer-0 neighbor once the graph has settled:
+        //   B (origin) gets F1 (far) as its only neighbor first, then F2
+        //   (much closer to B than F1) is inserted and connects to B.
+        //   Without the fix, B's array is already physically full with F1
+        //   and the claim for F2 just fails — B keeps the worse neighbor
+        //   forever. With the fix, the claim succeeds into the headroom
+        //   slot, the shrink step fires, and F1 (farther from B) is the
+        //   one evicted, leaving F2 (closer) as B's sole neighbor.
+        let graph = Graph::new(crate::distance::L2, 10);
+        let m_l = 1.0 / (16f64).ln();
+        graph
+            .insert(0, vec![0.0, 0.0, 0.0], 1, 1, 1, 10, m_l, 0.99)
+            .unwrap(); // B: first node, becomes the entry point
+        graph
+            .insert(1, vec![100.0, 0.0, 0.0], 1, 1, 1, 10, m_l, 0.99)
+            .unwrap(); // F1: far from B, fills B's single layer-0 slot
+        graph
+            .insert(2, vec![0.1, 0.0, 0.0], 1, 1, 1, 10, m_l, 0.99)
+            .unwrap(); // F2: much closer to B than F1 is
+
+        let b = graph.nodes.get(0).unwrap();
+        assert_eq!(
+            b.layer(0).occupied(),
+            vec![2],
+            "B must drop the far neighbor (row 1) and keep the close one \
+             (row 2) once its layer-0 list is full — proves the shrink \
+             step actually runs, not just that claim() silently no-ops \
+             when the array is full: {:?}",
+            b.layer(0).occupied()
+        );
     }
 }
 
