@@ -1063,7 +1063,7 @@ git commit -m "feat(index): add EntryPoint, the graph-level top-layer CAS cell"
 
 **Interfaces:**
 - Consumes: `NodeTable` (Task 2), `Node` (Task 3), `Distance` (Task 4), `EntryPoint` (Task 5).
-- Produces: `pub(crate) struct Graph<D: Distance> { nodes: NodeTable<Node>, entry_point: EntryPoint, distance: D, dimension: AtomicUsize }`, `pub(crate) fn Graph::new(distance: D, expected_capacity: usize) -> Self`, `fn search_layer(&self, query: &[f32], entry: u64, ef: usize, lc: usize) -> Vec<(u64, f32)>` (returns `(row_id, distance)` pairs, nearest-first) — consumed by Task 7's `SELECT-NEIGHBORS-*`, Task 8's `INSERT`, Task 9's `K-NN-SEARCH`.
+- Produces: `pub(crate) struct Graph<D: Distance> { nodes: NodeTable<Node>, entry_point: EntryPoint, distance: D, dimension: AtomicUsize }`, `pub(crate) fn Graph::new(distance: D, expected_capacity: usize) -> Self`, `fn search_layer(&self, query: &[f32], entry: u64, ef: usize, lc: usize, filter: &impl Fn(u64) -> bool) -> Vec<(u64, f32)>` (returns `(row_id, distance)` pairs, nearest-first; `filter` gates entry into the returned result set — composed with the deleted-flag check — but never gates traversal through a node's own edges, matching how the deleted flag itself already behaves; this is the real traversal-time membership predicate that lets `search_filtered`'s `live_ids` push all the way into the search, not just the deleted flag) — consumed by Task 7's `SELECT-NEIGHBORS-*`, Task 8's `INSERT` (which always passes an always-true filter — insert's own internal traversal has no membership concept), Task 9's `K-NN-SEARCH`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1077,7 +1077,7 @@ Add to `crates/index/src/graph.rs`'s existing `mod tests` block (create the `Gra
         graph.insert_for_test(1, vec![10.0, 0.0, 0.0]);
         graph.insert_for_test(2, vec![20.0, 0.0, 0.0]);
 
-        let results = graph.search_layer(&[0.5, 0.0, 0.0], 0, 3, 0);
+        let results = graph.search_layer(&[0.5, 0.0, 0.0], 0, 3, 0, &|_| true);
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].0, 0, "row 0 must be nearest");
         assert!(
@@ -1155,10 +1155,24 @@ impl<D: Distance> Graph<D> {
 
     /// Algorithm 2, `SEARCH-LAYER`. Returns up to `ef` `(row_id, distance)`
     /// pairs, nearest-first, found by greedy traversal from `entry` at
-    /// layer `lc`. Deleted nodes are excluded from the returned result set
-    /// but their edges are still traversed (see design doc §3 — tombstone
-    /// gates entry into `W`, never `neighbourhood(c)` traversal).
-    fn search_layer(&self, query: &[f32], entry: u64, ef: usize, lc: usize) -> Vec<(u64, f32)> {
+    /// layer `lc`. `filter` and the deleted-flag check both gate entry
+    /// into the returned result set `W`, never `neighbourhood(c)`
+    /// traversal — a node excluded by `filter` (or tombstoned) still
+    /// serves as a live waypoint for reaching other nodes, exactly
+    /// mirroring `hnsw_rs`'s own `FilterT` behavior (see the original
+    /// `crates/index/src/hnsw.rs`'s `search_filtered` doc comment: "both
+    /// are applied during hnsw_rs's own traversal... not as a post-filter
+    /// on an already-capped top-k"). This is what lets a caller's
+    /// `live_ids` membership push all the way into traversal-time
+    /// filtering, not just the deleted flag. See design doc §3.
+    fn search_layer(
+        &self,
+        query: &[f32],
+        entry: u64,
+        ef: usize,
+        lc: usize,
+        filter: &impl Fn(u64) -> bool,
+    ) -> Vec<(u64, f32)> {
         let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();
         visited.insert(entry);
 
@@ -1169,7 +1183,7 @@ impl<D: Distance> Graph<D> {
         // Max-heap of the best `ef` results found so far (farthest first, for cheap eviction).
         let mut result: BinaryHeap<Candidate> = BinaryHeap::new();
         if let Some(node) = self.nodes.get(entry) {
-            if !node.is_deleted() {
+            if !node.is_deleted() && filter(entry) {
                 result.push(Candidate { row_id: entry, dist: entry_dist });
             }
         }
@@ -1200,7 +1214,7 @@ impl<D: Distance> Graph<D> {
                 if should_add {
                     candidates.push(std::cmp::Reverse(Candidate { row_id: neighbor_id, dist: neighbor_dist }));
                     if let Some(neighbor_node) = self.nodes.get(neighbor_id) {
-                        if !neighbor_node.is_deleted() {
+                        if !neighbor_node.is_deleted() && filter(neighbor_id) {
                             result.push(Candidate { row_id: neighbor_id, dist: neighbor_dist });
                             if result.len() > ef {
                                 result.pop(); // evict the current furthest
@@ -1253,7 +1267,7 @@ Add to `crates/index/src/graph.rs`'s `mod tests`:
             node0.mark_deleted();
         }
 
-        let results = graph.search_layer(&[0.0, 0.0, 0.0], 1, 5, 0);
+        let results = graph.search_layer(&[0.0, 0.0, 0.0], 1, 5, 0, &|_| true);
         assert!(
             results.iter().all(|(id, _)| *id != 0),
             "a deleted node must never appear in results: {results:?}"
@@ -1263,16 +1277,42 @@ Add to `crates/index/src/graph.rs`'s `mod tests`:
             "the live node must still be found: {results:?}"
         );
     }
+
+    #[test]
+    fn search_layer_filter_excludes_a_live_node_from_results_but_not_from_traversal() {
+        // The direct test for the new membership-predicate parameter:
+        // node 0 fails an external `filter`, but a query routed through 0
+        // must still be able to reach node 1 via 0's edge.
+        let graph = Graph::new(crate::distance::L2, 10);
+        graph.insert_for_test(0, vec![0.0, 0.0, 0.0]);
+        graph.insert_for_test(1, vec![1000.0, 0.0, 0.0]);
+        if let Some(node0) = graph.nodes.get(0) {
+            node0.layer(0).claim(1);
+        }
+        if let Some(node1) = graph.nodes.get(1) {
+            node1.layer(0).claim(0);
+        }
+
+        let results = graph.search_layer(&[0.0, 0.0, 0.0], 1, 5, 0, &|id| id != 0);
+        assert!(
+            results.iter().all(|(id, _)| *id != 0),
+            "a filtered-out node must never appear in results: {results:?}"
+        );
+        assert!(
+            results.iter().any(|(id, _)| *id == 1),
+            "the filter must not have blocked traversal through node 0 to reach node 1: {results:?}"
+        );
+    }
 ```
 
 Run: `cargo test -p strata-index --lib graph::tests`
-Expected: PASS (both tests).
+Expected: PASS (three tests).
 
 - [ ] **Step 6: Commit**
 
 ```bash
 git add crates/index/src/graph.rs
-git commit -m "feat(index): implement SEARCH-LAYER (Algorithm 2)"
+git commit -m "feat(index): implement SEARCH-LAYER (Algorithm 2) with a traversal-time membership filter"
 ```
 
 ---
@@ -1459,7 +1499,7 @@ Replace every use of `insert_for_test` in `crates/index/src/graph.rs`'s existing
         graph.insert(1, vec![10.0, 0.0, 0.0], 16, 32, 16, 100, 1.0 / (16f64).ln(), 0.5).unwrap();
         graph.insert(2, vec![20.0, 0.0, 0.0], 16, 32, 16, 100, 1.0 / (16f64).ln(), 0.5).unwrap();
 
-        let results = graph.search_layer(&[0.5, 0.0, 0.0], 0, 3, 0);
+        let results = graph.search_layer(&[0.5, 0.0, 0.0], 0, 3, 0, &|_| true);
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].0, 0, "row 0 must be nearest");
     }
@@ -1558,7 +1598,10 @@ Add to `crates/index/src/graph.rs`, inside `impl<D: Distance> Graph<D>` (and del
         // top layer down to level+1, to find a good entry point for the
         // real connection-building phase.
         while entry_level > level {
-            let found = self.search_layer(&vector, entry, 1, entry_level);
+            // INSERT's own internal traversal has no membership-predicate
+            // concept — always-true filter, deleted-flag exclusion still
+            // applies via search_layer's own unconditional check.
+            let found = self.search_layer(&vector, entry, 1, entry_level, &|_| true);
             if let Some((nearest, _)) = found.first() {
                 entry = *nearest;
             }
@@ -1569,7 +1612,7 @@ Add to `crates/index/src/graph.rs`, inside `impl<D: Distance> Graph<D>` (and del
         // min(L, l) down to 0.
         let start_layer = entry_level.min(level);
         for lc in (0..=start_layer).rev() {
-            let candidates = self.search_layer(&vector, entry, ef_construction, lc);
+            let candidates = self.search_layer(&vector, entry, ef_construction, lc, &|_| true);
             if let Some((nearest, _)) = candidates.first() {
                 entry = *nearest;
             }
@@ -1660,7 +1703,7 @@ git commit -m "feat(index): implement INSERT (Algorithm 1) — lock-free bidirec
 
 **Interfaces:**
 - Consumes: `search_layer` (Task 6), `EntryPoint` (Task 5).
-- Produces: `pub(crate) fn Graph::k_nn_search(&self, query: &[f32], k: usize, ef: usize) -> Result<Vec<(u64, f32)>, IndexError>`, `pub(crate) fn Graph::delete(&self, row_id: u64)` — consumed by Task 14's `HnswIndex` wrapper.
+- Produces: `pub(crate) fn Graph::k_nn_search(&self, query: &[f32], k: usize, ef: usize, filter: impl Fn(u64) -> bool) -> Result<Vec<(u64, f32)>, IndexError>` (the `filter` parameter is `search_layer`'s traversal-time membership predicate, threaded all the way through both search phases — this is what lets `HnswIndex::search_filtered` push `live_ids` membership into the traversal itself, not a post-filter), `pub(crate) fn Graph::delete(&self, row_id: u64)` — consumed by Task 14's `HnswIndex` wrapper.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1674,7 +1717,7 @@ Add to `crates/index/src/graph.rs`'s `mod tests`:
         for i in 0..10u64 {
             graph.insert(i, vec![i as f32, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.5).unwrap();
         }
-        let results = graph.k_nn_search(&[0.0, 0.0, 0.0], 1, 50).unwrap();
+        let results = graph.k_nn_search(&[0.0, 0.0, 0.0], 1, 50, |_| true).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, 0);
     }
@@ -1687,7 +1730,7 @@ Add to `crates/index/src/graph.rs`'s `mod tests`:
             graph.insert(i, vec![i as f32, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.5).unwrap();
         }
         graph.delete(0);
-        let results = graph.k_nn_search(&[0.0, 0.0, 0.0], 1, 50).unwrap();
+        let results = graph.k_nn_search(&[0.0, 0.0, 0.0], 1, 50, |_| true).unwrap();
         assert_eq!(results.len(), 1);
         assert_ne!(results[0].0, 0, "deleted row must never be returned");
         assert_eq!(results[0].0, 1, "the next-nearest live row must be returned instead");
@@ -1696,8 +1739,21 @@ Add to `crates/index/src/graph.rs`'s `mod tests`:
     #[test]
     fn k_nn_search_on_an_empty_graph_returns_no_results() {
         let graph: Graph<crate::distance::L2> = Graph::new(crate::distance::L2, 10);
-        let results = graph.k_nn_search(&[0.0, 0.0, 0.0], 1, 50).unwrap();
+        let results = graph.k_nn_search(&[0.0, 0.0, 0.0], 1, 50, |_| true).unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn k_nn_search_filter_excludes_a_row_from_results_but_search_still_finds_others_through_it() {
+        let graph = Graph::new(crate::distance::L2, 20);
+        let m_l = 1.0 / (16f64).ln();
+        for i in 0..10u64 {
+            graph.insert(i, vec![i as f32, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.5).unwrap();
+        }
+        let results = graph.k_nn_search(&[0.0, 0.0, 0.0], 1, 50, |id| id != 0).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_ne!(results[0].0, 0, "a filtered-out row must never be returned");
+        assert_eq!(results[0].0, 1, "the next-nearest row passing the filter must be returned instead");
     }
 ```
 
@@ -1714,7 +1770,17 @@ Add to `crates/index/src/graph.rs`, inside `impl<D: Distance> Graph<D>`:
     /// Algorithm 5, `K-NN-SEARCH`. Descends layers `L..1` with `ef=1`
     /// greedy search, then one real `SEARCH-LAYER` at layer 0 with the
     /// caller's actual `ef`. Returns `(row_id, distance)` pairs,
-    /// nearest-first, capped at `k`.
+    /// nearest-first, capped at `k`. `filter` is threaded through every
+    /// `search_layer` call in both phases — matching `hnsw_rs`'s own
+    /// behavior of applying one filter predicate throughout the whole
+    /// search, not just the final layer — so a caller's membership
+    /// predicate (e.g. `HnswIndex::search_filtered`'s `live_ids`) can
+    /// never be silently missed by routing through a node the coarse ef=1
+    /// descent excluded from ITS results (excluding from results never
+    /// blocks traversal — see `search_layer`'s own doc comment — so this
+    /// is safe: the ef=1 phase still finds a good entry point even
+    /// through filtered-out nodes, it just never returns one as that
+    /// phase's own single "nearest" pick unless it passes the filter).
     ///
     /// # Errors
     ///
@@ -1725,6 +1791,7 @@ Add to `crates/index/src/graph.rs`, inside `impl<D: Distance> Graph<D>`:
         query: &[f32],
         k: usize,
         ef: usize,
+        filter: impl Fn(u64) -> bool,
     ) -> Result<Vec<(u64, f32)>, crate::hnsw::IndexError> {
         let established = self.dimension.load(Ordering::SeqCst);
         if established != 0 && query.len() != established {
@@ -1737,13 +1804,13 @@ Add to `crates/index/src/graph.rs`, inside `impl<D: Distance> Graph<D>`:
             return Ok(Vec::new());
         };
         while level >= 1 {
-            let found = self.search_layer(query, entry, 1, level);
+            let found = self.search_layer(query, entry, 1, level, &filter);
             if let Some((nearest, _)) = found.first() {
                 entry = *nearest;
             }
             level -= 1;
         }
-        let mut results = self.search_layer(query, entry, ef, 0);
+        let mut results = self.search_layer(query, entry, ef, 0, &filter);
         results.truncate(k);
         Ok(results)
     }
@@ -1812,7 +1879,7 @@ Add to `crates/index/src/graph.rs`'s `mod tests`:
         // check were broken, row 0 would be the unambiguous nearest
         // (distance 0.0). A correct implementation must instead return
         // row 1, even though it's 1000 units away.
-        let results = graph.k_nn_search(&[0.0, 0.0, 0.0], 1, 50).unwrap();
+        let results = graph.k_nn_search(&[0.0, 0.0, 0.0], 1, 50, |_| true).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(
             results[0].0, 1,
@@ -1890,7 +1957,7 @@ Add to `crates/index/src/graph.rs`'s `mod tests`:
         // own coordinates.
         for row_id in 0..(THREADS * PER_THREAD) {
             let results = graph
-                .k_nn_search(&[row_id as f32, 0.0, 0.0], 1, 200)
+                .k_nn_search(&[row_id as f32, 0.0, 0.0], 1, 200, |_| true)
                 .unwrap();
             assert_eq!(
                 results.len(),
@@ -1940,7 +2007,7 @@ Add to `crates/index/src/graph.rs`'s `mod tests`:
             .unwrap();
 
         for i in 0..5u64 {
-            let results = graph.k_nn_search(&[i as f32, 0.0, 0.0], 1, 50).unwrap();
+            let results = graph.k_nn_search(&[i as f32, 0.0, 0.0], 1, 50, |_| true).unwrap();
             assert_eq!(results[0].0, i);
         }
     }
@@ -2089,7 +2156,7 @@ fn main() {
         .iter()
         .map(|q| {
             graph
-                .k_nn_search(q, K, 50)
+                .k_nn_search(q, K, 50, |_| true)
                 .unwrap()
                 .into_iter()
                 .map(|(id, _)| id)
@@ -2129,7 +2196,7 @@ git commit -m "bench(index): recall/QPS comparison between the new lock-free Gra
 
 ### Task 14: Swap `HnswIndex`'s internals, remove `hnsw_rs`, full verification gate
 
-**⚠️ FULL SCRUTINY — this is the task that proves the "preserve HnswIndex's public API exactly" constraint actually held. Review the adapted tests especially closely: they must test the SAME properties as the original 11, not weaker ones.**
+**⚠️ FULL SCRUTINY — this is the task that proves the "preserve HnswIndex's public API exactly" constraint actually held, including that `search_filtered`'s traversal-time filtering is now genuinely equivalent to the original `hnsw_rs`-backed behavior (per the real membership predicate threaded through Tasks 6-9), not just API-compatible. Review the adapted tests especially closely: they must test the SAME properties as the original 11, not weaker ones.**
 
 **Files:**
 - Modify: `crates/index/src/hnsw.rs` (rewritten)
@@ -2224,10 +2291,9 @@ impl HnswIndex {
         ef_search: usize,
         is_visible: impl Fn(u64) -> bool,
     ) -> Result<Vec<VectorMatch>, IndexError> {
-        let raw = self.graph.k_nn_search(query, k, ef_search)?;
+        let raw = self.graph.k_nn_search(query, k, ef_search, is_visible)?;
         Ok(raw
             .into_iter()
-            .filter(|(id, _)| is_visible(*id))
             .map(|(row_id, dist)| VectorMatch { row_id, squared_distance: dist * dist })
             .collect())
     }
@@ -2240,12 +2306,19 @@ impl HnswIndex {
         live_ids: &[usize],
         is_visible: impl Fn(u64) -> bool,
     ) -> Result<Vec<VectorMatch>, IndexError> {
+        // live_ids membership and is_visible are composed into ONE
+        // predicate passed straight into k_nn_search -> search_layer,
+        // applied during traversal-time result-set construction — not a
+        // post-filter over an already-capped top-k. This matches
+        // hnsw_rs's original FilterT-based behavior exactly: a live_ids
+        // row deep in the graph is never missed just because it fell
+        // outside some pre-guessed widened candidate window, since the
+        // predicate is evaluated as part of the same search, not after it.
         let live: std::collections::HashSet<u64> = live_ids.iter().map(|&id| id as u64).collect();
-        let raw = self.graph.k_nn_search(query, k, ef_search.max(k * live_ids.len().max(1)))?;
+        let filter = move |id: u64| live.contains(&id) && is_visible(id);
+        let raw = self.graph.k_nn_search(query, k, ef_search, filter)?;
         Ok(raw
             .into_iter()
-            .filter(|(id, _)| live.contains(id) && is_visible(*id))
-            .take(k)
             .map(|(row_id, dist)| VectorMatch { row_id, squared_distance: dist * dist })
             .collect())
     }
@@ -2254,7 +2327,7 @@ impl HnswIndex {
 
 `squared_distance`: `Graph::k_nn_search` returns `L2::eval`'s output, which (per `anndists::DistL2`, matching this file's pre-existing verified-behavior comment) is already true (non-squared) Euclidean distance — squaring it here preserves `VectorMatch::squared_distance`'s existing documented units exactly as before.
 
-**Note on `search_filtered`'s widened `ef_search`:** unlike the old `hnsw_rs`-backed version (which pushed `live_ids` membership directly into `hnsw_rs`'s own traversal-time filter via `FilterT`), this rewrite's `k_nn_search` doesn't yet support a traversal-time membership filter — Step 1 works around this with a widened `ef_search` plus a post-filter, which is **weaker** than the original (a `live_ids`-matching row deep in the graph could still be missed if it falls outside the widened candidate set). Flag this explicitly to the reviewer: either (a) accept this as a known, documented gap for this rewrite's first cut (Stage 1 doesn't claim to have solved predicate-narrowed search, only base `search`/`insert`/`delete`), with a follow-up task filed, or (b) thread a real membership predicate into `search_layer` before this task is considered done — this decision should be made explicitly during review, not silently accepted by the implementer.
+This resolves the gap the initial draft of this plan flagged: because Task 9 threads `filter` all the way through `search_layer` (gating result-set entry only, never traversal, exactly like the deleted-flag check), `search_filtered` no longer needs the widened-`ef_search`-plus-post-filter workaround at all — `live_ids` membership is now a real traversal-time predicate, matching `hnsw_rs`'s original `FilterT` behavior with no weakening.
 
 - [ ] **Step 2: Adapt the 11 existing tests**
 
@@ -2314,6 +2387,6 @@ git commit -m "feat(index): swap HnswIndex onto the new lock-free Graph, remove 
 ## Self-Review Notes
 
 - **Spec coverage:** design doc §1 (scope/staging) → Task 8-9's tombstone-flag-only `delete`, no Stage 2 scaffolding anywhere; §2 (node representation) → Tasks 1-3; §3 (algorithm adaptation) → Tasks 6-9; §4 (performance) → Task 4 (`anndists`), Task 12 (`insert_batch`), explicit non-adoptions not implemented anywhere (verified: no quantization, no GPU code, no branchless micro-opt introduced); §5 (testing) → Tasks 1/2/5's loom tests, Task 10's deletion correctness test, Task 11's stress test, Task 13's benchmark, Task 14's adapted original 11.
-- **Placeholder scan:** no TBD/TODO; Task 14's `search_filtered` gap is flagged explicitly as a real, named limitation requiring an explicit reviewer decision, not a silent placeholder.
-- **Type consistency:** `Graph<D: Distance>` used consistently from Task 6 onward; `(u64, f32)` as the `(row_id, distance)` pair shape is consistent across `search_layer`, `k_nn_search`, `select_neighbors_*`; `HnswIndex`'s public signatures (Task 14) match the Global Constraints section verbatim, matching what Phase 6's paused plan depends on.
-- **Known gap surfaced during planning, not swept under the rug:** `search_filtered`'s traversal-time membership filtering is weaker in this rewrite than in the `hnsw_rs`-backed original (post-filter over a widened `ef_search` instead of a true traversal-time predicate) — Task 14 Step 1 flags this explicitly for reviewer decision rather than silently shipping a regression.
+- **Placeholder scan:** no TBD/TODO.
+- **Type consistency:** `Graph<D: Distance>` used consistently from Task 6 onward; `(u64, f32)` as the `(row_id, distance)` pair shape is consistent across `search_layer`, `k_nn_search`, `select_neighbors_*`; `search_layer`'s `filter: &impl Fn(u64) -> bool` and `k_nn_search`'s `filter: impl Fn(u64) -> bool` are consistent in every call site across Tasks 6, 8, 9, 10, 11, 12, 13, 14 (verified: every `search_layer`/`k_nn_search` call updated to pass a filter argument once Task 6 introduced the parameter, either `&|_| true`/`|_| true` for call sites with no membership concept, or a real predicate); `HnswIndex`'s public signatures (Task 14) match the Global Constraints section verbatim, matching what Phase 6's paused plan depends on.
+- **Gap identified during initial planning, then resolved per explicit direction:** the first draft of this plan had `search_filtered` fall back to a widened-`ef_search`-plus-post-filter workaround, weaker than `hnsw_rs`'s original traversal-time `FilterT` behavior. Tasks 6 and 9 now thread a real membership predicate through `search_layer`/`k_nn_search` (gating result-set entry only, never traversal — the same pattern the deleted-flag already used), so Task 14's `search_filtered` composes `live_ids` membership directly into that predicate with no weakening versus the original.
