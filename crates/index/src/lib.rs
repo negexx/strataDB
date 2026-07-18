@@ -5,6 +5,7 @@
 pub mod brute_force;
 pub mod delta_log;
 pub mod hnsw;
+mod node_table;
 mod slot_array;
 
 pub use brute_force::{Neighbor, brute_force_search};
