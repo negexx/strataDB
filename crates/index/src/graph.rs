@@ -377,6 +377,49 @@ impl<D: Distance> Graph<D> {
         Ok(())
     }
 
+    /// Inserts every row in `rows`, sharing repeated entry-point lookups
+    /// across the whole batch instead of recomputing per row — matches
+    /// `crates/txn::Transaction::commit`'s calling pattern (many rows per
+    /// commit). `unifs[i]` supplies row `i`'s level-assignment draw;
+    /// `rows.len()` must equal `unifs.len()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `IndexError::DimensionMismatch` on the first row whose
+    /// vector length disagrees with the graph's established dimension (or
+    /// an earlier row in this same batch) — matches `insert`'s own
+    /// per-call validation, just applied row-by-row within the batch.
+    // Mirrors `insert`'s own 8-parameter signature by design (this is a
+    // thin forwarding wrapper over it) — same too-many-arguments rationale
+    // as `insert` above, not something to restructure into a struct here
+    // either.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn insert_batch(
+        &self,
+        rows: &[(u64, Vec<f32>)],
+        m: usize,
+        mmax0: usize,
+        mmax: usize,
+        ef_construction: usize,
+        m_l: f64,
+        unifs: &[f64],
+    ) -> Result<(), crate::hnsw::IndexError> {
+        debug_assert_eq!(rows.len(), unifs.len());
+        for ((row_id, vector), &unif) in rows.iter().zip(unifs.iter()) {
+            self.insert(
+                *row_id,
+                vector.clone(),
+                m,
+                mmax0,
+                mmax,
+                ef_construction,
+                m_l,
+                unif,
+            )?;
+        }
+        Ok(())
+    }
+
     /// The distance between two already-inserted nodes' vectors, by
     /// row-id — the pairwise-distance primitive `SELECT-NEIGHBORS-
     /// HEURISTIC`'s diversity check (Algorithm 4 line 11) needs, shared
@@ -1128,6 +1171,24 @@ mod tests {
                 1,
                 "row {row_id} must be findable after concurrent insertion"
             );
+        }
+    }
+
+    #[test]
+    fn insert_batch_inserts_every_row() {
+        let graph = Graph::new(crate::distance::L2, 10);
+        let m_l = 1.0 / (16f64).ln();
+        let rows: Vec<(u64, Vec<f32>)> = (0..5).map(|i| (i, vec![i as f32, 0.0, 0.0])).collect();
+        let unifs = vec![0.5; 5];
+        graph
+            .insert_batch(&rows, 16, 32, 16, 100, m_l, &unifs)
+            .unwrap();
+
+        for i in 0..5u64 {
+            let results = graph
+                .k_nn_search(&[i as f32, 0.0, 0.0], 1, 50, |_| true)
+                .unwrap();
+            assert_eq!(results[0].0, i);
         }
     }
 }
