@@ -933,16 +933,7 @@ mod tests {
             .unwrap();
         for i in 1..=8u64 {
             graph
-                .insert(
-                    i,
-                    vec![f32::from(i as u16) * 0.1, 0.0, 0.0],
-                    16,
-                    32,
-                    16,
-                    100,
-                    m_l,
-                    0.9,
-                )
+                .insert(i, vec![i as f32 * 0.1, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.9)
                 .unwrap();
         }
         let (entry_row, entry_level) = graph.entry_point.get().unwrap();
@@ -961,8 +952,7 @@ mod tests {
             results[0].0, 4,
             "must find the true nearest neighbor (row 4, at x=0.4) despite the \
              entry point (row 0, at x=1000.0) being far away and only ef=1 \
-             being used at layer 0: {:?}",
-            results
+             being used at layer 0: {results:?}"
         );
     }
 
