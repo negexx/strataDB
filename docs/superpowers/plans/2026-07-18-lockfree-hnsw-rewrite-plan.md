@@ -1048,6 +1048,18 @@ mod tests {
             Some((7, 255)),
             "an out-of-range level must clamp to the maximum representable value, not wrap"
         );
+
+        // The concrete reachable trigger the original finding named:
+        // assign_level(m_l, 0.0) produces usize::MAX (-ln(0.0) is
+        // f64::INFINITY, saturating-cast to usize::MAX) — must clamp the
+        // same way, not just for the smaller 1000 case above.
+        let ep2 = EntryPoint::new();
+        ep2.advance_if_higher(8, usize::MAX);
+        assert_eq!(
+            ep2.get(),
+            Some((8, 255)),
+            "usize::MAX (assign_level's actual overflow value) must also clamp to 255"
+        );
     }
 }
 ```
