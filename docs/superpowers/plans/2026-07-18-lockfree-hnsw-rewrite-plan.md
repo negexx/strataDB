@@ -13,7 +13,13 @@
 - Branch: `explore/hnsw-lockfree-rewrite` (forked from `origin/main`). Every task's commits land here.
 - **`HnswIndex`'s public API must not change**: `new(MaxConnections, MaxElements, MaxLayers, EfConstruction) -> Result<Self, IndexError>`, `insert(&self, row_id: u64, vector: &[f32]) -> Result<(), IndexError>`, `established_dimension(&self) -> usize`, `search(&self, query: &[f32], k: usize, ef_search: usize, is_visible: impl Fn(u64) -> bool) -> Result<Vec<VectorMatch>, IndexError>`, `search_filtered(&self, query: &[f32], k: usize, ef_search: usize, live_ids: &[usize], is_visible: impl Fn(u64) -> bool) -> Result<Vec<VectorMatch>, IndexError>`. This is what lets Phase 6's already-approved, paused plan resume unmodified.
 - Every concurrency-touching change needs a `loom` test, not just happy-path `cargo test` (`.claude/rules/vector-index.md`).
-- Run loom tests via `cargo rustc -p strata-index --lib --profile test -- --cfg loom`, never a workspace-wide `RUSTFLAGS` (breaks on cross-crate `#[cfg(loom)]` shims elsewhere in the workspace).
+- Run loom tests via `cargo rustc -p strata-index --lib --profile test -- --cfg loom`, never a workspace-wide `RUSTFLAGS` (breaks on cross-crate `#[cfg(loom)]` shims elsewhere in the workspace). **This produces a special test binary that must be run directly — `cargo test -p strata-index --lib loom_tests` afterward silently reports 0 tests**, because that second command rebuilds without `--cfg loom`, compiling the `#[cfg(loom)]`-gated module out entirely (confirmed empirically during Task 5). Find and run the actual binary:
+  ```bash
+  cargo rustc -p strata-index --lib --profile test -- --cfg loom
+  BINARY=$(ls -t target/debug/deps/strata_index-* 2>/dev/null | grep -v '\.d$' | head -1)
+  "$BINARY" loom_tests --test-threads=1
+  ```
+  Every task step below that says "or `cargo test -p strata-index --lib loom_tests` once the build is confirmed" means: use this exact binary-invocation recipe, not a bare `cargo test` re-run.
 - No `crossbeam-epoch`, no hazard pointers, no reclamation scheme anywhere in this plan — Stage 1 never frees live node/edge data. The one `unsafe` raw-pointer pattern that's expected (the chunk-publish race's synchronous drop of a never-shared allocation) needs a `// SAFETY:` comment per task; anything beyond that pattern is a deviation requiring a stop-and-discuss, not silent implementation.
 - No OCC-retry-loop anywhere in `INSERT` — a failed slot CAS is a self-resolving no-op (leave the edge alone), never a retry-worthy error.
 - Stage 2 (active edge cleanup/connectivity repair on delete) is explicitly out of scope. Do not build scaffolding for it beyond the `deleted: AtomicBool` per node that Stage 1 already needs.
