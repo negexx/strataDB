@@ -1040,6 +1040,89 @@ mod tests {
              falling back to the far live node: {results:?}"
         );
     }
+
+    /// Deterministic seeded pseudo-random `unif` in `(0, 1)`, keyed by
+    /// `seed` -- avoids adding a `rand` dependency for a test-only need
+    /// (`unif` is caller-supplied by design; see
+    /// `crate::node::assign_level`'s doc comment). SplitMix64 mixing gives
+    /// a good spread across `[0, 1)` so this stress test's 320 rows
+    /// produce a realistic multi-layer graph instead of every row landing
+    /// on level 0.
+    fn test_unif(seed: u64) -> f64 {
+        let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        ((z >> 11) as f64 / (1u64 << 53) as f64).max(f64::EPSILON)
+    }
+
+    #[test]
+    fn concurrent_inserts_are_all_findable_afterward() {
+        use std::sync::Arc;
+
+        const THREADS: u64 = 16;
+        const PER_THREAD: u64 = 20;
+        let graph = Arc::new(Graph::new(
+            crate::distance::L2,
+            (THREADS * PER_THREAD) as usize,
+        ));
+        let m_l = 1.0 / (16f64).ln();
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let graph = Arc::clone(&graph);
+                std::thread::spawn(move || {
+                    for i in 0..PER_THREAD {
+                        let row_id = t * PER_THREAD + i;
+                        graph
+                            .insert(
+                                row_id,
+                                vec![row_id as f32, 0.0, 0.0],
+                                16,
+                                32,
+                                16,
+                                100,
+                                m_l,
+                                test_unif(row_id),
+                            )
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // Confirm this fixture actually built a multi-layer graph -- a
+        // fixed unif here would silently degrade to a level-0-only graph
+        // and this test would stop proving anything about the descent
+        // loop.
+        let (_, entry_level) = graph.entry_point.get().unwrap();
+        assert!(
+            entry_level >= 1,
+            "the varied-unif fixture must produce a real multi-layer graph, \
+             or this test no longer exercises k_nn_search's descent loop: \
+             entry level = {entry_level}"
+        );
+
+        // Every inserted row must be exactly findable via a query at its
+        // own coordinates -- each of these 320 queries goes through the
+        // real entry point (now at level >= 1), so this recall check
+        // exercises the multi-layer descent for real, not just a single
+        // hand-built case.
+        for row_id in 0..(THREADS * PER_THREAD) {
+            let results = graph
+                .k_nn_search(&[row_id as f32, 0.0, 0.0], 1, 200, |_| true)
+                .unwrap();
+            assert_eq!(
+                results.len(),
+                1,
+                "row {row_id} must be findable after concurrent insertion"
+            );
+        }
+    }
 }
 
 /// Run with: `cargo rustc -p strata-index --lib --profile test -- --cfg loom`
