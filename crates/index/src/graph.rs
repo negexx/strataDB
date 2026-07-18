@@ -1044,10 +1044,14 @@ mod tests {
     /// Deterministic seeded pseudo-random `unif` in `(0, 1)`, keyed by
     /// `seed` -- avoids adding a `rand` dependency for a test-only need
     /// (`unif` is caller-supplied by design; see
-    /// `crate::node::assign_level`'s doc comment). SplitMix64 mixing gives
-    /// a good spread across `[0, 1)` so this stress test's 320 rows
+    /// `crate::node::assign_level`'s doc comment). `SplitMix64` mixing
+    /// gives a good spread across `[0, 1)` so this stress test's 320 rows
     /// produce a realistic multi-layer graph instead of every row landing
     /// on level 0.
+    // Mapping a 53-bit mixed integer into an f64 in [0, 1) is an
+    // intentional, bounded precision reduction, not a bug -- assign_level
+    // only needs a uniform-ish draw, not full u64 precision.
+    #[allow(clippy::cast_precision_loss)]
     fn test_unif(seed: u64) -> f64 {
         let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -1062,6 +1066,9 @@ mod tests {
 
         const THREADS: u64 = 16;
         const PER_THREAD: u64 = 20;
+        // THREADS * PER_THREAD is a small compile-time constant (320),
+        // nowhere near usize::MAX on any real target.
+        #[allow(clippy::cast_possible_truncation)]
         let graph = Arc::new(Graph::new(
             crate::distance::L2,
             (THREADS * PER_THREAD) as usize,
