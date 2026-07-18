@@ -2550,7 +2550,31 @@ git commit -m "bench(index): recall/QPS comparison between the new lock-free Gra
 
 **⚠️ FULL SCRUTINY — this is the task that proves the "preserve HnswIndex's public API exactly" constraint actually held, including that `search_filtered`'s traversal-time filtering is now genuinely equivalent to the original `hnsw_rs`-backed behavior (per the real membership predicate threaded through Tasks 6-9), not just API-compatible. Review the adapted tests especially closely: they must test the SAME properties as the original 11, not weaker ones.**
 
+**Pre-dispatch correction:** Step 1's code below calls
+`self.graph.established_dimension()`, but `Graph` (as it stands after
+Tasks 1-13) has no such method — only a *private*
+`check_or_establish_dimension` (used internally by `Graph::insert`,
+which both establishes AND validates). Add this small, read-only
+reader to `crates/index/src/graph.rs`'s `impl<D: Distance> Graph<D>`
+block (mirroring the exact pattern the old `HnswIndex::established_dimension`
+used, per this task's own Step 2 note that dimension logic "is now
+`Graph`'s"):
+```rust
+/// The vector dimension established by the first-ever `insert` call, or
+/// `0` if none yet. Read-only — never establishes a dimension itself.
+#[must_use]
+pub(crate) fn established_dimension(&self) -> usize {
+    self.dimension.load(Ordering::SeqCst)
+}
+```
+`pub(crate)` is sufficient — `HnswIndex` lives in the same crate. Add
+this as part of Step 1 (before or alongside the `hnsw.rs` rewrite,
+since the rewrite depends on it existing) and include
+`crates/index/src/graph.rs` in the Files list below.
+
 **Files:**
+- Modify: `crates/index/src/graph.rs` (add `Graph::established_dimension`,
+  per the correction above — nothing else in `graph.rs` changes)
 - Modify: `crates/index/src/hnsw.rs` (rewritten)
 - Modify: `crates/index/src/lib.rs` (no export changes expected — verify)
 - Modify: `crates/index/Cargo.toml` (remove `hnsw_rs`)
