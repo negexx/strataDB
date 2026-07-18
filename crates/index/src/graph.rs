@@ -392,6 +392,65 @@ impl<D: Distance> Graph<D> {
         }
     }
 
+    /// Algorithm 5, `K-NN-SEARCH`. Descends layers `L..1` with `ef=1`
+    /// greedy search, then one real `SEARCH-LAYER` at layer 0 with the
+    /// caller's actual `ef`. Returns `(row_id, distance)` pairs,
+    /// nearest-first, capped at `k`. `filter` is threaded through every
+    /// `search_layer` call in both phases — matching `hnsw_rs`'s own
+    /// behavior of applying one filter predicate throughout the whole
+    /// search, not just the final layer — so a caller's membership
+    /// predicate (e.g. `HnswIndex::search_filtered`'s `live_ids`) can
+    /// never be silently missed by routing through a node the coarse ef=1
+    /// descent excluded from ITS results (excluding from results never
+    /// blocks traversal — see `search_layer`'s own doc comment — so this
+    /// is safe: the ef=1 phase still finds a good entry point even
+    /// through filtered-out nodes, it just never returns one as that
+    /// phase's own single "nearest" pick unless it passes the filter).
+    ///
+    /// # Errors
+    ///
+    /// Returns `IndexError::DimensionMismatch` if `query`'s length doesn't
+    /// match this graph's established dimension.
+    pub(crate) fn k_nn_search(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        filter: impl Fn(u64) -> bool,
+    ) -> Result<Vec<(u64, f32)>, crate::hnsw::IndexError> {
+        let established = self.dimension.load(Ordering::SeqCst);
+        if established != 0 && query.len() != established {
+            return Err(crate::hnsw::IndexError::DimensionMismatch {
+                query_len: query.len(),
+                expected: established,
+            });
+        }
+        let Some((mut entry, mut level)) = self.entry_point.get() else {
+            return Ok(Vec::new());
+        };
+        while level >= 1 {
+            let found = self.search_layer(query, entry, 1, level, &filter);
+            if let Some((nearest, _)) = found.first() {
+                entry = *nearest;
+            }
+            level -= 1;
+        }
+        let mut results = self.search_layer(query, entry, ef, 0, &filter);
+        results.truncate(k);
+        Ok(results)
+    }
+
+    /// Marks `row_id` as deleted — excluded from `k_nn_search` results
+    /// from this point on, but its edges remain intact and it continues
+    /// to serve as a live traversal waypoint for other queries (Stage 1's
+    /// tombstone-flag-only scope — see design doc §1/§3). A no-op if
+    /// `row_id` was never inserted.
+    pub(crate) fn delete(&self, row_id: u64) {
+        if let Some(node) = self.nodes.get(row_id) {
+            node.mark_deleted();
+        }
+    }
+
     fn check_or_establish_dimension(&self, len: usize) -> Result<(), crate::hnsw::IndexError> {
         let established = self.dimension.load(Ordering::SeqCst);
         if established == 0 {
@@ -817,6 +876,72 @@ mod tests {
              step actually runs, not just that claim() silently no-ops \
              when the array is full: {:?}",
             b.layer(0).occupied()
+        );
+    }
+
+    #[test]
+    fn k_nn_search_finds_the_true_nearest_neighbor_across_layers() {
+        let graph = Graph::new(crate::distance::L2, 20);
+        let m_l = 1.0 / (16f64).ln();
+        for i in 0..10u64 {
+            graph
+                .insert(i, vec![i as f32, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.5)
+                .unwrap();
+        }
+        let results = graph
+            .k_nn_search(&[0.0, 0.0, 0.0], 1, 50, |_| true)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, 0);
+    }
+
+    #[test]
+    fn delete_excludes_a_row_from_k_nn_search_results() {
+        let graph = Graph::new(crate::distance::L2, 20);
+        let m_l = 1.0 / (16f64).ln();
+        for i in 0..10u64 {
+            graph
+                .insert(i, vec![i as f32, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.5)
+                .unwrap();
+        }
+        graph.delete(0);
+        let results = graph
+            .k_nn_search(&[0.0, 0.0, 0.0], 1, 50, |_| true)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_ne!(results[0].0, 0, "deleted row must never be returned");
+        assert_eq!(
+            results[0].0, 1,
+            "the next-nearest live row must be returned instead"
+        );
+    }
+
+    #[test]
+    fn k_nn_search_on_an_empty_graph_returns_no_results() {
+        let graph: Graph<crate::distance::L2> = Graph::new(crate::distance::L2, 10);
+        let results = graph
+            .k_nn_search(&[0.0, 0.0, 0.0], 1, 50, |_| true)
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn k_nn_search_filter_excludes_a_row_from_results_but_search_still_finds_others_through_it() {
+        let graph = Graph::new(crate::distance::L2, 20);
+        let m_l = 1.0 / (16f64).ln();
+        for i in 0..10u64 {
+            graph
+                .insert(i, vec![i as f32, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.5)
+                .unwrap();
+        }
+        let results = graph
+            .k_nn_search(&[0.0, 0.0, 0.0], 1, 50, |id| id != 0)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_ne!(results[0].0, 0, "a filtered-out row must never be returned");
+        assert_eq!(
+            results[0].0, 1,
+            "the next-nearest row passing the filter must be returned instead"
         );
     }
 }
