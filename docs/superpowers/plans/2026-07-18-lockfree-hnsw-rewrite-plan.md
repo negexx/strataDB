@@ -1539,13 +1539,27 @@ Update Step 1's third test to match the real `select_neighbors_heuristic` signat
     #[test]
     fn select_neighbors_heuristic_prunes_a_candidate_dominated_by_an_already_picked_neighbor() {
         // Candidate 2: dist-to-query 1.0. Candidate 3: dist-to-query 3.0,
-        // but dist(3, 2) = 0.1 — candidate 3 is nearly redundant with
-        // already-picked candidate 2, so the heuristic should skip it in
-        // favor of a more diverse pick (candidate 4) if one exists.
+        // dist(3, 2) = 2.0 — candidate 3 is dominated by already-picked
+        // candidate 2, so the heuristic should skip it in favor of a more
+        // diverse pick (candidate 4) if one exists.
+        //
+        // The 2.0 value is deliberate, not arbitrary: it sits strictly
+        // BETWEEN the two possible reference points a correct-vs-backwards
+        // implementation could compare against — candidate 2's own
+        // query-distance (1.0) and candidate 3's own query-distance
+        // (3.0). This is what makes the test actually discriminate the
+        // correct comparison direction (Algorithm 4 line 11: is the
+        // candidate closer to an already-picked neighbor than the
+        // candidate itself is to the query?) from the backwards one
+        // (comparing against the picked neighbor's query-distance
+        // instead). A smaller value like 0.1 would sit below BOTH
+        // thresholds and pass identically under either comparison
+        // direction, silently failing to catch a swapped-direction
+        // regression — do not "simplify" this back to a small value.
         let candidates = vec![(2, 1.0), (3, 3.0), (4, 3.1)];
         let pairwise = |a: u64, b: u64| -> f32 {
             match (a, b) {
-                (3, 2) | (2, 3) => 0.1, // 3 is nearly redundant with 2
+                (3, 2) | (2, 3) => 2.0, // 3 is dominated by 2 (correct logic: 2.0 < 3.0)
                 (4, 2) | (2, 4) => 5.0, // 4 is genuinely distinct from 2
                 _ => 0.0,
             }
