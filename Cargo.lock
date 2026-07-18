@@ -1837,6 +1837,7 @@ dependencies = [
 name = "strata-index"
 version = "0.1.0"
 dependencies = [
+ "anndists",
  "arrow",
  "hnsw_rs",
  "loom",

@@ -4,6 +4,7 @@
 
 pub mod brute_force;
 pub mod delta_log;
+mod distance;
 pub mod hnsw;
 mod node;
 mod node_table;
