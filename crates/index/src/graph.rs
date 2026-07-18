@@ -258,9 +258,14 @@ impl<D: Distance> Graph<D> {
     /// Algorithm 1, `INSERT`. `unif` is a caller-supplied draw from
     /// `(0, 1)` (exclusive of 0) used for this node's random level
     /// assignment — see `crate::node::assign_level`. No OCC-retry-loop
-    /// exists anywhere in this method: every CAS (slot-claim, slot-clear,
-    /// entry-point-advance) is self-resolving on failure, per design doc
-    /// §3.
+    /// (the `Transaction::commit()` pattern of retrying a whole operation
+    /// after a conflict) exists anywhere in this method: a failed
+    /// slot-claim or slot-clear CAS is simply abandoned, never retried —
+    /// self-resolving, per design doc §3. `EntryPoint::advance_if_higher`
+    /// (called at the end of this method) does loop on CAS failure, but
+    /// that's the ordinary lock-free CAS idiom (re-check a fresh value,
+    /// terminate once it already satisfies the postcondition), not an
+    /// OCC retry — it never re-attempts this method's own work.
     ///
     /// # Errors
     ///

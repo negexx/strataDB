@@ -90,6 +90,25 @@ fn to_fixed_size_list(vectors: &[Vec<f32>]) -> FixedSizeListArray {
     FixedSizeListArray::new(item_field, VECTOR_DIM_I32, values, None)
 }
 
+/// Deterministic seeded pseudo-random `unif` in `(0, 1)`, keyed by `seed` —
+/// `SplitMix64` mixing, same construction as
+/// `graph::tests::concurrent_inserts_are_all_findable_afterward`'s
+/// `test_unif` and production `HnswIndex::insert`'s own `unif` derivation.
+/// **Not decorative**: a fixed `unif` (this file's original version used a
+/// constant `0.5` for every row) makes `assign_level` return `0` for every
+/// single node — a flat, single-layer graph that never exercises
+/// `k_nn_search`'s multi-layer descent loop, so the recall/QPS numbers
+/// below would characterize a configuration production never actually
+/// builds (found in final whole-branch review).
+#[allow(clippy::cast_precision_loss)]
+fn bench_unif(seed: u64) -> f64 {
+    let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    ((z >> 11) as f64 / (1u64 << 53) as f64).max(f64::EPSILON)
+}
+
 /// Recall@`K` of `found` against `truth`, both already capped to `K`.
 fn recall_at_k(found: &[u64], truth: &std::collections::HashSet<u64>) -> f64 {
     let hits = found.iter().filter(|id| truth.contains(id)).count();
@@ -128,7 +147,16 @@ fn bench_lockfree_vs_hnsw_rs(c: &mut Criterion) {
     let m_l = 1.0 / 16f64.ln();
     for (i, v) in vectors.iter().enumerate() {
         graph
-            .insert(i as u64, v.clone(), 16, 32, 16, 200, m_l, 0.5)
+            .insert(
+                i as u64,
+                v.clone(),
+                16,
+                32,
+                16,
+                200,
+                m_l,
+                bench_unif(i as u64),
+            )
             .unwrap();
     }
     let graph_results: Vec<Vec<u64>> = queries
