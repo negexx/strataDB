@@ -115,6 +115,12 @@ The transaction/conflict layer is an explicit, load-bearing architectural compon
 | Catalog integrations, geospatial, full-text search | Product-surface features, not the differentiator |
 | Object storage as the primary backend | Local disk first; cloud backend is Phase 9 |
 
+## Future Considerations (not scheduled — not a Strata roadmap commitment)
+
+Ideas worth remembering but not part of any phase above; revisit only when explicitly raised.
+
+- **Extract the lock-free HNSW engine (`crates/index/src/{slot_array,node_table,node,distance,graph}.rs`) into its own crate.** These modules are already generic — no Strata-specific concepts leak in (row-ids are plain `u64` keys) — so the cut is mostly already there at the module level; what's missing is crate-level separation, with `crates/index`'s `hnsw.rs` becoming a thin Strata-specific adapter over it. Raised because the user may want to keep developing the HNSW engine as a separate, standalone project later; doing the extraction now would make that split much cheaper than untangling interleaved code after more Strata-specific work lands on top. Not started — no crate exists yet.
+
 ## What this doc is NOT
 
 - Not an exhaustive file list — that's discoverable
