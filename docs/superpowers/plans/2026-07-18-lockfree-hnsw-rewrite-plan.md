@@ -2291,63 +2291,82 @@ now resolved:
    with each other" — two implementations can agree while both being
    wrong, or disagree without telling you which is closer to correct.
 
-**Corrected plan:**
+**Post-review amendment (second correction — the `internal-benchmarks`
+Cargo feature approach below does NOT work and must not be
+re-implemented):** Task 13's review caught this empirically: `bench` is
+an ordinary, unconditional workspace member, and Cargo unifies a
+package's features across every unit in the same build graph. Any
+workspace crate requesting `internal-benchmarks` — even only as a
+dev-dependency, even only for its own bench/test targets — makes rustc
+compile, and every OTHER workspace crate link against, the SAME
+feature-enabled `strata-index` rlib under `cargo build --workspace`.
+Moving the dependency to `[dev-dependencies]` narrowed the leak but did
+not fix it: a fully-clean `cargo test --workspace` (this project's own
+documented Test command, and one of the exact commands
+`.github/workflows/ci.yml` runs) still compiled every `strata_index`
+artifact with the feature active and linked it into `strata-cli`'s
+bin+test targets, `strata-txn`'s production lib, and every integration
+test/example in the workspace — silently defeating the entire point of
+gating `pub` behind a feature. There is no placement of the feature
+request within a workspace member that survives whole-workspace
+commands; the only structural fix would be removing `bench` from the
+workspace's `members` list entirely, which is a much bigger change than
+this task warrants.
+
+**Final approach: unconditional `#[doc(hidden)] pub`, no Cargo feature
+at all.** `strata-index` is an internal, unpublished workspace crate
+with no external consumers — "technically reachable via
+`strata_index::graph::Graph`" carries none of the semver/compatibility
+risk it would for a published library. The actual hard constraint (design
+doc: `HnswIndex`'s own public method signatures must never need to
+change) is satisfied either way, since it says nothing about whether
+`Graph` itself happens to be nameable from outside the crate.
+`#[doc(hidden)]` keeps these items out of generated rustdoc (satisfying
+CI's `cargo doc --workspace --no-deps` check) and clearly marks them as
+not a supported API, without any Cargo-resolver subtlety to get wrong.
 
 - **Files:**
   - Create: `bench/benches/lockfree_vs_hnsw_rs_bench.rs` (in the existing
     `bench/` crate, matching its established `_bench.rs` naming and
     `criterion`/`harness = false` pattern — NOT a new
     `crates/index/benches/` directory).
-  - Modify: `crates/index/Cargo.toml` — add:
-    ```toml
-    [features]
-    internal-benchmarks = []
-    ```
-  - Modify: `crates/index/src/lib.rs` — gate `graph`/`distance` module
-    visibility on that feature (private in every normal build; `pub` only
-    when a bench opts in):
+  - Modify: `crates/index/src/lib.rs` — replace the plain
+    `mod distance; mod graph;` lines with:
     ```rust
-    #[cfg(feature = "internal-benchmarks")]
+    #[doc(hidden)]
     pub mod distance;
-    #[cfg(not(feature = "internal-benchmarks"))]
-    mod distance;
-    #[cfg(feature = "internal-benchmarks")]
+    #[doc(hidden)]
     pub mod graph;
-    #[cfg(not(feature = "internal-benchmarks"))]
-    mod graph;
     ```
-    (Replacing the existing plain `mod distance;` / `mod graph;` lines.)
-  - Modify: `crates/index/src/graph.rs` — change `Graph::new`,
-    `Graph::insert`, `Graph::k_nn_search` from `pub(crate) fn` to
-    `pub fn` (harmless when the module itself stays private outside the
-    feature — Rust caps effective visibility at the containing module's;
-    this only becomes truly public when `internal-benchmarks` is also
-    enabled). Every other method on `Graph` (`delete`, `insert_batch`,
-    the private helpers) stays exactly as-is — do not widen anything not
-    listed here.
-  - Modify: `crates/index/src/distance.rs` — change `L2`'s struct
-    declaration (and its `Distance` impl block, which must match the
-    type's own visibility) from `pub(crate)` to `pub`. Leave `Cosine` and
-    `Dot` as `pub(crate)` — this bench only needs `L2`.
-  - Modify: `bench/Cargo.toml` — change the existing
-    `strata-index = { path = "../crates/index" }` line to
-    `strata-index = { path = "../crates/index", features = ["internal-benchmarks"] }`,
-    and add:
+    No Cargo feature, no `#[cfg(...)]` split — unconditionally `pub` in
+    every build.
+  - Modify: `crates/index/src/graph.rs` — change `Graph` (the struct
+    itself — naming the type at all requires this, not just its methods),
+    the `Distance` trait bound it's generic over, and `Graph::new`,
+    `Graph::insert`, `Graph::k_nn_search` from `pub(crate)` to `pub`.
+    Every other method on `Graph` (`delete`, `insert_batch`, the private
+    helpers) stays exactly as-is — do not widen anything not listed here.
+  - Modify: `crates/index/src/distance.rs` — change the `Distance` trait
+    and `L2`'s struct declaration (and its `Distance` impl block) from
+    `pub(crate)` to `pub`. Leave `Cosine` and `Dot` as `pub(crate)` —
+    this bench only needs `L2`.
+  - Modify: `bench/Cargo.toml` — add `hnsw_rs.workspace = true` (not
+    currently a `bench/Cargo.toml` dependency) and:
     ```toml
     [[bench]]
     name = "lockfree_vs_hnsw_rs_bench"
     harness = false
     ```
-    `hnsw_rs` is not currently a `bench/Cargo.toml` dependency — add
-    `hnsw_rs.workspace = true` there too.
+    The existing `strata-index = { path = "../crates/index" }` line
+    needs no change — no feature to request.
 
 - **Interfaces:**
-  - Consumes: `Graph::new`/`insert`/`k_nn_search` (Tasks 8-9, now `pub`
-    behind the feature above), `distance::L2` (Task 4, now `pub` behind
-    the same feature), `strata_index::brute_force_search` (already
-    fully `pub`, unrelated to this feature gate), `hnsw_rs` (still a
-    `crates/index` dependency until Task 14 removes it — this benchmark
-    is the reason it isn't removed before this task runs).
+  - Consumes: `Graph`/`Graph::new`/`insert`/`k_nn_search` (Tasks 8-9, now
+    unconditionally `pub`), `Distance`/`distance::L2` (Task 4, now
+    unconditionally `pub`), `strata_index::brute_force_search` (already
+    fully `pub`), `hnsw_rs` (still a `crates/index` dependency until
+    Task 14 removes it — this benchmark is the reason it isn't removed
+    before this task runs).
   - Produces: nothing consumed by other tasks — this is the empirical
     evidence for the "match/beat hnsw_rs" success bar, referenced in
     Task 14's commit message.
@@ -2360,23 +2379,25 @@ now resolved:
 
 - [ ] **Step 2: Apply the visibility and Cargo.toml changes**
 
-  Exactly as described in the Files section above (feature flag,
-  `lib.rs` module gating, `Graph`/`L2` visibility widening, `bench/Cargo.toml`
-  changes).
+  Exactly as described in the Files section above (`#[doc(hidden)] pub`
+  module/type/method widening, `bench/Cargo.toml` additions).
 
 - [ ] **Step 3: Confirm the rest of the workspace is unaffected**
 
-  Run `cargo build --workspace` and `cargo test -p strata-index --lib`
-  (without the `internal-benchmarks` feature — the default, every other
-  crate's build) to confirm `graph`/`distance` are still private and
-  nothing outside `strata-index` can see them by accident, and that
-  Tasks 1-12's tests still pass unchanged.
+  Run `cargo build --workspace`, `cargo test --workspace`, and
+  `cargo clippy --workspace --all-targets -- -D warnings` (all three —
+  this is exactly what caught the feature-based approach's failure;
+  don't settle for only the first one). `graph`/`distance` are
+  unconditionally `pub` now, so "unaffected" here means: no NEW clippy
+  findings introduced by this widening itself (pre-existing debt in
+  `crates/index` is out of scope), `cargo doc --workspace --no-deps`
+  doesn't surface `graph`/`distance` in generated docs (confirms
+  `#[doc(hidden)]` is doing its job), and Tasks 1-12's tests still pass
+  unchanged.
 
 - [ ] **Step 4: Run the benchmark**
 
-  Run: `cargo bench -p strata-bench --bench lockfree_vs_hnsw_rs_bench`
-  (this builds `strata-index` with `internal-benchmarks` enabled
-  automatically, since `bench/Cargo.toml` now requests that feature).
+  Run: `cargo bench -p strata-bench --bench lockfree_vs_hnsw_rs_bench`.
   Expected: prints `hnsw_rs`/`Graph` recall@10 (both against real
   brute-force ground truth), asserts the `hnsw_rs` baseline recall clears
   0.8 before trusting the comparison, then runs criterion's QPS

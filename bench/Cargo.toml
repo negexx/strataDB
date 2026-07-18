@@ -12,23 +12,13 @@ workspace = true
 arrow.workspace = true
 hnsw_rs.workspace = true
 parquet = "58"
+strata-index = { path = "../crates/index" }
 strata-query = { path = "../crates/query" }
 strata-storage = { path = "../crates/storage" }
 strata-txn = { path = "../crates/txn" }
 
 [dev-dependencies]
 criterion = { workspace = true, features = ["html_reports"] }
-# dev-dependency, not a normal dependency: this crate has no [lib]/[[bin]]
-# target, only [[bench]] entries, which see dev-dependencies. Keeping this
-# out of [dependencies] matters specifically because it requests
-# strata-index's internal-benchmarks feature -- as a normal dependency,
-# Cargo's feature unification would activate that feature (and its pub
-# widening of Graph/distance) for EVERY workspace crate's production build
-# under a plain `cargo build --workspace`, not just this bench, silently
-# defeating the whole point of gating it behind a feature. As a
-# dev-dependency it only activates for test/bench targets, never for
-# another crate's production lib.rs/main.rs build.
-strata-index = { path = "../crates/index", features = ["internal-benchmarks"] }
 
 [[bench]]
 name = "group_by_bench"
