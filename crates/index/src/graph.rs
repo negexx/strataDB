@@ -34,12 +34,25 @@ const NO_ENTRY: u64 = u64::MAX;
 const LEVEL_BITS: u32 = 8;
 const LEVEL_MASK: u64 = (1 << LEVEL_BITS) - 1;
 
+/// Packs `(row_id, level)` into a single `u64`. If `level` exceeds what
+/// `LEVEL_BITS` can represent, it is **clamped** to the maximum
+/// representable value (`LEVEL_MASK`) rather than silently truncated via
+/// the bitmask. A `debug_assert!` alone is not sufficient here: it
+/// compiles to a no-op in release builds, and `crate::node::assign_level`'s
+/// contract permits `unif == 0.0`, which makes `-unif.ln()` evaluate to
+/// `f64::INFINITY` and (via Rust's saturating float-to-int cast)
+/// `usize::MAX` — a real, reachable input once a later task wires
+/// `assign_level`'s output into `advance_if_higher`, not a hypothetical
+/// one. Clamping is a safe degradation: an out-of-range level clamped to
+/// the max representable value can never cause memory unsafety and can
+/// never produce an incorrect *lower* level than intended, just a
+/// possibly-suboptimal (but still valid) entry point. Silently truncating
+/// via the bitmask instead could wrap to an arbitrary, even lower, value —
+/// exactly the "never silently resolved" failure mode this project's
+/// conventions forbid for correctness-relevant state.
 fn pack(row_id: u64, level: usize) -> u64 {
-    debug_assert!(
-        (level as u64) <= LEVEL_MASK,
-        "level must fit in LEVEL_BITS — see this constant's doc comment for why 255 is generous"
-    );
-    (row_id << LEVEL_BITS) | (level as u64 & LEVEL_MASK)
+    let level = (level as u64).min(LEVEL_MASK);
+    (row_id << LEVEL_BITS) | level
 }
 
 fn unpack(packed: u64) -> (u64, usize) {
@@ -135,6 +148,33 @@ mod tests {
             ep.get(),
             Some((5, 3)),
             "neither an equal nor a lower level may replace the current entry point"
+        );
+    }
+
+    #[test]
+    fn advance_if_higher_clamps_an_out_of_range_level_instead_of_wrapping() {
+        let ep = EntryPoint::new();
+        // 1000 exceeds LEVEL_MASK (255). A bitmask truncation (1000 & 0xFF)
+        // would silently wrap to 232 — still a plausible-looking level,
+        // which is exactly the dangerous case: pack() must clamp to 255
+        // instead, never truncate.
+        ep.advance_if_higher(7, 1000);
+        assert_eq!(
+            ep.get(),
+            Some((7, 255)),
+            "an out-of-range level must clamp to the max representable value (255), \
+             not silently wrap via the bitmask"
+        );
+
+        // usize::MAX is the real reachable input this guards against (see
+        // pack()'s doc comment: assign_level(m_l, 0.0) produces exactly
+        // this via a saturating float-to-int cast on f64::INFINITY).
+        let ep2 = EntryPoint::new();
+        ep2.advance_if_higher(11, usize::MAX);
+        assert_eq!(
+            ep2.get(),
+            Some((11, 255)),
+            "usize::MAX must clamp to 255, not truncate to something else"
         );
     }
 }
