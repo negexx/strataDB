@@ -486,13 +486,27 @@ mod tests {
     #[test]
     fn select_neighbors_heuristic_prunes_a_candidate_dominated_by_an_already_picked_neighbor() {
         // Candidate 2: dist-to-query 1.0. Candidate 3: dist-to-query 3.0,
-        // but dist(3, 2) = 0.1 — candidate 3 is nearly redundant with
-        // already-picked candidate 2, so the heuristic should skip it in
-        // favor of a more diverse pick (candidate 4) if one exists.
+        // and dist(3, 2) = 2.0 — candidate 3 is dominated by already-picked
+        // candidate 2, so the heuristic should skip it in favor of a more
+        // diverse pick (candidate 4) if one exists.
+        //
+        // dist(3, 2) = 2.0 is deliberately chosen to sit strictly BETWEEN
+        // the two possible reference points a correct-vs-backwards
+        // implementation could compare it against: the picked neighbor's
+        // own query-distance (dist(2, q) = 1.0) and the candidate's own
+        // query-distance (dist(3, q) = 3.0). The correct check compares
+        // against the candidate's distance (2.0 < 3.0 -> dominated, matches
+        // Algorithm 4 line 11); a backwards implementation that compared
+        // against the picked neighbor's distance instead would see
+        // 2.0 < 1.0 -> false -> NOT dominated, and wrongly keep candidate 3,
+        // producing [2, 3] instead of [2, 4]. A value below both thresholds
+        // (e.g. the previous 0.1) or above both would pass under either
+        // comparison direction and silently fail to catch a swapped
+        // comparison — do not "simplify" this value back down.
         let candidates = vec![(2, 1.0), (3, 3.0), (4, 3.1)];
         let pairwise = |a: u64, b: u64| -> f32 {
             match (a, b) {
-                (3, 2) | (2, 3) => 0.1, // 3 is nearly redundant with 2
+                (3, 2) | (2, 3) => 2.0, // strictly between dist(2,q)=1.0 and dist(3,q)=3.0
                 (4, 2) | (2, 4) => 5.0, // 4 is genuinely distinct from 2
                 _ => 0.0,
             }
