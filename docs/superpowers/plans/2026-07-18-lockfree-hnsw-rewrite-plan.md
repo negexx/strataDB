@@ -314,14 +314,25 @@ use loom::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::ptr;
 
-/// Rows per chunk. Sized so the top-level chunk-pointer directory (sized in
-/// `NodeTable::new` from `expected_capacity`) stays small even at
-/// `crates/txn`'s own enforced row-id ceiling
-/// (`MAX_REASONABLE_ROW_ID_CAPACITY = 1_000_000_000` in
-/// `crates/txn/src/dataset.rs`): `1_000_000_000 / 65536 ≈ 15259` chunk
-/// pointers, ~122KB — cheap regardless of how many chunks are ever
-/// actually allocated, since chunks themselves are demand-allocated.
+/// Rows per chunk. Sized so the top-level chunk-pointer directory (always
+/// sized for `MAX_ROW_ID_CAPACITY`, never the caller's `expected_capacity`
+/// hint — see `NodeTable::new`) stays small even at that ceiling:
+/// `1_000_000_000 / 65536 ≈ 15259` chunk pointers, ~122KB — cheap
+/// regardless of how many chunks are ever actually allocated, since
+/// chunks themselves are demand-allocated.
 const CHUNK_SIZE: usize = 65536;
+
+/// Absolute ceiling on row-ids this table can address — matches
+/// `crates/txn`'s own enforced limit (`MAX_REASONABLE_ROW_ID_CAPACITY` in
+/// `crates/txn/src/dataset.rs`). The directory is always sized for this
+/// ceiling rather than `NodeTable::new`'s `expected_capacity` hint: sizing
+/// from the hint instead would panic on out-of-bounds directory access
+/// for any row-id beyond it, directly contradicting the "never a hard
+/// cap" contract `HnswIndex::new`'s existing `MaxElements` doc comment
+/// already promises. Since chunks are demand-allocated, sizing the
+/// (pointer-only) directory for the full ceiling costs a fixed ~122KB no
+/// matter how small the actual graph is.
+const MAX_ROW_ID_CAPACITY: usize = 1_000_000_000;
 
 struct Chunk<T> {
     slots: Box<[AtomicPtr<T>]>,
@@ -342,13 +353,13 @@ pub(crate) struct NodeTable<T> {
 }
 
 impl<T> NodeTable<T> {
-    /// `expected_capacity` sizes the chunk-pointer directory (a hint, like
-    /// `HnswIndex::new`'s existing `MaxElements` — never a hard cap, since
-    /// inserting beyond it just means every row-id maps into the last
-    /// directory slot's chunk range being reached via `chunk_index`'s plain
-    /// arithmetic; the directory itself is never resized).
+    /// `expected_capacity` is accepted for API symmetry with
+    /// `HnswIndex::new`'s existing `MaxElements` sizing hint but is
+    /// otherwise unused — the chunk-pointer directory is always sized for
+    /// `MAX_ROW_ID_CAPACITY` (see that constant's doc comment for why).
     pub(crate) fn new(expected_capacity: usize) -> Self {
-        let num_chunks = expected_capacity.div_ceil(CHUNK_SIZE).max(1);
+        let _ = expected_capacity;
+        let num_chunks = MAX_ROW_ID_CAPACITY.div_ceil(CHUNK_SIZE).max(1);
         let chunks = (0..num_chunks)
             .map(|_| AtomicPtr::new(ptr::null_mut()))
             .collect::<Vec<_>>()
