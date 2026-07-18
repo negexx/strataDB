@@ -417,6 +417,46 @@ mod tests {
             "the filter must not have blocked traversal through node 0 to reach node 1: {results:?}"
         );
     }
+
+    #[test]
+    fn search_layer_traverses_through_an_excluded_node_to_reach_a_node_beyond_it() {
+        // The core property this whole design fix exists to guarantee,
+        // proven on a THREE-node chain (unlike the two tests above, which
+        // only prove a filtered/deleted node is itself discovered — with
+        // nothing beyond it, they can't tell a real "traversal skips
+        // through it" from a coincidental "it just happens not to matter").
+        // Here A (entry, live) -- B (excluded via filter) -- C (live) are
+        // chained with NO direct A<->C edge, so C is reachable ONLY by
+        // routing through B's own edges. If `filter` ever leaked into the
+        // traversal/expansion path (instead of gating only `result`
+        // entry), B would never be expanded and C would never be found.
+        let graph = Graph::new(crate::distance::L2, 10);
+        graph.insert_for_test(0, vec![0.0, 0.0, 0.0]); // A: entry, live
+        graph.insert_for_test(1, vec![5.0, 0.0, 0.0]); // B: excluded by filter
+        graph.insert_for_test(2, vec![10.0, 0.0, 0.0]); // C: live, target
+        if let Some(node0) = graph.nodes.get(0) {
+            node0.layer(0).claim(1);
+        }
+        if let Some(node1) = graph.nodes.get(1) {
+            node1.layer(0).claim(0);
+            node1.layer(0).claim(2);
+        }
+        if let Some(node2) = graph.nodes.get(2) {
+            node2.layer(0).claim(1);
+        }
+
+        let results = graph.search_layer(&[10.0, 0.0, 0.0], 0, 5, 0, &|id| id != 1);
+        assert!(
+            results.iter().all(|(id, _)| *id != 1),
+            "the excluded middle node must never appear in results: {results:?}"
+        );
+        assert!(
+            results.iter().any(|(id, _)| *id == 2),
+            "traversal must reach row 2 through row 1's edges despite row 1 \
+             being excluded from results — a filtered node must still act \
+             as a live waypoint: {results:?}"
+        );
+    }
 }
 
 /// Run with: `cargo rustc -p strata-index --lib --profile test -- --cfg loom`
