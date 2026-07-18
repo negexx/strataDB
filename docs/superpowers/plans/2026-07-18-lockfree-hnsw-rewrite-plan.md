@@ -923,12 +923,19 @@ const NO_ENTRY: u64 = u64::MAX;
 const LEVEL_BITS: u32 = 8;
 const LEVEL_MASK: u64 = (1 << LEVEL_BITS) - 1;
 
+/// Packs `(row_id, level)`. `level` is clamped to `LEVEL_MASK` (255) with a
+/// hard runtime check, not a `debug_assert!` — reaching this function with
+/// `level > 255` should be practically impossible (see `LEVEL_BITS`'s doc
+/// comment), but a `debug_assert!` alone compiles to a no-op in release
+/// builds, and silently truncating via the bitmask instead of clamping
+/// could wrap an out-of-range level to an arbitrary, even lower, wrong
+/// value — exactly the "silently resolved" failure mode this project's
+/// conventions forbid for correctness-relevant state. Clamping instead
+/// degrades safely: the entry point stays at a valid, merely
+/// possibly-suboptimal level, never a corrupted one.
 fn pack(row_id: u64, level: usize) -> u64 {
-    debug_assert!(
-        (level as u64) <= LEVEL_MASK,
-        "level must fit in LEVEL_BITS — see this constant's doc comment for why 255 is generous"
-    );
-    (row_id << LEVEL_BITS) | (level as u64 & LEVEL_MASK)
+    let level = (level as u64).min(LEVEL_MASK);
+    (row_id << LEVEL_BITS) | level
 }
 
 fn unpack(packed: u64) -> (u64, usize) {
@@ -1026,13 +1033,29 @@ mod tests {
             "neither an equal nor a lower level may replace the current entry point"
         );
     }
+
+    #[test]
+    fn advance_if_higher_clamps_a_level_beyond_the_representable_range_instead_of_wrapping() {
+        // A level this large should never occur in practice (see
+        // LEVEL_BITS's doc comment) — this proves the defensive clamp is
+        // real, not just documented: a naive bitmask-truncate of 1000
+        // (0b11_1110_1000) would wrap to a small, WRONG value, not merely
+        // a clamped-but-still-maximal one.
+        let ep = EntryPoint::new();
+        ep.advance_if_higher(7, 1000);
+        assert_eq!(
+            ep.get(),
+            Some((7, 255)),
+            "an out-of-range level must clamp to the maximum representable value, not wrap"
+        );
+    }
 }
 ```
 
 - [ ] **Step 2: Run tests to verify they pass**
 
 Run: `cargo test -p strata-index --lib graph::tests`
-Expected: PASS (4 tests).
+Expected: PASS (5 tests).
 
 - [ ] **Step 3: Register the module**
 
