@@ -1195,9 +1195,7 @@ impl<D: Distance> Graph<D> {
                 }
             }
             let Some(node) = self.nodes.get(c.row_id) else { continue };
-            if c.row_id > node.level() as u64 {
-                // Defensive: a node's layer-lc slot array only exists for lc <= node.level().
-            }
+            // A node's layer-lc slot array only exists for lc <= node.level().
             if lc > node.level() {
                 continue;
             }
@@ -1410,20 +1408,19 @@ fn select_neighbors_heuristic(
     working.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(CmpOrdering::Equal));
 
     let mut result: Vec<u64> = Vec::new();
-    for (candidate_id, _query_dist) in working {
+    for (candidate_id, query_dist) in working {
         if result.len() >= m {
             break;
         }
-        let closer_to_an_existing_pick = result
+        // Algorithm 4 line 11's diversity check: keep `candidate_id` only
+        // if it is NOT dominated — i.e. no already-picked neighbor is
+        // closer to this candidate than the candidate itself is to the
+        // query. A dominated candidate is redundant with an existing pick
+        // (same direction, no new information); a non-dominated one
+        // represents a genuinely different direction.
+        let dominated = result
             .iter()
-            .any(|&picked| pairwise_dist(candidate_id, picked) < pairwise_dist(candidate_id, candidate_id));
-        // A candidate is kept if it is NOT dominated by (closer to) an
-        // already-picked neighbor than it is novel relative to the
-        // query — Algorithm 4 line 11's diversity check.
-        let dominated = result.iter().any(|&picked| {
-            pairwise_dist(candidate_id, picked) < candidates.iter().find(|c| c.0 == candidate_id).map(|c| c.1).unwrap_or(f32::INFINITY)
-        });
-        let _ = closer_to_an_existing_pick; // superseded by `dominated`'s equivalent, more literal translation below
+            .any(|&picked| pairwise_dist(candidate_id, picked) < query_dist);
         if !dominated {
             result.push(candidate_id);
         }
@@ -1616,12 +1613,8 @@ Add to `crates/index/src/graph.rs`, inside `impl<D: Distance> Graph<D>` (and del
             if let Some((nearest, _)) = candidates.first() {
                 entry = *nearest;
             }
-            let pairwise = |a: u64, b: u64| self.distance.eval(
-                self.nodes.get(a).map(Node::vector).unwrap_or(&[]),
-                self.nodes.get(b).map(Node::vector).unwrap_or(&[]),
-            );
             let capacity = if lc == 0 { mmax0 } else { mmax };
-            let chosen = select_neighbors_heuristic(&candidates, m, pairwise);
+            let chosen = select_neighbors_heuristic(&candidates, m, |a, b| self.pairwise_distance(a, b));
 
             let Some(new_node) = self.nodes.get(row_id) else { continue };
             for &neighbor_id in &chosen {
@@ -1632,23 +1625,11 @@ Add to `crates/index/src/graph.rs`, inside `impl<D: Distance> Graph<D>` (and del
                         // Shrink the neighbor's list if it now exceeds capacity.
                         let occupied = neighbor_node.layer(lc).occupied();
                         if occupied.len() > capacity {
-                            let neighbor_vec = neighbor_node.vector().to_vec();
                             let with_dists: Vec<(u64, f32)> = occupied
                                 .iter()
-                                .map(|&id| {
-                                    let dist = self
-                                        .nodes
-                                        .get(id)
-                                        .map(|n| self.distance.eval(&neighbor_vec, n.vector()))
-                                        .unwrap_or(f32::INFINITY);
-                                    (id, dist)
-                                })
+                                .map(|&id| (id, self.pairwise_distance(neighbor_id, id)))
                                 .collect();
-                            let pairwise2 = |a: u64, b: u64| self.distance.eval(
-                                self.nodes.get(a).map(Node::vector).unwrap_or(&[]),
-                                self.nodes.get(b).map(Node::vector).unwrap_or(&[]),
-                            );
-                            let keep = select_neighbors_heuristic(&with_dists, capacity, pairwise2);
+                            let keep = select_neighbors_heuristic(&with_dists, capacity, |a, b| self.pairwise_distance(a, b));
                             let to_remove: Vec<u64> = occupied
                                 .into_iter()
                                 .filter(|id| !keep.contains(id))
@@ -1662,6 +1643,21 @@ Add to `crates/index/src/graph.rs`, inside `impl<D: Distance> Graph<D>` (and del
 
         self.entry_point.advance_if_higher(row_id, level);
         Ok(())
+    }
+
+    /// The distance between two already-inserted nodes' vectors, by
+    /// row-id — the pairwise-distance primitive `SELECT-NEIGHBORS-
+    /// HEURISTIC`'s diversity check (Algorithm 4 line 11) needs, shared
+    /// between the initial connection-building and the shrink step so
+    /// neither duplicates the other's lookup-and-eval logic. Returns
+    /// `f32::INFINITY` if either row-id has no node (should not happen
+    /// for row-ids drawn from this same `insert` call's own candidate
+    /// set, but fails safe rather than panicking if it ever does).
+    fn pairwise_distance(&self, a: u64, b: u64) -> f32 {
+        match (self.nodes.get(a), self.nodes.get(b)) {
+            (Some(node_a), Some(node_b)) => self.distance.eval(node_a.vector(), node_b.vector()),
+            _ => f32::INFINITY,
+        }
     }
 
     fn check_or_establish_dimension(&self, len: usize) -> Result<(), crate::hnsw::IndexError> {
@@ -1680,7 +1676,7 @@ Add to `crates/index/src/graph.rs`, inside `impl<D: Distance> Graph<D>` (and del
     }
 ```
 
-This method is long because `INSERT` genuinely is the most involved algorithm in the paper — do not split it into more `pub(crate)` sub-methods than shown here; the private helper closures (`pairwise`) are intentionally kept inline/local since they're only meaningful within one call.
+This method is long because `INSERT` genuinely is the most involved algorithm in the paper — do not split it into more `pub(crate)` sub-methods than shown here, beyond the `pairwise_distance` helper above (which exists specifically to avoid duplicating the same lookup-and-eval logic between the initial connection-building step and the shrink step).
 
 - [ ] **Step 4: Run tests to verify they pass**
 
