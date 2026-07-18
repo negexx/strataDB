@@ -1005,6 +1005,41 @@ mod tests {
             "the next-nearest row passing the filter must be returned instead"
         );
     }
+
+    #[test]
+    fn deleted_node_is_never_returned_even_when_queried_at_its_own_exact_location() {
+        // The discriminating test, per this project's own Phase 5 lesson
+        // (crates/txn/tests/concurrent_snapshot_isolation.rs): querying
+        // somewhere a broken deleted-flag check and a correct one would
+        // look identical proves nothing. Querying AT the deleted node's
+        // own coordinates is where a broken check would return it as the
+        // unambiguous true nearest neighbor — a correct check must fall
+        // back to the next-nearest live node instead.
+        let graph = Graph::new(crate::distance::L2, 20);
+        let m_l = 1.0 / (16f64).ln();
+        graph
+            .insert(0, vec![0.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.5)
+            .unwrap();
+        graph
+            .insert(1, vec![1000.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.5)
+            .unwrap();
+
+        graph.delete(0);
+
+        // Querying exactly at row 0's own location: if the deleted-flag
+        // check were broken, row 0 would be the unambiguous nearest
+        // (distance 0.0). A correct implementation must instead return
+        // row 1, even though it's 1000 units away.
+        let results = graph
+            .k_nn_search(&[0.0, 0.0, 0.0], 1, 50, |_| true)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].0, 1,
+            "querying at the deleted node's own location must still exclude it, \
+             falling back to the far live node: {results:?}"
+        );
+    }
 }
 
 /// Run with: `cargo rustc -p strata-index --lib --profile test -- --cfg loom`
