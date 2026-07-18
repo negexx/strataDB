@@ -4,7 +4,13 @@
 
 pub mod brute_force;
 pub mod delta_log;
+#[cfg(feature = "internal-benchmarks")]
+pub mod distance;
+#[cfg(not(feature = "internal-benchmarks"))]
 mod distance;
+#[cfg(feature = "internal-benchmarks")]
+pub mod graph;
+#[cfg(not(feature = "internal-benchmarks"))]
 mod graph;
 pub mod hnsw;
 mod node;

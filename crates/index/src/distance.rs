@@ -8,13 +8,13 @@ use anndists::dist::{DistCosine, DistL2 as AnnDistsL2, Distance as AnnDistance};
 /// where smaller means "more similar" — callers needing true similarity
 /// (e.g. cosine similarity, where larger is more similar) should return
 /// its negation or complement, matching `anndists`' own convention.
-pub(crate) trait Distance: Send + Sync {
+pub trait Distance: Send + Sync {
     fn eval(&self, a: &[f32], b: &[f32]) -> f32;
 }
 
 /// Euclidean (L2) distance — Strata's existing default, matching today's
 /// `hnsw_rs`-backed `DistL2` usage exactly.
-pub(crate) struct L2;
+pub struct L2;
 
 impl Distance for L2 {
     fn eval(&self, a: &[f32], b: &[f32]) -> f32 {

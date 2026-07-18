@@ -117,7 +117,7 @@ impl EntryPoint {
     }
 }
 
-pub(crate) struct Graph<D: Distance> {
+pub struct Graph<D: Distance> {
     nodes: NodeTable<Node>,
     entry_point: EntryPoint,
     distance: D,
@@ -148,7 +148,7 @@ impl Ord for Candidate {
 }
 
 impl<D: Distance> Graph<D> {
-    pub(crate) fn new(distance: D, expected_capacity: usize) -> Self {
+    pub fn new(distance: D, expected_capacity: usize) -> Self {
         Self {
             nodes: NodeTable::new(expected_capacity),
             entry_point: EntryPoint::new(),
@@ -275,7 +275,7 @@ impl<D: Distance> Graph<D> {
     // 14's `HnswIndex` wrapper), not something to restructure into a
     // struct just to satisfy the lint.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn insert(
+    pub fn insert(
         &self,
         row_id: u64,
         vector: Vec<f32>,
@@ -459,7 +459,7 @@ impl<D: Distance> Graph<D> {
     ///
     /// Returns `IndexError::DimensionMismatch` if `query`'s length doesn't
     /// match this graph's established dimension.
-    pub(crate) fn k_nn_search(
+    pub fn k_nn_search(
         &self,
         query: &[f32],
         k: usize,

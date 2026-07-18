@@ -10,8 +10,9 @@ workspace = true
 
 [dependencies]
 arrow.workspace = true
+hnsw_rs.workspace = true
 parquet = "58"
-strata-index = { path = "../crates/index" }
+strata-index = { path = "../crates/index", features = ["internal-benchmarks"] }
 strata-query = { path = "../crates/query" }
 strata-storage = { path = "../crates/storage" }
 strata-txn = { path = "../crates/txn" }
@@ -25,4 +26,8 @@ harness = false
 
 [[bench]]
 name = "vector_search_bench"
+harness = false
+
+[[bench]]
+name = "lockfree_vs_hnsw_rs_bench"
 harness = false
