@@ -886,35 +886,68 @@ Create `crates/index/src/graph.rs`:
 //! `docs/superpowers/specs/2026-07-18-lockfree-hnsw-rewrite-design.md`.
 
 #[cfg(loom)]
-use loom::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use loom::sync::atomic::{AtomicU64, Ordering};
 #[cfg(not(loom))]
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::node::assign_level;
-use crate::slot_array::EMPTY as NO_ENTRY;
+
+/// Sentinel for "the graph has no nodes yet" — see `EntryPoint::new`.
+const NO_ENTRY: u64 = u64::MAX;
+
+/// `(row_id, level)` are packed into the low/high bits of a single
+/// `AtomicU64` and updated with ONE compare-exchange, not two separate
+/// atomics. This is not stylistic: an earlier version of this design used
+/// two separate atomics (`row_id: AtomicU64, level: AtomicUsize`) updated
+/// as two sequential operations, and loom found a genuine torn-state race
+/// — a thread can win the `row_id` CAS with a lower level, get preempted
+/// before its own `level.store`, let a higher-level thread complete its
+/// *entire* update, and then blindly overwrite the winner's correct level
+/// with its own stale one, producing a `(row_id, level)` pair neither
+/// thread ever proposed. Packing both fields into one atomic makes that
+/// class of bug structurally impossible: there is only ever one
+/// consistent `(row_id, level)` pair in existence at a time, because there
+/// is only one atomic word holding it.
+///
+/// `LEVEL_BITS = 8` (max representable level 255) is enormously generous:
+/// per the paper's own formula, expected max level for N nodes is roughly
+/// `mL * ln(N)` — for N at `crates/txn`'s own row-id ceiling of
+/// 1,000,000,000 and `mL = 1/ln(16) ≈ 0.36`, that's `0.36 * ln(1e9) ≈ 7.5`,
+/// vastly under 255 even accounting for statistical outliers.
+const LEVEL_BITS: u32 = 8;
+const LEVEL_MASK: u64 = (1 << LEVEL_BITS) - 1;
+
+fn pack(row_id: u64, level: usize) -> u64 {
+    debug_assert!(
+        (level as u64) <= LEVEL_MASK,
+        "level must fit in LEVEL_BITS — see this constant's doc comment for why 255 is generous"
+    );
+    (row_id << LEVEL_BITS) | (level as u64 & LEVEL_MASK)
+}
+
+fn unpack(packed: u64) -> (u64, usize) {
+    (packed >> LEVEL_BITS, (packed & LEVEL_MASK) as usize)
+}
 
 /// The graph's current top-layer entry point: which node, at which level.
-/// `EMPTY` in `row_id` means the graph has no nodes yet.
 pub(crate) struct EntryPoint {
-    row_id: AtomicU64,
-    level: AtomicUsize,
+    packed: AtomicU64,
 }
 
 impl EntryPoint {
     pub(crate) fn new() -> Self {
         Self {
-            row_id: AtomicU64::new(NO_ENTRY),
-            level: AtomicUsize::new(0),
+            packed: AtomicU64::new(NO_ENTRY),
         }
     }
 
     /// Returns `Some((row_id, level))`, or `None` if the graph is empty.
     pub(crate) fn get(&self) -> Option<(u64, usize)> {
-        let row_id = self.row_id.load(Ordering::SeqCst);
-        if row_id == NO_ENTRY {
+        let packed = self.packed.load(Ordering::SeqCst);
+        if packed == NO_ENTRY {
             return None;
         }
-        Some((row_id, self.level.load(Ordering::SeqCst)))
+        Some(unpack(packed))
     }
 
     /// Advances the entry point to `(row_id, level)` if the graph is
@@ -922,26 +955,29 @@ impl EntryPoint {
     /// level — matching Algorithm 1 step 18-19 ("if l > L, set enter
     /// point for hnsw to q"). A losing race here just means some other
     /// node's insert already advanced (or is concurrently advancing) to
-    /// an equal-or-higher level — never retried, self-resolving like every
-    /// other CAS in this design.
+    /// an equal-or-higher level — never retried beyond re-checking against
+    /// the fresh value, self-resolving like every other CAS in this
+    /// design.
     pub(crate) fn advance_if_higher(&self, row_id: u64, level: usize) {
+        let new_packed = pack(row_id, level);
         loop {
-            let current = self.row_id.load(Ordering::SeqCst);
-            let current_level = self.level.load(Ordering::SeqCst);
-            if current != NO_ENTRY && level <= current_level {
-                return;
+            let current = self.packed.load(Ordering::SeqCst);
+            if current != NO_ENTRY {
+                let (_, current_level) = unpack(current);
+                if level <= current_level {
+                    return;
+                }
             }
             if self
-                .row_id
-                .compare_exchange(current, row_id, Ordering::SeqCst, Ordering::SeqCst)
+                .packed
+                .compare_exchange(current, new_packed, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
             {
-                self.level.store(level, Ordering::SeqCst);
                 return;
             }
-            // Lost the race for row_id — loop and re-check: the winner
-            // may or may not have set a level high enough that we no
-            // longer need to advance at all.
+            // Lost the race — loop and re-check against the fresh value:
+            // the winner may or may not have advanced to a level high
+            // enough that we no longer need to advance at all.
         }
     }
 }
