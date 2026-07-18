@@ -3,11 +3,16 @@
 //! `docs/superpowers/specs/2026-07-18-lockfree-hnsw-rewrite-design.md`.
 
 #[cfg(loom)]
-use loom::sync::atomic::{AtomicU64, Ordering};
+use loom::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 #[cfg(not(loom))]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use crate::node::assign_level;
+use std::cmp::Ordering as CmpOrdering;
+use std::collections::BinaryHeap;
+
+use crate::distance::Distance;
+use crate::node::{Node, assign_level};
+use crate::node_table::NodeTable;
 
 /// Sentinel for "the graph has no nodes yet" — see `EntryPoint::new`.
 const NO_ENTRY: u64 = u64::MAX;
@@ -112,6 +117,156 @@ impl EntryPoint {
     }
 }
 
+pub(crate) struct Graph<D: Distance> {
+    nodes: NodeTable<Node>,
+    entry_point: EntryPoint,
+    distance: D,
+    dimension: AtomicUsize,
+    #[cfg(test)]
+    next_test_row_id: AtomicU64, // test-only bookkeeping; removed in Task 8's cleanup along with insert_for_test
+}
+
+/// A `(row_id, distance)` pair ordered so a `BinaryHeap` behaves as a
+/// min-heap by distance (nearest first) when wrapped in `Reverse`, or as a
+/// max-heap (farthest first, for evicting the worst candidate from a
+/// capped result set) when used directly — see `search_layer`'s two heaps.
+#[derive(Clone, Copy, PartialEq)]
+struct Candidate {
+    row_id: u64,
+    dist: f32,
+}
+impl Eq for Candidate {}
+impl PartialOrd for Candidate {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Candidate {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        self.dist
+            .partial_cmp(&other.dist)
+            .unwrap_or(CmpOrdering::Equal)
+    }
+}
+
+impl<D: Distance> Graph<D> {
+    pub(crate) fn new(distance: D, expected_capacity: usize) -> Self {
+        Self {
+            nodes: NodeTable::new(expected_capacity),
+            entry_point: EntryPoint::new(),
+            distance,
+            dimension: AtomicUsize::new(0),
+            #[cfg(test)]
+            next_test_row_id: AtomicU64::new(0),
+        }
+    }
+
+    #[cfg(test)]
+    fn insert_for_test(&self, row_id: u64, vector: Vec<f32>) {
+        let node = Node::new(row_id, vector, 0, 32, 16);
+        self.nodes.insert(row_id, node);
+        self.entry_point.advance_if_higher(row_id, 0);
+    }
+
+    /// Algorithm 2, `SEARCH-LAYER`. Returns up to `ef` `(row_id, distance)`
+    /// pairs, nearest-first, found by greedy traversal from `entry` at
+    /// layer `lc`. `filter` and the deleted-flag check both gate entry
+    /// into the returned result set `W`, never `neighbourhood(c)`
+    /// traversal — a node excluded by `filter` (or tombstoned) still
+    /// serves as a live waypoint for reaching other nodes, exactly
+    /// mirroring `hnsw_rs`'s own `FilterT` behavior (see the original
+    /// `crates/index/src/hnsw.rs`'s `search_filtered` doc comment: "both
+    /// are applied during `hnsw_rs`'s own traversal... not as a post-filter
+    /// on an already-capped top-k"). This is what lets a caller's
+    /// `live_ids` membership push all the way into traversal-time
+    /// filtering, not just the deleted flag. See design doc §3.
+    fn search_layer(
+        &self,
+        query: &[f32],
+        entry: u64,
+        ef: usize,
+        lc: usize,
+        filter: &impl Fn(u64) -> bool,
+    ) -> Vec<(u64, f32)> {
+        let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        visited.insert(entry);
+
+        let entry_dist = self.distance_to(query, entry);
+        // Min-heap of candidates still to explore (nearest first via `Reverse`).
+        let mut candidates: BinaryHeap<std::cmp::Reverse<Candidate>> = BinaryHeap::new();
+        candidates.push(std::cmp::Reverse(Candidate {
+            row_id: entry,
+            dist: entry_dist,
+        }));
+        // Max-heap of the best `ef` results found so far (farthest first, for cheap eviction).
+        let mut result: BinaryHeap<Candidate> = BinaryHeap::new();
+        if let Some(node) = self.nodes.get(entry)
+            && !node.is_deleted()
+            && filter(entry)
+        {
+            result.push(Candidate {
+                row_id: entry,
+                dist: entry_dist,
+            });
+        }
+
+        while let Some(std::cmp::Reverse(c)) = candidates.pop() {
+            if let Some(furthest) = result.peek()
+                && c.dist > furthest.dist
+                && result.len() >= ef
+            {
+                break; // Algorithm 2 line 7-8: all of W is settled.
+            }
+            let Some(node) = self.nodes.get(c.row_id) else {
+                continue;
+            };
+            // A node's layer-lc slot array only exists for lc <= node.level().
+            if lc > node.level() {
+                continue;
+            }
+            for neighbor_id in node.layer(lc).occupied() {
+                if visited.contains(&neighbor_id) {
+                    continue;
+                }
+                visited.insert(neighbor_id);
+                let neighbor_dist = self.distance_to(query, neighbor_id);
+                let should_add = match result.peek() {
+                    Some(furthest) => neighbor_dist < furthest.dist || result.len() < ef,
+                    None => true,
+                };
+                if should_add {
+                    candidates.push(std::cmp::Reverse(Candidate {
+                        row_id: neighbor_id,
+                        dist: neighbor_dist,
+                    }));
+                    if let Some(neighbor_node) = self.nodes.get(neighbor_id)
+                        && !neighbor_node.is_deleted()
+                        && filter(neighbor_id)
+                    {
+                        result.push(Candidate {
+                            row_id: neighbor_id,
+                            dist: neighbor_dist,
+                        });
+                        if result.len() > ef {
+                            result.pop(); // evict the current furthest
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut out: Vec<(u64, f32)> = result.into_iter().map(|c| (c.row_id, c.dist)).collect();
+        out.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(CmpOrdering::Equal));
+        out
+    }
+
+    fn distance_to(&self, query: &[f32], row_id: u64) -> f32 {
+        self.nodes
+            .get(row_id)
+            .map_or(f32::INFINITY, |n| self.distance.eval(query, n.vector()))
+    }
+}
+
 #[cfg(all(test, not(loom)))]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -175,6 +330,91 @@ mod tests {
             ep2.get(),
             Some((11, 255)),
             "usize::MAX must clamp to 255, not truncate to something else"
+        );
+    }
+
+    #[test]
+    fn search_layer_finds_the_true_nearest_neighbor_in_a_small_graph() {
+        let graph = Graph::new(crate::distance::L2, 10);
+        graph.insert_for_test(0, vec![0.0, 0.0, 0.0]);
+        graph.insert_for_test(1, vec![10.0, 0.0, 0.0]);
+        graph.insert_for_test(2, vec![20.0, 0.0, 0.0]);
+        // insert_for_test alone doesn't create edges (see the comment on
+        // search_layer_excludes_a_deleted_node_from_results below) — wire a
+        // 0 <-> 1 <-> 2 chain so greedy traversal from entry 0 can actually
+        // reach rows 1 and 2, exactly like INSERT will once Task 8 exists.
+        if let Some(node0) = graph.nodes.get(0) {
+            node0.layer(0).claim(1);
+        }
+        if let Some(node1) = graph.nodes.get(1) {
+            node1.layer(0).claim(0);
+            node1.layer(0).claim(2);
+        }
+        if let Some(node2) = graph.nodes.get(2) {
+            node2.layer(0).claim(1);
+        }
+
+        let results = graph.search_layer(&[0.5, 0.0, 0.0], 0, 3, 0, &|_| true);
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].0, 0, "row 0 must be nearest");
+        assert!(
+            results[0].1 <= results[1].1 && results[1].1 <= results[2].1,
+            "results must be nearest-first: {results:?}"
+        );
+    }
+
+    #[test]
+    fn search_layer_excludes_a_deleted_node_from_results() {
+        let graph = Graph::new(crate::distance::L2, 10);
+        graph.insert_for_test(0, vec![0.0, 0.0, 0.0]);
+        graph.insert_for_test(1, vec![10.0, 0.0, 0.0]);
+        // Manually wire an edge 0 <-> 1 at layer 0, mirroring what INSERT
+        // will do once Task 8 exists — insert_for_test alone doesn't
+        // create edges.
+        if let Some(node0) = graph.nodes.get(0) {
+            node0.layer(0).claim(1);
+        }
+        if let Some(node1) = graph.nodes.get(1) {
+            node1.layer(0).claim(0);
+        }
+        if let Some(node0) = graph.nodes.get(0) {
+            node0.mark_deleted();
+        }
+
+        let results = graph.search_layer(&[0.0, 0.0, 0.0], 1, 5, 0, &|_| true);
+        assert!(
+            results.iter().all(|(id, _)| *id != 0),
+            "a deleted node must never appear in results: {results:?}"
+        );
+        assert!(
+            results.iter().any(|(id, _)| *id == 1),
+            "the live node must still be found: {results:?}"
+        );
+    }
+
+    #[test]
+    fn search_layer_filter_excludes_a_live_node_from_results_but_not_from_traversal() {
+        // The direct test for the new membership-predicate parameter:
+        // node 0 fails an external `filter`, but a query routed through 0
+        // must still be able to reach node 1 via 0's edge.
+        let graph = Graph::new(crate::distance::L2, 10);
+        graph.insert_for_test(0, vec![0.0, 0.0, 0.0]);
+        graph.insert_for_test(1, vec![1000.0, 0.0, 0.0]);
+        if let Some(node0) = graph.nodes.get(0) {
+            node0.layer(0).claim(1);
+        }
+        if let Some(node1) = graph.nodes.get(1) {
+            node1.layer(0).claim(0);
+        }
+
+        let results = graph.search_layer(&[0.0, 0.0, 0.0], 1, 5, 0, &|id| id != 0);
+        assert!(
+            results.iter().all(|(id, _)| *id != 0),
+            "a filtered-out node must never appear in results: {results:?}"
+        );
+        assert!(
+            results.iter().any(|(id, _)| *id == 1),
+            "the filter must not have blocked traversal through node 0 to reach node 1: {results:?}"
         );
     }
 }
