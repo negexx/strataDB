@@ -625,6 +625,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn high_cardinality_grouping_matches_a_naive_reference_including_hash_collisions() {
         // 5,000 rows, 2,500 distinct groups (2 rows/group average) -- enough
         // distinct group keys to force real hash collisions in the
