@@ -162,6 +162,7 @@ fn print_distance_calls_per_search(vectors: &[Vec<f32>], queries: &[Vec<f32>], m
                 16,
                 200,
                 m_l,
+                1.0,
                 bench_unif(i as u64),
             )
             .unwrap();
@@ -184,6 +185,14 @@ fn print_distance_calls_per_search(vectors: &[Vec<f32>], queries: &[Vec<f32>], m
     );
 }
 
+// This benchmark function's linear setup-then-compare structure (load
+// vectors, build the hnsw_rs baseline, build the Graph comparator, then run
+// both criterion groups) is inherently sequential — splitting it into
+// smaller functions would just scatter tightly-coupled local state
+// (vectors, queries, m_l) across artificial boundaries for no readability
+// gain. Crossed the 100-line threshold by exactly the one line Task 4 added
+// (the new `alpha` argument to `graph.insert`).
+#[allow(clippy::too_many_lines)]
 fn bench_lockfree_vs_hnsw_rs(c: &mut Criterion) {
     let vectors = load_vectors(N);
     assert_eq!(
@@ -222,6 +231,7 @@ fn bench_lockfree_vs_hnsw_rs(c: &mut Criterion) {
                 16,
                 200,
                 m_l,
+                1.0,
                 bench_unif(i as u64),
             )
             .unwrap();

@@ -363,7 +363,7 @@ impl<D: Distance> Graph<D> {
     /// insert.
     // Algorithm 1's own parameter list (row-id, vector, M, Mmax0, Mmax,
     // efConstruction, mL, plus the caller-supplied `unif` draw this design
-    // injects instead of an internal RNG) is inherently 8 conceptual
+    // injects instead of an internal RNG) is inherently 9 conceptual
     // parameters wide — this is the exact interface Task 8's spec mandates
     // (consumed as-is by Task 9's tests, Task 11's stress test, and Task
     // 14's `HnswIndex` wrapper), not something to restructure into a
@@ -378,6 +378,7 @@ impl<D: Distance> Graph<D> {
         mmax: usize,
         ef_construction: usize,
         m_l: f64,
+        alpha: f64,
         unif: f64,
     ) -> Result<(), crate::hnsw::IndexError> {
         self.check_or_establish_dimension(vector.len())?;
@@ -435,8 +436,9 @@ impl<D: Distance> Graph<D> {
                 entry = *nearest;
             }
             let capacity = if lc == 0 { mmax0 } else { mmax };
-            let chosen =
-                select_neighbors_heuristic(&candidates, m, |a, b| self.pairwise_distance(a, b));
+            let chosen = select_neighbors_heuristic(&candidates, m, alpha, |a, b| {
+                self.pairwise_distance(a, b)
+            });
 
             let Some(new_node) = self.nodes.get(row_id) else {
                 continue;
@@ -454,9 +456,10 @@ impl<D: Distance> Graph<D> {
                             .iter()
                             .map(|&id| (id, self.pairwise_distance(neighbor_id, id)))
                             .collect();
-                        let keep = select_neighbors_heuristic(&with_dists, capacity, |a, b| {
-                            self.pairwise_distance(a, b)
-                        });
+                        let keep =
+                            select_neighbors_heuristic(&with_dists, capacity, alpha, |a, b| {
+                                self.pairwise_distance(a, b)
+                            });
                         let to_remove: Vec<u64> = occupied
                             .into_iter()
                             .filter(|id| !keep.contains(id))
@@ -488,7 +491,7 @@ impl<D: Distance> Graph<D> {
     /// vector length disagrees with the graph's established dimension (or
     /// an earlier row in this same batch) — matches `insert`'s own
     /// per-call validation, just applied row-by-row within the batch.
-    // Mirrors `insert`'s own 8-parameter signature by design (this is a
+    // Mirrors `insert`'s own 9-parameter signature by design (this is a
     // thin forwarding wrapper over it) — same too-many-arguments rationale
     // as `insert` above, not something to restructure into a struct here
     // either.
@@ -509,6 +512,7 @@ impl<D: Distance> Graph<D> {
         mmax: usize,
         ef_construction: usize,
         m_l: f64,
+        alpha: f64,
         unifs: &[f64],
     ) -> Result<(), crate::hnsw::IndexError> {
         debug_assert_eq!(rows.len(), unifs.len());
@@ -521,6 +525,7 @@ impl<D: Distance> Graph<D> {
                 mmax,
                 ef_construction,
                 m_l,
+                alpha,
                 unif,
             )?;
         }
@@ -660,6 +665,7 @@ fn select_neighbors_simple(candidates: &[(u64, f32)], m: usize) -> Vec<u64> {
 fn select_neighbors_heuristic(
     candidates: &[(u64, f32)],
     m: usize,
+    alpha: f64,
     pairwise_dist: impl Fn(u64, u64) -> f32,
 ) -> Vec<u64> {
     let mut working: Vec<(u64, f32)> = candidates.to_vec();
@@ -670,15 +676,18 @@ fn select_neighbors_heuristic(
         if result.len() >= m {
             break;
         }
-        // Algorithm 4 line 11's diversity check: keep `candidate_id` only
-        // if it is NOT dominated — i.e. no already-picked neighbor is
-        // closer to this candidate than the candidate itself is to the
-        // query. A dominated candidate is redundant with an existing pick
-        // (same direction, no new information); a non-dominated one
-        // represents a genuinely different direction.
+        // Vamana's RobustPrune reachability parameter (alpha >= 1,
+        // Subramanya et al. / DiskANN): a candidate is dominated only if
+        // some already-picked neighbor is closer to it than
+        // query_dist/alpha. alpha=1.0 reproduces Algorithm 4 line 11's
+        // original check exactly (the previous, hardcoded behavior);
+        // alpha>1.0 relaxes the check, retaining more longer-range
+        // edges.
+        #[allow(clippy::cast_possible_truncation)]
+        let relaxed_threshold = (f64::from(query_dist) / alpha) as f32;
         let dominated = result
             .iter()
-            .any(|&picked| pairwise_dist(candidate_id, picked) < query_dist);
+            .any(|&picked| pairwise_dist(candidate_id, picked) < relaxed_threshold);
         if !dominated {
             result.push(candidate_id);
         }
@@ -768,6 +777,7 @@ mod tests {
                 16,
                 100,
                 1.0 / (16f64).ln(),
+                1.0,
                 0.5,
             )
             .unwrap();
@@ -780,6 +790,7 @@ mod tests {
                 16,
                 100,
                 1.0 / (16f64).ln(),
+                1.0,
                 0.5,
             )
             .unwrap();
@@ -792,6 +803,7 @@ mod tests {
                 16,
                 100,
                 1.0 / (16f64).ln(),
+                1.0,
                 0.5,
             )
             .unwrap();
@@ -806,10 +818,10 @@ mod tests {
         let graph = Graph::new(crate::distance::L2, 10);
         let m_l = 1.0 / (16f64).ln();
         graph
-            .insert(0, vec![0.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.5)
+            .insert(0, vec![0.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 1.0, 0.5)
             .unwrap();
         graph
-            .insert(1, vec![10.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.5)
+            .insert(1, vec![10.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 1.0, 0.5)
             .unwrap();
         // INSERT itself wires the bidirectional 0 <-> 1 edge at layer 0.
         if let Some(node0) = graph.nodes.get(0) {
@@ -835,10 +847,10 @@ mod tests {
         let graph = Graph::new(crate::distance::L2, 10);
         let m_l = 1.0 / (16f64).ln();
         graph
-            .insert(0, vec![0.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.5)
+            .insert(0, vec![0.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 1.0, 0.5)
             .unwrap();
         graph
-            .insert(1, vec![1000.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.5)
+            .insert(1, vec![1000.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 1.0, 0.5)
             .unwrap();
         // INSERT itself wires the bidirectional 0 <-> 1 edge at layer 0.
 
@@ -858,10 +870,10 @@ mod tests {
         let graph = Graph::new(crate::distance::L2, 10);
         let m_l = 1.0 / (16f64).ln();
         graph
-            .insert(0, vec![0.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.5)
+            .insert(0, vec![0.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 1.0, 0.5)
             .unwrap();
         graph
-            .insert(1, vec![0.1, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.5)
+            .insert(1, vec![0.1, 0.0, 0.0], 16, 32, 16, 100, m_l, 1.0, 0.5)
             .unwrap();
 
         // First call, entry = row 0: row 0 gets marked visited in
@@ -904,36 +916,48 @@ mod tests {
     #[test]
     fn select_neighbors_heuristic_prunes_a_candidate_dominated_by_an_already_picked_neighbor() {
         // Candidate 2: dist-to-query 1.0. Candidate 3: dist-to-query 3.0,
-        // and dist(3, 2) = 2.0 — candidate 3 is dominated by already-picked
+        // and dist(3, 2) = 2.0 -- candidate 3 is dominated by already-picked
         // candidate 2, so the heuristic should skip it in favor of a more
         // diverse pick (candidate 4) if one exists.
-        //
-        // dist(3, 2) = 2.0 is deliberately chosen to sit strictly BETWEEN
-        // the two possible reference points a correct-vs-backwards
-        // implementation could compare it against: the picked neighbor's
-        // own query-distance (dist(2, q) = 1.0) and the candidate's own
-        // query-distance (dist(3, q) = 3.0). The correct check compares
-        // against the candidate's distance (2.0 < 3.0 -> dominated, matches
-        // Algorithm 4 line 11); a backwards implementation that compared
-        // against the picked neighbor's distance instead would see
-        // 2.0 < 1.0 -> false -> NOT dominated, and wrongly keep candidate 3,
-        // producing [2, 3] instead of [2, 4]. A value below both thresholds
-        // (e.g. the previous 0.1) or above both would pass under either
-        // comparison direction and silently fail to catch a swapped
-        // comparison — do not "simplify" this value back down.
         let candidates = vec![(2, 1.0), (3, 3.0), (4, 3.1)];
         let pairwise = |a: u64, b: u64| -> f32 {
             match (a, b) {
-                (3, 2) | (2, 3) => 2.0, // strictly between dist(2,q)=1.0 and dist(3,q)=3.0
-                (4, 2) | (2, 4) => 5.0, // 4 is genuinely distinct from 2
+                (3, 2) | (2, 3) => 2.0,
+                (4, 2) | (2, 4) => 5.0,
                 _ => 0.0,
             }
         };
-        let selected = select_neighbors_heuristic(&candidates, 2, pairwise);
+        let selected = select_neighbors_heuristic(&candidates, 2, 1.0, pairwise);
         assert_eq!(
             selected,
             vec![2, 4],
-            "must prefer the diverse candidate (4) over the redundant one (3), unlike SIMPLE: {selected:?}"
+            "alpha=1.0 must reproduce the original heuristic exactly: {selected:?}"
+        );
+    }
+
+    #[test]
+    fn select_neighbors_heuristic_alpha_greater_than_one_retains_a_previously_dominated_candidate()
+    {
+        // Same fixture as the alpha=1.0 test above. At alpha=2.0,
+        // candidate 3's relaxed threshold (query_dist 3.0 / alpha 2.0 =
+        // 1.5) is no longer exceeded by pairwise_dist(3, 2) = 2.0, so 3
+        // is no longer dominated and gets kept ahead of the more-diverse
+        // candidate 4 -- proving alpha genuinely changes behavior, not
+        // just an inert parameter that's accepted and ignored.
+        let candidates = vec![(2, 1.0), (3, 3.0), (4, 3.1)];
+        let pairwise = |a: u64, b: u64| -> f32 {
+            match (a, b) {
+                (3, 2) | (2, 3) => 2.0,
+                (4, 2) | (2, 4) => 5.0,
+                _ => 0.0,
+            }
+        };
+        let selected = select_neighbors_heuristic(&candidates, 2, 2.0, pairwise);
+        assert_eq!(
+            selected,
+            vec![2, 3],
+            "alpha=2.0 must retain candidate 3 (no longer dominated at the \
+             relaxed threshold), unlike alpha=1.0's [2, 4]: {selected:?}"
         );
     }
 
@@ -958,13 +982,13 @@ mod tests {
         // exactly the "no direct A<->C edge" topology this test needs,
         // without manually wiring it.
         graph
-            .insert(0, vec![0.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.5)
+            .insert(0, vec![0.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 1.0, 0.5)
             .unwrap(); // A: entry, live
         graph
-            .insert(1, vec![5.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.5)
+            .insert(1, vec![5.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 1.0, 0.5)
             .unwrap(); // B: excluded by filter
         graph
-            .insert(2, vec![10.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.5)
+            .insert(2, vec![10.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 1.0, 0.5)
             .unwrap(); // C: live, target
 
         // Hardens this test against a silent regression: it depends on
@@ -1000,10 +1024,10 @@ mod tests {
         let graph = Graph::new(crate::distance::L2, 10);
         let m_l = 1.0 / (16f64).ln();
         graph
-            .insert(0, vec![0.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.9)
+            .insert(0, vec![0.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 1.0, 0.9)
             .unwrap();
         graph
-            .insert(1, vec![0.1, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.9)
+            .insert(1, vec![0.1, 0.0, 0.0], 16, 32, 16, 100, m_l, 1.0, 0.9)
             .unwrap();
 
         let node0 = graph.nodes.get(0).unwrap();
@@ -1024,12 +1048,12 @@ mod tests {
         let m_l = 1.0 / (16f64).ln();
         // unif close to 1.0 -> level 0; unif close to 0.0 -> a high level.
         graph
-            .insert(0, vec![0.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.99)
+            .insert(0, vec![0.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 1.0, 0.99)
             .unwrap();
         assert_eq!(graph.entry_point.get().map(|(_, level)| level), Some(0));
 
         graph
-            .insert(1, vec![1.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.000_001)
+            .insert(1, vec![1.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 1.0, 0.000_001)
             .unwrap();
         let (entry_row, entry_level) = graph.entry_point.get().unwrap();
         assert_eq!(
@@ -1062,13 +1086,13 @@ mod tests {
         let graph = Graph::new(crate::distance::L2, 10);
         let m_l = 1.0 / (16f64).ln();
         graph
-            .insert(0, vec![0.0, 0.0, 0.0], 1, 1, 1, 10, m_l, 0.99)
+            .insert(0, vec![0.0, 0.0, 0.0], 1, 1, 1, 10, m_l, 1.0, 0.99)
             .unwrap(); // B: first node, becomes the entry point
         graph
-            .insert(1, vec![100.0, 0.0, 0.0], 1, 1, 1, 10, m_l, 0.99)
+            .insert(1, vec![100.0, 0.0, 0.0], 1, 1, 1, 10, m_l, 1.0, 0.99)
             .unwrap(); // F1: far from B, fills B's single layer-0 slot
         graph
-            .insert(2, vec![0.1, 0.0, 0.0], 1, 1, 1, 10, m_l, 0.99)
+            .insert(2, vec![0.1, 0.0, 0.0], 1, 1, 1, 10, m_l, 1.0, 0.99)
             .unwrap(); // F2: much closer to B than F1 is
 
         let b = graph.nodes.get(0).unwrap();
@@ -1089,7 +1113,7 @@ mod tests {
         let m_l = 1.0 / (16f64).ln();
         for i in 0..10u64 {
             graph
-                .insert(i, vec![i as f32, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.5)
+                .insert(i, vec![i as f32, 0.0, 0.0], 16, 32, 16, 100, m_l, 1.0, 0.5)
                 .unwrap();
         }
         let results = graph
@@ -1133,11 +1157,31 @@ mod tests {
         let graph = Graph::new(crate::distance::L2, 20);
         let m_l = 1.0 / (16f64).ln();
         graph
-            .insert(0, vec![1000.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.000_001)
+            .insert(
+                0,
+                vec![1000.0, 0.0, 0.0],
+                16,
+                32,
+                16,
+                100,
+                m_l,
+                1.0,
+                0.000_001,
+            )
             .unwrap();
         for i in 1..=8u64 {
             graph
-                .insert(i, vec![i as f32 * 0.1, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.9)
+                .insert(
+                    i,
+                    vec![i as f32 * 0.1, 0.0, 0.0],
+                    16,
+                    32,
+                    16,
+                    100,
+                    m_l,
+                    1.0,
+                    0.9,
+                )
                 .unwrap();
         }
         let (entry_row, entry_level) = graph.entry_point.get().unwrap();
@@ -1166,7 +1210,7 @@ mod tests {
         let m_l = 1.0 / (16f64).ln();
         for i in 0..10u64 {
             graph
-                .insert(i, vec![i as f32, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.5)
+                .insert(i, vec![i as f32, 0.0, 0.0], 16, 32, 16, 100, m_l, 1.0, 0.5)
                 .unwrap();
         }
         graph.delete(0);
@@ -1196,7 +1240,7 @@ mod tests {
         let m_l = 1.0 / (16f64).ln();
         for i in 0..10u64 {
             graph
-                .insert(i, vec![i as f32, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.5)
+                .insert(i, vec![i as f32, 0.0, 0.0], 16, 32, 16, 100, m_l, 1.0, 0.5)
                 .unwrap();
         }
         let results = graph
@@ -1222,10 +1266,10 @@ mod tests {
         let graph = Graph::new(crate::distance::L2, 20);
         let m_l = 1.0 / (16f64).ln();
         graph
-            .insert(0, vec![0.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.5)
+            .insert(0, vec![0.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 1.0, 0.5)
             .unwrap();
         graph
-            .insert(1, vec![1000.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.5)
+            .insert(1, vec![1000.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 1.0, 0.5)
             .unwrap();
 
         graph.delete(0);
@@ -1294,6 +1338,7 @@ mod tests {
                                 16,
                                 100,
                                 m_l,
+                                1.0,
                                 test_unif(row_id),
                             )
                             .unwrap();
@@ -1342,7 +1387,7 @@ mod tests {
         let rows: Vec<(u64, Vec<f32>)> = (0..5).map(|i| (i, vec![i as f32, 0.0, 0.0])).collect();
         let unifs = vec![0.5; 5];
         graph
-            .insert_batch(&rows, 16, 32, 16, 100, m_l, &unifs)
+            .insert_batch(&rows, 16, 32, 16, 100, m_l, 1.0, &unifs)
             .unwrap();
 
         for i in 0..5u64 {
@@ -1453,7 +1498,9 @@ mod tests {
                 (radius * angle.sin()) as f32,
                 0.0,
             ];
-            graph.insert(i, vector, 16, 32, 16, 100, m_l, 0.5).unwrap();
+            graph
+                .insert(i, vector, 16, 32, 16, 100, m_l, 1.0, 0.5)
+                .unwrap();
         }
 
         // True nearest 10: distance ~1.0000-1.0009, tightly clustered.
@@ -1464,7 +1511,17 @@ mod tests {
             #[allow(clippy::cast_precision_loss)]
             let offset = (i - 60) as f32 * 0.0001;
             graph
-                .insert(i, vec![1.0 + offset, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.5)
+                .insert(
+                    i,
+                    vec![1.0 + offset, 0.0, 0.0],
+                    16,
+                    32,
+                    16,
+                    100,
+                    m_l,
+                    1.0,
+                    0.5,
+                )
                 .unwrap();
         }
 
@@ -1495,6 +1552,7 @@ mod tests {
                     16,
                     100,
                     m_l,
+                    1.0,
                     0.5,
                 )
                 .unwrap();
