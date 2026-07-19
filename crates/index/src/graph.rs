@@ -199,6 +199,25 @@ impl<D: Distance> Graph<D> {
             });
         }
 
+        // Saturation-based early termination ("Patience in Proximity",
+        // Teofili & Lin, ECIR 2025 -- see design doc
+        // docs/superpowers/specs/2026-07-19-hnsw-search-performance-improvements-design.md
+        // §3). `ef` stands in for the paper's `k`: this function has no
+        // separate top-k concept, only the ef-capped `result` set. If the
+        // result set's membership stops changing across consecutive
+        // candidate visits, further traversal is unlikely to improve it.
+        #[allow(clippy::items_after_statements)]
+        const SATURATION_THRESHOLD_PERCENT: u32 = 95;
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
+        let patience: u32 = ((ef as f64) * 0.3).ceil().max(7.0) as u32;
+        let mut previous_result_ids: std::collections::HashSet<u64> =
+            std::collections::HashSet::new();
+        let mut saturated_streak: u32 = 0;
+
         while let Some(std::cmp::Reverse(c)) = candidates.pop() {
             if let Some(furthest) = result.peek()
                 && c.dist > furthest.dist
@@ -242,6 +261,29 @@ impl<D: Distance> Graph<D> {
                     }
                 }
             }
+
+            let current_result_ids: std::collections::HashSet<u64> =
+                result.iter().map(|c| c.row_id).collect();
+            if !previous_result_ids.is_empty() && ef > 0 {
+                let overlap = previous_result_ids
+                    .intersection(&current_result_ids)
+                    .count();
+                #[allow(
+                    clippy::cast_precision_loss,
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss
+                )]
+                let overlap_percent = ((overlap as f64 / ef as f64) * 100.0) as u32;
+                if overlap_percent >= SATURATION_THRESHOLD_PERCENT {
+                    saturated_streak += 1;
+                    if saturated_streak >= patience {
+                        break;
+                    }
+                } else {
+                    saturated_streak = 0;
+                }
+            }
+            previous_result_ids = current_result_ids;
         }
 
         let mut out: Vec<(u64, f32)> = result.into_iter().map(|c| (c.row_id, c.dist)).collect();
@@ -1232,6 +1274,185 @@ mod tests {
                 .unwrap();
             assert_eq!(results[0].0, i);
         }
+    }
+
+    #[test]
+    fn saturation_based_early_termination_preserves_recall_and_reduces_distance_evals() {
+        // Regression/discrimination test for saturation-based early
+        // termination ("Patience in Proximity", see design doc): proves
+        // (a) recall is unaffected -- the returned top-k set still
+        // exactly matches the true nearest neighbors -- and (b) early
+        // termination actually fires -- fewer distance evaluations than
+        // fully verifying the ef-capped result set would require.
+        //
+        // Fixture design note (this is a REWORK of the brief's original
+        // Step 1 draft -- see the empirical justification below):
+        //
+        // `search_layer`'s candidate/result heaps guarantee candidates
+        // are popped in strictly non-decreasing true distance. Any
+        // already-discovered-but-since-evicted candidate ("zombie") that
+        // gets popped later necessarily has `dist` greater than the
+        // *current* (already-converged) `furthest.dist`, so it trips
+        // Algorithm 2's own break condition immediately, at zero extra
+        // cost, the very first time one is popped. That means the only
+        // candidates that ever cost real distance evals *after* the true
+        // top set has been found are the true set's own members getting
+        // their neighbor lists opened for verification (each pops
+        // exactly once). With `ef=5` that caps the achievable run of
+        // genuinely-safe "stable, no-op" opens at 5 -- but this
+        // function's `patience` is `max(ceil(ef * 0.3), 7)`, i.e. always
+        // >= 7 for any `ef` up to ~20. A 5-point true set structurally
+        // can never reach a 7-long stable streak, so the brief's
+        // original 5-true-points/25-ring-points draft is *provably*
+        // unable to discriminate, independent of tuning the ring's size
+        // or tightness -- confirmed empirically: with the ring widened to
+        // 95 points and the cluster tightened to 0.0001 offsets, and
+        // separately with a slow-gradient 150-point boundary swarm, the
+        // saturation check never fired either way (evals identical with
+        // it enabled vs. disabled). The fix is structural, not a matter
+        // of degree: widen the true set to >= `patience` points (here,
+        // 10) so there are enough post-convergence verification opens
+        // for the streak to actually reach the threshold, then use
+        // `ef=10` (`k=5` still trims the returned/checked set to the
+        // true nearest 5 of those 10).
+        //
+        // Fixture: query at the origin, `k=5`, `ef=10`. Ten points at
+        // distance ~1.0000-1.0009 (tightly clustered, nearly
+        // indistinguishable from each other -- the "flat convergence
+        // zone" the saturation mechanism targets). Sixty additional
+        // points on a swarm at distance >= 1.4, inserted *before* the
+        // cluster so the graph's single entry point (this fixture uses
+        // `unif=0.5` for every insert, which deterministically assigns
+        // level 0 to every node, making the first-ever insert the
+        // permanent entry point) starts outside the cluster and must
+        // genuinely traverse into it, giving the cluster members real
+        // (non-cluster) graph edges whose distance evals a working
+        // saturation check has something to save.
+        //
+        // NOTE for whoever maintains this test: this fixture's exact
+        // discriminating power (does the assertion at the bottom
+        // actually catch a broken/disabled saturation check?) was
+        // verified empirically during implementation by temporarily
+        // reverting the saturation-check code in Step 3 and confirming
+        // `evals_with_patience` increased (see task-2-report.md for the
+        // recorded numbers). If you change `search_layer`'s traversal
+        // logic and this test's second assertion becomes flaky or stops
+        // discriminating, re-run that same red/green check rather than
+        // assuming the fixture still works -- do not just loosen the
+        // bound to make it pass.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingL2 {
+            calls: Arc<AtomicUsize>,
+        }
+        impl crate::distance::Distance for CountingL2 {
+            fn eval(&self, a: &[f32], b: &[f32]) -> f32 {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                crate::distance::L2.eval(a, b)
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let graph = Graph::new(
+            CountingL2 {
+                calls: Arc::clone(&calls),
+            },
+            80,
+        );
+        let m_l = 1.0 / (16f64).ln();
+
+        // Swarm: 60 points at distance >= 1.4, inserted FIRST so the
+        // (level-0-only, since `unif` is fixed) entry point starts here,
+        // outside the true cluster.
+        for i in 0..60u64 {
+            #[allow(clippy::cast_precision_loss)]
+            let radius = 1.4 + (i % 10) as f64 * 0.05;
+            #[allow(clippy::cast_precision_loss)]
+            let angle = i as f64 * 0.55;
+            #[allow(clippy::cast_possible_truncation)]
+            let vector = vec![
+                (radius * angle.cos()) as f32,
+                (radius * angle.sin()) as f32,
+                0.0,
+            ];
+            graph.insert(i, vector, 16, 32, 16, 100, m_l, 0.5).unwrap();
+        }
+
+        // True nearest 10: distance ~1.0000-1.0009, tightly clustered.
+        // Inserted after the swarm (ids 60..70) so they connect into the
+        // already-built swarm graph rather than being the first (and
+        // therefore entry) node.
+        for i in 60..70u64 {
+            #[allow(clippy::cast_precision_loss)]
+            let offset = (i - 60) as f32 * 0.0001;
+            graph
+                .insert(i, vec![1.0 + offset, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.5)
+                .unwrap();
+        }
+
+        // Satellites: 10 points (ids 70..80), one anchored near each
+        // cluster member (matching x-coordinate, offset 0.05 in y) --
+        // far enough from the origin (distance ~0.05, well past the
+        // 5th-nearest true member's ~1.0004) to never enter the true
+        // top-5, but close enough to their specific cluster anchor to be
+        // selected as one of ITS graph edges (with a reciprocal edge
+        // added back per `insert`'s bidirectional linking) rather than
+        // the swarm's. Inserted last so their own construction-time
+        // search finds the cluster (already built) as the closest
+        // candidates available. This gives each cluster member a
+        // distinct, otherwise-unvisited neighbor to discover when (and
+        // only when) that specific member's own neighbor list is
+        // opened -- exactly the marginal eval cost saturation-based
+        // early termination is meant to save by not opening every
+        // member of the final result set.
+        for i in 70..80u64 {
+            #[allow(clippy::cast_precision_loss)]
+            let anchor_offset = (i - 70) as f32 * 0.0001;
+            graph
+                .insert(
+                    i,
+                    vec![1.0 + anchor_offset, 0.05, 0.0],
+                    16,
+                    32,
+                    16,
+                    100,
+                    m_l,
+                    0.5,
+                )
+                .unwrap();
+        }
+
+        calls.store(0, Ordering::Relaxed);
+        let results = graph
+            .k_nn_search(&[0.0, 0.0, 0.0], 5, 10, |_| true)
+            .unwrap();
+        let evals_with_patience = calls.load(Ordering::Relaxed);
+
+        let mut result_ids: Vec<u64> = results.iter().map(|(id, _)| *id).collect();
+        result_ids.sort_unstable();
+        assert_eq!(
+            result_ids,
+            vec![60, 61, 62, 63, 64],
+            "must still find the true 5 nearest neighbors despite early \
+             termination: {result_ids:?}"
+        );
+
+        // Bound tuned against the empirically measured red/green pair
+        // for this exact fixture (see task-2-report.md Step 5): 35
+        // evals with the saturation check disabled (candidates 67, 68,
+        // 69 each get opened, discovering their previously-unvisited
+        // satellite), vs. 32 evals with it enabled (those three opens,
+        // and their satellite discoveries, are skipped once the streak
+        // reaches `patience`). The bound sits strictly between the two
+        // so this assertion fails if saturation-based termination stops
+        // firing, rather than passing trivially either way.
+        assert!(
+            evals_with_patience < 34,
+            "saturation-based termination should skip verifying the \
+             final few (67, 68, 69) result-set members once membership \
+             has stabilized: {evals_with_patience} evals"
+        );
     }
 }
 
