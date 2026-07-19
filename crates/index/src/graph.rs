@@ -211,6 +211,7 @@ impl<D: Distance> Graph<D> {
         ef: usize,
         lc: usize,
         filter: &impl Fn(u64) -> bool,
+        saturate: bool,
     ) -> Vec<(u64, f32)> {
         SEARCH_SCRATCH.with_borrow_mut(|scratch| {
             scratch.visited.clear();
@@ -239,12 +240,12 @@ impl<D: Distance> Graph<D> {
             }
 
             // Saturation-based early termination ("Patience in Proximity",
-            // Teofili & Lin, ECIR 2025 -- see design doc
-            // docs/superpowers/specs/2026-07-19-hnsw-search-performance-improvements-design.md
-            // §3). `ef` stands in for the paper's `k`: this function has no
-            // separate top-k concept, only the ef-capped `result` set. If the
-            // result set's membership stops changing across consecutive
-            // candidate visits, further traversal is unlikely to improve it.
+            // Teofili & Lin, ECIR 2025) -- gated by `saturate`: firing
+            // during Graph::insert's own construction-time search_layer
+            // calls permanently bakes truncated-candidate-set edges into
+            // the graph for a one-time build-speed win, a worse trade
+            // than the intended recurring per-query one -- see design doc
+            // docs/superpowers/specs/2026-07-19-saturation-during-insert-design.md.
             #[allow(clippy::items_after_statements)]
             const SATURATION_THRESHOLD_PERCENT: u32 = 95;
             #[allow(
@@ -301,34 +302,36 @@ impl<D: Distance> Graph<D> {
                     }
                 }
 
-                scratch.current_result_ids.clear();
-                scratch
-                    .current_result_ids
-                    .extend(scratch.result.iter().map(|c| c.row_id));
-                if !scratch.previous_result_ids.is_empty() && ef > 0 {
-                    let overlap = scratch
-                        .previous_result_ids
-                        .intersection(&scratch.current_result_ids)
-                        .count();
-                    #[allow(
-                        clippy::cast_precision_loss,
-                        clippy::cast_possible_truncation,
-                        clippy::cast_sign_loss
-                    )]
-                    let overlap_percent = ((overlap as f64 / ef as f64) * 100.0) as u32;
-                    if overlap_percent >= SATURATION_THRESHOLD_PERCENT {
-                        saturated_streak += 1;
-                        if saturated_streak >= patience {
-                            break;
+                if saturate {
+                    scratch.current_result_ids.clear();
+                    scratch
+                        .current_result_ids
+                        .extend(scratch.result.iter().map(|c| c.row_id));
+                    if !scratch.previous_result_ids.is_empty() && ef > 0 {
+                        let overlap = scratch
+                            .previous_result_ids
+                            .intersection(&scratch.current_result_ids)
+                            .count();
+                        #[allow(
+                            clippy::cast_precision_loss,
+                            clippy::cast_possible_truncation,
+                            clippy::cast_sign_loss
+                        )]
+                        let overlap_percent = ((overlap as f64 / ef as f64) * 100.0) as u32;
+                        if overlap_percent >= SATURATION_THRESHOLD_PERCENT {
+                            saturated_streak += 1;
+                            if saturated_streak >= patience {
+                                break;
+                            }
+                        } else {
+                            saturated_streak = 0;
                         }
-                    } else {
-                        saturated_streak = 0;
                     }
+                    std::mem::swap(
+                        &mut scratch.previous_result_ids,
+                        &mut scratch.current_result_ids,
+                    );
                 }
-                std::mem::swap(
-                    &mut scratch.previous_result_ids,
-                    &mut scratch.current_result_ids,
-                );
             }
 
             let mut out: Vec<(u64, f32)> =
@@ -420,7 +423,7 @@ impl<D: Distance> Graph<D> {
             // INSERT's own internal traversal has no membership-predicate
             // concept — always-true filter, deleted-flag exclusion still
             // applies via search_layer's own unconditional check.
-            let found = self.search_layer(query, entry, 1, entry_level, &|_| true);
+            let found = self.search_layer(query, entry, 1, entry_level, &|_| true, false);
             if let Some((nearest, _)) = found.first() {
                 entry = *nearest;
             }
@@ -431,7 +434,7 @@ impl<D: Distance> Graph<D> {
         // min(L, l) down to 0.
         let start_layer = entry_level.min(level);
         for lc in (0..=start_layer).rev() {
-            let candidates = self.search_layer(query, entry, ef_construction, lc, &|_| true);
+            let candidates = self.search_layer(query, entry, ef_construction, lc, &|_| true, false);
             if let Some((nearest, _)) = candidates.first() {
                 entry = *nearest;
             }
@@ -584,13 +587,13 @@ impl<D: Distance> Graph<D> {
             return Ok(Vec::new());
         };
         while level >= 1 {
-            let found = self.search_layer(query, entry, 1, level, &filter);
+            let found = self.search_layer(query, entry, 1, level, &filter, true);
             if let Some((nearest, _)) = found.first() {
                 entry = *nearest;
             }
             level -= 1;
         }
-        let mut results = self.search_layer(query, entry, ef, 0, &filter);
+        let mut results = self.search_layer(query, entry, ef, 0, &filter, true);
         results.truncate(k);
         Ok(results)
     }
@@ -808,7 +811,7 @@ mod tests {
             )
             .unwrap();
 
-        let results = graph.search_layer(&[0.5, 0.0, 0.0], 0, 3, 0, &|_| true);
+        let results = graph.search_layer(&[0.5, 0.0, 0.0], 0, 3, 0, &|_| true, true);
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].0, 0, "row 0 must be nearest");
     }
@@ -828,7 +831,7 @@ mod tests {
             node0.mark_deleted();
         }
 
-        let results = graph.search_layer(&[0.0, 0.0, 0.0], 1, 5, 0, &|_| true);
+        let results = graph.search_layer(&[0.0, 0.0, 0.0], 1, 5, 0, &|_| true, true);
         assert!(
             results.iter().all(|(id, _)| *id != 0),
             "a deleted node must never appear in results: {results:?}"
@@ -854,7 +857,7 @@ mod tests {
             .unwrap();
         // INSERT itself wires the bidirectional 0 <-> 1 edge at layer 0.
 
-        let results = graph.search_layer(&[0.0, 0.0, 0.0], 1, 5, 0, &|id| id != 0);
+        let results = graph.search_layer(&[0.0, 0.0, 0.0], 1, 5, 0, &|id| id != 0, true);
         assert!(
             results.iter().all(|(id, _)| *id != 0),
             "a filtered-out node must never appear in results: {results:?}"
@@ -878,7 +881,7 @@ mod tests {
 
         // First call, entry = row 0: row 0 gets marked visited in
         // whatever scratch buffer backs this call.
-        let first = graph.search_layer(&[0.0, 0.0, 0.0], 0, 5, 0, &|_| true);
+        let first = graph.search_layer(&[0.0, 0.0, 0.0], 0, 5, 0, &|_| true, true);
         assert!(first.iter().any(|(id, _)| *id == 0));
 
         // Second, independent call from a DIFFERENT entry point (row 1)
@@ -886,7 +889,7 @@ mod tests {
         // if a reused scratch buffer's `visited` set wasn't cleared
         // between calls, row 0 would still show up as "already visited"
         // from the first call and get wrongly skipped here.
-        let second = graph.search_layer(&[0.0, 0.0, 0.0], 1, 5, 0, &|_| true);
+        let second = graph.search_layer(&[0.0, 0.0, 0.0], 1, 5, 0, &|_| true, true);
         assert!(
             second.iter().any(|(id, _)| *id == 0),
             "reused scratch buffers must be cleared between calls -- row 0 \
@@ -1006,7 +1009,7 @@ mod tests {
              would pass vacuously"
         );
 
-        let results = graph.search_layer(&[10.0, 0.0, 0.0], 0, 5, 0, &|id| id != 1);
+        let results = graph.search_layer(&[10.0, 0.0, 0.0], 0, 5, 0, &|id| id != 1, true);
         assert!(
             results.iter().all(|(id, _)| *id != 1),
             "the excluded middle node must never appear in results: {results:?}"
@@ -1587,6 +1590,128 @@ mod tests {
             "saturation-based termination should skip verifying the \
              final few (67, 68, 69) result-set members once membership \
              has stabilized: {evals_with_patience} evals"
+        );
+    }
+
+    #[test]
+    fn search_layer_saturate_false_visits_more_candidates_than_saturate_true() {
+        // Direct discrimination test for the `saturate` parameter itself
+        // (not routed through insert/k_nn_search): on a fixture already
+        // proven to trigger saturation, calling search_layer with
+        // saturate=false must visit strictly more candidates than
+        // saturate=true, on the identical graph and query.
+        //
+        // Deviates from this task's brief in one respect: the brief's own
+        // Step-1 snippet used a smaller 10-point-cluster + 10-satellite
+        // fixture (no swarm), but that fixture measurably does NOT
+        // discriminate (verified empirically: 20 evals either way,
+        // saturate=true vs. false). This is the exact same structural
+        // non-discrimination the adjacent
+        // saturation_based_early_termination_preserves_recall_and_reduces_distance_evals
+        // test's own comment documents for a too-small true-set fixture,
+        // and that test was already reworked to fix it by widening to a
+        // 60-point swarm + 10-point cluster + 10-point satellite fixture.
+        // Reusing that exact, already-validated-to-discriminate fixture
+        // here instead (per this task's brief note that its snippet is
+        // "a starting point, not guaranteed byte-exact" and should reuse
+        // "the same ... fixture ... already validated to discriminate").
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingL2 {
+            calls: Arc<AtomicUsize>,
+        }
+        impl crate::distance::Distance for CountingL2 {
+            fn eval(&self, a: &[f32], b: &[f32]) -> f32 {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                crate::distance::L2.eval(a, b)
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let graph = Graph::new(
+            CountingL2 {
+                calls: Arc::clone(&calls),
+            },
+            80,
+        );
+        let m_l = 1.0 / (16f64).ln();
+
+        // Swarm: 60 points at distance >= 1.4, inserted FIRST so the
+        // (level-0-only, since `unif` is fixed) entry point starts here,
+        // outside the true cluster.
+        for i in 0..60u64 {
+            #[allow(clippy::cast_precision_loss)]
+            let radius = 1.4 + (i % 10) as f64 * 0.05;
+            #[allow(clippy::cast_precision_loss)]
+            let angle = i as f64 * 0.55;
+            #[allow(clippy::cast_possible_truncation)]
+            let vector = vec![
+                (radius * angle.cos()) as f32,
+                (radius * angle.sin()) as f32,
+                0.0,
+            ];
+            graph
+                .insert(i, vector, 16, 32, 16, 100, m_l, 1.0, 0.5)
+                .unwrap();
+        }
+
+        // True nearest 10: distance ~1.0000-1.0009, tightly clustered.
+        for i in 60..70u64 {
+            #[allow(clippy::cast_precision_loss)]
+            let offset = (i - 60) as f32 * 0.0001;
+            graph
+                .insert(
+                    i,
+                    vec![1.0 + offset, 0.0, 0.0],
+                    16,
+                    32,
+                    16,
+                    100,
+                    m_l,
+                    1.0,
+                    0.5,
+                )
+                .unwrap();
+        }
+
+        // Satellites: 10 points (ids 70..80), one anchored near each
+        // cluster member -- see the sibling test's fixture comment above
+        // for the full rationale.
+        for i in 70..80u64 {
+            #[allow(clippy::cast_precision_loss)]
+            let anchor_offset = (i - 70) as f32 * 0.0001;
+            graph
+                .insert(
+                    i,
+                    vec![1.0 + anchor_offset, 0.05, 0.0],
+                    16,
+                    32,
+                    16,
+                    100,
+                    m_l,
+                    1.0,
+                    0.5,
+                )
+                .unwrap();
+        }
+
+        let (entry, entry_level) = graph.entry_point.get().unwrap();
+        let query = [0.0, 0.0, 0.0];
+
+        calls.store(0, Ordering::Relaxed);
+        let _ = graph.search_layer(&query, entry, 10, entry_level, &|_| true, true);
+        let evals_with_saturation = calls.load(Ordering::Relaxed);
+
+        calls.store(0, Ordering::Relaxed);
+        let _ = graph.search_layer(&query, entry, 10, entry_level, &|_| true, false);
+        let evals_without_saturation = calls.load(Ordering::Relaxed);
+
+        assert!(
+            evals_without_saturation > evals_with_saturation,
+            "saturate=false must visit strictly more candidates than \
+             saturate=true on this fixture: {evals_without_saturation} vs \
+             {evals_with_saturation}"
         );
     }
 }
