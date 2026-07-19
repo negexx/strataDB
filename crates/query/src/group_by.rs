@@ -623,4 +623,136 @@ mod tests {
             "the null value must form its own group, not be dropped or merged"
         );
     }
+
+    #[test]
+    fn high_cardinality_grouping_matches_a_naive_reference_including_hash_collisions() {
+        // 5,000 rows, 2,500 distinct groups (2 rows/group average) -- enough
+        // distinct group keys to force real hash collisions in the
+        // implementation's lookup structure, unlike the 2-5-group
+        // hand-written tests above, which never stress it meaningfully.
+        // Guards the Phase A rewrite described in
+        // docs/superpowers/specs/2026-07-19-group-by-phase-a-optimization-design.md.
+        const ROW_COUNT: usize = 5_000;
+        const CARDINALITY: i64 = 2_500;
+
+        let categories: Vec<String> = (0..ROW_COUNT)
+            .map(|i| {
+                #[allow(clippy::cast_possible_wrap)]
+                let i = i as i64;
+                format!("group-{}", i % CARDINALITY)
+            })
+            .collect();
+        let amounts: Vec<i64> = (0..ROW_COUNT)
+            .map(|i| {
+                #[allow(clippy::cast_possible_wrap)]
+                let i = i as i64;
+                i % 997
+            })
+            .collect();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("category", DataType::Utf8, false),
+            Field::new("amount", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(categories.clone())),
+                Arc::new(Int64Array::from(amounts.clone())),
+            ],
+        )
+        .unwrap();
+
+        let result = group_by(
+            &batch,
+            &["category"],
+            &[
+                ("amount", AggFunc::Count),
+                ("amount", AggFunc::Sum),
+                ("amount", AggFunc::Min),
+                ("amount", AggFunc::Max),
+            ],
+        )
+        .unwrap();
+
+        // Independent, deliberately naive reference -- plain HashMap over
+        // materialized native values, no RowConverter/Row involved, so it
+        // can't share a bug with the implementation under test.
+        let mut reference: std::collections::HashMap<String, (i64, i64, i64, i64)> =
+            std::collections::HashMap::new();
+        for i in 0..ROW_COUNT {
+            let entry =
+                reference
+                    .entry(categories[i].clone())
+                    .or_insert((0, 0, i64::MAX, i64::MIN));
+            entry.0 += 1; // count
+            entry.1 += amounts[i]; // sum
+            entry.2 = entry.2.min(amounts[i]); // min
+            entry.3 = entry.3.max(amounts[i]); // max
+        }
+
+        let result_categories = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let result_counts = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let result_sums = result
+            .column(2)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let result_mins = result
+            .column(3)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let result_maxes = result
+            .column(4)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+
+        assert_eq!(
+            result.num_rows(),
+            reference.len(),
+            "group count mismatch: expected {} distinct groups",
+            reference.len()
+        );
+
+        // Order-independent: build both sides as sets keyed by group,
+        // since group_by's output row order has never been guaranteed
+        // (see the design doc) -- every amount here is a small integer
+        // (i % 997), so sum/min/max are always exact integers with no
+        // fractional part, making the f64 -> i64 cast below lossless.
+        let mut got: std::collections::HashSet<(String, i64, i64, i64, i64)> =
+            std::collections::HashSet::new();
+        for i in 0..result.num_rows() {
+            #[allow(clippy::cast_possible_truncation)]
+            let sum = result_sums.value(i) as i64;
+            #[allow(clippy::cast_possible_truncation)]
+            let min = result_mins.value(i) as i64;
+            #[allow(clippy::cast_possible_truncation)]
+            let max = result_maxes.value(i) as i64;
+            got.insert((
+                result_categories.value(i).to_string(),
+                result_counts.value(i),
+                sum,
+                min,
+                max,
+            ));
+        }
+        let expected: std::collections::HashSet<(String, i64, i64, i64, i64)> = reference
+            .into_iter()
+            .map(|(cat, (count, sum, min, max))| (cat, count, sum, min, max))
+            .collect();
+
+        assert_eq!(
+            got, expected,
+            "high-cardinality grouped output must exactly match the naive reference"
+        );
+    }
 }
