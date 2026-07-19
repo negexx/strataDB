@@ -369,7 +369,7 @@ Include the four recorded numbers from Step 3 in the commit message body.
 - Consumes: `group_by`, `AggFunc` — existing public API, unchanged by this task.
 - Produces: nothing consumed by later tasks — this is a standalone test that must pass both before (this task) and after (Task 3) the rewrite, unmodified in between.
 
-- [ ] **Step 1: Add the test**
+- [x] **Step 1: Add the test**
 
 Insert immediately before the final closing `}` of `mod tests` in `crates/query/src/group_by.rs` (i.e., directly after the `group_by_accepts_a_dictionary_encoded_group_column_with_a_null_entry` test's closing `}`):
 
@@ -506,17 +506,17 @@ Insert immediately before the final closing `}` of `mod tests` in `crates/query/
     }
 ```
 
-- [ ] **Step 2: Run it against today's (pre-rewrite) implementation**
+- [x] **Step 2: Run it against today's (pre-rewrite) implementation**
 
 Run: `cargo test -p strata-query --lib group_by::tests::high_cardinality_grouping_matches_a_naive_reference_including_hash_collisions`
 Expected: PASS. This confirms two things before the risky rewrite starts: the fixture itself is correct, and today's implementation is correct at this scale — so this test is a trustworthy regression harness for Task 3, not a test that happens to only pass after the rewrite.
 
-- [ ] **Step 3: Run the full existing suite to confirm nothing else broke**
+- [x] **Step 3: Run the full existing suite to confirm nothing else broke**
 
 Run: `cargo test -p strata-query --lib`
 Expected: PASS — every existing test plus the new one.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add crates/query/src/group_by.rs
@@ -534,7 +534,7 @@ git commit -m "test(query): add high-cardinality GROUP BY differential test ahea
 - Consumes: nothing new — same inputs as today's `group_by`.
 - Produces: `group_by(batch: &RecordBatch, group_cols: &[&str], aggs: &[(&str, AggFunc)]) -> Result<RecordBatch, ArrowError>` — **identical signature**, consumed by every existing caller (`crates/query/src/lib.rs`'s `pub use group_by::{AggFunc, group_by};`, both bench files, the full `mod tests` block) with zero changes required at any call site.
 
-- [ ] **Step 1: Replace lines 1–241 of `crates/query/src/group_by.rs`**
+- [x] **Step 1: Replace lines 1–241 of `crates/query/src/group_by.rs`**
 
 Replace everything from the top of the file through the end of `finish_agg_column` (i.e., everything before `#[cfg(test)]`) with:
 
@@ -869,17 +869,17 @@ fn finish_agg_column(values: Vec<AggValue>, name: &str, func: AggFunc) -> (Field
 
 Leave `#[cfg(test)] mod tests { ... }` (everything after this point in the file) completely untouched.
 
-- [ ] **Step 2: Build**
+- [x] **Step 2: Build**
 
 Run: `cargo build -p strata-query`
 Expected: builds cleanly. If it doesn't, the most likely issue is a borrow-checker error around `group_index_of`/`group_key_rows`/`state` all being captured inside the `or_insert_with` closure — `Row<'_>` is `Copy` (confirmed: `#[derive(Debug, Copy, Clone)] pub struct Row<'a>` in `arrow-row-58.3.0/src/lib.rs:1441`), so `row` remains usable after being passed into `.entry(row)`; `group_key_rows` and `state` are captured by unique mutable borrow only for the closure's duration, released before the next statement borrows `state` again — this should compile as written, but if it doesn't, the fix is almost certainly reordering statements inside the closure, not restructuring the data model.
 
-- [ ] **Step 3: Run the full existing test suite — must pass with zero test-file changes**
+- [x] **Step 3: Run the full existing test suite — must pass with zero test-file changes**
 
 Run: `cargo test -p strata-query --lib`
 Expected: PASS — every test in `group_by.rs`'s `mod tests`, including the Task 2 differential test, unchanged. This is the "byte-for-byte identical" gate: if any existing assertion fails, that's a real behavioral regression in this rewrite, not a test to adjust.
 
-- [ ] **Step 4: Clippy and format**
+- [x] **Step 4: Clippy and format**
 
 Run: `cargo clippy -p strata-query --all-targets -- -D warnings`
 Expected: clean.
@@ -887,12 +887,12 @@ Expected: clean.
 Run: `cargo fmt --check -p strata-query`
 Expected: clean (or run `cargo fmt -p strata-query` to fix, then re-check).
 
-- [ ] **Step 5: Run the full workspace test suite**
+- [x] **Step 5: Run the full workspace test suite**
 
 Run: `cargo test --workspace`
 Expected: PASS — confirms no downstream crate (there are none that call `group_by` outside `crates/query` and the bench crate, but this is the cheap way to be sure).
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/query/src/group_by.rs
@@ -910,13 +910,13 @@ git commit -m "perf(query): replace GROUP BY's per-row OwnedRow allocation with 
 - Consumes: `bench_group_by_cardinality_sweep` (Task 1), the rewritten `group_by` (Task 3).
 - Produces: nothing consumed by later tasks.
 
-- [ ] **Step 1: Re-run the identical benchmark**
+- [x] **Step 1: Re-run the identical benchmark**
 
 Run: `cargo bench -p strata-bench --bench group_by_bench -- group_by_cardinality_sweep`
 
 Expected: all four correctness gates pass silently (proves the rewrite is correct at this scale too, independent of Task 3's unit tests), followed by Criterion's timing report for all four cases.
 
-- [ ] **Step 2: Compare against Task 1's recorded baseline**
+- [x] **Step 2: Compare against Task 1's recorded baseline**
 
 Read this file's Task 1 checkbox note (the four baseline numbers recorded there) and compare against this run's four numbers.
 
@@ -924,7 +924,7 @@ Read this file's Task 1 checkbox note (the four baseline numbers recorded there)
 
 **If either does not show improvement:** stop. Do not proceed to Step 3 or mark this plan done. Per this plan's Global Constraints, an architecturally "correct" rewrite with no measured win at the 1,000,000-group case does not satisfy this plan's success criterion — this means either the benchmark isn't actually exercising the allocation-heavy path as intended, or the rewrite has an unexpected inefficiency (e.g., `HashMap<Row<'_>, usize>`'s hashing cost is higher than expected relative to the eliminated `OwnedRow` allocation). Investigate via `cargo bench -p strata-bench --bench group_by_bench -- group_by_cardinality_sweep -- --profile-time 10` or by re-reading Task 3's implementation against §3 of the design doc before considering any further change — do not weaken this task's stop condition to force a "done" state.
 
-- [ ] **Step 3: Record the comparison**
+- [x] **Step 3: Record the comparison**
 
 Append a note under this task's checkbox in this plan file, e.g.:
 
@@ -942,7 +942,7 @@ Append a note under this task's checkbox in this plan file, e.g.:
 
 Both gated 1,000,000-group cases show a measured improvement well outside their own confidence intervals — decision gate passes. Full run output, environment, and reasoning: `.superpowers/sdd/task-4-report.md`.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add docs/superpowers/plans/2026-07-19-group-by-phase-a-optimization-plan.md
@@ -959,31 +959,31 @@ Include the full before/after numbers for all four cases in the commit message b
 
 **Interfaces:** none.
 
-- [ ] **Step 1: Full workspace build**
+- [x] **Step 1: Full workspace build**
 
 Run: `cargo build --workspace`
 Expected: clean, no warnings.
 
-- [ ] **Step 2: Full workspace test suite**
+- [x] **Step 2: Full workspace test suite**
 
 Run: `cargo test --workspace`
 Expected: PASS.
 
-- [ ] **Step 3: Full workspace clippy**
+- [x] **Step 3: Full workspace clippy**
 
 Run: `cargo clippy --workspace --all-targets -- -D warnings`
 Expected: clean.
 
-- [ ] **Step 4: Full workspace format check**
+- [x] **Step 4: Full workspace format check**
 
 Run: `cargo fmt --check`
 Expected: clean.
 
-- [ ] **Step 5: Dispatch the `reviewer` subagent**
+- [x] **Step 5: Dispatch the `reviewer` subagent**
 
 Review the full diff this plan produced: `git diff <base-branch>...HEAD -- crates/query/src/group_by.rs bench/benches/group_by_bench.rs`. Per this project's standing rule, no task in this plan is done until reviewed — address any findings (fix and re-run Steps 1–4) before considering this plan complete. If the reviewer has no findings, note that explicitly rather than leaving review status ambiguous.
 
-- [ ] **Step 6: Commit any review-driven fixes**
+- [x] **Step 6: Commit any review-driven fixes**
 
 Only if Step 5 produced changes:
 
@@ -991,3 +991,5 @@ Only if Step 5 produced changes:
 git add -A
 git commit -m "fix(query): address reviewer findings on GROUP BY Phase A rewrite"
 ```
+
+N/A — Step 5's final whole-branch review (Opus) returned "Ready to merge: Yes" with zero Critical or Important findings; only two Minor, non-blocking notes (a stale-checkbox tracking artifact, since fixed by this edit, and an honestly-disclosed within-noise regression at the non-gated `sum_1000_groups` case). No code fix was required.
