@@ -1,5 +1,12 @@
 //! Hash-based `GROUP BY`, per
 //! `.claude/docs/design/phase-2-encodings-and-groupby-spec.md` §2.
+//!
+//! Internals per
+//! `docs/superpowers/specs/2026-07-19-group-by-phase-a-optimization-design.md`:
+//! a `HashMap<Row<'_>, usize>` index over the `Rows` buffer already built
+//! for the whole batch, instead of a fresh `OwnedRow` heap allocation per
+//! row, plus columnar (`Vec<T>`-per-`group_idx`) accumulator state instead
+//! of one small heap-allocated `Vec<Accumulator>` per group.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -7,7 +14,7 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef, Float64Array, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::error::ArrowError;
-use arrow::row::{OwnedRow, RowConverter, SortField};
+use arrow::row::{Row, RowConverter, SortField};
 
 /// Which aggregate to compute over a column within each group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,54 +33,91 @@ enum AggValue {
     Float(f64),
 }
 
-/// One row's running aggregate state for a single `(column, AggFunc)` pair.
-#[derive(Debug, Clone, Copy)]
-enum Accumulator {
-    Count(u64),
-    Sum(f64),
-    Min(f64),
-    Max(f64),
-    Avg { sum: f64, count: u64 },
+/// Dense, group-indexed aggregate state for one `(column, AggFunc)` pair:
+/// all groups' running state for one aggregate lives in one contiguous,
+/// type-specialized vector, indexed by `group_idx`, instead of one small
+/// `Accumulator` instance existing per group. Same identity values and
+/// update/finish math as the scalar accumulator this replaces.
+#[derive(Debug)]
+enum ColumnarAccumulator {
+    Count(Vec<u64>),
+    Sum(Vec<f64>),
+    Min(Vec<f64>),
+    Max(Vec<f64>),
+    Avg { sum: Vec<f64>, count: Vec<u64> },
 }
 
-impl Accumulator {
+impl ColumnarAccumulator {
     fn new(func: AggFunc) -> Self {
         match func {
-            AggFunc::Count => Self::Count(0),
-            AggFunc::Sum => Self::Sum(0.0),
-            AggFunc::Min => Self::Min(f64::INFINITY),
-            AggFunc::Max => Self::Max(f64::NEG_INFINITY),
-            AggFunc::Avg => Self::Avg { sum: 0.0, count: 0 },
+            AggFunc::Count => Self::Count(Vec::new()),
+            AggFunc::Sum => Self::Sum(Vec::new()),
+            AggFunc::Min => Self::Min(Vec::new()),
+            AggFunc::Max => Self::Max(Vec::new()),
+            AggFunc::Avg => Self::Avg {
+                sum: Vec::new(),
+                count: Vec::new(),
+            },
         }
     }
 
-    fn update(&mut self, value: f64) {
+    /// Appends this variant's identity element -- called for every
+    /// requested aggregate the moment a new group is discovered, so
+    /// `group_idx` is always a valid index into every `ColumnarAccumulator`
+    /// afterward, regardless of which columns are null on the row that
+    /// discovered the group.
+    fn push_identity(&mut self) {
         match self {
-            Self::Count(n) => *n += 1,
-            Self::Sum(s) => *s += value,
-            Self::Min(m) => *m = m.min(value),
-            Self::Max(m) => *m = m.max(value),
+            Self::Count(v) => v.push(0),
+            Self::Sum(v) => v.push(0.0),
+            Self::Min(v) => v.push(f64::INFINITY),
+            Self::Max(v) => v.push(f64::NEG_INFINITY),
             Self::Avg { sum, count } => {
-                *sum += value;
-                *count += 1;
+                sum.push(0.0);
+                count.push(0);
             }
         }
     }
 
-    fn finish(self) -> AggValue {
+    fn update(&mut self, group_idx: usize, value: f64) {
         match self {
-            Self::Count(n) => {
-                // Counts cannot realistically exceed i64::MAX in an in-memory batch.
-                #[allow(clippy::cast_possible_wrap)]
-                let n = n as i64;
-                AggValue::Int(n)
-            }
-            Self::Sum(s) | Self::Min(s) | Self::Max(s) => AggValue::Float(s),
+            Self::Count(v) => v[group_idx] += 1,
+            Self::Sum(v) => v[group_idx] += value,
+            Self::Min(v) => v[group_idx] = v[group_idx].min(value),
+            Self::Max(v) => v[group_idx] = v[group_idx].max(value),
             Self::Avg { sum, count } => {
-                #[allow(clippy::cast_precision_loss)]
-                let count = count as f64;
-                AggValue::Float(sum / count)
+                sum[group_idx] += value;
+                count[group_idx] += 1;
             }
+        }
+    }
+
+    /// Consumes the whole vector at once, mapping every group's finished
+    /// value -- same per-variant math as the scalar accumulator's
+    /// `finish()` this replaces.
+    fn finish_all(self) -> Vec<AggValue> {
+        match self {
+            Self::Count(v) => v
+                .into_iter()
+                .map(|n| {
+                    // Counts cannot realistically exceed i64::MAX in an in-memory batch.
+                    #[allow(clippy::cast_possible_wrap)]
+                    let n = n as i64;
+                    AggValue::Int(n)
+                })
+                .collect(),
+            Self::Sum(v) | Self::Min(v) | Self::Max(v) => {
+                v.into_iter().map(AggValue::Float).collect()
+            }
+            Self::Avg { sum, count } => sum
+                .into_iter()
+                .zip(count)
+                .map(|(s, c)| {
+                    #[allow(clippy::cast_precision_loss)]
+                    let c = c as f64;
+                    AggValue::Float(s / c)
+                })
+                .collect(),
         }
     }
 }
@@ -165,53 +209,55 @@ pub fn group_by(
         })
         .collect::<Result<_, ArrowError>>()?;
 
-    let mut groups: HashMap<OwnedRow, Vec<Accumulator>> = HashMap::new();
+    // group_index_of maps a *borrowed* row (a zero-allocation view into
+    // `rows`) to its group index -- unlike a `HashMap<OwnedRow, _>`, this
+    // needs no fresh heap allocation on every input row, only lazily on the
+    // O(distinct groups) subset that turn out to be new. `Row<'_>` already
+    // implements `Hash`/`Eq`/`Copy` purely over its byte slice (confirmed
+    // against arrow-row 58.3.0's source), so no custom hashing/probing is
+    // needed.
+    let mut group_index_of: HashMap<Row<'_>, usize> = HashMap::new();
+    let mut group_key_rows: Vec<Row<'_>> = Vec::new();
+    let mut state: Vec<ColumnarAccumulator> = aggs
+        .iter()
+        .map(|(_, f)| ColumnarAccumulator::new(*f))
+        .collect();
+
     for i in 0..batch.num_rows() {
-        let key = rows.row(i).owned();
-        let accs = groups.entry(key).or_insert_with(|| {
-            agg_arrays
-                .iter()
-                .map(|(_, f)| Accumulator::new(*f))
-                .collect()
+        let row = rows.row(i);
+        let group_idx = *group_index_of.entry(row).or_insert_with(|| {
+            let idx = group_key_rows.len();
+            group_key_rows.push(row);
+            for acc in &mut state {
+                acc.push_identity();
+            }
+            idx
         });
-        for ((acc, (arr, func)), float_arr) in accs
-            .iter_mut()
-            .zip(&agg_arrays)
-            .zip(agg_float_arrays.iter().copied())
-        {
+        for (agg_idx, (arr, func)) in agg_arrays.iter().enumerate() {
             if arr.is_null(i) {
                 continue;
             }
             if matches!(func, AggFunc::Count) {
-                acc.update(0.0); // value is unused by Accumulator::Count
+                state[agg_idx].update(group_idx, 0.0); // value unused by Count's update
                 continue;
             }
-            if let Some(col) = float_arr {
-                acc.update(col.value(i));
+            if let Some(col) = agg_float_arrays[agg_idx] {
+                state[agg_idx].update(group_idx, col.value(i));
             }
         }
     }
 
-    build_result_batch(group_cols, aggs, &converter, &groups)
+    build_result_batch(group_cols, aggs, &converter, group_key_rows, state)
 }
 
 fn build_result_batch(
     group_cols: &[&str],
     aggs: &[(&str, AggFunc)],
     converter: &RowConverter,
-    groups: &HashMap<OwnedRow, Vec<Accumulator>>,
+    group_key_rows: Vec<Row<'_>>,
+    state: Vec<ColumnarAccumulator>,
 ) -> Result<RecordBatch, ArrowError> {
-    let owned_keys: Vec<OwnedRow> = groups.keys().cloned().collect();
-    let borrowed_keys: Vec<_> = owned_keys.iter().map(OwnedRow::row).collect();
-    let group_columns = converter.convert_rows(borrowed_keys)?;
-
-    let mut agg_columns: Vec<Vec<AggValue>> = vec![Vec::with_capacity(groups.len()); aggs.len()];
-    for key in &owned_keys {
-        let accs = &groups[key];
-        for (col, acc) in agg_columns.iter_mut().zip(accs) {
-            col.push(acc.finish());
-        }
-    }
+    let group_columns = converter.convert_rows(group_key_rows)?;
 
     // The output field's type comes from `group_columns` — the array
     // RowConverter::convert_rows actually produced — not from the original
@@ -230,8 +276,8 @@ fn build_result_batch(
         .map(|(name, arr)| Field::new(*name, arr.data_type().clone(), true))
         .collect();
     let mut columns: Vec<ArrayRef> = group_columns;
-    for ((name, func), values) in aggs.iter().zip(agg_columns) {
-        let (field, array) = finish_agg_column(values, name, *func);
+    for ((name, func), acc) in aggs.iter().zip(state) {
+        let (field, array) = finish_agg_column(acc.finish_all(), name, *func);
         fields.push(field);
         columns.push(array);
     }
@@ -243,7 +289,7 @@ fn build_result_batch(
 /// Converts one aggregate column's finished values into an Arrow field +
 /// array, per [`AggFunc`]: `Count` produces `Int64`, every other `AggFunc`
 /// produces `Float64` — both `unreachable!()` arms below hold because
-/// `Accumulator::finish()` guarantees that mapping.
+/// `ColumnarAccumulator::finish_all()` guarantees that mapping.
 fn finish_agg_column(values: Vec<AggValue>, name: &str, func: AggFunc) -> (Field, ArrayRef) {
     let field_name = format!("{name}_{func:?}").to_lowercase();
     if matches!(func, AggFunc::Count) {
@@ -251,7 +297,7 @@ fn finish_agg_column(values: Vec<AggValue>, name: &str, func: AggFunc) -> (Field
             .into_iter()
             .map(|v| match v {
                 AggValue::Int(n) => n,
-                // Accumulator::finish()'s Count arm guarantees this.
+                // ColumnarAccumulator::finish_all()'s Count arm guarantees this.
                 AggValue::Float(_) => {
                     unreachable!("Count aggregation should produce Int, not Float")
                 }
@@ -266,7 +312,7 @@ fn finish_agg_column(values: Vec<AggValue>, name: &str, func: AggFunc) -> (Field
             .into_iter()
             .map(|v| match v {
                 AggValue::Float(f) => f,
-                // Accumulator::finish()'s non-Count arms guarantee this.
+                // ColumnarAccumulator::finish_all()'s non-Count arms guarantee this.
                 AggValue::Int(_) => {
                     unreachable!("Non-Count aggregation should produce Float, not Int")
                 }
