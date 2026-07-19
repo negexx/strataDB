@@ -19,14 +19,34 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow::array::{Array, FixedSizeListArray, Float32Array, Float64Array};
 use arrow::datatypes::Field;
 use criterion::{Criterion, criterion_group, criterion_main};
 use hnsw_rs::prelude::{DistL2, Hnsw};
 use strata_index::brute_force_search;
-use strata_index::distance::L2;
+use strata_index::distance::{Distance, L2};
 use strata_index::graph::Graph;
+
+/// Wraps `L2` to count `eval()` calls — used to answer "how much of a
+/// search's time is plausibly distance computation vs. everything else
+/// (traversal, heap/hashset allocation, CAS)?" without OS-level profiler
+/// tooling. This machine is Windows, where `perf`/`cargo-flamegraph` (the
+/// usual answer) aren't reliably available; multiplying this count by the
+/// isolated per-call cost from `l2_distance_eval_only` below gives an
+/// upper-bound estimate of distance-only time per search, comparable by
+/// hand against this same run's `graph_top_10` criterion result.
+struct CountingL2 {
+    calls: Arc<AtomicUsize>,
+}
+
+impl Distance for CountingL2 {
+    fn eval(&self, a: &[f32], b: &[f32]) -> f32 {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        L2.eval(a, b)
+    }
+}
 
 const DATASET_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -117,6 +137,62 @@ fn recall_at_k(found: &[u64], truth: &std::collections::HashSet<u64>) -> f64 {
     recall
 }
 
+/// Builds a second, identical graph (same vectors, same `bench_unif`
+/// sequence, so the topology is deterministic and matches the main
+/// benchmark's `graph` exactly) wired through a call-counting `Distance`,
+/// then prints how many `eval()` calls one real `k_nn_search` performs on
+/// average. Multiply by `l2_distance_eval_only`'s reported time for an
+/// upper-bound estimate of distance-only time per search, and compare that
+/// by hand against `graph_top_10`'s reported time.
+fn print_distance_calls_per_search(vectors: &[Vec<f32>], queries: &[Vec<f32>], m_l: f64) {
+    let call_counter = Arc::new(AtomicUsize::new(0));
+    let counting_graph = Graph::new(
+        CountingL2 {
+            calls: Arc::clone(&call_counter),
+        },
+        vectors.len(),
+    );
+    for (i, v) in vectors.iter().enumerate() {
+        counting_graph
+            .insert(
+                i as u64,
+                v.clone(),
+                16,
+                32,
+                16,
+                200,
+                m_l,
+                1.0,
+                bench_unif(i as u64),
+            )
+            .unwrap();
+    }
+    call_counter.store(0, Ordering::Relaxed);
+    for query in queries {
+        counting_graph.k_nn_search(query, K, 50, |_| true).unwrap();
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let avg_distance_calls_per_search =
+        call_counter.load(Ordering::Relaxed) as f64 / queries.len() as f64;
+    println!(
+        "avg distance eval() calls per k_nn_search (ef=50, {} queries): {avg_distance_calls_per_search:.1}",
+        queries.len()
+    );
+    println!(
+        "  -> multiply by l2_distance_eval_only's reported time below for an upper-bound \
+         estimate of distance-only time per search; compare that by hand against \
+         graph_top_10's reported time to see what fraction it explains"
+    );
+}
+
+// This benchmark function's linear setup-then-compare structure (load
+// vectors, build the hnsw_rs baseline, build the Graph comparator, then run
+// both criterion groups) is inherently sequential — splitting it into
+// smaller functions would just scatter tightly-coupled local state
+// (vectors, queries, m_l) across artificial boundaries for no readability
+// gain. Crossed the 100-line threshold by exactly the one line Task 4 added
+// (the new `alpha` argument to `graph.insert`).
+#[allow(clippy::too_many_lines)]
 fn bench_lockfree_vs_hnsw_rs(c: &mut Criterion) {
     let vectors = load_vectors(N);
     assert_eq!(
@@ -155,6 +231,7 @@ fn bench_lockfree_vs_hnsw_rs(c: &mut Criterion) {
                 16,
                 200,
                 m_l,
+                1.0,
                 bench_unif(i as u64),
             )
             .unwrap();
@@ -202,7 +279,14 @@ fn bench_lockfree_vs_hnsw_rs(c: &mut Criterion) {
          comparison's premise -- fix the fixture before trusting either QPS number"
     );
 
+    print_distance_calls_per_search(&vectors, &queries, m_l);
+
     let mut group = c.benchmark_group("lockfree_vs_hnsw_rs");
+    group.bench_function("l2_distance_eval_only", |b| {
+        let a = &vectors[0];
+        let other = &vectors[1];
+        b.iter(|| L2.eval(std::hint::black_box(a), std::hint::black_box(other)));
+    });
     group.bench_function("hnsw_rs_top_10", |b| {
         b.iter(|| {
             let query = &queries[0];

@@ -24,7 +24,7 @@ unsafe_op_in_unsafe_fn = "deny"
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
 
 [dependencies]
-anndists = "0.1"
+anndists = { version = "0.1", features = ["simdeez_f"] }
 arrow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

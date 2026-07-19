@@ -183,6 +183,7 @@ impl HnswIndex {
             self.mmax,
             self.ef_construction,
             self.m_l,
+            1.0,
             unif,
         )
     }

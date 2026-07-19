@@ -91,6 +91,7 @@ dependencies = [
  "num-traits",
  "num_cpus",
  "rayon",
+ "simdeez",
 ]
 
 [[package]]
@@ -1769,6 +1770,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
 
 [[package]]
+name = "simdeez"
+version = "3.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "35bc92272e09cdb506befe0c48f5f865fdda52e77bbe1738f74bed79f29c4733"
+dependencies = [
+ "cfg-if",
+ "paste",
+]
+
+[[package]]
 name = "simdutf8"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1808,6 +1819,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "criterion",
+ "hnsw_rs",
  "parquet",
  "strata-index",
  "strata-query",
@@ -1839,7 +1851,6 @@ version = "0.1.0"
 dependencies = [
  "anndists",
  "arrow",
- "hnsw_rs",
  "loom",
  "serde",
  "serde_json",

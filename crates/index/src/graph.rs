@@ -147,6 +147,34 @@ impl Ord for Candidate {
     }
 }
 
+/// Per-thread reusable scratch space for `search_layer`, avoiding a
+/// fresh `HashSet`/two `BinaryHeap`s/two more `HashSet`s on every call.
+/// Safe as plain `RefCell` (not a `Mutex`/atomic): `search_layer` is
+/// never called reentrantly on the same thread -- every caller
+/// (`Graph::insert`'s two call sites, `Graph::k_nn_search`'s two call
+/// sites) calls it sequentially and lets each call fully return before
+/// starting the next, so a nested `borrow_mut()` can never happen. This
+/// also depends on every caller-supplied `filter` closure (threaded
+/// through from `HnswIndex::search`/`search_filtered`'s public,
+/// caller-controlled `impl Fn(u64) -> bool`) being a pure membership/
+/// visibility predicate that never itself calls back into this graph's
+/// search path -- every filter passed anywhere in this codebase today
+/// is, but this is an invariant on the caller, not something the type
+/// system enforces.
+#[derive(Default)]
+struct SearchScratch {
+    visited: std::collections::HashSet<u64>,
+    candidates: BinaryHeap<std::cmp::Reverse<Candidate>>,
+    result: BinaryHeap<Candidate>,
+    previous_result_ids: std::collections::HashSet<u64>,
+    current_result_ids: std::collections::HashSet<u64>,
+}
+
+thread_local! {
+    static SEARCH_SCRATCH: std::cell::RefCell<SearchScratch> =
+        std::cell::RefCell::new(SearchScratch::default());
+}
+
 impl<D: Distance> Graph<D> {
     pub fn new(distance: D, expected_capacity: usize) -> Self {
         Self {
@@ -169,6 +197,13 @@ impl<D: Distance> Graph<D> {
     /// on an already-capped top-k"). This is what lets a caller's
     /// `live_ids` membership push all the way into traversal-time
     /// filtering, not just the deleted flag. See design doc §3.
+    // The thread-local-scratch closure (Task 3 of the HNSW search-perf
+    // plan) pushed this past clippy's default 100-line threshold; the
+    // extra length is entirely the pre-existing Task 2 algorithm body now
+    // wrapped in `with_borrow_mut`, not new complexity -- splitting it
+    // into sub-functions would mean threading `scratch`'s fields through
+    // several new signatures for no behavioral benefit.
+    #[allow(clippy::too_many_lines)]
     fn search_layer(
         &self,
         query: &[f32],
@@ -177,76 +212,130 @@ impl<D: Distance> Graph<D> {
         lc: usize,
         filter: &impl Fn(u64) -> bool,
     ) -> Vec<(u64, f32)> {
-        let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();
-        visited.insert(entry);
+        SEARCH_SCRATCH.with_borrow_mut(|scratch| {
+            scratch.visited.clear();
+            scratch.candidates.clear();
+            scratch.result.clear();
+            scratch.previous_result_ids.clear();
+            scratch.current_result_ids.clear();
 
-        let entry_dist = self.distance_to(query, entry);
-        // Min-heap of candidates still to explore (nearest first via `Reverse`).
-        let mut candidates: BinaryHeap<std::cmp::Reverse<Candidate>> = BinaryHeap::new();
-        candidates.push(std::cmp::Reverse(Candidate {
-            row_id: entry,
-            dist: entry_dist,
-        }));
-        // Max-heap of the best `ef` results found so far (farthest first, for cheap eviction).
-        let mut result: BinaryHeap<Candidate> = BinaryHeap::new();
-        if let Some(node) = self.nodes.get(entry)
-            && !node.is_deleted()
-            && filter(entry)
-        {
-            result.push(Candidate {
+            scratch.visited.insert(entry);
+
+            let entry_dist = self.distance_to(query, entry);
+            // Min-heap of candidates still to explore (nearest first via `Reverse`).
+            scratch.candidates.push(std::cmp::Reverse(Candidate {
                 row_id: entry,
                 dist: entry_dist,
-            });
-        }
-
-        while let Some(std::cmp::Reverse(c)) = candidates.pop() {
-            if let Some(furthest) = result.peek()
-                && c.dist > furthest.dist
-                && result.len() >= ef
+            }));
+            // Max-heap of the best `ef` results found so far (farthest first, for cheap eviction).
+            if let Some(node) = self.nodes.get(entry)
+                && !node.is_deleted()
+                && filter(entry)
             {
-                break; // Algorithm 2 line 7-8: all of W is settled.
+                scratch.result.push(Candidate {
+                    row_id: entry,
+                    dist: entry_dist,
+                });
             }
-            let Some(node) = self.nodes.get(c.row_id) else {
-                continue;
-            };
-            // A node's layer-lc slot array only exists for lc <= node.level().
-            if lc > node.level() {
-                continue;
-            }
-            for neighbor_id in node.layer(lc).occupied() {
-                if visited.contains(&neighbor_id) {
+
+            // Saturation-based early termination ("Patience in Proximity",
+            // Teofili & Lin, ECIR 2025 -- see design doc
+            // docs/superpowers/specs/2026-07-19-hnsw-search-performance-improvements-design.md
+            // §3). `ef` stands in for the paper's `k`: this function has no
+            // separate top-k concept, only the ef-capped `result` set. If the
+            // result set's membership stops changing across consecutive
+            // candidate visits, further traversal is unlikely to improve it.
+            #[allow(clippy::items_after_statements)]
+            const SATURATION_THRESHOLD_PERCENT: u32 = 95;
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                clippy::cast_precision_loss
+            )]
+            let patience: u32 = ((ef as f64) * 0.3).ceil().max(7.0) as u32;
+            let mut saturated_streak: u32 = 0;
+
+            while let Some(std::cmp::Reverse(c)) = scratch.candidates.pop() {
+                if let Some(furthest) = scratch.result.peek()
+                    && c.dist > furthest.dist
+                    && scratch.result.len() >= ef
+                {
+                    break; // Algorithm 2 line 7-8: all of W is settled.
+                }
+                let Some(node) = self.nodes.get(c.row_id) else {
+                    continue;
+                };
+                // A node's layer-lc slot array only exists for lc <= node.level().
+                if lc > node.level() {
                     continue;
                 }
-                visited.insert(neighbor_id);
-                let neighbor_dist = self.distance_to(query, neighbor_id);
-                let should_add = match result.peek() {
-                    Some(furthest) => neighbor_dist < furthest.dist || result.len() < ef,
-                    None => true,
-                };
-                if should_add {
-                    candidates.push(std::cmp::Reverse(Candidate {
-                        row_id: neighbor_id,
-                        dist: neighbor_dist,
-                    }));
-                    if let Some(neighbor_node) = self.nodes.get(neighbor_id)
-                        && !neighbor_node.is_deleted()
-                        && filter(neighbor_id)
-                    {
-                        result.push(Candidate {
+                for neighbor_id in node.layer(lc).occupied() {
+                    if scratch.visited.contains(&neighbor_id) {
+                        continue;
+                    }
+                    scratch.visited.insert(neighbor_id);
+                    let neighbor_dist = self.distance_to(query, neighbor_id);
+                    let should_add = match scratch.result.peek() {
+                        Some(furthest) => {
+                            neighbor_dist < furthest.dist || scratch.result.len() < ef
+                        }
+                        None => true,
+                    };
+                    if should_add {
+                        scratch.candidates.push(std::cmp::Reverse(Candidate {
                             row_id: neighbor_id,
                             dist: neighbor_dist,
-                        });
-                        if result.len() > ef {
-                            result.pop(); // evict the current furthest
+                        }));
+                        if let Some(neighbor_node) = self.nodes.get(neighbor_id)
+                            && !neighbor_node.is_deleted()
+                            && filter(neighbor_id)
+                        {
+                            scratch.result.push(Candidate {
+                                row_id: neighbor_id,
+                                dist: neighbor_dist,
+                            });
+                            if scratch.result.len() > ef {
+                                scratch.result.pop(); // evict the current furthest
+                            }
                         }
                     }
                 }
-            }
-        }
 
-        let mut out: Vec<(u64, f32)> = result.into_iter().map(|c| (c.row_id, c.dist)).collect();
-        out.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(CmpOrdering::Equal));
-        out
+                scratch.current_result_ids.clear();
+                scratch
+                    .current_result_ids
+                    .extend(scratch.result.iter().map(|c| c.row_id));
+                if !scratch.previous_result_ids.is_empty() && ef > 0 {
+                    let overlap = scratch
+                        .previous_result_ids
+                        .intersection(&scratch.current_result_ids)
+                        .count();
+                    #[allow(
+                        clippy::cast_precision_loss,
+                        clippy::cast_possible_truncation,
+                        clippy::cast_sign_loss
+                    )]
+                    let overlap_percent = ((overlap as f64 / ef as f64) * 100.0) as u32;
+                    if overlap_percent >= SATURATION_THRESHOLD_PERCENT {
+                        saturated_streak += 1;
+                        if saturated_streak >= patience {
+                            break;
+                        }
+                    } else {
+                        saturated_streak = 0;
+                    }
+                }
+                std::mem::swap(
+                    &mut scratch.previous_result_ids,
+                    &mut scratch.current_result_ids,
+                );
+            }
+
+            let mut out: Vec<(u64, f32)> =
+                scratch.result.iter().map(|c| (c.row_id, c.dist)).collect();
+            out.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(CmpOrdering::Equal));
+            out
+        })
     }
 
     fn distance_to(&self, query: &[f32], row_id: u64) -> f32 {
@@ -274,7 +363,7 @@ impl<D: Distance> Graph<D> {
     /// insert.
     // Algorithm 1's own parameter list (row-id, vector, M, Mmax0, Mmax,
     // efConstruction, mL, plus the caller-supplied `unif` draw this design
-    // injects instead of an internal RNG) is inherently 8 conceptual
+    // injects instead of an internal RNG) is inherently 9 conceptual
     // parameters wide — this is the exact interface Task 8's spec mandates
     // (consumed as-is by Task 9's tests, Task 11's stress test, and Task
     // 14's `HnswIndex` wrapper), not something to restructure into a
@@ -289,6 +378,7 @@ impl<D: Distance> Graph<D> {
         mmax: usize,
         ef_construction: usize,
         m_l: f64,
+        alpha: f64,
         unif: f64,
     ) -> Result<(), crate::hnsw::IndexError> {
         self.check_or_establish_dimension(vector.len())?;
@@ -346,8 +436,9 @@ impl<D: Distance> Graph<D> {
                 entry = *nearest;
             }
             let capacity = if lc == 0 { mmax0 } else { mmax };
-            let chosen =
-                select_neighbors_heuristic(&candidates, m, |a, b| self.pairwise_distance(a, b));
+            let chosen = select_neighbors_heuristic(&candidates, m, alpha, |a, b| {
+                self.pairwise_distance(a, b)
+            });
 
             let Some(new_node) = self.nodes.get(row_id) else {
                 continue;
@@ -365,9 +456,10 @@ impl<D: Distance> Graph<D> {
                             .iter()
                             .map(|&id| (id, self.pairwise_distance(neighbor_id, id)))
                             .collect();
-                        let keep = select_neighbors_heuristic(&with_dists, capacity, |a, b| {
-                            self.pairwise_distance(a, b)
-                        });
+                        let keep =
+                            select_neighbors_heuristic(&with_dists, capacity, alpha, |a, b| {
+                                self.pairwise_distance(a, b)
+                            });
                         let to_remove: Vec<u64> = occupied
                             .into_iter()
                             .filter(|id| !keep.contains(id))
@@ -399,7 +491,7 @@ impl<D: Distance> Graph<D> {
     /// vector length disagrees with the graph's established dimension (or
     /// an earlier row in this same batch) — matches `insert`'s own
     /// per-call validation, just applied row-by-row within the batch.
-    // Mirrors `insert`'s own 8-parameter signature by design (this is a
+    // Mirrors `insert`'s own 9-parameter signature by design (this is a
     // thin forwarding wrapper over it) — same too-many-arguments rationale
     // as `insert` above, not something to restructure into a struct here
     // either.
@@ -420,6 +512,7 @@ impl<D: Distance> Graph<D> {
         mmax: usize,
         ef_construction: usize,
         m_l: f64,
+        alpha: f64,
         unifs: &[f64],
     ) -> Result<(), crate::hnsw::IndexError> {
         debug_assert_eq!(rows.len(), unifs.len());
@@ -432,6 +525,7 @@ impl<D: Distance> Graph<D> {
                 mmax,
                 ef_construction,
                 m_l,
+                alpha,
                 unif,
             )?;
         }
@@ -571,6 +665,7 @@ fn select_neighbors_simple(candidates: &[(u64, f32)], m: usize) -> Vec<u64> {
 fn select_neighbors_heuristic(
     candidates: &[(u64, f32)],
     m: usize,
+    alpha: f64,
     pairwise_dist: impl Fn(u64, u64) -> f32,
 ) -> Vec<u64> {
     let mut working: Vec<(u64, f32)> = candidates.to_vec();
@@ -581,15 +676,18 @@ fn select_neighbors_heuristic(
         if result.len() >= m {
             break;
         }
-        // Algorithm 4 line 11's diversity check: keep `candidate_id` only
-        // if it is NOT dominated — i.e. no already-picked neighbor is
-        // closer to this candidate than the candidate itself is to the
-        // query. A dominated candidate is redundant with an existing pick
-        // (same direction, no new information); a non-dominated one
-        // represents a genuinely different direction.
+        // Vamana's RobustPrune reachability parameter (alpha >= 1,
+        // Subramanya et al. / DiskANN): a candidate is dominated only if
+        // some already-picked neighbor is closer to it than
+        // query_dist/alpha. alpha=1.0 reproduces Algorithm 4 line 11's
+        // original check exactly (the previous, hardcoded behavior);
+        // alpha>1.0 relaxes the check, retaining more longer-range
+        // edges.
+        #[allow(clippy::cast_possible_truncation)]
+        let relaxed_threshold = (f64::from(query_dist) / alpha) as f32;
         let dominated = result
             .iter()
-            .any(|&picked| pairwise_dist(candidate_id, picked) < query_dist);
+            .any(|&picked| pairwise_dist(candidate_id, picked) < relaxed_threshold);
         if !dominated {
             result.push(candidate_id);
         }
@@ -679,6 +777,7 @@ mod tests {
                 16,
                 100,
                 1.0 / (16f64).ln(),
+                1.0,
                 0.5,
             )
             .unwrap();
@@ -691,6 +790,7 @@ mod tests {
                 16,
                 100,
                 1.0 / (16f64).ln(),
+                1.0,
                 0.5,
             )
             .unwrap();
@@ -703,6 +803,7 @@ mod tests {
                 16,
                 100,
                 1.0 / (16f64).ln(),
+                1.0,
                 0.5,
             )
             .unwrap();
@@ -717,10 +818,10 @@ mod tests {
         let graph = Graph::new(crate::distance::L2, 10);
         let m_l = 1.0 / (16f64).ln();
         graph
-            .insert(0, vec![0.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.5)
+            .insert(0, vec![0.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 1.0, 0.5)
             .unwrap();
         graph
-            .insert(1, vec![10.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.5)
+            .insert(1, vec![10.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 1.0, 0.5)
             .unwrap();
         // INSERT itself wires the bidirectional 0 <-> 1 edge at layer 0.
         if let Some(node0) = graph.nodes.get(0) {
@@ -746,10 +847,10 @@ mod tests {
         let graph = Graph::new(crate::distance::L2, 10);
         let m_l = 1.0 / (16f64).ln();
         graph
-            .insert(0, vec![0.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.5)
+            .insert(0, vec![0.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 1.0, 0.5)
             .unwrap();
         graph
-            .insert(1, vec![1000.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.5)
+            .insert(1, vec![1000.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 1.0, 0.5)
             .unwrap();
         // INSERT itself wires the bidirectional 0 <-> 1 edge at layer 0.
 
@@ -761,6 +862,36 @@ mod tests {
         assert!(
             results.iter().any(|(id, _)| *id == 1),
             "the filter must not have blocked traversal through node 0 to reach node 1: {results:?}"
+        );
+    }
+
+    #[test]
+    fn search_layer_scratch_buffers_do_not_leak_state_across_calls() {
+        let graph = Graph::new(crate::distance::L2, 10);
+        let m_l = 1.0 / (16f64).ln();
+        graph
+            .insert(0, vec![0.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 1.0, 0.5)
+            .unwrap();
+        graph
+            .insert(1, vec![0.1, 0.0, 0.0], 16, 32, 16, 100, m_l, 1.0, 0.5)
+            .unwrap();
+
+        // First call, entry = row 0: row 0 gets marked visited in
+        // whatever scratch buffer backs this call.
+        let first = graph.search_layer(&[0.0, 0.0, 0.0], 0, 5, 0, &|_| true);
+        assert!(first.iter().any(|(id, _)| *id == 0));
+
+        // Second, independent call from a DIFFERENT entry point (row 1)
+        // must still be able to reach and return row 0 via traversal --
+        // if a reused scratch buffer's `visited` set wasn't cleared
+        // between calls, row 0 would still show up as "already visited"
+        // from the first call and get wrongly skipped here.
+        let second = graph.search_layer(&[0.0, 0.0, 0.0], 1, 5, 0, &|_| true);
+        assert!(
+            second.iter().any(|(id, _)| *id == 0),
+            "reused scratch buffers must be cleared between calls -- row 0 \
+             was wrongly excluded, implying stale `visited` state leaked \
+             across calls: {second:?}"
         );
     }
 
@@ -785,36 +916,48 @@ mod tests {
     #[test]
     fn select_neighbors_heuristic_prunes_a_candidate_dominated_by_an_already_picked_neighbor() {
         // Candidate 2: dist-to-query 1.0. Candidate 3: dist-to-query 3.0,
-        // and dist(3, 2) = 2.0 — candidate 3 is dominated by already-picked
+        // and dist(3, 2) = 2.0 -- candidate 3 is dominated by already-picked
         // candidate 2, so the heuristic should skip it in favor of a more
         // diverse pick (candidate 4) if one exists.
-        //
-        // dist(3, 2) = 2.0 is deliberately chosen to sit strictly BETWEEN
-        // the two possible reference points a correct-vs-backwards
-        // implementation could compare it against: the picked neighbor's
-        // own query-distance (dist(2, q) = 1.0) and the candidate's own
-        // query-distance (dist(3, q) = 3.0). The correct check compares
-        // against the candidate's distance (2.0 < 3.0 -> dominated, matches
-        // Algorithm 4 line 11); a backwards implementation that compared
-        // against the picked neighbor's distance instead would see
-        // 2.0 < 1.0 -> false -> NOT dominated, and wrongly keep candidate 3,
-        // producing [2, 3] instead of [2, 4]. A value below both thresholds
-        // (e.g. the previous 0.1) or above both would pass under either
-        // comparison direction and silently fail to catch a swapped
-        // comparison — do not "simplify" this value back down.
         let candidates = vec![(2, 1.0), (3, 3.0), (4, 3.1)];
         let pairwise = |a: u64, b: u64| -> f32 {
             match (a, b) {
-                (3, 2) | (2, 3) => 2.0, // strictly between dist(2,q)=1.0 and dist(3,q)=3.0
-                (4, 2) | (2, 4) => 5.0, // 4 is genuinely distinct from 2
+                (3, 2) | (2, 3) => 2.0,
+                (4, 2) | (2, 4) => 5.0,
                 _ => 0.0,
             }
         };
-        let selected = select_neighbors_heuristic(&candidates, 2, pairwise);
+        let selected = select_neighbors_heuristic(&candidates, 2, 1.0, pairwise);
         assert_eq!(
             selected,
             vec![2, 4],
-            "must prefer the diverse candidate (4) over the redundant one (3), unlike SIMPLE: {selected:?}"
+            "alpha=1.0 must reproduce the original heuristic exactly: {selected:?}"
+        );
+    }
+
+    #[test]
+    fn select_neighbors_heuristic_alpha_greater_than_one_retains_a_previously_dominated_candidate()
+    {
+        // Same fixture as the alpha=1.0 test above. At alpha=2.0,
+        // candidate 3's relaxed threshold (query_dist 3.0 / alpha 2.0 =
+        // 1.5) is no longer exceeded by pairwise_dist(3, 2) = 2.0, so 3
+        // is no longer dominated and gets kept ahead of the more-diverse
+        // candidate 4 -- proving alpha genuinely changes behavior, not
+        // just an inert parameter that's accepted and ignored.
+        let candidates = vec![(2, 1.0), (3, 3.0), (4, 3.1)];
+        let pairwise = |a: u64, b: u64| -> f32 {
+            match (a, b) {
+                (3, 2) | (2, 3) => 2.0,
+                (4, 2) | (2, 4) => 5.0,
+                _ => 0.0,
+            }
+        };
+        let selected = select_neighbors_heuristic(&candidates, 2, 2.0, pairwise);
+        assert_eq!(
+            selected,
+            vec![2, 3],
+            "alpha=2.0 must retain candidate 3 (no longer dominated at the \
+             relaxed threshold), unlike alpha=1.0's [2, 4]: {selected:?}"
         );
     }
 
@@ -839,13 +982,13 @@ mod tests {
         // exactly the "no direct A<->C edge" topology this test needs,
         // without manually wiring it.
         graph
-            .insert(0, vec![0.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.5)
+            .insert(0, vec![0.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 1.0, 0.5)
             .unwrap(); // A: entry, live
         graph
-            .insert(1, vec![5.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.5)
+            .insert(1, vec![5.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 1.0, 0.5)
             .unwrap(); // B: excluded by filter
         graph
-            .insert(2, vec![10.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.5)
+            .insert(2, vec![10.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 1.0, 0.5)
             .unwrap(); // C: live, target
 
         // Hardens this test against a silent regression: it depends on
@@ -881,10 +1024,10 @@ mod tests {
         let graph = Graph::new(crate::distance::L2, 10);
         let m_l = 1.0 / (16f64).ln();
         graph
-            .insert(0, vec![0.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.9)
+            .insert(0, vec![0.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 1.0, 0.9)
             .unwrap();
         graph
-            .insert(1, vec![0.1, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.9)
+            .insert(1, vec![0.1, 0.0, 0.0], 16, 32, 16, 100, m_l, 1.0, 0.9)
             .unwrap();
 
         let node0 = graph.nodes.get(0).unwrap();
@@ -905,12 +1048,12 @@ mod tests {
         let m_l = 1.0 / (16f64).ln();
         // unif close to 1.0 -> level 0; unif close to 0.0 -> a high level.
         graph
-            .insert(0, vec![0.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.99)
+            .insert(0, vec![0.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 1.0, 0.99)
             .unwrap();
         assert_eq!(graph.entry_point.get().map(|(_, level)| level), Some(0));
 
         graph
-            .insert(1, vec![1.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.000_001)
+            .insert(1, vec![1.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 1.0, 0.000_001)
             .unwrap();
         let (entry_row, entry_level) = graph.entry_point.get().unwrap();
         assert_eq!(
@@ -943,13 +1086,13 @@ mod tests {
         let graph = Graph::new(crate::distance::L2, 10);
         let m_l = 1.0 / (16f64).ln();
         graph
-            .insert(0, vec![0.0, 0.0, 0.0], 1, 1, 1, 10, m_l, 0.99)
+            .insert(0, vec![0.0, 0.0, 0.0], 1, 1, 1, 10, m_l, 1.0, 0.99)
             .unwrap(); // B: first node, becomes the entry point
         graph
-            .insert(1, vec![100.0, 0.0, 0.0], 1, 1, 1, 10, m_l, 0.99)
+            .insert(1, vec![100.0, 0.0, 0.0], 1, 1, 1, 10, m_l, 1.0, 0.99)
             .unwrap(); // F1: far from B, fills B's single layer-0 slot
         graph
-            .insert(2, vec![0.1, 0.0, 0.0], 1, 1, 1, 10, m_l, 0.99)
+            .insert(2, vec![0.1, 0.0, 0.0], 1, 1, 1, 10, m_l, 1.0, 0.99)
             .unwrap(); // F2: much closer to B than F1 is
 
         let b = graph.nodes.get(0).unwrap();
@@ -970,7 +1113,7 @@ mod tests {
         let m_l = 1.0 / (16f64).ln();
         for i in 0..10u64 {
             graph
-                .insert(i, vec![i as f32, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.5)
+                .insert(i, vec![i as f32, 0.0, 0.0], 16, 32, 16, 100, m_l, 1.0, 0.5)
                 .unwrap();
         }
         let results = graph
@@ -1014,11 +1157,31 @@ mod tests {
         let graph = Graph::new(crate::distance::L2, 20);
         let m_l = 1.0 / (16f64).ln();
         graph
-            .insert(0, vec![1000.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.000_001)
+            .insert(
+                0,
+                vec![1000.0, 0.0, 0.0],
+                16,
+                32,
+                16,
+                100,
+                m_l,
+                1.0,
+                0.000_001,
+            )
             .unwrap();
         for i in 1..=8u64 {
             graph
-                .insert(i, vec![i as f32 * 0.1, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.9)
+                .insert(
+                    i,
+                    vec![i as f32 * 0.1, 0.0, 0.0],
+                    16,
+                    32,
+                    16,
+                    100,
+                    m_l,
+                    1.0,
+                    0.9,
+                )
                 .unwrap();
         }
         let (entry_row, entry_level) = graph.entry_point.get().unwrap();
@@ -1047,7 +1210,7 @@ mod tests {
         let m_l = 1.0 / (16f64).ln();
         for i in 0..10u64 {
             graph
-                .insert(i, vec![i as f32, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.5)
+                .insert(i, vec![i as f32, 0.0, 0.0], 16, 32, 16, 100, m_l, 1.0, 0.5)
                 .unwrap();
         }
         graph.delete(0);
@@ -1077,7 +1240,7 @@ mod tests {
         let m_l = 1.0 / (16f64).ln();
         for i in 0..10u64 {
             graph
-                .insert(i, vec![i as f32, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.5)
+                .insert(i, vec![i as f32, 0.0, 0.0], 16, 32, 16, 100, m_l, 1.0, 0.5)
                 .unwrap();
         }
         let results = graph
@@ -1103,10 +1266,10 @@ mod tests {
         let graph = Graph::new(crate::distance::L2, 20);
         let m_l = 1.0 / (16f64).ln();
         graph
-            .insert(0, vec![0.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.5)
+            .insert(0, vec![0.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 1.0, 0.5)
             .unwrap();
         graph
-            .insert(1, vec![1000.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.5)
+            .insert(1, vec![1000.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 1.0, 0.5)
             .unwrap();
 
         graph.delete(0);
@@ -1175,6 +1338,7 @@ mod tests {
                                 16,
                                 100,
                                 m_l,
+                                1.0,
                                 test_unif(row_id),
                             )
                             .unwrap();
@@ -1223,7 +1387,7 @@ mod tests {
         let rows: Vec<(u64, Vec<f32>)> = (0..5).map(|i| (i, vec![i as f32, 0.0, 0.0])).collect();
         let unifs = vec![0.5; 5];
         graph
-            .insert_batch(&rows, 16, 32, 16, 100, m_l, &unifs)
+            .insert_batch(&rows, 16, 32, 16, 100, m_l, 1.0, &unifs)
             .unwrap();
 
         for i in 0..5u64 {
@@ -1232,6 +1396,198 @@ mod tests {
                 .unwrap();
             assert_eq!(results[0].0, i);
         }
+    }
+
+    #[test]
+    fn saturation_based_early_termination_preserves_recall_and_reduces_distance_evals() {
+        // Regression/discrimination test for saturation-based early
+        // termination ("Patience in Proximity", see design doc): proves
+        // (a) recall is unaffected -- the returned top-k set still
+        // exactly matches the true nearest neighbors -- and (b) early
+        // termination actually fires -- fewer distance evaluations than
+        // fully verifying the ef-capped result set would require.
+        //
+        // Fixture design note (this is a REWORK of the brief's original
+        // Step 1 draft -- see the empirical justification below):
+        //
+        // `search_layer`'s candidate/result heaps guarantee candidates
+        // are popped in strictly non-decreasing true distance. Any
+        // already-discovered-but-since-evicted candidate ("zombie") that
+        // gets popped later necessarily has `dist` greater than the
+        // *current* (already-converged) `furthest.dist`, so it trips
+        // Algorithm 2's own break condition immediately, at zero extra
+        // cost, the very first time one is popped. That means the only
+        // candidates that ever cost real distance evals *after* the true
+        // top set has been found are the true set's own members getting
+        // their neighbor lists opened for verification (each pops
+        // exactly once). With `ef=5` that caps the achievable run of
+        // genuinely-safe "stable, no-op" opens at 5 -- but this
+        // function's `patience` is `max(ceil(ef * 0.3), 7)`, i.e. always
+        // >= 7 for any `ef` up to ~20. A 5-point true set structurally
+        // can never reach a 7-long stable streak, so the brief's
+        // original 5-true-points/25-ring-points draft is *provably*
+        // unable to discriminate, independent of tuning the ring's size
+        // or tightness -- confirmed empirically: with the ring widened to
+        // 95 points and the cluster tightened to 0.0001 offsets, and
+        // separately with a slow-gradient 150-point boundary swarm, the
+        // saturation check never fired either way (evals identical with
+        // it enabled vs. disabled). The fix is structural, not a matter
+        // of degree: widen the true set to >= `patience` points (here,
+        // 10) so there are enough post-convergence verification opens
+        // for the streak to actually reach the threshold, then use
+        // `ef=10` (`k=5` still trims the returned/checked set to the
+        // true nearest 5 of those 10).
+        //
+        // Fixture: query at the origin, `k=5`, `ef=10`. Ten points at
+        // distance ~1.0000-1.0009 (tightly clustered, nearly
+        // indistinguishable from each other -- the "flat convergence
+        // zone" the saturation mechanism targets). Sixty additional
+        // points on a swarm at distance >= 1.4, inserted *before* the
+        // cluster so the graph's single entry point (this fixture uses
+        // `unif=0.5` for every insert, which deterministically assigns
+        // level 0 to every node, making the first-ever insert the
+        // permanent entry point) starts outside the cluster and must
+        // genuinely traverse into it, giving the cluster members real
+        // (non-cluster) graph edges whose distance evals a working
+        // saturation check has something to save.
+        //
+        // NOTE for whoever maintains this test: this fixture's exact
+        // discriminating power (does the assertion at the bottom
+        // actually catch a broken/disabled saturation check?) was
+        // verified empirically during implementation by temporarily
+        // reverting the saturation-check code in Step 3 and confirming
+        // `evals_with_patience` increased (see task-2-report.md for the
+        // recorded numbers). If you change `search_layer`'s traversal
+        // logic and this test's second assertion becomes flaky or stops
+        // discriminating, re-run that same red/green check rather than
+        // assuming the fixture still works -- do not just loosen the
+        // bound to make it pass.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingL2 {
+            calls: Arc<AtomicUsize>,
+        }
+        impl crate::distance::Distance for CountingL2 {
+            fn eval(&self, a: &[f32], b: &[f32]) -> f32 {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                crate::distance::L2.eval(a, b)
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let graph = Graph::new(
+            CountingL2 {
+                calls: Arc::clone(&calls),
+            },
+            80,
+        );
+        let m_l = 1.0 / (16f64).ln();
+
+        // Swarm: 60 points at distance >= 1.4, inserted FIRST so the
+        // (level-0-only, since `unif` is fixed) entry point starts here,
+        // outside the true cluster.
+        for i in 0..60u64 {
+            #[allow(clippy::cast_precision_loss)]
+            let radius = 1.4 + (i % 10) as f64 * 0.05;
+            #[allow(clippy::cast_precision_loss)]
+            let angle = i as f64 * 0.55;
+            #[allow(clippy::cast_possible_truncation)]
+            let vector = vec![
+                (radius * angle.cos()) as f32,
+                (radius * angle.sin()) as f32,
+                0.0,
+            ];
+            graph
+                .insert(i, vector, 16, 32, 16, 100, m_l, 1.0, 0.5)
+                .unwrap();
+        }
+
+        // True nearest 10: distance ~1.0000-1.0009, tightly clustered.
+        // Inserted after the swarm (ids 60..70) so they connect into the
+        // already-built swarm graph rather than being the first (and
+        // therefore entry) node.
+        for i in 60..70u64 {
+            #[allow(clippy::cast_precision_loss)]
+            let offset = (i - 60) as f32 * 0.0001;
+            graph
+                .insert(
+                    i,
+                    vec![1.0 + offset, 0.0, 0.0],
+                    16,
+                    32,
+                    16,
+                    100,
+                    m_l,
+                    1.0,
+                    0.5,
+                )
+                .unwrap();
+        }
+
+        // Satellites: 10 points (ids 70..80), one anchored near each
+        // cluster member (matching x-coordinate, offset 0.05 in y) --
+        // far enough from the origin (distance ~0.05, well past the
+        // 5th-nearest true member's ~1.0004) to never enter the true
+        // top-5, but close enough to their specific cluster anchor to be
+        // selected as one of ITS graph edges (with a reciprocal edge
+        // added back per `insert`'s bidirectional linking) rather than
+        // the swarm's. Inserted last so their own construction-time
+        // search finds the cluster (already built) as the closest
+        // candidates available. This gives each cluster member a
+        // distinct, otherwise-unvisited neighbor to discover when (and
+        // only when) that specific member's own neighbor list is
+        // opened -- exactly the marginal eval cost saturation-based
+        // early termination is meant to save by not opening every
+        // member of the final result set.
+        for i in 70..80u64 {
+            #[allow(clippy::cast_precision_loss)]
+            let anchor_offset = (i - 70) as f32 * 0.0001;
+            graph
+                .insert(
+                    i,
+                    vec![1.0 + anchor_offset, 0.05, 0.0],
+                    16,
+                    32,
+                    16,
+                    100,
+                    m_l,
+                    1.0,
+                    0.5,
+                )
+                .unwrap();
+        }
+
+        calls.store(0, Ordering::Relaxed);
+        let results = graph
+            .k_nn_search(&[0.0, 0.0, 0.0], 5, 10, |_| true)
+            .unwrap();
+        let evals_with_patience = calls.load(Ordering::Relaxed);
+
+        let mut result_ids: Vec<u64> = results.iter().map(|(id, _)| *id).collect();
+        result_ids.sort_unstable();
+        assert_eq!(
+            result_ids,
+            vec![60, 61, 62, 63, 64],
+            "must still find the true 5 nearest neighbors despite early \
+             termination: {result_ids:?}"
+        );
+
+        // Bound tuned against the empirically measured red/green pair
+        // for this exact fixture (see task-2-report.md Step 5): 35
+        // evals with the saturation check disabled (candidates 67, 68,
+        // 69 each get opened, discovering their previously-unvisited
+        // satellite), vs. 32 evals with it enabled (those three opens,
+        // and their satellite discoveries, are skipped once the streak
+        // reaches `patience`). The bound sits strictly between the two
+        // so this assertion fails if saturation-based termination stops
+        // firing, rather than passing trivially either way.
+        assert!(
+            evals_with_patience < 34,
+            "saturation-based termination should skip verifying the \
+             final few (67, 68, 69) result-set members once membership \
+             has stabilized: {evals_with_patience} evals"
+        );
     }
 }
 
