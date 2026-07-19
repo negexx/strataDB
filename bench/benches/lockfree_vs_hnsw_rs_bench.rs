@@ -221,6 +221,7 @@ fn bench_lockfree_vs_hnsw_rs(c: &mut Criterion) {
     // --- new lock-free Graph ---
     let graph = Graph::new(L2, N);
     let m_l = 1.0 / 16f64.ln();
+    let graph_insert_start = std::time::Instant::now();
     for (i, v) in vectors.iter().enumerate() {
         graph
             .insert(
@@ -236,6 +237,13 @@ fn bench_lockfree_vs_hnsw_rs(c: &mut Criterion) {
             )
             .unwrap();
     }
+    let graph_insert_elapsed = graph_insert_start.elapsed();
+    #[allow(clippy::cast_precision_loss)]
+    let inserts_per_sec = N as f64 / graph_insert_elapsed.as_secs_f64();
+    println!(
+        "Graph::insert wall-clock time for {N} vectors: {graph_insert_elapsed:?} \
+         ({inserts_per_sec:.1} inserts/sec)"
+    );
     let graph_results: Vec<Vec<u64>> = queries
         .iter()
         .map(|q| {
