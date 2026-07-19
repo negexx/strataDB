@@ -934,6 +934,14 @@ Append a note under this task's checkbox in this plan file, e.g.:
       count_sum_min_max_1000000_groups: <baseline> -> <after>
 ```
 
+- [x] Task 4: confirmed 2026-07-19 — point estimates (Criterion's `[lower point upper]`, matching how Task 1's baseline was recorded), 10 samples each:
+      sum_1000_groups: 82.613 ms -> 95.945 ms [74.674 ms, 120.32 ms] (not gated; slightly worse, within this case's own noise band — see report),
+      sum_100000_groups: 279.32 ms -> 136.88 ms [126.67 ms, 151.21 ms] (not gated; improved),
+      sum_1000000_groups: 1.2435 s -> 531.43 ms [502.05 ms, 564.44 ms] (**gated — improved, ~57% faster**),
+      count_sum_min_max_1000000_groups: 1.2910 s -> 575.18 ms [551.44 ms, 601.89 ms] (**gated — improved, ~55% faster**)
+
+Both gated 1,000,000-group cases show a measured improvement well outside their own confidence intervals — decision gate passes. Full run output, environment, and reasoning: `.superpowers/sdd/task-4-report.md`.
+
 - [ ] **Step 4: Commit**
 
 ```bash
