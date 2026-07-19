@@ -106,6 +106,20 @@ for whoever reviews the actual numbers), that's a signal to revisit §4's
 rejected adaptive-saturation option, not a reason to silently accept a
 worse insert-time regression than the recall gain justifies.
 
+**Actual outcome (recorded after implementation, not a prediction):**
+recall@10 landed at exactly 0.9940 as targeted, reproduced identically
+across two independent runs. Insert wall-clock got *faster*, not slower
+as predicted above — the saturation bookkeeping (clearing/extending a
+`HashSet`, computing an intersection) costs real time every loop
+iteration regardless of whether it ever triggers an early exit, and
+`Graph::insert`'s `ef_construction = 200` phase requires a 60-iteration
+stable-membership streak to fire at all, rarely reached while the
+result set is still churning during construction. Removing the check
+strips that per-iteration cost while forfeiting an early exit that
+seldom paid for itself during insert — net speedup, not the assumed
+tradeoff. See the implementation plan's "Task 3 Results" section for
+the exact numbers.
+
 ## 4. Explicitly not pursued: adaptive/tunable saturation during insert
 
 Considered and rejected for this fix: instead of a binary on/off, give
