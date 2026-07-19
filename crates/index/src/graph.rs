@@ -147,6 +147,27 @@ impl Ord for Candidate {
     }
 }
 
+/// Per-thread reusable scratch space for `search_layer`, avoiding a
+/// fresh `HashSet`/two `BinaryHeap`s/two more `HashSet`s on every call.
+/// Safe as plain `RefCell` (not a `Mutex`/atomic): `search_layer` is
+/// never called reentrantly on the same thread -- every caller
+/// (`Graph::insert`'s two call sites, `Graph::k_nn_search`'s two call
+/// sites) calls it sequentially and lets each call fully return before
+/// starting the next, so a nested `borrow_mut()` can never happen.
+#[derive(Default)]
+struct SearchScratch {
+    visited: std::collections::HashSet<u64>,
+    candidates: BinaryHeap<std::cmp::Reverse<Candidate>>,
+    result: BinaryHeap<Candidate>,
+    previous_result_ids: std::collections::HashSet<u64>,
+    current_result_ids: std::collections::HashSet<u64>,
+}
+
+thread_local! {
+    static SEARCH_SCRATCH: std::cell::RefCell<SearchScratch> =
+        std::cell::RefCell::new(SearchScratch::default());
+}
+
 impl<D: Distance> Graph<D> {
     pub fn new(distance: D, expected_capacity: usize) -> Self {
         Self {
@@ -169,6 +190,13 @@ impl<D: Distance> Graph<D> {
     /// on an already-capped top-k"). This is what lets a caller's
     /// `live_ids` membership push all the way into traversal-time
     /// filtering, not just the deleted flag. See design doc §3.
+    // The thread-local-scratch closure (Task 3 of the HNSW search-perf
+    // plan) pushed this past clippy's default 100-line threshold; the
+    // extra length is entirely the pre-existing Task 2 algorithm body now
+    // wrapped in `with_borrow_mut`, not new complexity -- splitting it
+    // into sub-functions would mean threading `scratch`'s fields through
+    // several new signatures for no behavioral benefit.
+    #[allow(clippy::too_many_lines)]
     fn search_layer(
         &self,
         query: &[f32],
@@ -177,118 +205,130 @@ impl<D: Distance> Graph<D> {
         lc: usize,
         filter: &impl Fn(u64) -> bool,
     ) -> Vec<(u64, f32)> {
-        let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();
-        visited.insert(entry);
+        SEARCH_SCRATCH.with_borrow_mut(|scratch| {
+            scratch.visited.clear();
+            scratch.candidates.clear();
+            scratch.result.clear();
+            scratch.previous_result_ids.clear();
+            scratch.current_result_ids.clear();
 
-        let entry_dist = self.distance_to(query, entry);
-        // Min-heap of candidates still to explore (nearest first via `Reverse`).
-        let mut candidates: BinaryHeap<std::cmp::Reverse<Candidate>> = BinaryHeap::new();
-        candidates.push(std::cmp::Reverse(Candidate {
-            row_id: entry,
-            dist: entry_dist,
-        }));
-        // Max-heap of the best `ef` results found so far (farthest first, for cheap eviction).
-        let mut result: BinaryHeap<Candidate> = BinaryHeap::new();
-        if let Some(node) = self.nodes.get(entry)
-            && !node.is_deleted()
-            && filter(entry)
-        {
-            result.push(Candidate {
+            scratch.visited.insert(entry);
+
+            let entry_dist = self.distance_to(query, entry);
+            // Min-heap of candidates still to explore (nearest first via `Reverse`).
+            scratch.candidates.push(std::cmp::Reverse(Candidate {
                 row_id: entry,
                 dist: entry_dist,
-            });
-        }
-
-        // Saturation-based early termination ("Patience in Proximity",
-        // Teofili & Lin, ECIR 2025 -- see design doc
-        // docs/superpowers/specs/2026-07-19-hnsw-search-performance-improvements-design.md
-        // §3). `ef` stands in for the paper's `k`: this function has no
-        // separate top-k concept, only the ef-capped `result` set. If the
-        // result set's membership stops changing across consecutive
-        // candidate visits, further traversal is unlikely to improve it.
-        #[allow(clippy::items_after_statements)]
-        const SATURATION_THRESHOLD_PERCENT: u32 = 95;
-        #[allow(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            clippy::cast_precision_loss
-        )]
-        let patience: u32 = ((ef as f64) * 0.3).ceil().max(7.0) as u32;
-        let mut previous_result_ids: std::collections::HashSet<u64> =
-            std::collections::HashSet::new();
-        let mut saturated_streak: u32 = 0;
-
-        while let Some(std::cmp::Reverse(c)) = candidates.pop() {
-            if let Some(furthest) = result.peek()
-                && c.dist > furthest.dist
-                && result.len() >= ef
+            }));
+            // Max-heap of the best `ef` results found so far (farthest first, for cheap eviction).
+            if let Some(node) = self.nodes.get(entry)
+                && !node.is_deleted()
+                && filter(entry)
             {
-                break; // Algorithm 2 line 7-8: all of W is settled.
+                scratch.result.push(Candidate {
+                    row_id: entry,
+                    dist: entry_dist,
+                });
             }
-            let Some(node) = self.nodes.get(c.row_id) else {
-                continue;
-            };
-            // A node's layer-lc slot array only exists for lc <= node.level().
-            if lc > node.level() {
-                continue;
-            }
-            for neighbor_id in node.layer(lc).occupied() {
-                if visited.contains(&neighbor_id) {
+
+            // Saturation-based early termination ("Patience in Proximity",
+            // Teofili & Lin, ECIR 2025 -- see design doc
+            // docs/superpowers/specs/2026-07-19-hnsw-search-performance-improvements-design.md
+            // §3). `ef` stands in for the paper's `k`: this function has no
+            // separate top-k concept, only the ef-capped `result` set. If the
+            // result set's membership stops changing across consecutive
+            // candidate visits, further traversal is unlikely to improve it.
+            #[allow(clippy::items_after_statements)]
+            const SATURATION_THRESHOLD_PERCENT: u32 = 95;
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                clippy::cast_precision_loss
+            )]
+            let patience: u32 = ((ef as f64) * 0.3).ceil().max(7.0) as u32;
+            let mut saturated_streak: u32 = 0;
+
+            while let Some(std::cmp::Reverse(c)) = scratch.candidates.pop() {
+                if let Some(furthest) = scratch.result.peek()
+                    && c.dist > furthest.dist
+                    && scratch.result.len() >= ef
+                {
+                    break; // Algorithm 2 line 7-8: all of W is settled.
+                }
+                let Some(node) = self.nodes.get(c.row_id) else {
+                    continue;
+                };
+                // A node's layer-lc slot array only exists for lc <= node.level().
+                if lc > node.level() {
                     continue;
                 }
-                visited.insert(neighbor_id);
-                let neighbor_dist = self.distance_to(query, neighbor_id);
-                let should_add = match result.peek() {
-                    Some(furthest) => neighbor_dist < furthest.dist || result.len() < ef,
-                    None => true,
-                };
-                if should_add {
-                    candidates.push(std::cmp::Reverse(Candidate {
-                        row_id: neighbor_id,
-                        dist: neighbor_dist,
-                    }));
-                    if let Some(neighbor_node) = self.nodes.get(neighbor_id)
-                        && !neighbor_node.is_deleted()
-                        && filter(neighbor_id)
-                    {
-                        result.push(Candidate {
+                for neighbor_id in node.layer(lc).occupied() {
+                    if scratch.visited.contains(&neighbor_id) {
+                        continue;
+                    }
+                    scratch.visited.insert(neighbor_id);
+                    let neighbor_dist = self.distance_to(query, neighbor_id);
+                    let should_add = match scratch.result.peek() {
+                        Some(furthest) => {
+                            neighbor_dist < furthest.dist || scratch.result.len() < ef
+                        }
+                        None => true,
+                    };
+                    if should_add {
+                        scratch.candidates.push(std::cmp::Reverse(Candidate {
                             row_id: neighbor_id,
                             dist: neighbor_dist,
-                        });
-                        if result.len() > ef {
-                            result.pop(); // evict the current furthest
+                        }));
+                        if let Some(neighbor_node) = self.nodes.get(neighbor_id)
+                            && !neighbor_node.is_deleted()
+                            && filter(neighbor_id)
+                        {
+                            scratch.result.push(Candidate {
+                                row_id: neighbor_id,
+                                dist: neighbor_dist,
+                            });
+                            if scratch.result.len() > ef {
+                                scratch.result.pop(); // evict the current furthest
+                            }
                         }
                     }
                 }
-            }
 
-            let current_result_ids: std::collections::HashSet<u64> =
-                result.iter().map(|c| c.row_id).collect();
-            if !previous_result_ids.is_empty() && ef > 0 {
-                let overlap = previous_result_ids
-                    .intersection(&current_result_ids)
-                    .count();
-                #[allow(
-                    clippy::cast_precision_loss,
-                    clippy::cast_possible_truncation,
-                    clippy::cast_sign_loss
-                )]
-                let overlap_percent = ((overlap as f64 / ef as f64) * 100.0) as u32;
-                if overlap_percent >= SATURATION_THRESHOLD_PERCENT {
-                    saturated_streak += 1;
-                    if saturated_streak >= patience {
-                        break;
+                scratch.current_result_ids.clear();
+                scratch
+                    .current_result_ids
+                    .extend(scratch.result.iter().map(|c| c.row_id));
+                if !scratch.previous_result_ids.is_empty() && ef > 0 {
+                    let overlap = scratch
+                        .previous_result_ids
+                        .intersection(&scratch.current_result_ids)
+                        .count();
+                    #[allow(
+                        clippy::cast_precision_loss,
+                        clippy::cast_possible_truncation,
+                        clippy::cast_sign_loss
+                    )]
+                    let overlap_percent = ((overlap as f64 / ef as f64) * 100.0) as u32;
+                    if overlap_percent >= SATURATION_THRESHOLD_PERCENT {
+                        saturated_streak += 1;
+                        if saturated_streak >= patience {
+                            break;
+                        }
+                    } else {
+                        saturated_streak = 0;
                     }
-                } else {
-                    saturated_streak = 0;
                 }
+                std::mem::swap(
+                    &mut scratch.previous_result_ids,
+                    &mut scratch.current_result_ids,
+                );
             }
-            previous_result_ids = current_result_ids;
-        }
 
-        let mut out: Vec<(u64, f32)> = result.into_iter().map(|c| (c.row_id, c.dist)).collect();
-        out.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(CmpOrdering::Equal));
-        out
+            let mut out: Vec<(u64, f32)> =
+                scratch.result.iter().map(|c| (c.row_id, c.dist)).collect();
+            out.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(CmpOrdering::Equal));
+            out
+        })
     }
 
     fn distance_to(&self, query: &[f32], row_id: u64) -> f32 {
@@ -803,6 +843,36 @@ mod tests {
         assert!(
             results.iter().any(|(id, _)| *id == 1),
             "the filter must not have blocked traversal through node 0 to reach node 1: {results:?}"
+        );
+    }
+
+    #[test]
+    fn search_layer_scratch_buffers_do_not_leak_state_across_calls() {
+        let graph = Graph::new(crate::distance::L2, 10);
+        let m_l = 1.0 / (16f64).ln();
+        graph
+            .insert(0, vec![0.0, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.5)
+            .unwrap();
+        graph
+            .insert(1, vec![0.1, 0.0, 0.0], 16, 32, 16, 100, m_l, 0.5)
+            .unwrap();
+
+        // First call, entry = row 0: row 0 gets marked visited in
+        // whatever scratch buffer backs this call.
+        let first = graph.search_layer(&[0.0, 0.0, 0.0], 0, 5, 0, &|_| true);
+        assert!(first.iter().any(|(id, _)| *id == 0));
+
+        // Second, independent call from a DIFFERENT entry point (row 1)
+        // must still be able to reach and return row 0 via traversal --
+        // if a reused scratch buffer's `visited` set wasn't cleared
+        // between calls, row 0 would still show up as "already visited"
+        // from the first call and get wrongly skipped here.
+        let second = graph.search_layer(&[0.0, 0.0, 0.0], 1, 5, 0, &|_| true);
+        assert!(
+            second.iter().any(|(id, _)| *id == 0),
+            "reused scratch buffers must be cleared between calls -- row 0 \
+             was wrongly excluded, implying stale `visited` state leaked \
+             across calls: {second:?}"
         );
     }
 
