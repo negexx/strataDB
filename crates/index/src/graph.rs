@@ -153,7 +153,14 @@ impl Ord for Candidate {
 /// never called reentrantly on the same thread -- every caller
 /// (`Graph::insert`'s two call sites, `Graph::k_nn_search`'s two call
 /// sites) calls it sequentially and lets each call fully return before
-/// starting the next, so a nested `borrow_mut()` can never happen.
+/// starting the next, so a nested `borrow_mut()` can never happen. This
+/// also depends on every caller-supplied `filter` closure (threaded
+/// through from `HnswIndex::search`/`search_filtered`'s public,
+/// caller-controlled `impl Fn(u64) -> bool`) being a pure membership/
+/// visibility predicate that never itself calls back into this graph's
+/// search path -- every filter passed anywhere in this codebase today
+/// is, but this is an invariant on the caller, not something the type
+/// system enforces.
 #[derive(Default)]
 struct SearchScratch {
     visited: std::collections::HashSet<u64>,
