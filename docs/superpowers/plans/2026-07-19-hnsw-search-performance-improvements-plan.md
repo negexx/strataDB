@@ -754,6 +754,26 @@ git commit -m "perf(index): add alpha-tunable RobustPrune-style pruning to selec
 
 ### Task 5: Conditional software prefetch — decision gate
 
+**Outcome: IMPLEMENTED, THEN REVERTED after empirical A/B testing showed no
+measurable benefit.** Step 1's gap criterion was genuinely met (post-Task-1-4
+`graph_top_10` re-run: the gap between expected distance-only time and
+measured full-search time is ~85-87% of total time, ~115-130us absolute,
+consistent across three back-to-back runs), so Step 2's `_mm_prefetch`
+implementation was written and passed Step 3's correctness tests
+(26/26 `graph::tests` green, full workspace green, clippy/fmt clean).
+Step 4's re-benchmark, done as a controlled same-window A/B (three runs each
+way, toggling the prefetch code via `#[cfg]`) because this shared machine's
+noise floor shifted mid-task, found the with-prefetch and without-prefetch
+`graph_top_10` means (182.15us vs. 183.07us) statistically indistinguishable
+-- well inside each side's own ~7us run-to-run spread. Likely mechanistic
+reason: a single `_mm_prefetch` call only warms one 64-byte cache line, but
+each 512-dim f32 vector is 2048 bytes (32 cache lines), so `distance_to`'s
+`eval()` still stalls on the other ~31 lines regardless. Per this task's
+"evidence before assertions" mandate, the code was reverted rather than kept
+on a disproven justification -- `crates/index/src/graph.rs` is byte-for-byte
+identical to its pre-Task-5 state. Full numbers and reasoning:
+`.superpowers/sdd/task-5-report.md`.
+
 **Files:**
 - Modify (only if the decision criteria in Step 1 are met): `crates/index/src/graph.rs` (`search_layer`'s neighbor-expansion loop)
 
