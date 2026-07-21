@@ -31,3 +31,7 @@ harness = false
 [[bench]]
 name = "lockfree_vs_hnsw_rs_bench"
 harness = false
+
+[[bench]]
+name = "concurrent_commit_bench"
+harness = false
