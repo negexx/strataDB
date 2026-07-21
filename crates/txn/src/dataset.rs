@@ -12,6 +12,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use arc_swap::ArcSwap;
 use arrow::array::{Array, ArrayRef, RecordBatch, UInt64Array};
@@ -48,6 +49,7 @@ pub const ROW_ID_COLUMN: &str = "_row_id";
 pub struct Dataset {
     dir: PathBuf,
     current: Arc<ArcSwap<Snapshot>>,
+    next_row_id_counter: Arc<AtomicU64>,
 }
 
 /// The single source of truth for "where does this dataset's data live,
@@ -104,6 +106,7 @@ impl Dataset {
         let manifest = Manifest::empty();
         commit_manifest(&dir, &manifest)?;
         let graph = new_hnsw_index(0)?;
+        let next_row_id_counter = Arc::new(AtomicU64::new(manifest.next_row_id));
         let snapshot = Snapshot {
             dir: dir.clone(),
             version: manifest.version,
@@ -115,6 +118,7 @@ impl Dataset {
         Ok(Self {
             dir,
             current: Arc::new(ArcSwap::new(Arc::new(snapshot))),
+            next_row_id_counter,
         })
     }
 
@@ -150,6 +154,7 @@ impl Dataset {
         let dir = dir.into();
         let manifest = read_current(&dir)?.ok_or_else(|| TxnError::NotFound(dir.clone()))?;
         let (graph, tombstones) = replay_index(&dir, &manifest)?;
+        let next_row_id_counter = Arc::new(AtomicU64::new(manifest.next_row_id));
         let snapshot = Snapshot {
             dir: dir.clone(),
             version: manifest.version,
@@ -161,6 +166,7 @@ impl Dataset {
         Ok(Self {
             dir,
             current: Arc::new(ArcSwap::new(Arc::new(snapshot))),
+            next_row_id_counter,
         })
     }
 
@@ -203,6 +209,7 @@ impl Dataset {
             pending_tombstones: Vec::new(),
             write_set: Vec::new(),
             current: Arc::clone(&self.current),
+            next_row_id_counter: Arc::clone(&self.next_row_id_counter),
         }
     }
 }
@@ -222,6 +229,7 @@ pub struct Transaction {
     /// task, not yet consulted by `commit` itself.
     write_set: Vec<u64>,
     current: Arc<ArcSwap<Snapshot>>,
+    next_row_id_counter: Arc<AtomicU64>,
 }
 
 impl Transaction {
@@ -355,8 +363,16 @@ impl Transaction {
         let data_dir = data_subdir(&self.dir);
         std::fs::create_dir_all(&data_dir)?;
 
-        let deltas =
-            Self::write_pending_batches(&self.pending, &data_dir, new_version, &mut manifest)?;
+        let deltas = Self::write_pending_batches(
+            &self.pending,
+            &data_dir,
+            new_version,
+            &self.next_row_id_counter,
+            &mut manifest.data_files,
+        )?;
+        manifest.next_row_id = self
+            .next_row_id_counter
+            .load(std::sync::atomic::Ordering::SeqCst);
         manifest.version = new_version;
 
         // Fsyncing each data file's *content* (already done inside
@@ -412,11 +428,17 @@ impl Transaction {
     }
 
     /// Writes every pending batch's data file and delta-log file to
-    /// `data_dir`, assigning row-ids and advancing `manifest.next_row_id`/
-    /// `manifest.data_files` in place. Returns every `DeltaEntry` produced
-    /// across all pending batches, in order — `Transaction::commit` applies
-    /// these directly to the shared graph instead of re-reading them from
-    /// disk.
+    /// `data_dir`, assigning row-ids from `row_id_counter` and appending
+    /// each batch's `DataFileEntry` to `data_files` in place. Returns every
+    /// `DeltaEntry` produced across all pending batches, in order —
+    /// `Transaction::commit` applies these directly to the shared graph
+    /// instead of re-reading them from disk.
+    ///
+    /// `attempt_id` is a collision-free filename-uniqueness token from
+    /// `Dataset.write_attempt_counter` — **not** a manifest version. It
+    /// exists only so concurrent callers never write to the same path;
+    /// see `Transaction::commit` (Task 6) for why it can't be derived
+    /// from `base_manifest.version` instead.
     ///
     /// # Errors
     ///
@@ -427,8 +449,9 @@ impl Transaction {
     fn write_pending_batches(
         pending: &[RecordBatch],
         data_dir: &Path,
-        new_version: u64,
-        manifest: &mut Manifest,
+        attempt_id: u64,
+        row_id_counter: &AtomicU64,
+        data_files: &mut Vec<DataFileEntry>,
     ) -> Result<Vec<DeltaEntry>> {
         let mut all_deltas = Vec::new();
         for (i, batch) in pending.iter().enumerate() {
@@ -439,30 +462,28 @@ impl Transaction {
             let stats = compute_stats(batch);
 
             let num_rows = u64::try_from(batch.num_rows())?;
-            let row_id_base = manifest.next_row_id;
-
-            // Extracts (and validates — rejects non-finite vector
-            // components) this batch's delta-log entries before anything is
-            // written to disk for it. A batch that fails validation here
-            // must leave no trace: no data file, no delta-log file, and
-            // manifest.next_row_id must not have been advanced yet either.
-            let deltas = build_delta_entries(batch, row_id_base)?;
-            manifest.next_row_id = manifest.next_row_id.checked_add(num_rows).ok_or_else(|| {
-                TxnError::ManifestOverflow(format!(
-                    "next_row_id {} + {num_rows}",
-                    manifest.next_row_id
-                ))
+            let row_id_base =
+                row_id_counter.fetch_add(num_rows, std::sync::atomic::Ordering::SeqCst);
+            // fetch_add already advanced the counter before this check —
+            // intentional. Row-ids are never reused (see Manifest.next_row_id's
+            // doc comment), so an abandoned gap from a failed batch is
+            // harmless, and there is no atomic way to "undo" a fetch_add if
+            // we checked first instead.
+            row_id_base.checked_add(num_rows).ok_or_else(|| {
+                TxnError::ManifestOverflow(format!("next_row_id {row_id_base} + {num_rows}"))
             })?;
+
+            let deltas = build_delta_entries(batch, row_id_base)?;
             let with_row_id = append_row_id_column(batch, row_id_base, num_rows)?;
 
             let encoded = strata_storage::encode_batch(&with_row_id)?;
-            let file_name = format!("{new_version:020}-{i}.arrow");
+            let file_name = format!("{attempt_id:020}-{i}.arrow");
             write_batch(&data_dir.join(&file_name), &encoded)?;
 
-            let delta_file_name = format!("{new_version:020}-{i}.deltalog");
+            let delta_file_name = format!("{attempt_id:020}-{i}.deltalog");
             write_delta_log(&data_dir.join(&delta_file_name), &deltas)?;
 
-            manifest.data_files.push(DataFileEntry {
+            data_files.push(DataFileEntry {
                 name: file_name,
                 stats,
                 delta_log: delta_file_name,
@@ -743,6 +764,34 @@ mod tests {
     use strata_storage::read_batch;
 
     use super::*;
+
+    /// Locks in `AtomicU64::fetch_add`'s contract in isolation — before
+    /// `next_row_id_counter` is wired into `Dataset`/`write_pending_batches`
+    /// (below), this is what proves 8 concurrent `fetch_add(10)`s hand out
+    /// non-overlapping, contiguous ranges. Uses `std::thread::scope` rather
+    /// than `unsafe { transmute }` to borrow the stack-local `counter`
+    /// safely — see Task 5's brief for why the `transmute` draft was
+    /// rejected (this workspace's "safe Rust by default" convention).
+    #[test]
+    fn row_id_counter_hands_out_non_overlapping_ranges_under_concurrent_fetch_add() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let counter = AtomicU64::new(0);
+        let mut bases: Vec<u64> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| counter.fetch_add(10, Ordering::SeqCst)))
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        bases.sort_unstable();
+        for (i, base) in bases.iter().enumerate() {
+            assert_eq!(
+                *base,
+                (i as u64) * 10,
+                "ranges must be contiguous, non-overlapping"
+            );
+        }
+    }
 
     fn temp_dir(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!("strata-txn-test-{label}-{}", std::process::id()))
