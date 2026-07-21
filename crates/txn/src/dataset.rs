@@ -55,7 +55,18 @@ pub const ROW_ID_COLUMN: &str = "_row_id";
 /// in-flight transaction (which would surface as a conservative
 /// `InsufficientHistory` conflict), small enough to be a trivial memory
 /// cost. Not a public tunable yet, per YAGNI.
-const COMMIT_LOG_CAPACITY: usize = 256;
+///
+/// Bumped from 256 to 2048 per the design council's recommendation on
+/// whether to build epoch-based dynamic history pruning: rather than adding
+/// a new active-transaction-lifetime registry on unmeasured need, widen the
+/// cheap, already-bounded window and instrument how often
+/// `InsufficientHistory` actually fires (see
+/// [`Dataset::insufficient_history_conflict_count`]). If telemetry later
+/// shows this still firing under real concurrent-agent load, revisit with
+/// data — either a further bump or, per the council's stronger alternative,
+/// a row/version-keyed overlap check that doesn't need a bounded window at
+/// all.
+const COMMIT_LOG_CAPACITY: usize = 2048;
 
 #[derive(Clone)]
 pub struct Dataset {
@@ -74,6 +85,13 @@ pub struct Dataset {
     /// lock in the crate, acquired at exactly one site, so there is no
     /// lock-ordering concern.
     commit_lock: Arc<Mutex<CommitLog>>,
+    /// Counts every commit that hit `ConflictCheck::InsufficientHistory` —
+    /// its read-version aged out of `COMMIT_LOG_CAPACITY` before it could
+    /// commit. Pure observability, not used for any decision; exists so a
+    /// real firing rate can be measured before ever building the more
+    /// complex active-transaction-lifetime tracking this was weighed
+    /// against. See [`Dataset::insufficient_history_conflict_count`].
+    insufficient_history_conflicts: Arc<AtomicU64>,
 }
 
 /// The single source of truth for "where does this dataset's data live,
@@ -122,6 +140,25 @@ impl Dataset {
     /// `dir`, or an I/O/storage error if the directory or initial manifest
     /// can't be created.
     pub fn create(dir: impl Into<PathBuf>) -> Result<Self> {
+        Self::create_with_commit_log_capacity(dir, COMMIT_LOG_CAPACITY)
+    }
+
+    /// Same as [`Dataset::create`], but with an explicit `CommitLog`
+    /// capacity instead of the production [`COMMIT_LOG_CAPACITY`] default.
+    /// `pub(crate)` only — exists so the wraparound/`InsufficientHistory`
+    /// regression tests can prove the eviction logic is correct at a small
+    /// capacity (milliseconds) instead of paying the real production
+    /// capacity's fill cost (which grows with the capacity itself, since
+    /// proving eviction requires actually filling it — see the git history
+    /// around `COMMIT_LOG_CAPACITY`'s 256→2048 bump for the ~50x test
+    /// runtime cost that motivated this). The capacity value itself has no
+    /// bearing on whether the conflict-detection *logic* is correct, only
+    /// on how much history it retains — so testing the logic at a small
+    /// capacity is exactly as rigorous as testing it at the real one.
+    fn create_with_commit_log_capacity(
+        dir: impl Into<PathBuf>,
+        commit_log_capacity: usize,
+    ) -> Result<Self> {
         let dir = dir.into();
         if read_current(&dir)?.is_some() {
             return Err(TxnError::AlreadyExists(dir));
@@ -145,7 +182,8 @@ impl Dataset {
             current: Arc::new(ArcSwap::new(Arc::new(snapshot))),
             next_row_id_counter,
             write_attempt_counter,
-            commit_lock: Arc::new(Mutex::new(CommitLog::new(COMMIT_LOG_CAPACITY))),
+            commit_lock: Arc::new(Mutex::new(CommitLog::new(commit_log_capacity))),
+            insufficient_history_conflicts: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -207,6 +245,7 @@ impl Dataset {
             next_row_id_counter,
             write_attempt_counter,
             commit_lock: Arc::new(Mutex::new(CommitLog::new(COMMIT_LOG_CAPACITY))),
+            insufficient_history_conflicts: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -251,7 +290,22 @@ impl Dataset {
             next_row_id_counter: Arc::clone(&self.next_row_id_counter),
             write_attempt_counter: Arc::clone(&self.write_attempt_counter),
             commit_lock: Arc::clone(&self.commit_lock),
+            insufficient_history_conflicts: Arc::clone(&self.insufficient_history_conflicts),
         }
+    }
+
+    /// How many commits have hit `ConflictCheck::InsufficientHistory` over
+    /// this `Dataset` handle's lifetime — a transaction whose read-version
+    /// aged out of the bounded commit-log before it could commit, and was
+    /// therefore conservatively rejected even though it may never have
+    /// touched a contested row. Pure observability: this number existing
+    /// and staying at (or near) zero under real workloads is the evidence
+    /// needed before ever building active-transaction-lifetime tracking to
+    /// eliminate the false-positive case entirely.
+    #[must_use]
+    pub fn insufficient_history_conflict_count(&self) -> u64 {
+        self.insufficient_history_conflicts
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -272,6 +326,7 @@ pub struct Transaction {
     next_row_id_counter: Arc<AtomicU64>,
     write_attempt_counter: Arc<AtomicU64>,
     commit_lock: Arc<Mutex<CommitLog>>,
+    insufficient_history_conflicts: Arc<AtomicU64>,
 }
 
 impl Transaction {
@@ -475,6 +530,8 @@ impl Transaction {
                 return Err(TxnError::Conflict { contested_row_ids });
             }
             ConflictCheck::InsufficientHistory => {
+                self.insufficient_history_conflicts
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Err(TxnError::Conflict {
                     contested_row_ids: self.write_set.clone(),
                 });
@@ -888,6 +945,16 @@ mod tests {
     use strata_storage::read_batch;
 
     use super::*;
+
+    /// Small `CommitLog` capacity used only by the wraparound/
+    /// `InsufficientHistory` regression tests below, via
+    /// `Dataset::create_with_commit_log_capacity`. The eviction *logic*
+    /// under test doesn't care what the capacity's magnitude is, only that
+    /// eviction happens once it's exceeded — so proving it at 8 is exactly
+    /// as rigorous as proving it at the real `COMMIT_LOG_CAPACITY` (2048),
+    /// without paying that capacity's fill cost (see
+    /// `create_with_commit_log_capacity`'s doc comment).
+    const TEST_COMMIT_LOG_CAPACITY: usize = 8;
 
     /// Locks in `AtomicU64::fetch_add`'s contract in isolation — before
     /// `next_row_id_counter` is wired into `Dataset`/`write_pending_batches`
@@ -2489,18 +2556,17 @@ mod tests {
     }
 
     #[test]
-    // COMMIT_LOG_CAPACITY (256) comfortably fits in i64/i16 for this loop's
+    // TEST_COMMIT_LOG_CAPACITY comfortably fits in i64/i16 for this loop's
     // small range (capacity + 2), matching the existing cast-allow precedent
     // on `cluster_vectors` above.
     #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
     fn a_transaction_whose_history_has_aged_out_of_the_commit_log_conflicts_conservatively() {
-        // COMMIT_LOG_CAPACITY is 256 in production; committing that many
-        // transactions here to force wraparound is wasteful but the most
-        // direct way to exercise the real end-to-end path without adding
-        // a test-only constructor parameter for capacity. Kept small
-        // enough (log capacity + a few) to run quickly.
+        // Uses TEST_COMMIT_LOG_CAPACITY (not the real, much larger
+        // production COMMIT_LOG_CAPACITY) via
+        // create_with_commit_log_capacity — see that constant's doc
+        // comment for why this is exactly as rigorous a test.
         let dir = temp_dir("commit-log-wraparound-e2e");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create_with_commit_log_capacity(&dir, TEST_COMMIT_LOG_CAPACITY).unwrap();
         let batch = vector_batch(vec![1i64], cluster_vectors(1, [0.0, 0.0, 0.0], 0.0));
         let mut setup = ds.begin();
         setup.insert(batch);
@@ -2514,7 +2580,7 @@ mod tests {
 
         // Commit enough disjoint no-op-ish filler transactions to push the
         // CommitLog's oldest retained entry past txn's read-version.
-        for i in 0..(super::COMMIT_LOG_CAPACITY as i64 + 2) {
+        for i in 0..(TEST_COMMIT_LOG_CAPACITY as i64 + 2) {
             let filler = vector_batch(
                 vec![100 + i],
                 cluster_vectors(1, [f32::from(i as i16), 0.0, 0.0], 0.0),
@@ -2524,10 +2590,21 @@ mod tests {
             filler_txn.commit().unwrap();
         }
 
+        assert_eq!(
+            ds.insufficient_history_conflict_count(),
+            0,
+            "no InsufficientHistory conflict should have fired yet"
+        );
+
         let result = txn.commit();
         assert!(
             matches!(result, Err(TxnError::Conflict { .. })),
             "expected a conservative conflict once history aged out, got {result:?}"
+        );
+        assert_eq!(
+            ds.insufficient_history_conflict_count(),
+            1,
+            "the aged-out commit should have incremented the observability counter exactly once"
         );
 
         // Same PID-reuse collision risk as
@@ -2548,7 +2625,7 @@ mod tests {
         // the bounded CommitLog — this must succeed even when its
         // base_manifest.version has aged out of the ring buffer.
         let dir = temp_dir("commit-log-wraparound-insert-only-e2e");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create_with_commit_log_capacity(&dir, TEST_COMMIT_LOG_CAPACITY).unwrap();
 
         // txn begins here, before every filler commit below — its
         // base_manifest.version stays fixed at whatever ds.current_version()
@@ -2560,7 +2637,7 @@ mod tests {
 
         // Commit enough disjoint filler transactions to push the
         // CommitLog's oldest retained entry past txn's read-version.
-        for i in 0..(super::COMMIT_LOG_CAPACITY as i64 + 2) {
+        for i in 0..(TEST_COMMIT_LOG_CAPACITY as i64 + 2) {
             let filler = vector_batch(
                 vec![100 + i],
                 cluster_vectors(1, [f32::from(i as i16), 0.0, 0.0], 0.0),
