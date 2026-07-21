@@ -1,18 +1,27 @@
-//! Single-writer transaction path for Phase 1's vertical slice. Implements
-//! spec §3's write/durability steps (3-5) — Phase 1 has exactly one writer,
-//! so §3.1's read/write-set accumulation and §3.2's conflict check are both
-//! deliberate no-ops, and §3.4's "atomic CAS of the manifest pointer" is
-//! implemented here as an unconditional versioned-file rename
-//! (`strata_storage::commit_manifest`), not a real compare-and-swap — two
-//! concurrent writers would last-writer-win silently rather than fail. Both
-//! are acceptable only because there is exactly one writer today. See
-//! `.claude/rules/concurrency-txn-layer.md` before adding real conflict
-//! detection or a real CAS here; this API is shaped so Phase 6 can slot
-//! both in without a rewrite, but neither is implemented yet.
+//! Multi-writer transaction path. Implements spec §3's write/durability
+//! steps (3-5) plus — as of Phase 6 — §3.1's write-set accumulation
+//! (`Transaction::delete`/`update`) and §3.2's real conflict check:
+//! `Transaction::commit` re-reads the *latest* committed snapshot inside
+//! `Dataset.commit_lock`, runs `CommitLog::conflicts_with` over every
+//! version that landed after this transaction's `begin()`, and surfaces any
+//! write-write overlap as a typed `TxnError::Conflict` naming the contested
+//! rows — before a single graph delta is applied. §3.4's "atomic CAS of the
+//! manifest pointer" is realized as the lock-serialized
+//! check-then-commit-then-swap sequence in `commit` (equivalent to a CAS
+//! that can never spuriously fail, because the version check and the swap
+//! are atomic with respect to other committers by construction). See
+//! `.claude/rules/concurrency-txn-layer.md` and
+//! `docs/superpowers/specs/2026-07-21-phase-6-concurrent-write-engine-design.md`
+//! §3/§5 before changing the commit protocol.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+
+#[cfg(loom)]
+use loom::sync::Mutex;
+#[cfg(not(loom))]
+use std::sync::Mutex;
 
 use arc_swap::ArcSwap;
 use arrow::array::{Array, ArrayRef, RecordBatch, UInt64Array};
@@ -26,6 +35,7 @@ use strata_storage::{
     DataFileEntry, Manifest, commit_manifest, compute_stats, read_current, write_batch,
 };
 
+use crate::commit_log::{CommitLog, ConflictCheck};
 use crate::error::{Result, TxnError};
 use crate::snapshot::Snapshot;
 
@@ -45,11 +55,30 @@ use crate::snapshot::Snapshot;
 /// `.claude/docs/design/phase-0-transaction-and-format-spec.md` §8.
 pub const ROW_ID_COLUMN: &str = "_row_id";
 
+/// Bounded capacity of the in-memory [`CommitLog`] ring buffer — generous
+/// enough that ordinary workloads never evict history still needed by an
+/// in-flight transaction (which would surface as a conservative
+/// `InsufficientHistory` conflict), small enough to be a trivial memory
+/// cost. Not a public tunable yet, per YAGNI.
+const COMMIT_LOG_CAPACITY: usize = 256;
+
 #[derive(Clone)]
 pub struct Dataset {
     dir: PathBuf,
     current: Arc<ArcSwap<Snapshot>>,
     next_row_id_counter: Arc<AtomicU64>,
+    /// Monotonic counter whose sole job is generating a collision-free
+    /// filename prefix for each commit *attempt*'s data/delta-log files —
+    /// deliberately independent of both `next_row_id_counter` and the real
+    /// manifest version. See `Transaction::commit` for why filenames must
+    /// not be derived from `base_manifest.version`.
+    write_attempt_counter: Arc<AtomicU64>,
+    /// Serializes the conflict-check → graph-apply → manifest-commit →
+    /// snapshot-swap critical section of `Transaction::commit`, and guards
+    /// the recent-write-set history that check reads. This is the only
+    /// lock in the crate, acquired at exactly one site, so there is no
+    /// lock-ordering concern.
+    commit_lock: Arc<Mutex<CommitLog>>,
 }
 
 /// The single source of truth for "where does this dataset's data live,
@@ -119,6 +148,8 @@ impl Dataset {
             dir,
             current: Arc::new(ArcSwap::new(Arc::new(snapshot))),
             next_row_id_counter,
+            write_attempt_counter: Arc::new(AtomicU64::new(0)),
+            commit_lock: Arc::new(Mutex::new(CommitLog::new(COMMIT_LOG_CAPACITY))),
         })
     }
 
@@ -167,6 +198,8 @@ impl Dataset {
             dir,
             current: Arc::new(ArcSwap::new(Arc::new(snapshot))),
             next_row_id_counter,
+            write_attempt_counter: Arc::new(AtomicU64::new(0)),
+            commit_lock: Arc::new(Mutex::new(CommitLog::new(COMMIT_LOG_CAPACITY))),
         })
     }
 
@@ -204,12 +237,13 @@ impl Dataset {
             dir: self.dir.clone(),
             base_manifest: snapshot.manifest.as_ref().clone(),
             graph: Arc::clone(&snapshot.graph),
-            tombstones: snapshot.tombstones.as_ref().clone(),
             pending: Vec::new(),
             pending_tombstones: Vec::new(),
             write_set: Vec::new(),
             current: Arc::clone(&self.current),
             next_row_id_counter: Arc::clone(&self.next_row_id_counter),
+            write_attempt_counter: Arc::clone(&self.write_attempt_counter),
+            commit_lock: Arc::clone(&self.commit_lock),
         }
     }
 }
@@ -218,18 +252,19 @@ pub struct Transaction {
     dir: PathBuf,
     base_manifest: Manifest,
     graph: Arc<HnswIndex>,
-    tombstones: im::HashSet<u64>,
     pending: Vec<RecordBatch>,
     /// Row-ids queued for tombstoning by [`Transaction::delete`]/
     /// [`Transaction::update`], applied at commit time (see
     /// [`Transaction::commit`]) — mirrors how `pending` buffers inserts.
     pending_tombstones: Vec<u64>,
     /// Every row-id this transaction has written (via `delete`, and
-    /// transitively `update`) — read by conflict detection in a later
-    /// task, not yet consulted by `commit` itself.
+    /// transitively `update`) — consulted by `commit`'s conflict check
+    /// against every transaction that committed after this one began.
     write_set: Vec<u64>,
     current: Arc<ArcSwap<Snapshot>>,
     next_row_id_counter: Arc<AtomicU64>,
+    write_attempt_counter: Arc<AtomicU64>,
+    commit_lock: Arc<Mutex<CommitLog>>,
 }
 
 impl Transaction {
@@ -289,13 +324,22 @@ impl Transaction {
         self.insert(batch);
     }
 
-    /// Commits per spec §3's write/durability steps (3-5). Applies only
-    /// this transaction's own new delta entries directly to the shared,
+    /// Commits per spec §3's write/durability steps (3-5), with Phase 6's
+    /// real conflict check (§3.1/§3.2) in front of them. Data files are
+    /// written outside any lock (they are unique to this transaction);
+    /// then, inside `Dataset.commit_lock`, the *latest* committed snapshot
+    /// is re-read (not this transaction's stale `begin()`-time view),
+    /// `CommitLog::conflicts_with` checks every version that landed in
+    /// between against this transaction's write-set, and only if clean are
+    /// this commit's own new delta entries applied to the shared,
     /// ever-growing `HnswIndex` graph (no full historical replay — see
-    /// `docs/superpowers/specs/2026-07-17-phase-5-mvcc-snapshot-isolation-design.md`),
-    /// then — only after `commit_manifest` succeeds — freezes this
-    /// transaction's tombstone accumulator and swaps in a new `Snapshot`.
-    /// Any `Dataset` handle sharing this same `ArcSwap` (including the one
+    /// `docs/superpowers/specs/2026-07-17-phase-5-mvcc-snapshot-isolation-design.md`).
+    /// A conflicting transaction leaves the graph completely untouched.
+    /// The new manifest and tombstone set are layered on top of the latest
+    /// snapshot's state, so a clean commit composes with whatever else
+    /// committed after this transaction began. Only after
+    /// `commit_manifest` succeeds is the new `Snapshot` swapped in. Any
+    /// `Dataset` handle sharing this same `ArcSwap` (including the one
     /// this transaction was created from) observes the new state on its
     /// next [`Dataset::snapshot`] call; nothing is mutated in place.
     ///
@@ -326,6 +370,14 @@ impl Transaction {
     ///
     /// # Errors
     ///
+    /// Returns [`TxnError::Conflict`] — naming every contested row-id — if
+    /// another transaction that committed after this one began wrote any
+    /// row in this transaction's write-set, or (conservatively, with this
+    /// transaction's entire write-set as the contested rows) if the
+    /// bounded in-memory commit log has already evicted history needed to
+    /// prove cleanliness. A conflicting transaction applies none of its
+    /// deltas to the shared graph and leaves the manifest unadvanced.
+    ///
     /// Returns [`TxnError::NonFiniteVectorComponent`] if any pending batch's
     /// vector column contains a `NaN`/`Infinity` component — checked, and
     /// rejected, before any file for that batch is written to disk. Also
@@ -352,45 +404,90 @@ impl Transaction {
     /// entirely, not just narrows it. A residual, more exotic concern
     /// remains out of scope here: if a future change ever gives graph
     /// mutation additional failure modes beyond dimension mismatch, this
-    /// same partial-mutation risk could reopen for those — revisit if
-    /// Phase 6's real conflict/CAS logic changes what "applying a delta to
-    /// the graph" can fail on.
+    /// same partial-mutation risk could reopen for those. (Phase 6's
+    /// conflict check did not add such a mode — it runs, and returns,
+    /// strictly before the first delta is applied.)
     pub fn commit(self) -> Result<()> {
-        let mut manifest = self.base_manifest;
-        let new_version = manifest.version.checked_add(1).ok_or_else(|| {
-            TxnError::ManifestOverflow(format!("version {} + 1", manifest.version))
-        })?;
         let data_dir = data_subdir(&self.dir);
         std::fs::create_dir_all(&data_dir)?;
 
+        // Data-file writes happen before the lock — they touch only
+        // files unique to this transaction and never collide with a
+        // concurrent transaction's own writes. The filename prefix comes
+        // from write_attempt_counter, NOT base_manifest.version + 1: two
+        // truly concurrent transactions can share the same stale
+        // base_manifest.version, which would make them compute the same
+        // "next version" and collide on the same filename before either
+        // reaches commit_lock. write_attempt_counter is unique per
+        // attempt regardless of version, so no such collision is
+        // possible. See design doc §3 (data-file writes need no
+        // conflict information to proceed) — this counter is what makes
+        // that safe to do outside the lock at all.
+        let attempt_id = self
+            .write_attempt_counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut new_data_files = Vec::new();
         let deltas = Self::write_pending_batches(
             &self.pending,
             &data_dir,
-            new_version,
+            attempt_id,
             &self.next_row_id_counter,
-            &mut manifest.data_files,
+            &mut new_data_files,
         )?;
-        manifest.next_row_id = self
-            .next_row_id_counter
-            .load(std::sync::atomic::Ordering::SeqCst);
-        manifest.version = new_version;
-
         // Fsyncing each data file's *content* (already done inside
         // write_batch) is not sufficient — the new directory entries
         // themselves must also be fsynced, or a real power-loss crash can
         // leave a file's bytes durable while the file itself is absent.
         // Must happen before the graph update/manifest commit below.
         strata_storage::sync_dir(&data_dir)?;
+        validate_delta_dimensions(&deltas, &self.graph)?;
+
+        // Everything from here is the tightly-scoped critical section:
+        // re-read latest state, conflict-check, apply, commit, swap. See
+        // design doc §5. This is the crate's only lock, acquired at
+        // exactly this one site, so no lock-ordering concern exists; a
+        // poisoned lock (a prior committer panicked) is recovered rather
+        // than propagated — the CommitLog is only ever mutated by `push`
+        // as the final in-memory step after a durable commit, so it can't
+        // be observed half-updated.
+        let mut commit_log = self
+            .commit_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let latest_snapshot = self.current.load_full();
+        let latest_version = latest_snapshot.version;
+
+        // Conflict detection MUST run before any mutation of the shared
+        // graph: a transaction that turns out to conflict must leave the
+        // graph completely untouched.
+        match commit_log.conflicts_with(self.base_manifest.version, latest_version, &self.write_set)
+        {
+            ConflictCheck::Clean => {}
+            ConflictCheck::Conflict(contested_row_ids) => {
+                return Err(TxnError::Conflict { contested_row_ids });
+            }
+            ConflictCheck::InsufficientHistory => {
+                return Err(TxnError::Conflict {
+                    contested_row_ids: self.write_set.clone(),
+                });
+            }
+        }
+
+        let new_version = latest_version
+            .checked_add(1)
+            .ok_or_else(|| TxnError::ManifestOverflow(format!("version {latest_version} + 1")))?;
 
         // Apply only this commit's new deltas to the shared graph — the
         // fix for the O(historical)-per-commit regression. `HnswIndex`'s
         // graph only ever grows (hnsw_rs has no node-removal API), so
         // extending the same Arc'd instance every commit is safe and
         // matches what every existing/future Snapshot's Arc<HnswIndex>
-        // already points at.
-        validate_delta_dimensions(&deltas, &self.graph)?;
-
-        let mut tombstones = self.tombstones;
+        // already points at. Tombstones layer on top of the *latest*
+        // snapshot's set (not this transaction's stale begin()-time view),
+        // so a clean commit composes with everything that landed in
+        // between.
+        let mut tombstones = latest_snapshot.tombstones.as_ref().clone();
         for delta in &deltas {
             match delta {
                 DeltaEntry::Insert { row_id, vector } => self.graph.insert(*row_id, vector)?,
@@ -399,24 +496,36 @@ impl Transaction {
                 }
             }
         }
-
         for row_id in &self.pending_tombstones {
             tombstones.insert(*row_id);
         }
+
+        // The new manifest is likewise built from the latest snapshot's
+        // manifest: this transaction's new data files are *appended* to
+        // the latest file list (never substituted for it wholesale —
+        // that would silently drop data files committed by concurrent,
+        // non-conflicting transactions after this one began).
+        let mut manifest = latest_snapshot.manifest.as_ref().clone();
+        manifest.version = new_version;
+        manifest.data_files.extend(new_data_files);
+        manifest.next_row_id = self
+            .next_row_id_counter
+            .load(std::sync::atomic::Ordering::SeqCst);
         manifest
             .tombstones
             .extend(self.pending_tombstones.iter().copied());
 
         commit_manifest(&self.dir, &manifest)?;
 
+        commit_log.push(new_version, self.write_set);
+
         // Only after commit_manifest succeeds does the new state become
         // visible to future Dataset::snapshot() calls — the in-memory swap
         // must never run ahead of the on-disk durability point.
         let watermark = manifest.next_row_id.saturating_sub(1);
-        let version = manifest.version;
         let snapshot = Snapshot {
             dir: self.dir,
-            version,
+            version: new_version,
             manifest: Arc::new(manifest),
             graph: self.graph,
             watermark,
@@ -1859,6 +1968,121 @@ mod tests {
 
         let reopened = Dataset::open(&dir).unwrap();
         assert!(!reopened.snapshot().is_visible(0));
+    }
+
+    #[test]
+    fn concurrent_delete_of_the_same_row_conflicts() {
+        let dir = temp_dir("commit-lock-conflict");
+        let ds = Dataset::create(&dir).unwrap();
+        let batch = vector_batch(vec![1i64], cluster_vectors(1, [0.0, 0.0, 0.0], 0.0));
+        let mut setup = ds.begin();
+        setup.insert(batch);
+        setup.commit().unwrap();
+
+        let mut txn_a = ds.begin();
+        txn_a.delete(0);
+        let mut txn_b = ds.begin();
+        txn_b.delete(0);
+
+        txn_a.commit().unwrap();
+        let result = txn_b.commit();
+        match result {
+            Err(TxnError::Conflict { contested_row_ids }) => {
+                assert_eq!(contested_row_ids, vec![0]);
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn concurrent_delete_of_disjoint_rows_both_commit() {
+        let dir = temp_dir("commit-lock-no-conflict");
+        let ds = Dataset::create(&dir).unwrap();
+        let batch = vector_batch(vec![1i64, 2i64], cluster_vectors(2, [0.0, 0.0, 0.0], 0.01));
+        let mut setup = ds.begin();
+        setup.insert(batch);
+        setup.commit().unwrap();
+
+        let mut txn_a = ds.begin();
+        txn_a.delete(0);
+        let mut txn_b = ds.begin();
+        txn_b.delete(1);
+
+        txn_a.commit().unwrap();
+        txn_b.commit().unwrap();
+
+        let snapshot = ds.snapshot();
+        assert!(!snapshot.is_visible(0));
+        assert!(!snapshot.is_visible(1));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn commit_version_is_sourced_from_latest_state_not_stale_base_manifest() {
+        // Regression test for the original unconditional
+        // `base_manifest.version + 1` bug: txn_a and txn_b both begin
+        // against version 0; txn_a commits (version 1); txn_b's disjoint
+        // write must land at version 2, not also attempt version 1.
+        let dir = temp_dir("commit-version-source");
+        let ds = Dataset::create(&dir).unwrap();
+        let batch = vector_batch(vec![1i64, 2i64], cluster_vectors(2, [0.0, 0.0, 0.0], 0.01));
+        let mut setup = ds.begin();
+        setup.insert(batch);
+        setup.commit().unwrap();
+        assert_eq!(ds.current_version(), 1);
+
+        let mut txn_a = ds.begin();
+        txn_a.delete(0);
+        let mut txn_b = ds.begin();
+        txn_b.delete(1);
+
+        txn_a.commit().unwrap();
+        assert_eq!(ds.current_version(), 2);
+        txn_b.commit().unwrap();
+        assert_eq!(ds.current_version(), 3);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn concurrent_inserts_preserve_both_transactions_data_files() {
+        // Insert-only transactions have empty write-sets, so two of them
+        // never conflict — both must commit, and the second's manifest
+        // must *append* its files to the latest committed file list, not
+        // substitute a stale base_manifest-derived list for it (which
+        // would silently drop the first transaction's committed data — a
+        // lost update the conflict check can't catch, because there is no
+        // write-write overlap to detect).
+        let dir = temp_dir("concurrent-insert-data-files");
+        let ds = Dataset::create(&dir).unwrap();
+        let schema = test_schema();
+
+        let mut txn_a = ds.begin();
+        txn_a.insert(
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1]))])
+                .unwrap(),
+        );
+        let mut txn_b = ds.begin();
+        txn_b.insert(
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![2]))])
+                .unwrap(),
+        );
+
+        txn_a.commit().unwrap();
+        txn_b.commit().unwrap();
+
+        assert_eq!(
+            ds.data_files().len(),
+            2,
+            "both transactions' data files must survive in the final manifest"
+        );
+        let scanned = ds.snapshot().scan(&schema).unwrap();
+        assert_eq!(scanned.num_rows(), 2, "no committed row may be lost");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
