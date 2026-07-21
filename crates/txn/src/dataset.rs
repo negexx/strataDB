@@ -136,6 +136,7 @@ impl Dataset {
         commit_manifest(&dir, &manifest)?;
         let graph = new_hnsw_index(0)?;
         let next_row_id_counter = Arc::new(AtomicU64::new(manifest.next_row_id));
+        let write_attempt_counter = Arc::new(AtomicU64::new(manifest.next_attempt_id));
         let snapshot = Snapshot {
             dir: dir.clone(),
             version: manifest.version,
@@ -148,7 +149,7 @@ impl Dataset {
             dir,
             current: Arc::new(ArcSwap::new(Arc::new(snapshot))),
             next_row_id_counter,
-            write_attempt_counter: Arc::new(AtomicU64::new(0)),
+            write_attempt_counter,
             commit_lock: Arc::new(Mutex::new(CommitLog::new(COMMIT_LOG_CAPACITY))),
         })
     }
@@ -186,6 +187,17 @@ impl Dataset {
         let manifest = read_current(&dir)?.ok_or_else(|| TxnError::NotFound(dir.clone()))?;
         let (graph, tombstones) = replay_index(&dir, &manifest)?;
         let next_row_id_counter = Arc::new(AtomicU64::new(manifest.next_row_id));
+        // The real fix for the cross-session filename-collision bug: seed
+        // from the persisted `manifest.next_attempt_id`, not 0. Without
+        // this, a reopened dataset would regenerate the same
+        // `{attempt_id:020}-{i}.arrow`/`.deltalog` filenames a prior
+        // session already committed, and `write_batch`'s `File::create`
+        // would silently truncate and destroy that prior session's
+        // already-durable data. See `Manifest.next_attempt_id`'s doc
+        // comment and `Transaction::commit`, which persists this counter's
+        // value forward on every commit the same way it does
+        // `next_row_id_counter` -> `manifest.next_row_id`.
+        let write_attempt_counter = Arc::new(AtomicU64::new(manifest.next_attempt_id));
         let snapshot = Snapshot {
             dir: dir.clone(),
             version: manifest.version,
@@ -198,7 +210,7 @@ impl Dataset {
             dir,
             current: Arc::new(ArcSwap::new(Arc::new(snapshot))),
             next_row_id_counter,
-            write_attempt_counter: Arc::new(AtomicU64::new(0)),
+            write_attempt_counter,
             commit_lock: Arc::new(Mutex::new(CommitLog::new(COMMIT_LOG_CAPACITY))),
         })
     }
@@ -510,6 +522,14 @@ impl Transaction {
         manifest.data_files.extend(new_data_files);
         manifest.next_row_id = self
             .next_row_id_counter
+            .load(std::sync::atomic::Ordering::SeqCst);
+        // Mirrors next_row_id_counter -> manifest.next_row_id immediately
+        // above: persist the counter's current value (already past this
+        // commit's own attempt_id, via the fetch_add above) so a future
+        // Dataset::open never regenerates a filename this session already
+        // committed. See Manifest.next_attempt_id's doc comment.
+        manifest.next_attempt_id = self
+            .write_attempt_counter
             .load(std::sync::atomic::Ordering::SeqCst);
         manifest
             .tombstones
@@ -979,6 +999,69 @@ mod tests {
     }
 
     #[test]
+    fn commit_after_reopen_does_not_destroy_prior_sessions_data_files() {
+        // Regression test for the cross-session filename-collision bug
+        // found during Task 6 self-review (see "Concern 1" in
+        // .superpowers/sdd/task-6-report.md): before the fix,
+        // `write_attempt_counter` was reseeded to 0 on every `Dataset::open`,
+        // so a session that reopened an existing dataset and committed
+        // again would regenerate the exact same `{attempt_id:020}-{i}`
+        // data/delta-log filenames a prior session already committed.
+        // `write_batch` uses `File::create`, which truncates — silently
+        // destroying the prior session's already-durable data file, while
+        // the manifest ended up referencing the same filename twice. The
+        // empirically-confirmed symptom was a scan returning fewer rows
+        // than were ever committed (3 destroyed, 1 new double-counted via
+        // the duplicate manifest entry, netting 2 instead of 4). The fix
+        // persists the counter in `Manifest.next_attempt_id`, seeded on
+        // `open` the same way `next_row_id_counter` is seeded from
+        // `manifest.next_row_id`.
+        let dir = temp_dir("reopen-no-filename-collision");
+        let schema = test_schema();
+
+        {
+            let ds = Dataset::create(&dir).unwrap();
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+            )
+            .unwrap();
+            let mut txn = ds.begin();
+            txn.insert(batch);
+            txn.commit().unwrap();
+            // `ds` (and with it, its in-memory write_attempt_counter) is
+            // dropped at the end of this block — the next session has no
+            // memory of attempt_id 0 having already been used, except
+            // through whatever `Dataset::open` reads back from disk.
+        }
+
+        let reopened = Dataset::open(&dir).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![4]))])
+            .unwrap();
+        let mut txn = reopened.begin();
+        txn.insert(batch);
+        txn.commit().unwrap();
+
+        let scanned = reopened.snapshot().scan(&schema).unwrap();
+        let ids = scanned
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let mut got: Vec<i64> = (0..ids.len()).map(|i| ids.value(i)).collect();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec![1, 2, 3, 4],
+            "all rows from both sessions must be present — the first \
+             session's committed data file must not be silently truncated \
+             by the second session reusing its filename"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn insert_then_commit_then_scan_round_trips() {
         let dir = temp_dir("insert-scan");
         let schema = test_schema();
@@ -1050,6 +1133,7 @@ mod tests {
             data_files: Vec::new(),
             next_row_id: u64::MAX,
             tombstones: Vec::new(),
+            next_attempt_id: 0,
         };
         strata_storage::commit_manifest(&dir, &hostile).unwrap();
 
@@ -1075,6 +1159,7 @@ mod tests {
             data_files: Vec::new(),
             next_row_id: 0,
             tombstones: Vec::new(),
+            next_attempt_id: 0,
         };
         strata_storage::commit_manifest(&dir, &hostile).unwrap();
         let ds = Dataset::open(&dir).unwrap();
@@ -1568,6 +1653,7 @@ mod tests {
             }],
             next_row_id: 0,
             tombstones: Vec::new(),
+            next_attempt_id: 0,
         };
         strata_storage::commit_manifest(&dir, &hostile).unwrap();
         // The delta log must exist (empty is fine — it replays to zero

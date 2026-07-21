@@ -53,6 +53,21 @@ pub struct Manifest {
     /// dataset-wide fixed schema to fabricate an empty batch from.
     #[serde(default)]
     pub tombstones: Vec<u64>,
+    /// The next filename-uniqueness "attempt id" to hand out for data/
+    /// delta-log filenames — see `strata_txn::Dataset.write_attempt_counter`.
+    /// Persisted (rather than always restarting at 0) so that
+    /// `Dataset::open` never regenerates a filename a prior session already
+    /// committed: `write_batch` truncates via `File::create`, so a filename
+    /// collision across sessions would silently destroy already-durable
+    /// data. Analogous to `next_row_id` (never resets, never reused), but
+    /// this counter identifies filename-uniqueness attempts rather than row
+    /// identity — see `.claude/docs/design/phase-0-transaction-and-format-spec.md`
+    /// §8 for `next_row_id`'s parallel contract.
+    ///
+    /// `#[serde(default)]` so manifests written before this field existed
+    /// still deserialize, same reasoning as `tombstones` above.
+    #[serde(default)]
+    pub next_attempt_id: u64,
 }
 
 impl Manifest {
@@ -63,6 +78,7 @@ impl Manifest {
             data_files: Vec::new(),
             next_row_id: 0,
             tombstones: Vec::new(),
+            next_attempt_id: 0,
         }
     }
 }
@@ -187,6 +203,7 @@ mod tests {
             }],
             next_row_id: 0,
             tombstones: Vec::new(),
+            next_attempt_id: 0,
         };
         commit_manifest(&dir, &m0).unwrap();
         let m1 = Manifest {
@@ -205,6 +222,7 @@ mod tests {
             ],
             next_row_id: 0,
             tombstones: Vec::new(),
+            next_attempt_id: 0,
         };
         commit_manifest(&dir, &m1).unwrap();
 
@@ -228,6 +246,7 @@ mod tests {
             }],
             next_row_id: 0,
             tombstones: Vec::new(),
+            next_attempt_id: 0,
         };
         commit_manifest(&dir, &m0).unwrap();
 
@@ -304,6 +323,7 @@ mod tests {
             }],
             next_row_id: 0,
             tombstones: Vec::new(),
+            next_attempt_id: 0,
         };
 
         commit_manifest(&dir, &m0).unwrap();
@@ -368,5 +388,34 @@ mod tests {
         let json = serde_json::to_vec(&manifest).unwrap();
         let deserialized: Manifest = serde_json::from_slice(&json).unwrap();
         assert_eq!(deserialized.tombstones, vec![3, 7, 12]);
+    }
+
+    #[test]
+    fn empty_manifest_has_zero_next_attempt_id() {
+        let manifest = Manifest::empty();
+        assert_eq!(manifest.next_attempt_id, 0);
+    }
+
+    #[test]
+    fn manifest_with_next_attempt_id_round_trips_through_json() {
+        let mut manifest = Manifest::empty();
+        manifest.next_attempt_id = 42;
+        let json = serde_json::to_vec(&manifest).unwrap();
+        let deserialized: Manifest = serde_json::from_slice(&json).unwrap();
+        assert_eq!(deserialized.next_attempt_id, 42);
+    }
+
+    #[test]
+    fn manifest_without_next_attempt_id_field_deserializes_with_default_zero() {
+        // Simulates a manifest written to disk before `next_attempt_id`
+        // existed — must still deserialize, defaulting to 0, same as
+        // `tombstones` does for pre-tombstone manifests.
+        let old_json = serde_json::json!({
+            "version": 0,
+            "data_files": [],
+            "next_row_id": 0,
+        });
+        let deserialized: Manifest = serde_json::from_value(old_json).unwrap();
+        assert_eq!(deserialized.next_attempt_id, 0);
     }
 }
