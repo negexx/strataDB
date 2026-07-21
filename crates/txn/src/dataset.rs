@@ -2529,6 +2529,11 @@ mod tests {
             matches!(result, Err(TxnError::Conflict { .. })),
             "expected a conservative conflict once history aged out, got {result:?}"
         );
+
+        // Same PID-reuse collision risk as
+        // `losing_transactions_graph_insert_never_lands_when_it_conflicts` —
+        // see that test's cleanup comment for why this matters.
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 
