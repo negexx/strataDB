@@ -2485,6 +2485,49 @@ mod tests {
             "loser's vector must not be findable near its own coordinates, got {results:?}"
         );
     }
+
+    #[test]
+    // COMMIT_LOG_CAPACITY (256) comfortably fits in i64/i16 for this loop's
+    // small range (capacity + 2), matching the existing cast-allow precedent
+    // on `cluster_vectors` above.
+    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+    fn a_transaction_whose_history_has_aged_out_of_the_commit_log_conflicts_conservatively() {
+        // COMMIT_LOG_CAPACITY is 256 in production; committing that many
+        // transactions here to force wraparound is wasteful but the most
+        // direct way to exercise the real end-to-end path without adding
+        // a test-only constructor parameter for capacity. Kept small
+        // enough (log capacity + a few) to run quickly.
+        let dir = temp_dir("commit-log-wraparound-e2e");
+        let ds = Dataset::create(&dir).unwrap();
+        let batch = vector_batch(vec![1i64], cluster_vectors(1, [0.0, 0.0, 0.0], 0.0));
+        let mut setup = ds.begin();
+        setup.insert(batch);
+        setup.commit().unwrap();
+
+        // txn begins here, before every filler commit below — its
+        // base_manifest.version stays fixed at whatever ds.current_version()
+        // is right now.
+        let mut txn = ds.begin();
+        txn.delete(0);
+
+        // Commit enough disjoint no-op-ish filler transactions to push the
+        // CommitLog's oldest retained entry past txn's read-version.
+        for i in 0..(super::COMMIT_LOG_CAPACITY as i64 + 2) {
+            let filler = vector_batch(
+                vec![100 + i],
+                cluster_vectors(1, [f32::from(i as i16), 0.0, 0.0], 0.0),
+            );
+            let mut filler_txn = ds.begin();
+            filler_txn.insert(filler);
+            filler_txn.commit().unwrap();
+        }
+
+        let result = txn.commit();
+        assert!(
+            matches!(result, Err(TxnError::Conflict { .. })),
+            "expected a conservative conflict once history aged out, got {result:?}"
+        );
+    }
 }
 
 /// Run with:
