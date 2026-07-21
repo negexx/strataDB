@@ -45,6 +45,14 @@ pub struct Manifest {
     /// resets, never reused — see
     /// `.claude/docs/design/phase-0-transaction-and-format-spec.md` §8.
     pub next_row_id: u64,
+    /// Row-ids tombstoned (deleted, or superseded by `update`) as of this
+    /// version. Accumulated across every committed version, same as
+    /// `data_files` — see Phase 6's design doc for why this lives directly
+    /// in the manifest rather than a delta-log file: a delete-only
+    /// transaction has no data file to attach one to, since there is no
+    /// dataset-wide fixed schema to fabricate an empty batch from.
+    #[serde(default)]
+    pub tombstones: Vec<u64>,
 }
 
 impl Manifest {
@@ -54,6 +62,7 @@ impl Manifest {
             version: 0,
             data_files: Vec::new(),
             next_row_id: 0,
+            tombstones: Vec::new(),
         }
     }
 }
@@ -177,6 +186,7 @@ mod tests {
                 delta_log: "d.deltalog".to_string(),
             }],
             next_row_id: 0,
+            tombstones: Vec::new(),
         };
         commit_manifest(&dir, &m0).unwrap();
         let m1 = Manifest {
@@ -194,6 +204,7 @@ mod tests {
                 },
             ],
             next_row_id: 0,
+            tombstones: Vec::new(),
         };
         commit_manifest(&dir, &m1).unwrap();
 
@@ -216,6 +227,7 @@ mod tests {
                 delta_log: "d.deltalog".to_string(),
             }],
             next_row_id: 0,
+            tombstones: Vec::new(),
         };
         commit_manifest(&dir, &m0).unwrap();
 
@@ -291,6 +303,7 @@ mod tests {
                 delta_log: "d.deltalog".to_string(),
             }],
             next_row_id: 0,
+            tombstones: Vec::new(),
         };
 
         commit_manifest(&dir, &m0).unwrap();
@@ -340,5 +353,20 @@ mod tests {
             "a versions/ directory containing only a leftover .tmp file must read as fresh, not current"
         );
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn empty_manifest_has_no_tombstones() {
+        let manifest = Manifest::empty();
+        assert!(manifest.tombstones.is_empty());
+    }
+
+    #[test]
+    fn manifest_with_tombstones_round_trips_through_json() {
+        let mut manifest = Manifest::empty();
+        manifest.tombstones = vec![3, 7, 12];
+        let json = serde_json::to_vec(&manifest).unwrap();
+        let deserialized: Manifest = serde_json::from_slice(&json).unwrap();
+        assert_eq!(deserialized.tombstones, vec![3, 7, 12]);
     }
 }

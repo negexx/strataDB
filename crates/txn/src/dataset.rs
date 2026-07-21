@@ -850,6 +850,7 @@ mod tests {
             version: 0,
             data_files: Vec::new(),
             next_row_id: u64::MAX,
+            tombstones: Vec::new(),
         };
         strata_storage::commit_manifest(&dir, &hostile).unwrap();
 
@@ -874,6 +875,7 @@ mod tests {
             version: u64::MAX,
             data_files: Vec::new(),
             next_row_id: 0,
+            tombstones: Vec::new(),
         };
         strata_storage::commit_manifest(&dir, &hostile).unwrap();
         let ds = Dataset::open(&dir).unwrap();
@@ -1366,6 +1368,7 @@ mod tests {
                 delta_log: "d.deltalog".to_string(),
             }],
             next_row_id: 0,
+            tombstones: Vec::new(),
         };
         strata_storage::commit_manifest(&dir, &hostile).unwrap();
         // The delta log must exist (empty is fine — it replays to zero
