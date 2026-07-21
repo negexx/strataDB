@@ -502,16 +502,21 @@ impl Transaction {
             (Vec::new(), Vec::new())
         } else {
             std::fs::create_dir_all(&data_dir)?;
-            // `SeqCst` here (and at every other atomic-counter site in
-            // this function) is the simple, always-correct default: each
-            // counter's own fetch_add/load pair is already ordered by
-            // program order plus `commit_lock`'s surrounding
-            // acquire/release edges, so a weaker ordering would likely be
-            // sound too — but the cost difference against this
-            // function's dominant work (fsync, JSON serialization) is
-            // immaterial, and isn't worth the reduced auditability of
-            // proving a weaker ordering correct at each site
-            // independently. See `.claude/rules/concurrency-txn-layer.md`.
+            // SeqCst ordering justification (this site and its sibling in
+            // write_pending_batches, both pre-lock fetch_adds): the only
+            // property either needs is per-atomic RMW uniqueness — no two
+            // fetch_adds on the same AtomicU64 ever return the same value
+            // — which every atomic's own total modification order already
+            // guarantees regardless of the chosen Ordering, even Relaxed.
+            // commit_lock plays no role here; these run *before* it's
+            // acquired. (The *load* sites further down, which persist
+            // these counters' values into the manifest, have a different
+            // justification — see the comment there.) SeqCst is kept
+            // anyway as the simple, always-correct default: the cost
+            // difference against this function's dominant work (fsync,
+            // JSON serialization) is immaterial, and isn't worth the
+            // reduced auditability of proving a weaker ordering correct
+            // per site. See `.claude/rules/concurrency-txn-layer.md`.
             let attempt_id = self
                 .write_attempt_counter
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -597,6 +602,19 @@ impl Transaction {
         let mut manifest = latest_snapshot.manifest.as_ref().clone();
         manifest.version = new_version;
         manifest.data_files.extend(new_data_files);
+        // SeqCst ordering justification for both `.load()`s below (distinct
+        // from the pre-lock fetch_adds' justification above): each must
+        // observe a value at least as large as every commit that landed
+        // before this one, including this transaction's own prior
+        // fetch_add — not just its own thread's value. That's guaranteed
+        // by commit_lock's Acquire/Release chain across successive lock
+        // holders, transitively carrying each earlier committer's
+        // program-order-prior fetch_add forward to every later committer's
+        // load — a property of the Mutex, not of the fetch_add/load calls'
+        // own Ordering (Relaxed on both ends would be equally sound here).
+        // SeqCst is kept as the simple, always-correct default; see the
+        // fetch_add comment above for why the negligible cost isn't worth
+        // trading for reduced auditability.
         manifest.next_row_id = self
             .next_row_id_counter
             .load(std::sync::atomic::Ordering::SeqCst);
