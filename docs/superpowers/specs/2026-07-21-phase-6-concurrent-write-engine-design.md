@@ -108,6 +108,14 @@ manifest write (a small JSON file, cheap `fsync`), and the `ArcSwap` swap.
 Scoped that tightly, the throughput gap against a fully lock-free design is an
 empirical question, not an assumed one — see §6's benchmark requirement.
 
+**This also resolves §2's `commit_manifest` overwrite bug without touching
+`crates/storage/src/manifest.rs` at all.** Once `commit_lock` guarantees only
+one transaction ever calls `commit_manifest` at a time, there is no longer a
+concurrent caller for `fs::rename` to race against — the existing
+tmp-file-then-rename implementation becomes safe as a direct consequence of
+the locking, not because its own logic changed. Do not "fix" `manifest.rs`'s
+rename separately; that would be solving the same problem twice.
+
 ## 4. Data structures
 
 **`Transaction` gains:**
