@@ -2436,6 +2436,55 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn losing_transactions_graph_insert_never_lands_when_it_conflicts() {
+        // Deterministic, not loom: both transactions begin from the same
+        // snapshot, then commit sequentially (not concurrently) so which
+        // one wins is fixed by test order, not explored interleavings —
+        // there is no concurrency to model here, only a specific sequence
+        // to regression-test. This is what actually exercises the
+        // graph-mutation-ordering bug (design doc §2): both transactions
+        // use `update`, not `delete`, since a delete-only transaction has
+        // nothing to insert and can't trigger this bug at all.
+        let dir = temp_dir("abort-leaves-no-graph-trace");
+        let ds = Dataset::create(&dir).unwrap();
+        let setup_batch = vector_batch(vec![1i64], cluster_vectors(1, [0.0, 0.0, 0.0], 0.0));
+        let mut setup = ds.begin();
+        setup.insert(setup_batch);
+        setup.commit().unwrap();
+
+        // Distinctive, far-apart, never-elsewhere-used coordinates so a
+        // vector_search near either one unambiguously reveals whether
+        // that specific insert ever reached the graph.
+        let winner_batch = vector_batch(vec![2i64], cluster_vectors(1, [500.0, 500.0, 500.0], 0.0));
+        let loser_batch = vector_batch(vec![3i64], cluster_vectors(1, [900.0, 900.0, 900.0], 0.0));
+
+        let mut txn_winner = ds.begin();
+        txn_winner.update(0, winner_batch);
+        let mut txn_loser = ds.begin();
+        txn_loser.update(0, loser_batch);
+
+        txn_winner.commit().unwrap();
+        let result = txn_loser.commit();
+        assert!(
+            matches!(result, Err(TxnError::Conflict { .. })),
+            "expected the second update to conflict on row 0, got {result:?}"
+        );
+
+        // The loser's insert must never have reached the graph — search
+        // near its distinctive coordinates and confirm nothing close
+        // exists (a large squared_distance means the nearest match found
+        // is the unrelated winner/setup data, not the loser's own point).
+        let results = ds
+            .snapshot()
+            .vector_search(&[900.0, 900.0, 900.0], 1, None)
+            .unwrap();
+        assert!(
+            results.is_empty() || results[0].squared_distance > 1000.0,
+            "loser's vector must not be findable near its own coordinates, got {results:?}"
+        );
+    }
 }
 
 /// Run with:
@@ -2512,6 +2561,105 @@ mod loom_tests {
 
             writer.join().unwrap();
             reader.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn two_threads_deleting_the_same_row_exactly_one_conflicts() {
+        loom::model(|| {
+            let dir = std::env::temp_dir().join(format!(
+                "strata-loom-conflict-{}-{:?}",
+                std::process::id(),
+                loom::thread::current().id()
+            ));
+            let ds = crate::Dataset::create(&dir).unwrap();
+            let schema = StdArc::new(arrow::datatypes::Schema::new(vec![
+                arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+            ]));
+            let batch = arrow::array::RecordBatch::try_new(
+                schema,
+                vec![StdArc::new(arrow::array::Int64Array::from(vec![1]))],
+            )
+            .unwrap();
+            let mut setup = ds.begin();
+            setup.insert(batch);
+            setup.commit().unwrap();
+
+            let ds_a = ds.clone();
+            let ds_b = ds.clone();
+
+            // Both transactions begin (and capture their shared, fixed base
+            // snapshot version) before either thread starts, mirroring the
+            // deterministic `losing_transactions_graph_insert_never_lands_when_it_conflicts`
+            // test above. This guarantees the two transactions are actually
+            // concurrent (design doc §7's intent) instead of allowing loom
+            // to explore a schedule where thread A's begin()-through-commit()
+            // runs to completion before thread B's begin() even executes —
+            // under that schedule B would legitimately observe A's commit
+            // as "nothing changed since I began" and its delete(0) on an
+            // already-tombstoned row would be an idempotent no-op success,
+            // not a real conflict. See task-7-report.md for the full
+            // root-cause diagnosis.
+            let mut txn_a = ds_a.begin();
+            txn_a.delete(0);
+            let mut txn_b = ds_b.begin();
+            txn_b.delete(0);
+
+            let thread_a = loom::thread::spawn(move || txn_a.commit());
+            let thread_b = loom::thread::spawn(move || txn_b.commit());
+
+            let result_a = thread_a.join().unwrap();
+            let result_b = thread_b.join().unwrap();
+            let successes = [&result_a, &result_b].iter().filter(|r| r.is_ok()).count();
+            let conflicts = [&result_a, &result_b]
+                .iter()
+                .filter(|r| matches!(r, Err(crate::TxnError::Conflict { .. })))
+                .count();
+            assert_eq!(successes, 1, "exactly one commit must succeed");
+            assert_eq!(conflicts, 1, "exactly one commit must report a conflict");
+
+            std::fs::remove_dir_all(&dir).ok();
+        });
+    }
+
+    #[test]
+    fn two_threads_deleting_disjoint_rows_both_succeed() {
+        loom::model(|| {
+            let dir = std::env::temp_dir().join(format!(
+                "strata-loom-disjoint-{}-{:?}",
+                std::process::id(),
+                loom::thread::current().id()
+            ));
+            let ds = crate::Dataset::create(&dir).unwrap();
+            let schema = StdArc::new(arrow::datatypes::Schema::new(vec![
+                arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+            ]));
+            let batch = arrow::array::RecordBatch::try_new(
+                schema,
+                vec![StdArc::new(arrow::array::Int64Array::from(vec![1, 2]))],
+            )
+            .unwrap();
+            let mut setup = ds.begin();
+            setup.insert(batch);
+            setup.commit().unwrap();
+
+            let ds_a = ds.clone();
+            let ds_b = ds.clone();
+            let thread_a = loom::thread::spawn(move || {
+                let mut txn = ds_a.begin();
+                txn.delete(0);
+                txn.commit()
+            });
+            let thread_b = loom::thread::spawn(move || {
+                let mut txn = ds_b.begin();
+                txn.delete(1);
+                txn.commit()
+            });
+
+            assert!(thread_a.join().unwrap().is_ok());
+            assert!(thread_b.join().unwrap().is_ok());
+
+            std::fs::remove_dir_all(&dir).ok();
         });
     }
 }
