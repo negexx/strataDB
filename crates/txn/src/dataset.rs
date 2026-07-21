@@ -200,6 +200,8 @@ impl Dataset {
             graph: Arc::clone(&snapshot.graph),
             tombstones: snapshot.tombstones.as_ref().clone(),
             pending: Vec::new(),
+            pending_tombstones: Vec::new(),
+            write_set: Vec::new(),
             current: Arc::clone(&self.current),
         }
     }
@@ -211,6 +213,14 @@ pub struct Transaction {
     graph: Arc<HnswIndex>,
     tombstones: im::HashSet<u64>,
     pending: Vec<RecordBatch>,
+    /// Row-ids queued for tombstoning by [`Transaction::delete`]/
+    /// [`Transaction::update`], applied at commit time (see
+    /// [`Transaction::commit`]) — mirrors how `pending` buffers inserts.
+    pending_tombstones: Vec<u64>,
+    /// Every row-id this transaction has written (via `delete`, and
+    /// transitively `update`) — read by conflict detection in a later
+    /// task, not yet consulted by `commit` itself.
+    write_set: Vec<u64>,
     current: Arc<ArcSwap<Snapshot>>,
 }
 
@@ -248,6 +258,27 @@ impl Transaction {
     /// process — until [`Transaction::commit`] succeeds. See spec §2.
     pub fn insert(&mut self, batch: RecordBatch) {
         self.pending.push(batch);
+    }
+
+    /// Tombstones `row_id`, making it invisible to every snapshot taken
+    /// after this transaction commits — see spec §2. Buffered, not
+    /// applied until [`Transaction::commit`] succeeds, same as
+    /// [`Transaction::insert`].
+    pub fn delete(&mut self, row_id: u64) {
+        self.pending_tombstones.push(row_id);
+        self.write_set.push(row_id);
+    }
+
+    /// Tombstones `row_id` and inserts `batch` as its replacement, within
+    /// the same transaction — commits atomically as one unit. Equivalent
+    /// to calling [`Transaction::delete`] then [`Transaction::insert`],
+    /// provided as one call because that's the common case and keeps the
+    /// write-set bookkeeping (used by conflict detection) obviously
+    /// correct at the call site rather than relying on the caller to
+    /// remember both.
+    pub fn update(&mut self, row_id: u64, batch: RecordBatch) {
+        self.delete(row_id);
+        self.insert(batch);
     }
 
     /// Commits per spec §3's write/durability steps (3-5). Applies only
@@ -352,6 +383,13 @@ impl Transaction {
                 }
             }
         }
+
+        for row_id in &self.pending_tombstones {
+            tombstones.insert(*row_id);
+        }
+        manifest
+            .tombstones
+            .extend(self.pending_tombstones.iter().copied());
 
         commit_manifest(&self.dir, &manifest)?;
 
@@ -496,6 +534,9 @@ fn replay_index(dir: &Path, manifest: &Manifest) -> Result<(HnswIndex, im::HashS
                 }
             }
         }
+    }
+    for row_id in &manifest.tombstones {
+        tombstones.insert(*row_id);
     }
     Ok((index, tombstones))
 }
@@ -1713,6 +1754,62 @@ mod tests {
              not a fallback to the far cluster: {results:?}"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn delete_tombstones_a_row_and_it_becomes_invisible() {
+        let dir = temp_dir("delete-basic");
+        let ds = Dataset::create(&dir).unwrap();
+
+        let batch = vector_batch(vec![1i64], cluster_vectors(1, [0.0, 0.0, 0.0], 0.0));
+        let mut txn = ds.begin();
+        txn.insert(batch);
+        txn.commit().unwrap();
+
+        let mut txn = ds.begin();
+        txn.delete(0);
+        txn.commit().unwrap();
+
+        assert!(!ds.snapshot().is_visible(0));
+    }
+
+    #[test]
+    fn update_tombstones_old_row_and_makes_new_row_visible() {
+        let dir = temp_dir("update-basic");
+        let ds = Dataset::create(&dir).unwrap();
+
+        let batch = vector_batch(vec![1i64], cluster_vectors(1, [0.0, 0.0, 0.0], 0.0));
+        let mut txn = ds.begin();
+        txn.insert(batch);
+        txn.commit().unwrap();
+
+        let replacement = vector_batch(vec![1i64], cluster_vectors(1, [5.0, 5.0, 5.0], 0.0));
+        let mut txn = ds.begin();
+        txn.update(0, replacement);
+        txn.commit().unwrap();
+
+        let snapshot = ds.snapshot();
+        assert!(!snapshot.is_visible(0), "old row must be tombstoned");
+        assert!(snapshot.is_visible(1), "replacement row must be visible");
+    }
+
+    #[test]
+    fn tombstones_persist_across_reopen() {
+        let dir = temp_dir("delete-persists");
+        let ds = Dataset::create(&dir).unwrap();
+
+        let batch = vector_batch(vec![1i64], cluster_vectors(1, [0.0, 0.0, 0.0], 0.0));
+        let mut txn = ds.begin();
+        txn.insert(batch);
+        txn.commit().unwrap();
+
+        let mut txn = ds.begin();
+        txn.delete(0);
+        txn.commit().unwrap();
+        drop(ds);
+
+        let reopened = Dataset::open(&dir).unwrap();
+        assert!(!reopened.snapshot().is_visible(0));
     }
 
     #[test]
