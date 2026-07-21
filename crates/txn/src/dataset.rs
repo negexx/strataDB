@@ -77,7 +77,7 @@ pub struct Dataset {
     /// filename prefix for each commit *attempt*'s data/delta-log files —
     /// deliberately independent of both `next_row_id_counter` and the real
     /// manifest version. See `Transaction::commit` for why filenames must
-    /// not be derived from `base_manifest.version`.
+    /// not be derived from `base_version`.
     write_attempt_counter: Arc<AtomicU64>,
     /// Serializes the conflict-check → graph-apply → manifest-commit →
     /// snapshot-swap critical section of `Transaction::commit`, and guards
@@ -282,7 +282,7 @@ impl Dataset {
         let snapshot = self.snapshot();
         Transaction {
             dir: self.dir.clone(),
-            base_manifest: snapshot.manifest.as_ref().clone(),
+            base_version: snapshot.version,
             graph: Arc::clone(&snapshot.graph),
             pending: Vec::new(),
             pending_tombstones: Vec::new(),
@@ -312,7 +312,13 @@ impl Dataset {
 
 pub struct Transaction {
     dir: PathBuf,
-    base_manifest: Manifest,
+    /// This transaction's read-version, captured at `begin()`. The only
+    /// piece of `base`-time state this type retains — `commit()` rebuilds
+    /// `data_files`/`tombstones`/the rest of the manifest from the *latest*
+    /// snapshot inside the lock, not from anything captured here, so
+    /// cloning the whole `Manifest` at `begin()` time (as earlier Phase 6
+    /// commits did) was pure waste: every field but `version` went unused.
+    base_version: u64,
     graph: Arc<HnswIndex>,
     pending: Vec<RecordBatch>,
     /// Row-ids queued for tombstoning by [`Transaction::delete`]/
@@ -472,37 +478,60 @@ impl Transaction {
     /// strictly before the first delta is applied.)
     pub fn commit(self) -> Result<()> {
         let data_dir = data_subdir(&self.dir);
-        std::fs::create_dir_all(&data_dir)?;
 
         // Data-file writes happen before the lock — they touch only
         // files unique to this transaction and never collide with a
         // concurrent transaction's own writes. The filename prefix comes
-        // from write_attempt_counter, NOT base_manifest.version + 1: two
+        // from write_attempt_counter, NOT base_version + 1: two
         // truly concurrent transactions can share the same stale
-        // base_manifest.version, which would make them compute the same
+        // base_version, which would make them compute the same
         // "next version" and collide on the same filename before either
         // reaches commit_lock. write_attempt_counter is unique per
         // attempt regardless of version, so no such collision is
         // possible. See design doc §3 (data-file writes need no
         // conflict information to proceed) — this counter is what makes
         // that safe to do outside the lock at all.
-        let attempt_id = self
-            .write_attempt_counter
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let mut new_data_files = Vec::new();
-        let deltas = Self::write_pending_batches(
-            &self.pending,
-            &data_dir,
-            attempt_id,
-            &self.next_row_id_counter,
-            &mut new_data_files,
-        )?;
-        // Fsyncing each data file's *content* (already done inside
-        // write_batch) is not sufficient — the new directory entries
-        // themselves must also be fsynced, or a real power-loss crash can
-        // leave a file's bytes durable while the file itself is absent.
-        // Must happen before the graph update/manifest commit below.
-        strata_storage::sync_dir(&data_dir)?;
+        //
+        // Skipped entirely when there's nothing to insert: a delete-only
+        // transaction writes no new files, so there's no new directory
+        // entry to create or fsync and no attempt_id needs reserving.
+        // `Dataset::create`/`open` already ensure `data_dir` exists once
+        // per `Dataset` lifetime; recreating it on every single commit
+        // regardless of whether it had anything to write was redundant.
+        let (new_data_files, deltas) = if self.pending.is_empty() {
+            (Vec::new(), Vec::new())
+        } else {
+            std::fs::create_dir_all(&data_dir)?;
+            // `SeqCst` here (and at every other atomic-counter site in
+            // this function) is the simple, always-correct default: each
+            // counter's own fetch_add/load pair is already ordered by
+            // program order plus `commit_lock`'s surrounding
+            // acquire/release edges, so a weaker ordering would likely be
+            // sound too — but the cost difference against this
+            // function's dominant work (fsync, JSON serialization) is
+            // immaterial, and isn't worth the reduced auditability of
+            // proving a weaker ordering correct at each site
+            // independently. See `.claude/rules/concurrency-txn-layer.md`.
+            let attempt_id = self
+                .write_attempt_counter
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut new_data_files = Vec::new();
+            let deltas = Self::write_pending_batches(
+                &self.pending,
+                &data_dir,
+                attempt_id,
+                &self.next_row_id_counter,
+                &mut new_data_files,
+            )?;
+            // Fsyncing each data file's *content* (already done inside
+            // write_batch) is not sufficient — the new directory entries
+            // themselves must also be fsynced, or a real power-loss crash
+            // can leave a file's bytes durable while the file itself is
+            // absent. Must happen before the graph update/manifest commit
+            // below.
+            strata_storage::sync_dir(&data_dir)?;
+            (new_data_files, deltas)
+        };
         validate_delta_dimensions(&deltas, &self.graph)?;
 
         // Everything from here is the tightly-scoped critical section:
@@ -524,8 +553,7 @@ impl Transaction {
         // Conflict detection MUST run before any mutation of the shared
         // graph: a transaction that turns out to conflict must leave the
         // graph completely untouched.
-        match commit_log.conflicts_with(self.base_manifest.version, latest_version, &self.write_set)
-        {
+        match commit_log.conflicts_with(self.base_version, latest_version, &self.write_set) {
             ConflictCheck::Clean => {}
             ConflictCheck::Conflict(contested_row_ids) => {
                 return Err(TxnError::Conflict { contested_row_ids });
@@ -561,10 +589,6 @@ impl Transaction {
                 }
             }
         }
-        for row_id in &self.pending_tombstones {
-            tombstones.insert(*row_id);
-        }
-
         // The new manifest is likewise built from the latest snapshot's
         // manifest: this transaction's new data files are *appended* to
         // the latest file list (never substituted for it wholesale —
@@ -584,9 +608,20 @@ impl Transaction {
         manifest.next_attempt_id = self
             .write_attempt_counter
             .load(std::sync::atomic::Ordering::SeqCst);
-        manifest
-            .tombstones
-            .extend(self.pending_tombstones.iter().copied());
+        // Dedup against both the current in-memory tombstone set and
+        // duplicates within this same transaction's own pending_tombstones
+        // (e.g. two delete() calls on the same row): without this check,
+        // an idempotent re-delete of an already-tombstoned row would grow
+        // the *persisted* manifest.tombstones Vec unboundedly (cloned,
+        // JSON-serialized, and fsynced on every future commit; replayed on
+        // every open), even though the in-memory im::HashSet below already
+        // dedupes for free.
+        for row_id in &self.pending_tombstones {
+            if !tombstones.contains(row_id) {
+                manifest.tombstones.push(*row_id);
+            }
+            tombstones.insert(*row_id);
+        }
 
         commit_manifest(&self.dir, &manifest)?;
 
@@ -620,7 +655,7 @@ impl Transaction {
     /// `Dataset.write_attempt_counter` — **not** a manifest version. It
     /// exists only so concurrent callers never write to the same path;
     /// see `Transaction::commit` (Task 6) for why it can't be derived
-    /// from `base_manifest.version` instead.
+    /// from `base_version` instead.
     ///
     /// # Errors
     ///
@@ -644,6 +679,10 @@ impl Transaction {
             let stats = compute_stats(batch);
 
             let num_rows = u64::try_from(batch.num_rows())?;
+            // SeqCst: see the ordering-justification comment on
+            // Transaction::commit's write_attempt_counter.fetch_add — the
+            // same reasoning applies here (this is the sibling counter for
+            // row-ids rather than filenames).
             let row_id_base =
                 row_id_counter.fetch_add(num_rows, std::sync::atomic::Ordering::SeqCst);
             // fetch_add already advanced the counter before this check —
@@ -2081,6 +2120,61 @@ mod tests {
     }
 
     #[test]
+    fn redeleting_an_already_tombstoned_row_does_not_duplicate_it_in_the_persisted_manifest() {
+        let dir = temp_dir("tombstone-dedup-cross-txn");
+        let ds = Dataset::create(&dir).unwrap();
+
+        let batch = vector_batch(vec![1i64], cluster_vectors(1, [0.0, 0.0, 0.0], 0.0));
+        let mut setup = ds.begin();
+        setup.insert(batch);
+        setup.commit().unwrap();
+
+        let mut txn_a = ds.begin();
+        txn_a.delete(0);
+        txn_a.commit().unwrap();
+        assert_eq!(ds.snapshot().manifest.tombstones.len(), 1);
+
+        // A second, later transaction re-deleting the same already-tombstoned
+        // row is Clean (no write-set overlap with anything that committed in
+        // between) and must not grow the persisted tombstones list, even
+        // though it's a genuinely separate commit.
+        let mut txn_b = ds.begin();
+        txn_b.delete(0);
+        txn_b.commit().unwrap();
+        assert_eq!(
+            ds.snapshot().manifest.tombstones.len(),
+            1,
+            "re-deleting an already-tombstoned row in a later transaction must not duplicate it"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn deleting_the_same_row_twice_in_one_transaction_does_not_duplicate_persisted_tombstone() {
+        let dir = temp_dir("tombstone-dedup-intra-txn");
+        let ds = Dataset::create(&dir).unwrap();
+
+        let batch = vector_batch(vec![1i64], cluster_vectors(1, [0.0, 0.0, 0.0], 0.0));
+        let mut setup = ds.begin();
+        setup.insert(batch);
+        setup.commit().unwrap();
+
+        let mut txn = ds.begin();
+        txn.delete(0);
+        txn.delete(0); // duplicate delete() call within the same transaction
+        txn.commit().unwrap();
+
+        assert_eq!(
+            ds.snapshot().manifest.tombstones.len(),
+            1,
+            "calling delete() twice on the same row within one transaction must not duplicate it"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn update_tombstones_old_row_and_makes_new_row_visible() {
         let dir = temp_dir("update-basic");
         let ds = Dataset::create(&dir).unwrap();
@@ -2574,7 +2668,7 @@ mod tests {
         setup.commit().unwrap();
 
         // txn begins here, before every filler commit below — its
-        // base_manifest.version stays fixed at whatever ds.current_version()
+        // base_version stays fixed at whatever ds.current_version()
         // is right now.
         let mut txn = ds.begin();
         txn.delete(0);
@@ -2624,12 +2718,12 @@ mod tests {
         // conflict" rule, an empty write-set can never conflict with
         // anything, regardless of how much commit history has aged out of
         // the bounded CommitLog — this must succeed even when its
-        // base_manifest.version has aged out of the ring buffer.
+        // base_version has aged out of the ring buffer.
         let dir = temp_dir("commit-log-wraparound-insert-only-e2e");
         let ds = Dataset::create_with_commit_log_capacity(&dir, TEST_COMMIT_LOG_CAPACITY).unwrap();
 
         // txn begins here, before every filler commit below — its
-        // base_manifest.version stays fixed at whatever ds.current_version()
+        // base_version stays fixed at whatever ds.current_version()
         // is right now.
         let mut txn = ds.begin();
         let insert_only_batch =
