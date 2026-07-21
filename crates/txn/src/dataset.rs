@@ -145,7 +145,8 @@ impl Dataset {
 
     /// Same as [`Dataset::create`], but with an explicit `CommitLog`
     /// capacity instead of the production [`COMMIT_LOG_CAPACITY`] default.
-    /// `pub(crate)` only — exists so the wraparound/`InsufficientHistory`
+    /// Private to this module (no `pub`/`pub(crate)` — even more
+    /// restrictive than crate-wide reach) — exists so the wraparound/`InsufficientHistory`
     /// regression tests can prove the eviction logic is correct at a small
     /// capacity (milliseconds) instead of paying the real production
     /// capacity's fill cost (which grows with the capacity itself, since
