@@ -10,13 +10,23 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use arrow::array::{Int64Array, RecordBatch};
+use arrow::array::{FixedSizeListArray, Float32Array, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 use criterion::{Criterion, criterion_group, criterion_main};
 use strata_txn::Dataset;
 
 const NUM_THREADS: usize = 8;
 const COMMITS_PER_THREAD: i64 = 50;
+/// Matches `vector_search_bench.rs`'s dimension, for consistency across this
+/// workspace's benchmarks rather than picking a new arbitrary value.
+const VECTOR_DIM: usize = 512;
+/// Smaller than `COMMITS_PER_THREAD`: each vector insert does a real
+/// `ef_construction=200` HNSW candidate search, meaningfully more expensive
+/// per commit than an `Int64`-only row — at `COMMITS_PER_THREAD`'s scale
+/// this benchmark's total runtime would be impractical. Still large enough
+/// (`NUM_THREADS * VECTOR_COMMITS_PER_THREAD` = 80 total inserts) to grow a
+/// real, non-trivial graph within one iteration.
+const VECTOR_COMMITS_PER_THREAD: i64 = 10;
 
 /// This workspace's benches and tests use `std::env::temp_dir().join(...)`
 /// directly rather than the `tempfile` crate (confirmed against
@@ -54,6 +64,59 @@ fn setup_dataset(row_count: i64) -> TempDataset {
     TempDataset { dir, dataset }
 }
 
+/// Schema for the vector-workload benchmarks: an `id` column plus a
+/// `"vector"` `FixedSizeList<Float32, VECTOR_DIM>` column — the presence of
+/// a `"vector"` column is what makes `build_delta_entries` (inside
+/// `Transaction::commit`) actually produce `DeltaEntry::Insert` entries,
+/// which is what makes `HnswIndex::insert` run at all. The plain-`Int64`
+/// benchmarks above never exercise this path.
+fn vector_schema() -> Arc<Schema> {
+    let item_field = Arc::new(Field::new("item", DataType::Float32, false));
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new(
+            "vector",
+            DataType::FixedSizeList(item_field, VECTOR_DIM.try_into().unwrap()),
+            false,
+        ),
+    ]))
+}
+
+/// Builds a single-row batch with a deterministic, finite, non-degenerate
+/// vector derived from `id` — deterministic so the benchmark needs no `rand`
+/// dependency, varied per row so `ef_construction=200`'s candidate search
+/// during `HnswIndex::insert` does real work rather than deduping identical
+/// points.
+#[allow(clippy::cast_precision_loss)]
+fn vector_row_batch(id: i64) -> RecordBatch {
+    let item_field = Arc::new(Field::new("item", DataType::Float32, false));
+    let base = id as f32;
+    let values: Vec<f32> = (0..VECTOR_DIM).map(|d| base + (d as f32) * 0.01).collect();
+    let values_array = Arc::new(Float32Array::from(values));
+    let vector_dim_i32 = i32::try_from(VECTOR_DIM).unwrap();
+    let vectors = Arc::new(
+        FixedSizeListArray::try_new(item_field, vector_dim_i32, values_array, None).unwrap(),
+    );
+    RecordBatch::try_new(
+        vector_schema(),
+        vec![Arc::new(Int64Array::from(vec![id])), vectors],
+    )
+    .unwrap()
+}
+
+fn setup_vector_dataset() -> TempDataset {
+    let dir = std::env::temp_dir().join(format!(
+        "strata-bench-concurrent-commit-vector-{}",
+        std::process::id()
+    ));
+    std::fs::remove_dir_all(&dir).ok();
+    let dataset = Dataset::create(&dir).unwrap();
+    let mut txn = dataset.begin();
+    txn.insert(vector_row_batch(0));
+    txn.commit().unwrap();
+    TempDataset { dir, dataset }
+}
+
 /// `NUM_THREADS` threads each committing `COMMITS_PER_THREAD` inserts of
 /// fresh (never-colliding) rows — zero conflicts by construction, since
 /// inserts always get fresh monotonic row-ids (design doc §1). This is the
@@ -87,6 +150,65 @@ fn bench_concurrent_non_conflicting_inserts(c: &mut Criterion) {
                         });
                     }
                 });
+            },
+            criterion::BatchSize::LargeInput,
+        );
+    });
+}
+
+/// Vector-workload counterpart to `bench_concurrent_non_conflicting_inserts`.
+/// The two `Int64`-only benchmarks above never populate a `"vector"` column,
+/// so `HnswIndex::insert` never runs inside `commit_lock` during them — the
+/// "concurrent beats sequential" result they measure comes entirely from
+/// data-file fsync (which runs outside the lock) parallelizing across
+/// threads. This benchmark is what actually exercises the flagship
+/// "atomic row+index commit" workload, where the expensive work (graph
+/// insert) runs *inside* the lock instead. See
+/// `docs/superpowers/specs/2026-07-21-phase-6-concurrent-write-engine-design.md`
+/// §3 for why that placement was a deliberate, but until now unmeasured,
+/// choice.
+fn bench_concurrent_non_conflicting_vector_inserts(c: &mut Criterion) {
+    c.bench_function("concurrent_non_conflicting_vector_inserts", |b| {
+        b.iter_batched(
+            setup_vector_dataset,
+            |temp_dataset| {
+                std::thread::scope(|scope| {
+                    for thread_idx in 0..NUM_THREADS {
+                        let ds = temp_dataset.dataset.clone();
+                        scope.spawn(move || {
+                            for i in 0..VECTOR_COMMITS_PER_THREAD {
+                                let id = i64::try_from(thread_idx).unwrap()
+                                    * VECTOR_COMMITS_PER_THREAD
+                                    + i
+                                    + 1;
+                                let mut txn = ds.begin();
+                                txn.insert(vector_row_batch(id));
+                                txn.commit().unwrap();
+                            }
+                        });
+                    }
+                });
+            },
+            criterion::BatchSize::LargeInput,
+        );
+    });
+}
+
+/// Vector-workload counterpart to `bench_single_writer_baseline` — same
+/// total commit count as `bench_concurrent_non_conflicting_vector_inserts`
+/// (`NUM_THREADS * VECTOR_COMMITS_PER_THREAD`), sequential on one thread, so
+/// the two are directly comparable the same way the `Int64` pair is.
+fn bench_single_writer_vector_baseline(c: &mut Criterion) {
+    c.bench_function("single_writer_vector_baseline", |b| {
+        b.iter_batched(
+            setup_vector_dataset,
+            |temp_dataset| {
+                let total = i64::try_from(NUM_THREADS).unwrap() * VECTOR_COMMITS_PER_THREAD;
+                for i in 1..=total {
+                    let mut txn = temp_dataset.dataset.begin();
+                    txn.insert(vector_row_batch(i));
+                    txn.commit().unwrap();
+                }
             },
             criterion::BatchSize::LargeInput,
         );
@@ -179,7 +301,9 @@ fn bench_single_writer_baseline(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_concurrent_non_conflicting_inserts,
+    bench_concurrent_non_conflicting_vector_inserts,
     bench_high_conflict_rate,
-    bench_single_writer_baseline
+    bench_single_writer_baseline,
+    bench_single_writer_vector_baseline
 );
 criterion_main!(benches);
