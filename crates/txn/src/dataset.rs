@@ -2535,6 +2535,53 @@ mod tests {
         // see that test's cleanup comment for why this matters.
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    // Same cast-allow precedent as the sibling test above.
+    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+    fn an_insert_only_transaction_whose_history_has_aged_out_of_the_commit_log_still_commits() {
+        // Mirrors `a_transaction_whose_history_has_aged_out_of_the_commit_log_conflicts_conservatively`
+        // but for an insert-only transaction (never calls update/delete, so
+        // its write_set is empty). Per the design doc's "appends never
+        // conflict" rule, an empty write-set can never conflict with
+        // anything, regardless of how much commit history has aged out of
+        // the bounded CommitLog — this must succeed even when its
+        // base_manifest.version has aged out of the ring buffer.
+        let dir = temp_dir("commit-log-wraparound-insert-only-e2e");
+        let ds = Dataset::create(&dir).unwrap();
+
+        // txn begins here, before every filler commit below — its
+        // base_manifest.version stays fixed at whatever ds.current_version()
+        // is right now.
+        let mut txn = ds.begin();
+        let insert_only_batch =
+            vector_batch(vec![99_999], cluster_vectors(1, [500.0, 500.0, 500.0], 0.0));
+        txn.insert(insert_only_batch);
+
+        // Commit enough disjoint filler transactions to push the
+        // CommitLog's oldest retained entry past txn's read-version.
+        for i in 0..(super::COMMIT_LOG_CAPACITY as i64 + 2) {
+            let filler = vector_batch(
+                vec![100 + i],
+                cluster_vectors(1, [f32::from(i as i16), 0.0, 0.0], 0.0),
+            );
+            let mut filler_txn = ds.begin();
+            filler_txn.insert(filler);
+            filler_txn.commit().unwrap();
+        }
+
+        let result = txn.commit();
+        assert!(
+            result.is_ok(),
+            "insert-only transactions have an empty write-set and can never \
+             conflict, even with aged-out history, but got {result:?}"
+        );
+
+        // Same PID-reuse collision risk as
+        // `losing_transactions_graph_insert_never_lands_when_it_conflicts` —
+        // see that test's cleanup comment for why this matters.
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
 
 /// Run with:

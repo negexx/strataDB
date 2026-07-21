@@ -34,8 +34,9 @@ pub struct CommitLog {
 impl CommitLog {
     #[must_use]
     pub fn new(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
         Self {
-            capacity: capacity.max(1),
+            capacity,
             entries: VecDeque::with_capacity(capacity),
         }
     }
@@ -59,11 +60,21 @@ impl CommitLog {
         up_to_version: u64,
         write_set: &[u64],
     ) -> ConflictCheck {
+        // An empty write-set can never conflict with anything, regardless
+        // of how much history has aged out of the log — appends never
+        // conflict (see design doc §4). Must run before the
+        // InsufficientHistory check below, or an insert-only transaction
+        // (empty write_set) whose base version has aged out of the ring
+        // buffer would be conservatively — and wrongly — treated as a
+        // conflict.
+        if write_set.is_empty() {
+            return ConflictCheck::Clean;
+        }
         if up_to_version <= since_version {
             return ConflictCheck::Clean;
         }
         if let Some((oldest_version, _)) = self.entries.front() {
-            if *oldest_version > since_version + 1 && !self.entries.is_empty() {
+            if *oldest_version > since_version + 1 {
                 return ConflictCheck::InsufficientHistory;
             }
         } else {
@@ -155,5 +166,21 @@ mod tests {
         log.push(3, vec![30]); // evicts version 1
         // since_version=2 only needs versions >2 to be present, which they are.
         assert_eq!(log.conflicts_with(2, 3, &[999]), ConflictCheck::Clean);
+    }
+
+    #[test]
+    fn empty_write_set_is_clean_even_with_insufficient_history() {
+        // An insert-only transaction's write_set is empty (see
+        // Transaction::insert vs. delete/update in dataset.rs). Per the
+        // design doc's "appends never conflict" rule, an empty write-set
+        // can never conflict with anything — this must be Clean even when
+        // the log's history has aged out and would otherwise report
+        // InsufficientHistory for a non-empty write-set (as
+        // `log_wraparound_reports_insufficient_history` above confirms).
+        let mut log = CommitLog::new(2);
+        log.push(1, vec![10]);
+        log.push(2, vec![20]);
+        log.push(3, vec![30]); // evicts version 1's entry
+        assert_eq!(log.conflicts_with(0, 3, &[]), ConflictCheck::Clean);
     }
 }
