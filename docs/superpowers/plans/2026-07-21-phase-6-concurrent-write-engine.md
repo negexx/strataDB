@@ -1351,7 +1351,7 @@ git commit -m "test(txn): end-to-end CommitLog wraparound conflict regression te
 - Consumes: `Dataset`, `Transaction` public API only.
 - Produces: a runnable `cargo bench` target; no library code.
 
-- [ ] **Step 1: Register the bench target**
+- [x] **Step 1: Register the bench target**
 
 In `bench/Cargo.toml`, add after the existing `[[bench]]` entries:
 
@@ -1361,7 +1361,7 @@ name = "concurrent_commit_bench"
 harness = false
 ```
 
-- [ ] **Step 2: Write the benchmark**
+- [x] **Step 2: Write the benchmark**
 
 Create `bench/benches/concurrent_commit_bench.rs`:
 
@@ -1542,12 +1542,24 @@ criterion_group!(
 criterion_main!(benches);
 ```
 
-- [ ] **Step 3: Run the benchmark**
+- [x] **Step 3: Run the benchmark**
 
 Run: `cargo bench -p strata-bench --bench concurrent_commit_bench`
 Expected: completes and prints Criterion's timing report for all three functions. There is no pass/fail gate on the numbers themselves — per the design doc, this is exit *evidence*, not a threshold. Record all three numbers in the plan's completion notes or a short results doc, mirroring how the GROUP BY Phase A plan recorded its benchmark numbers (`docs(plan): record GROUP BY Phase A benchmark results` in this repo's git log is the precedent to follow).
 
-- [ ] **Step 4: Commit**
+**Results (2026-07-21, release profile, 100 samples/function where criterion could complete them in the target window):**
+
+| Benchmark | Result | Notes |
+|---|---|---|
+| `concurrent_non_conflicting_inserts` | ~9.9s / iteration (8 threads × 50 commits = 400 total) → **~40 commits/sec** | Zero conflicts by construction (fresh monotonic row-ids) |
+| `high_conflict_rate_delete_retries` | ~22.9ms / iteration (8 threads racing for one row) | Only one thread can ever succeed; the rest resolve to `Conflict` on their first and only attempt |
+| `single_writer_baseline` | ~12.1s / iteration (same 400 sequential commits) → **~33 commits/sec** | Same total commit count as the concurrent benchmark, for direct comparison |
+
+**Headline finding:** concurrent commits (9.9s) are **~18% faster** than the sequential single-writer baseline (12.1s) for the same 400 total commits — not slower, despite `commit_lock` serializing part of each commit. Validates Task 6's Approach-A design (tightly-scoped mutex, data-file fsync outside the lock): the expensive I/O parallelizes across threads while only the small critical section (conflict check + manifest write + `ArcSwap` swap) serializes, so the lock isn't the bottleneck for this workload shape. No motivation found to revisit toward a fully lock-free rewrite.
+
+Note: the benchmark file committed in Task 9 differs slightly from the code shown above — `bench_high_conflict_rate`'s retry loop doesn't compile as written here, since `Snapshot::is_visible` is `pub(crate)` and unreachable from this external bench crate. The committed version removes the `is_visible` call and treats any `Conflict` as "done" (sound, since this workload has exactly one contested row and no writer besides the benchmark's own threads — any conflict can only mean another thread already won), which also collapses the `loop` into a single match (every arm terminated on the first pass regardless, matching `clippy::never_loop`'s diagnosis).
+
+- [x] **Step 4: Commit**
 
 ```bash
 git add bench/Cargo.toml bench/benches/concurrent_commit_bench.rs
