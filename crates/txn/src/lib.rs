@@ -3,6 +3,7 @@
 //! `.claude/rules/concurrency-txn-layer.md` before editing anything here for
 //! real.
 
+pub mod commit_log;
 pub mod dataset;
 pub mod error;
 pub mod mvp_fixtures;

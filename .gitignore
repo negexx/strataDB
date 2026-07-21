@@ -2,6 +2,7 @@
 .claude/settings.local.json
 .claude/memory/
 .claude/scheduled_tasks.lock
+.claude/worktrees/
 
 # superpowers subagent-driven-development scratch state
 .superpowers/

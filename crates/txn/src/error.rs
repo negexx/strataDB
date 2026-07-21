@@ -43,6 +43,8 @@ pub enum TxnError {
     UnsafeManifestPath(String),
     #[error("schema mismatch casting a data file: expected {expected} columns, found {actual}")]
     SchemaMismatch { expected: usize, actual: usize },
+    #[error("conflict: {contested_row_ids:?} were modified by another transaction")]
+    Conflict { contested_row_ids: Vec<u64> },
 }
 
 pub type Result<T> = std::result::Result<T, TxnError>;
@@ -72,6 +74,17 @@ mod tests {
             }
             .to_string(),
             "schema mismatch casting a data file: expected 3 columns, found 2"
+        );
+    }
+
+    #[test]
+    fn conflict_error_names_contested_rows() {
+        let err = TxnError::Conflict {
+            contested_row_ids: vec![5, 9],
+        };
+        assert_eq!(
+            err.to_string(),
+            "conflict: [5, 9] were modified by another transaction"
         );
     }
 }
