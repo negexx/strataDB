@@ -1,18 +1,13 @@
-//! Multi-writer transaction path. Implements spec §3's write/durability
-//! steps (3-5) plus — as of Phase 6 — §3.1's write-set accumulation
-//! (`Transaction::delete`/`update`) and §3.2's real conflict check:
-//! `Transaction::commit` re-reads the *latest* committed snapshot inside
-//! `Dataset.commit_lock`, runs `CommitLog::conflicts_with` over every
-//! version that landed after this transaction's `begin()`, and surfaces any
-//! write-write overlap as a typed `TxnError::Conflict` naming the contested
-//! rows — before a single graph delta is applied. §3.4's "atomic CAS of the
-//! manifest pointer" is realized as the lock-serialized
-//! check-then-commit-then-swap sequence in `commit` (equivalent to a CAS
-//! that can never spuriously fail, because the version check and the swap
-//! are atomic with respect to other committers by construction). See
-//! `.claude/rules/concurrency-txn-layer.md` and
+//! Transaction path for `strata-txn`. Implements spec §3's commit protocol
+//! in full, including real OCC conflict detection and an atomic
+//! commit critical section (Phase 6) — see
 //! `docs/superpowers/specs/2026-07-21-phase-6-concurrent-write-engine-design.md`
-//! §3/§5 before changing the commit protocol.
+//! and `.claude/rules/concurrency-txn-layer.md` before editing anything
+//! here. Conflict detection is write-write only, keyed by row-id, and
+//! scoped to in-process concurrency (multiple threads/tasks sharing one
+//! `Dataset` handle) — see the design doc §1 for why cross-process
+//! visibility and read-set tracking are explicit non-goals for this slice,
+//! not gaps.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -2484,6 +2479,13 @@ mod tests {
             results.is_empty() || results[0].squared_distance > 1000.0,
             "loser's vector must not be findable near its own coordinates, got {results:?}"
         );
+
+        // Without this, `temp_dir`'s PID-only naming can collide with a
+        // leftover directory from an earlier process that happened to
+        // reuse the same PID (observed in practice on Windows) — a stale
+        // manifest from that leftover directory makes the next
+        // `Dataset::create` at this path fail with `AlreadyExists`.
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
