@@ -636,8 +636,8 @@ git commit -m "feat(chaos-worker): interleave agents via a seeded scheduler inst
 - Modify: `Cargo.toml` (workspace root — add member)
 
 **Interfaces:**
-- Consumes: the `chaos-worker` binary (Tasks 3-4) via `env!("CARGO_BIN_EXE_chaos-worker")` — Cargo only makes this available to a package that depends on `strata-chaos-worker`, so `tests/sim`'s `Cargo.toml` must list it as a `[dev-dependencies]` entry even though the orchestrator never calls its Rust API directly, only spawns the binary.
-- Consumes: `strata_txn::Dataset` (no `chaos-injection` feature enabled — verification is a plain read path).
+- Consumes: the `chaos-worker` binary (Tasks 3-4), located and built via the `escargot` crate (`escargot::CargoBuild::new().bin("chaos-worker").package("strata-chaos-worker").current_release().run()`), NOT via `env!("CARGO_BIN_EXE_...")`. **Correction from an earlier draft of this plan, found during Task 5's implementation:** `CARGO_BIN_EXE_<name>` is only ever defined for binary targets of the *same package* whose integration test is being compiled — it is never set for a dependency's binaries on stable Cargo (cross-package binary artifact access needs the unstabilized `-Z bindeps`/RFC 3028, nightly-only). `escargot` is the standard, well-maintained crate for exactly this "locate/build a sibling workspace binary from an integration test" problem — it shells out to `cargo build --message-format=json` and parses the resulting artifact path via `cargo metadata`, which is more robust than a hand-rolled relative-path guess from `std::env::current_exe()`. This keeps the orchestrator at its architecture-doc-reserved `tests/sim` location (rejected alternative: moving the test into `crates/chaos-worker/tests/`, which would work via the same-package `CARGO_BIN_EXE_` mechanism, but would also pull `chaos-injection` into the orchestrator's own build via Cargo's feature unification — silently breaking the design doc's explicit "verification is a plain read path" contract). Justification for the new dependency (per this project's "don't add dependencies without justifying" rule): `escargot` is dev-only (never ships in the built `strata` binary or any published crate), has no further transitive runtime surface, and is the standard mitigation for this specific, well-known Cargo limitation.
+- Consumes: `strata_txn::Dataset` (no `chaos-injection` feature enabled — verification is a plain read path, now genuinely isolated from the worker's build since `tests/sim` no longer depends on `strata-chaos-worker` or its `chaos-injection`-enabled `strata-txn`/`strata-storage` edges at all).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -656,11 +656,13 @@ workspace = true
 
 [dev-dependencies]
 strata-txn = { path = "../../crates/txn" }
-strata-chaos-worker = { path = "../../crates/chaos-worker" }
 arrow.workspace = true
 rand = "0.9"
 rand_chacha = "0.9"
+escargot = "0.5"
 ```
+
+(`strata-chaos-worker` is deliberately NOT a dependency here — see the Interfaces section above on why, and how `escargot` builds/locates its binary instead without pulling its `chaos-injection`-enabled dependency edges into this crate's own build.)
 
 Create `tests/sim/tests/chaos.rs`:
 
@@ -692,9 +694,28 @@ struct RunResult {
     crashed: bool,
 }
 
+/// Builds (once, lazily — `OnceLock` caches the result across every
+/// `run_worker` call in this test binary rather than re-invoking `cargo
+/// build` per iteration) and locates the `chaos-worker` binary. Uses
+/// `escargot` instead of `env!("CARGO_BIN_EXE_...")` because that macro is
+/// only ever defined for a package's OWN binary targets, never a
+/// dependency's — see this task's Interfaces note above.
+fn worker_bin_path() -> &'static std::path::Path {
+    static WORKER_BIN: std::sync::OnceLock<escargot::CargoRun> = std::sync::OnceLock::new();
+    WORKER_BIN
+        .get_or_init(|| {
+            escargot::CargoBuild::new()
+                .bin("chaos-worker")
+                .package("strata-chaos-worker")
+                .current_release()
+                .run()
+                .expect("failed to build chaos-worker via escargot")
+        })
+        .path()
+}
+
 fn run_worker(dir: &std::path::Path, seed: u64, abort_at: Option<u64>) -> RunResult {
-    let worker_bin = env!("CARGO_BIN_EXE_chaos-worker");
-    let mut cmd = Command::new(worker_bin);
+    let mut cmd = Command::new(worker_bin_path());
     cmd.args([
         dir.to_str().unwrap(),
         &seed.to_string(),
@@ -755,7 +776,21 @@ fn check_invariants(dir: &std::path::Path, acknowledged: &HashSet<u64>) {
     // losing_transactions_graph_insert_never_lands_when_it_conflicts test
     // used: a near-zero squared_distance on a self-query proves the
     // row's vector is genuinely indexed, not just present in the row
-    // store.
+    // store. NOTE (correction from an earlier draft of this plan, found
+    // during implementation): this deliberately does NOT also assert
+    // `results[0].row_id == row_id` — `VectorMatch::row_id` is the
+    // dataset's own internal monotonic row-id (assigned by commit order),
+    // a completely different namespace from this workload's `id` schema
+    // column (`global_id`, the value checked against `acknowledged`
+    // here). Since chaos-worker's whole point is randomized interleaving,
+    // a row's commit-order position is scrambled relative to its
+    // `global_id` on almost every seed — asserting the two are equal
+    // would fail constantly for reasons unrelated to any real bug. The
+    // near-zero `squared_distance` on a self-query is what actually
+    // proves row+index consistency; which internal row-id it resolves to
+    // is irrelevant to this invariant, and the workload's per-row random
+    // vector jitter makes cross-row collisions within this distance
+    // essentially impossible.
     for &row_id in acknowledged {
         let row_idx = (0..batch.num_rows())
             .find(|&i| u64::try_from(id_col.value(i)).unwrap() == row_id)
@@ -774,7 +809,7 @@ fn check_invariants(dir: &std::path::Path, acknowledged: &HashSet<u64>) {
             .vector_search(&query, 1, None)
             .expect("vector_search failed");
         assert!(
-            !results.is_empty() && results[0].row_id == row_id && results[0].squared_distance < 0.001,
+            !results.is_empty() && results[0].squared_distance < 0.001,
             "row {row_id} is visible in the row store but not findable in the HNSW graph \
              (row+index consistency violated) — got {results:?}"
         );
@@ -821,11 +856,11 @@ Add `"tests/sim"` to the root `Cargo.toml`'s `[workspace] members` list.
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p strata-sim`
-Expected: FAIL — compile error, `strata-chaos-worker`/`CARGO_BIN_EXE_chaos-worker` not resolvable until the `Cargo.toml`/workspace-member wiring above is in place.
+Expected: FAIL — compile error until the `tests/sim/Cargo.toml` (with `escargot` as a dev-dependency) and workspace-member wiring above are in place.
 
 - [ ] **Step 3: Fix wiring issues found**
 
-If the build fails on `CARGO_BIN_EXE_chaos-worker` specifically (Cargo requires the exact package/binary name match — the binary is named `chaos-worker` per Task 3's `[[bin]] name = "chaos-worker"`, so the env var is `CARGO_BIN_EXE_chaos-worker`, not `CARGO_BIN_EXE_strata-chaos-worker`), confirm the two names line up as written above.
+Confirm `escargot`'s exact API (method names/signatures can drift slightly by version — check the installed `escargot` crate's docs if `CargoBuild`/`CargoRun`'s methods don't match this brief's code exactly) and that `.bin("chaos-worker").package("strata-chaos-worker")` correctly identifies Task 3's binary (bin name `chaos-worker` per its `[[bin]] name`, package name `strata-chaos-worker` per its `[package] name`). Minor API-shape fixes here are expected and don't need escalation; anything that changes the architecture (dependency direction, `tests/sim`'s location, or the `chaos-injection` feature-isolation contract) does.
 
 - [ ] **Step 4: Run test to verify it passes**
 
