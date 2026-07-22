@@ -741,9 +741,26 @@ fn run_worker(dir: &std::path::Path, seed: u64, abort_at: Option<u64>) -> RunRes
 }
 
 fn check_invariants(dir: &std::path::Path, acknowledged: &HashSet<u64>, crashed: bool) {
-    // Invariant 1: no corruption. A crash mid-write must never leave the
-    // dataset unable to open at all.
-    let dataset = strata_txn::Dataset::open(dir).expect("dataset failed to reopen after crash — corruption");
+    // Invariant 1: no corruption. A crash mid-write must never leave an
+    // EXISTING dataset unable to open. One narrow, precisely-scoped
+    // exception (found during implementation): if the crash landed before
+    // the dataset's very first commit_manifest call ever completed its
+    // rename (e.g. abort_at=1, landing inside Dataset::create's own
+    // initial-manifest write), no manifest file -- not even the initial
+    // empty one -- was ever durably created, so NotFound is the correct,
+    // expected response to "nothing exists yet," not corruption. This can
+    // only be legitimate when nothing was ever acknowledged either
+    // (acknowledged non-empty would mean at least one commit fully
+    // landed, which requires a manifest to already exist) -- any other
+    // open failure, or a NotFound with a non-empty acknowledged set, is
+    // genuine corruption and must still fail loudly. All four invariants
+    // are trivially satisfied when nothing was ever created, so return
+    // early rather than trying to scan a dataset that doesn't exist.
+    let dataset = match strata_txn::Dataset::open(dir) {
+        Ok(ds) => ds,
+        Err(strata_txn::TxnError::NotFound(_)) if acknowledged.is_empty() => return,
+        Err(e) => panic!("dataset failed to reopen after crash — corruption: {e}"),
+    };
 
     let schema = strata_txn::mvp_fixtures::mvp_schema();
     let batch = dataset.snapshot().scan(&schema).expect("scan failed after reopen");
