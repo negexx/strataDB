@@ -112,8 +112,10 @@ pub fn commit_manifest(dataset_dir: &Path, manifest: &Manifest) -> Result<()> {
         let mut tmp_file = File::create(&tmp_path)?;
         tmp_file.write_all(&json)?;
         tmp_file.sync_all()?;
+        crate::chaos::chaos_checkpoint(); // tmp manifest is durable, about to rename
     }
     fs::rename(&tmp_path, &final_path)?;
+    crate::chaos::chaos_checkpoint(); // renamed into place, about to fsync the directory entry
 
     // fsync the containing directory so the rename itself survives a crash,
     // not just the file content — see `crate::datafile::sync_dir`. Not fatal

@@ -31,6 +31,7 @@ pub fn write_batch(path: &Path, batch: &RecordBatch) -> Result<()> {
     writer.finish()?;
     let file = writer.into_inner()?;
     file.sync_all()?;
+    crate::chaos::chaos_checkpoint(); // data-file content is now durable
     Ok(())
 }
 
@@ -54,6 +55,7 @@ pub fn sync_dir(dir: &Path) -> Result<()> {
     if let Ok(handle) = File::open(dir) {
         let _ = handle.sync_all();
     }
+    crate::chaos::chaos_checkpoint(); // directory entries are now durable (best-effort per-platform, see doc comment above)
     Ok(())
 }
 

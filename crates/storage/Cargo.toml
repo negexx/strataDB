@@ -15,3 +15,13 @@ thiserror.workspace = true
 
 [features]
 chaos-injection = []
+
+[[bin]]
+name = "chaos_checkpoint_helper"
+# Lives in tests/bin/, not directly under tests/, so Cargo's test-file
+# autodiscovery doesn't also register this same source as a second,
+# separate `integration-test` target (which would silently do nothing,
+# since it has no #[test] fns, but prints a "found in multiple build
+# targets" warning on every build).
+path = "tests/bin/chaos_checkpoint_helper.rs"
+required-features = ["chaos-injection"]
