@@ -1,6 +1,7 @@
 //! Columnar file format, manifest/versioning. See
 //! `.claude/docs/design/phase-0-transaction-and-format-spec.md`.
 
+pub mod chaos;
 pub mod datafile;
 pub mod encoding;
 pub mod error;
