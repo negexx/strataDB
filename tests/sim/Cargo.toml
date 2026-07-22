@@ -1,0 +1,16 @@
+[package]
+name = "strata-sim"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+strata-txn = { path = "../../crates/txn" }
+arrow.workspace = true
+rand = "0.9"
+rand_chacha = "0.9"
+escargot = "0.5"

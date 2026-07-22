@@ -7,7 +7,9 @@ members = [
     "crates/query",
     "crates/bindings",
     "crates/cli",
+    "crates/chaos-worker",
     "bench",
+    "tests/sim",
 ]
 
 [workspace.package]

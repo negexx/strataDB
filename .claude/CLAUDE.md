@@ -19,7 +19,7 @@ The flagship claim: "correct under concurrent multi-agent writes, with no silent
 - **Columnar library:** `arrow` (arrow-rs)
 - **HNSW library:** `hnsw_rs` (pure Rust — chosen over `usearch`'s Rust bindings specifically to avoid re-introducing a C++ core via FFI, which would undercut the reason for switching to Rust; see `docs/decisions/0005-rust-over-cpp-reversal.md`). Like every HNSW library audited (C++ or Rust), it doesn't expose graph internals for a native delta log — Strata's transaction shim maintains that log itself.
 - **Python bindings:** PyO3 (modern `#[pymodule] mod { #[pymodule_export] ... }` form, not the older function-based API) + `maturin` for building wheels
-- **Concurrency correctness:** `loom` (exhaustive interleaving testing of locks/atomics/CAS loops — this is the whole reason Rust was the original recommendation) + `madsim`/`turmoil` for FoundationDB-style deterministic simulation (Phase 7). Unlike C++, both are real, maintained, reusable crates — no bespoke VOPR-style simulator has to be built from scratch.
+- **Concurrency correctness:** `loom` (exhaustive interleaving testing of locks/atomics/CAS loops — this is the whole reason Rust was the original recommendation) for `crates/txn`/`crates/index`. Phase 7's correctness harness (`tests/sim`, `crates/chaos-worker`) does NOT use `madsim`/`turmoil` as originally planned here — both were found to be async/tokio-shaped and a poor fit for this codebase's entirely synchronous production code (see `docs/superpowers/specs/2026-07-22-phase-7-correctness-harness-design.md` §2). Phase 7 instead follows Jepsen's methodology: real process spawn, real `std::process::abort()` at instrumented checkpoints, seed-reproducible scenarios. The instrumented checkpoints live behind an off-by-default `chaos-injection` Cargo feature that's functionally inert (no aborts) unless `STRATA_CHAOS_ABORT_AT` is set, and a package-scoped build (e.g. `cargo build --release -p strata-cli`) is fully clean of it — but `cargo build --workspace` (this file's own documented default) unifies `chaos-injection` into the shared `strata-storage` artifact, including the one the `strata` CLI binary links, because `crates/chaos-worker` requests it as a normal workspace dependency. Don't leave `STRATA_CHAOS_ABORT_AT` set in your shell when running a `--workspace`-built `strata` binary — that's the one combination that would actually trigger an unwanted abort.
 
 ## Commands
 
@@ -53,7 +53,7 @@ Cargo workspace layout:
 - `crates/query/` — expression/filter API, vectorized scan/filter/agg (`strata-query`)
 - `crates/bindings/` — PyO3 Python bindings, builds `strata_ext` (see `rules/python-bindings.md`)
 - `crates/cli/` — `strata` binary, CLI for inspecting datasets/manifests
-- `tests/sim/` — deterministic simulation / chaos harness using `madsim` (Phase 7 — the correctness-proof suite)
+- `tests/sim/` — deterministic simulation / chaos harness (Phase 7 — the correctness-proof suite)
 - `bench/` — benchmarks (`criterion`, once real code exists to benchmark)
 
 Unit tests live inline per crate (`#[cfg(test)] mod tests`) — idiomatic Rust, not a centralized top-level `tests/` binary like the abandoned C++ scaffold used.
