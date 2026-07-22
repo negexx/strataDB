@@ -32,11 +32,20 @@ pub enum DeltaEntry {
 /// [`IndexError::Serde`] if an entry fails to serialize.
 pub fn write_delta_log(path: &Path, entries: &[DeltaEntry]) -> Result<(), IndexError> {
     use std::io::Write as _;
-    let mut file = std::fs::File::create(path)?;
+    let file = std::fs::File::create(path)?;
+    // One writeln! per entry against a raw File is one syscall per entry; a
+    // BufWriter coalesces them into 64 KiB writes.
+    let mut writer = std::io::BufWriter::with_capacity(64 * 1024, file);
     for entry in entries {
         let line = serde_json::to_string(entry)?;
-        writeln!(file, "{line}")?;
+        writeln!(writer, "{line}")?;
     }
+    // Ordering is load-bearing: `into_inner` flushes the userspace buffer
+    // into the OS *before* the fsync — `sync_all()` only flushes OS-level
+    // buffers and would silently miss unflushed userspace bytes otherwise.
+    let file = writer
+        .into_inner()
+        .map_err(std::io::IntoInnerError::into_error)?;
     file.sync_all()?;
     Ok(())
 }
