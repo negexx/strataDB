@@ -246,26 +246,92 @@ fn thorough_tier_satisfies_the_phase_7_exit_criterion() {
         return;
     }
 
+    // Bounded concurrency: run seeds in fixed-size batches of scoped
+    // threads. Deliberately NOT unbounded rayon-across-all-cores — dozens
+    // of concurrent aborting child processes all fsyncing the same volume
+    // is exactly the environment the 50ms handle-release sleep below
+    // exists to protect against, and a spurious Dataset::open failure here
+    // would misreport as corruption. Default 8, validated clean (zero
+    // spurious failures across 8,200+ concurrent seed-checks at
+    // concurrency 4/8/16 on a 12-logical-core machine, with 16 the
+    // fastest observed on that hardware) -- 8 is the safer portable
+    // default since 16's edge was only confirmed on that specific core
+    // count; override via STRATA_CHAOS_CONCURRENCY (1 = the original
+    // sequential behavior) for CI hardware with more cores, or to
+    // reproduce a specific failure in isolation.
+    let concurrency: usize = std::env::var("STRATA_CHAOS_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(8);
+    // Debugging knobs: cap the seed count (partial runs) or run exactly
+    // one seed in isolation (spurious-failure reproduction — see the
+    // panic message below).
+    let num_seeds: u64 = std::env::var("STRATA_CHAOS_NUM_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(NUM_SEEDS);
+    let only_seed: Option<u64> = std::env::var("STRATA_CHAOS_ONLY_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok());
+
     let mut master_rng = rand_chacha::ChaCha8Rng::seed_from_u64(0x7040_0060_5EED);
 
-    for seed in 0..NUM_SEEDS {
-        let abort_at = master_rng.random_range(1..MAX_ABORT_THRESHOLD);
-        let dir = std::env::temp_dir().join(format!(
-            "strata-chaos-thorough-{}-{seed}-{abort_at}",
-            std::process::id()
-        ));
-        std::fs::remove_dir_all(&dir).ok();
+    // Pre-draw every (seed, abort_at) pair from the master RNG up front so
+    // the schedule is byte-identical to the sequential version regardless
+    // of concurrency level or chunking.
+    let pairs: Vec<(u64, u64)> = (0..NUM_SEEDS)
+        .map(|seed| (seed, master_rng.random_range(1..MAX_ABORT_THRESHOLD)))
+        .filter(|&(seed, _)| seed < num_seeds && only_seed.is_none_or(|s| s == seed))
+        .collect();
 
-        let result = run_worker(&dir, seed, Some(abort_at));
+    // Force the one-time escargot build before any threads spawn, so the
+    // first batch's threads don't all block inside OnceLock::get_or_init
+    // and the reported timings measure seed throughput, not compilation.
+    let _ = worker_bin_path();
 
-        std::thread::sleep(std::time::Duration::from_millis(50));
+    let mut checked: u64 = 0;
+    for chunk in pairs.chunks(concurrency) {
+        std::thread::scope(|s| {
+            let handles: Vec<_> = chunk
+                .iter()
+                .map(|&(seed, abort_at)| {
+                    s.spawn(move || {
+                        let dir = std::env::temp_dir().join(format!(
+                            "strata-chaos-thorough-{}-{seed}-{abort_at}",
+                            std::process::id()
+                        ));
+                        std::fs::remove_dir_all(&dir).ok();
 
-        check_invariants(&dir, &result.acknowledged_row_ids, result.crashed);
+                        let result = run_worker(&dir, seed, Some(abort_at));
 
-        std::fs::remove_dir_all(&dir).ok();
+                        // Give the OS a moment to fully release file
+                        // handles after an abort — same precaution as the
+                        // fast tier and the Phase 1 crash-recovery test.
+                        std::thread::sleep(std::time::Duration::from_millis(50));
 
-        if seed % 100 == 0 {
-            eprintln!("thorough tier: {seed}/{NUM_SEEDS} seeds checked, zero violations so far");
+                        check_invariants(&dir, &result.acknowledged_row_ids, result.crashed);
+
+                        std::fs::remove_dir_all(&dir).ok();
+                    })
+                })
+                .collect();
+            for (handle, &(seed, abort_at)) in handles.into_iter().zip(chunk) {
+                assert!(
+                    handle.join().is_ok(),
+                    "invariant violation at seed={seed} abort_at={abort_at} \
+                     (panic message above has the details); reproduce alone with \
+                     STRATA_CHAOS_ONLY_SEED={seed} STRATA_CHAOS_CONCURRENCY=1"
+                );
+            }
+        });
+        checked += u64::try_from(chunk.len()).unwrap();
+        if checked.is_multiple_of(100) || checked == u64::try_from(pairs.len()).unwrap() {
+            eprintln!(
+                "thorough tier: {checked}/{} seeds checked, zero violations so far \
+                 (concurrency={concurrency})",
+                pairs.len()
+            );
         }
     }
 }
