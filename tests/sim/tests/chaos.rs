@@ -226,3 +226,42 @@ fn fast_tier_random_seeds_survive_random_crash_points() {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
+
+/// The actual Phase 7 exit criterion: "thousands of randomized
+/// concurrent-agent runs, zero invariant violations." Opt-in via
+/// `STRATA_CHAOS_THOROUGH=1` — NOT part of default `cargo test --workspace`
+/// (see the design doc §5 for why: each iteration's real process spawn +
+/// real fsyncs make thousands of them too slow for the normal dev loop).
+/// Intended for a scheduled/on-demand CI job.
+#[test]
+fn thorough_tier_satisfies_the_phase_7_exit_criterion() {
+    const NUM_SEEDS: u64 = 2000;
+
+    if std::env::var("STRATA_CHAOS_THOROUGH").is_err() {
+        eprintln!("skipping thorough tier: set STRATA_CHAOS_THOROUGH=1 to run it");
+        return;
+    }
+
+    let mut master_rng = rand_chacha::ChaCha8Rng::seed_from_u64(0x7040_0060_5EED);
+
+    for seed in 0..NUM_SEEDS {
+        let dir = std::env::temp_dir().join(format!(
+            "strata-chaos-thorough-{}-{seed}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+
+        let abort_at = master_rng.random_range(1..MAX_ABORT_THRESHOLD);
+        let result = run_worker(&dir, seed, Some(abort_at));
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        check_invariants(&dir, &result.acknowledged_row_ids, result.crashed);
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        if seed % 100 == 0 {
+            eprintln!("thorough tier: {seed}/{NUM_SEEDS} seeds checked, zero violations so far");
+        }
+    }
+}
