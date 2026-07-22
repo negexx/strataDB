@@ -740,7 +740,7 @@ fn run_worker(dir: &std::path::Path, seed: u64, abort_at: Option<u64>) -> RunRes
     }
 }
 
-fn check_invariants(dir: &std::path::Path, acknowledged: &HashSet<u64>) {
+fn check_invariants(dir: &std::path::Path, acknowledged: &HashSet<u64>, crashed: bool) {
     // Invariant 1: no corruption. A crash mid-write must never leave the
     // dataset unable to open at all.
     let dataset = strata_txn::Dataset::open(dir).expect("dataset failed to reopen after crash — corruption");
@@ -763,11 +763,27 @@ fn check_invariants(dir: &std::path::Path, acknowledged: &HashSet<u64>) {
         "lost commits: acknowledged but not visible after reopen: {lost:?}"
     );
 
-    // Invariant 3: no phantom commits. Everything visible must have been acknowledged.
+    // Invariant 3: no phantom commits. Everything visible must trace back
+    // to an acknowledgment, with one narrow, provably-bounded exception
+    // (found during implementation): a CRASHED run may have exactly one
+    // row that completed commit_manifest's rename (and is therefore
+    // genuinely, correctly durable) but whose worker process died before
+    // it could print the acknowledgment line -- the classic Jepsen
+    // "info"/ambiguous-outcome case (a write can succeed on the server
+    // while the client's own confirmation is lost), not a storage-layer
+    // bug. The worker is single-threaded and fully completes (or fully
+    // fails) each op before starting the next, so at most one op can ever
+    // be "in flight" at abort time -- more than one phantom row would
+    // indicate a real bug, not this narrow race, so the tolerance stays
+    // tight and only applies to crashed runs (a clean exit had time to
+    // print every acknowledgment, so it must have zero).
     let phantom: Vec<&u64> = visible_row_ids.difference(acknowledged).collect();
+    let max_tolerated_phantoms = usize::from(crashed);
     assert!(
-        phantom.is_empty(),
-        "phantom commits: visible after reopen but never acknowledged: {phantom:?}"
+        phantom.len() <= max_tolerated_phantoms,
+        "phantom commits: visible after reopen but never acknowledged: {phantom:?} \
+         (tolerated at most {max_tolerated_phantoms} for this {} run)",
+        if crashed { "crashed" } else { "clean" }
     );
 
     // Invariant 4: row + index consistency. Every acknowledged (and
@@ -833,7 +849,7 @@ fn fast_tier_random_seeds_survive_random_crash_points() {
         // already takes.
         std::thread::sleep(std::time::Duration::from_millis(50));
 
-        check_invariants(&dir, &result.acknowledged_row_ids);
+        check_invariants(&dir, &result.acknowledged_row_ids, result.crashed);
 
         if !result.crashed {
             // The randomly-picked threshold happened to exceed the total
@@ -922,7 +938,7 @@ fn thorough_tier_satisfies_the_phase_7_exit_criterion() {
 
         std::thread::sleep(std::time::Duration::from_millis(50));
 
-        check_invariants(&dir, &result.acknowledged_row_ids);
+        check_invariants(&dir, &result.acknowledged_row_ids, result.crashed);
 
         std::fs::remove_dir_all(&dir).ok();
 
