@@ -900,7 +900,7 @@ Confirm `escargot`'s exact API (method names/signatures can drift slightly by ve
 Run: `cargo test -p strata-sim -- --nocapture`
 Expected: PASS — `fast_tier_random_seeds_survive_random_crash_points` completes, `ok`. This run also validates all four invariants held across 30 random seeds and random crash points, each including data-file-content, directory-entry, manifest-tmp, and manifest-rename crash boundaries.
 
-If a real invariant violation is found, STOP — do not weaken the assertion or the check. Report back with the specific seed/threshold that reproduces it (both are printed on panic via the test's own `dir` path, which includes the seed) and escalate; this would be an actual correctness bug in Phase 6's implementation being caught by this exact harness doing its job.
+If a real invariant violation is found, STOP — do not weaken the assertion or the check. Report back with the specific seed/threshold that reproduces it (both the seed and the `abort_at` threshold are encoded in the test's own `dir` path — `strata-chaos-fast-{pid}-{seed}-{abort_at}` — so the failing directory name alone is enough to reconstruct the `run_worker(&dir, seed, Some(abort_at))` call that reproduces it) and escalate; this would be an actual correctness bug in Phase 6's implementation being caught by this exact harness doing its job.
 
 - [ ] **Step 5: Run the full workspace gate**
 

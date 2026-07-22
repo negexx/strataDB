@@ -62,8 +62,21 @@ to reflect it once this design is implemented.
   `rename`. Each call increments the counter and, only when a
   `STRATA_CHAOS_ABORT_AT` env var is set, compares against it and calls
   `std::process::abort()` on match. Gated behind a new, off-by-default
-  Cargo feature (`chaos-injection`) — zero cost and zero surface for the
-  real `strata` binary and every other consumer.
+  Cargo feature (`chaos-injection`), off by default and functionally inert
+  (the counter increments but nothing ever aborts) unless
+  `STRATA_CHAOS_ABORT_AT` is set. A package-scoped build (`cargo build
+  --release -p strata-cli`, or any build that doesn't include
+  `crates/chaos-worker`) is fully clean of the feature. However, because
+  `crates/chaos-worker` is a normal workspace member that depends on
+  `strata-storage` with `chaos-injection` enabled, Cargo's resolver-v2
+  feature unification means `cargo build --workspace` — this project's own
+  documented default build command — compiles `strata-storage` ONCE with
+  `chaos-injection` on, and that single unified artifact is what the
+  `strata` CLI binary links too. So the isolation is real but narrower than
+  "zero surface": don't leave `STRATA_CHAOS_ABORT_AT` set in your shell
+  environment when running a `--workspace`-built `strata` binary, since
+  that combination (feature unified in + env var set) is what would
+  actually trigger an unwanted abort.
 - **`crates/chaos-worker/`** (new workspace member, `publish = false`) — a
   small binary crate depending on `strata-txn`/`strata-storage` with
   `chaos-injection` enabled. Takes a seed, agent count, and op count;

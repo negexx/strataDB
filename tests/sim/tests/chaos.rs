@@ -139,13 +139,17 @@ fn check_invariants(dir: &std::path::Path, acknowledged: &HashSet<u64>, crashed:
         if crashed { "crashed" } else { "clean" }
     );
 
-    // Invariant 4: row + index consistency. Every acknowledged (and
-    // therefore visible) row's own vector must be findable in the HNSW
-    // graph — same pattern Phase 6's own
+    // Invariant 4: row + index consistency. Every visible row's own vector
+    // must be findable in the HNSW graph — same pattern Phase 6's own
     // losing_transactions_graph_insert_never_lands_when_it_conflicts test
     // used: a near-zero squared_distance on a self-query proves the
     // row's vector is genuinely indexed, not just present in the row
-    // store.
+    // store. Deliberately iterates `visible_row_ids`, not `acknowledged`:
+    // the one tolerated phantom row from invariant 3 (durably committed
+    // but never acknowledged, because the worker died before it could
+    // print) is still genuinely visible and durable, so it should still
+    // be checked for row+index consistency — this is a strict superset
+    // of the acknowledged set at no extra cost.
     //
     // NOTE: this deliberately does NOT compare `results[0].row_id` against
     // `row_id` here. `row_id` in this loop is the "id" *data* column value
@@ -165,12 +169,10 @@ fn check_invariants(dir: &std::path::Path, acknowledged: &HashSet<u64>, crashed:
     // more than one agent, not catch a real bug. The near-zero distance
     // check alone is what actually proves this row's vector reached the
     // graph — the exact standard the existing sibling test above uses.
-    for &row_id in acknowledged {
+    for &row_id in &visible_row_ids {
         let row_idx = (0..batch.num_rows())
             .find(|&i| u64::try_from(id_col.value(i)).unwrap() == row_id)
-            .expect(
-                "acknowledged row must be in the scanned batch (invariant 2 already checked this)",
-            );
+            .expect("visible row must be in the scanned batch (it was just derived from it)");
         let vector_col = batch
             .column(2)
             .as_any()
@@ -198,11 +200,13 @@ fn fast_tier_random_seeds_survive_random_crash_points() {
     let mut master_rng = rand_chacha::ChaCha8Rng::seed_from_u64(0xF457_7E57);
 
     for seed in 0..NUM_SEEDS {
-        let dir =
-            std::env::temp_dir().join(format!("strata-chaos-fast-{}-{seed}", std::process::id()));
+        let abort_at = master_rng.random_range(1..MAX_ABORT_THRESHOLD);
+        let dir = std::env::temp_dir().join(format!(
+            "strata-chaos-fast-{}-{seed}-{abort_at}",
+            std::process::id()
+        ));
         std::fs::remove_dir_all(&dir).ok();
 
-        let abort_at = master_rng.random_range(1..MAX_ABORT_THRESHOLD);
         let result = run_worker(&dir, seed, Some(abort_at));
 
         // Give the OS a moment to fully release file handles after an
@@ -245,13 +249,13 @@ fn thorough_tier_satisfies_the_phase_7_exit_criterion() {
     let mut master_rng = rand_chacha::ChaCha8Rng::seed_from_u64(0x7040_0060_5EED);
 
     for seed in 0..NUM_SEEDS {
+        let abort_at = master_rng.random_range(1..MAX_ABORT_THRESHOLD);
         let dir = std::env::temp_dir().join(format!(
-            "strata-chaos-thorough-{}-{seed}",
+            "strata-chaos-thorough-{}-{seed}-{abort_at}",
             std::process::id()
         ));
         std::fs::remove_dir_all(&dir).ok();
 
-        let abort_at = master_rng.random_range(1..MAX_ABORT_THRESHOLD);
         let result = run_worker(&dir, seed, Some(abort_at));
 
         std::thread::sleep(std::time::Duration::from_millis(50));
