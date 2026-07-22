@@ -107,7 +107,7 @@ pub fn commit_manifest(dataset_dir: &Path, manifest: &Manifest) -> Result<()> {
     let final_path = manifest_path(dataset_dir, manifest.version);
     let tmp_path = versions.join(format!(".tmp-{}", manifest.version));
 
-    let json = serde_json::to_vec_pretty(manifest)?;
+    let json = serde_json::to_vec(manifest)?;
     {
         let mut tmp_file = File::create(&tmp_path)?;
         tmp_file.write_all(&json)?;
@@ -405,6 +405,39 @@ mod tests {
         let json = serde_json::to_vec(&manifest).unwrap();
         let deserialized: Manifest = serde_json::from_slice(&json).unwrap();
         assert_eq!(deserialized.next_attempt_id, 42);
+    }
+
+    #[test]
+    fn commit_manifest_writes_compact_json_not_pretty_printed() {
+        // The manifest is cumulative and re-serialized+fsynced on every
+        // commit, so it's written compact (no indentation/newlines) rather
+        // than pretty-printed — smaller on disk, faster to (de)serialize.
+        // JSON is JSON either way, so this is purely a byte-format check.
+        let dir = temp_dataset_dir("compact-json");
+        let m0 = Manifest {
+            version: 0,
+            data_files: vec![DataFileEntry {
+                name: "a.arrow".to_string(),
+                stats: HashMap::new(),
+                delta_log: "d.deltalog".to_string(),
+            }],
+            next_row_id: 0,
+            tombstones: Vec::new(),
+            next_attempt_id: 0,
+        };
+        commit_manifest(&dir, &m0).unwrap();
+
+        let bytes = fs::read(manifest_path(&dir, 0)).unwrap();
+        assert_eq!(
+            bytes,
+            serde_json::to_vec(&m0).unwrap(),
+            "on-disk manifest bytes must match serde_json::to_vec's compact output exactly"
+        );
+        assert!(
+            !bytes.contains(&b'\n'),
+            "compact JSON must not contain newlines"
+        );
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
