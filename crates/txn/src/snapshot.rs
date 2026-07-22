@@ -22,7 +22,7 @@ pub struct Snapshot {
     pub(crate) manifest: Arc<Manifest>,
     pub(crate) graph: Arc<HnswIndex>,
     pub(crate) watermark: u64,
-    pub(crate) tombstones: Arc<im::HashSet<u64>>,
+    pub(crate) tombstones: Arc<imbl::HashSet<u64>>,
 }
 
 /// The outcome of [`Snapshot::explain`] — which files a predicate would

@@ -30,7 +30,7 @@ strata-storage = { path = "../storage" }
 strata-query = { path = "../query" }
 strata-index = { path = "../index" }
 arc-swap = "1"
-im = "15"
+imbl = "7"
 
 [dev-dependencies]
 loom = "0.7"

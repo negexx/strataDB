@@ -176,7 +176,7 @@ impl Dataset {
             watermark: manifest.next_row_id.saturating_sub(1),
             manifest: Arc::new(manifest),
             graph: Arc::new(graph),
-            tombstones: Arc::new(im::HashSet::new()),
+            tombstones: Arc::new(imbl::HashSet::new()),
         };
         Ok(Self {
             dir,
@@ -632,7 +632,7 @@ impl Transaction {
         // an idempotent re-delete of an already-tombstoned row would grow
         // the *persisted* manifest.tombstones Vec unboundedly (cloned,
         // JSON-serialized, and fsynced on every future commit; replayed on
-        // every open), even though the in-memory im::HashSet below already
+        // every open), even though the in-memory imbl::HashSet below already
         // dedupes for free.
         for row_id in &self.pending_tombstones {
             if !tombstones.contains(row_id) {
@@ -774,7 +774,7 @@ const MAX_REASONABLE_ROW_ID_CAPACITY: u64 = 1_000_000_000;
 /// replayed `DeltaEntry::Insert`'s vector length doesn't match the
 /// dimensionality established by the first vector ever inserted into the
 /// index.
-fn replay_index(dir: &Path, manifest: &Manifest) -> Result<(HnswIndex, im::HashSet<u64>)> {
+fn replay_index(dir: &Path, manifest: &Manifest) -> Result<(HnswIndex, imbl::HashSet<u64>)> {
     if manifest.next_row_id > MAX_REASONABLE_ROW_ID_CAPACITY {
         return Err(TxnError::UnreasonableCapacity(
             manifest.next_row_id,
@@ -783,7 +783,7 @@ fn replay_index(dir: &Path, manifest: &Manifest) -> Result<(HnswIndex, im::HashS
     }
     let capacity = usize::try_from(manifest.next_row_id).unwrap_or(usize::MAX);
     let index = new_hnsw_index(capacity)?;
-    let mut tombstones: im::HashSet<u64> = im::HashSet::new();
+    let mut tombstones: imbl::HashSet<u64> = imbl::HashSet::new();
     let data_dir = data_subdir(dir);
     for entry in &manifest.data_files {
         for delta in read_delta_log(&safe_join(&data_dir, &entry.delta_log)?)? {
