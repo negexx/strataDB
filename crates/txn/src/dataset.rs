@@ -55,7 +55,18 @@ pub const ROW_ID_COLUMN: &str = "_row_id";
 /// in-flight transaction (which would surface as a conservative
 /// `InsufficientHistory` conflict), small enough to be a trivial memory
 /// cost. Not a public tunable yet, per YAGNI.
-const COMMIT_LOG_CAPACITY: usize = 256;
+///
+/// Bumped from 256 to 2048 per the design council's recommendation on
+/// whether to build epoch-based dynamic history pruning: rather than adding
+/// a new active-transaction-lifetime registry on unmeasured need, widen the
+/// cheap, already-bounded window and instrument how often
+/// `InsufficientHistory` actually fires (see
+/// [`Dataset::insufficient_history_conflict_count`]). If telemetry later
+/// shows this still firing under real concurrent-agent load, revisit with
+/// data — either a further bump or, per the council's stronger alternative,
+/// a row/version-keyed overlap check that doesn't need a bounded window at
+/// all.
+const COMMIT_LOG_CAPACITY: usize = 2048;
 
 #[derive(Clone)]
 pub struct Dataset {
@@ -66,7 +77,7 @@ pub struct Dataset {
     /// filename prefix for each commit *attempt*'s data/delta-log files —
     /// deliberately independent of both `next_row_id_counter` and the real
     /// manifest version. See `Transaction::commit` for why filenames must
-    /// not be derived from `base_manifest.version`.
+    /// not be derived from `base_version`.
     write_attempt_counter: Arc<AtomicU64>,
     /// Serializes the conflict-check → graph-apply → manifest-commit →
     /// snapshot-swap critical section of `Transaction::commit`, and guards
@@ -74,6 +85,13 @@ pub struct Dataset {
     /// lock in the crate, acquired at exactly one site, so there is no
     /// lock-ordering concern.
     commit_lock: Arc<Mutex<CommitLog>>,
+    /// Counts every commit that hit `ConflictCheck::InsufficientHistory` —
+    /// its read-version aged out of `COMMIT_LOG_CAPACITY` before it could
+    /// commit. Pure observability, not used for any decision; exists so a
+    /// real firing rate can be measured before ever building the more
+    /// complex active-transaction-lifetime tracking this was weighed
+    /// against. See [`Dataset::insufficient_history_conflict_count`].
+    insufficient_history_conflicts: Arc<AtomicU64>,
 }
 
 /// The single source of truth for "where does this dataset's data live,
@@ -122,6 +140,26 @@ impl Dataset {
     /// `dir`, or an I/O/storage error if the directory or initial manifest
     /// can't be created.
     pub fn create(dir: impl Into<PathBuf>) -> Result<Self> {
+        Self::create_with_commit_log_capacity(dir, COMMIT_LOG_CAPACITY)
+    }
+
+    /// Same as [`Dataset::create`], but with an explicit `CommitLog`
+    /// capacity instead of the production [`COMMIT_LOG_CAPACITY`] default.
+    /// Private to this module (no `pub`/`pub(crate)` — even more
+    /// restrictive than crate-wide reach) — exists so the wraparound/`InsufficientHistory`
+    /// regression tests can prove the eviction logic is correct at a small
+    /// capacity (milliseconds) instead of paying the real production
+    /// capacity's fill cost (which grows with the capacity itself, since
+    /// proving eviction requires actually filling it — see the git history
+    /// around `COMMIT_LOG_CAPACITY`'s 256→2048 bump for the ~50x test
+    /// runtime cost that motivated this). The capacity value itself has no
+    /// bearing on whether the conflict-detection *logic* is correct, only
+    /// on how much history it retains — so testing the logic at a small
+    /// capacity is exactly as rigorous as testing it at the real one.
+    fn create_with_commit_log_capacity(
+        dir: impl Into<PathBuf>,
+        commit_log_capacity: usize,
+    ) -> Result<Self> {
         let dir = dir.into();
         if read_current(&dir)?.is_some() {
             return Err(TxnError::AlreadyExists(dir));
@@ -145,7 +183,8 @@ impl Dataset {
             current: Arc::new(ArcSwap::new(Arc::new(snapshot))),
             next_row_id_counter,
             write_attempt_counter,
-            commit_lock: Arc::new(Mutex::new(CommitLog::new(COMMIT_LOG_CAPACITY))),
+            commit_lock: Arc::new(Mutex::new(CommitLog::new(commit_log_capacity))),
+            insufficient_history_conflicts: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -207,6 +246,7 @@ impl Dataset {
             next_row_id_counter,
             write_attempt_counter,
             commit_lock: Arc::new(Mutex::new(CommitLog::new(COMMIT_LOG_CAPACITY))),
+            insufficient_history_conflicts: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -242,7 +282,7 @@ impl Dataset {
         let snapshot = self.snapshot();
         Transaction {
             dir: self.dir.clone(),
-            base_manifest: snapshot.manifest.as_ref().clone(),
+            base_version: snapshot.version,
             graph: Arc::clone(&snapshot.graph),
             pending: Vec::new(),
             pending_tombstones: Vec::new(),
@@ -251,13 +291,34 @@ impl Dataset {
             next_row_id_counter: Arc::clone(&self.next_row_id_counter),
             write_attempt_counter: Arc::clone(&self.write_attempt_counter),
             commit_lock: Arc::clone(&self.commit_lock),
+            insufficient_history_conflicts: Arc::clone(&self.insufficient_history_conflicts),
         }
+    }
+
+    /// How many commits have hit `ConflictCheck::InsufficientHistory` over
+    /// this `Dataset` handle's lifetime — a transaction whose read-version
+    /// aged out of the bounded commit-log before it could commit, and was
+    /// therefore conservatively rejected even though it may never have
+    /// touched a contested row. Pure observability: this number existing
+    /// and staying at (or near) zero under real workloads is the evidence
+    /// needed before ever building active-transaction-lifetime tracking to
+    /// eliminate the false-positive case entirely.
+    #[must_use]
+    pub fn insufficient_history_conflict_count(&self) -> u64 {
+        self.insufficient_history_conflicts
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
 pub struct Transaction {
     dir: PathBuf,
-    base_manifest: Manifest,
+    /// This transaction's read-version, captured at `begin()`. The only
+    /// piece of `base`-time state this type retains — `commit()` rebuilds
+    /// `data_files`/`tombstones`/the rest of the manifest from the *latest*
+    /// snapshot inside the lock, not from anything captured here, so
+    /// cloning the whole `Manifest` at `begin()` time (as earlier Phase 6
+    /// commits did) was pure waste: every field but `version` went unused.
+    base_version: u64,
     graph: Arc<HnswIndex>,
     pending: Vec<RecordBatch>,
     /// Row-ids queued for tombstoning by [`Transaction::delete`]/
@@ -272,6 +333,7 @@ pub struct Transaction {
     next_row_id_counter: Arc<AtomicU64>,
     write_attempt_counter: Arc<AtomicU64>,
     commit_lock: Arc<Mutex<CommitLog>>,
+    insufficient_history_conflicts: Arc<AtomicU64>,
 }
 
 impl Transaction {
@@ -416,37 +478,65 @@ impl Transaction {
     /// strictly before the first delta is applied.)
     pub fn commit(self) -> Result<()> {
         let data_dir = data_subdir(&self.dir);
-        std::fs::create_dir_all(&data_dir)?;
 
         // Data-file writes happen before the lock — they touch only
         // files unique to this transaction and never collide with a
         // concurrent transaction's own writes. The filename prefix comes
-        // from write_attempt_counter, NOT base_manifest.version + 1: two
+        // from write_attempt_counter, NOT base_version + 1: two
         // truly concurrent transactions can share the same stale
-        // base_manifest.version, which would make them compute the same
+        // base_version, which would make them compute the same
         // "next version" and collide on the same filename before either
         // reaches commit_lock. write_attempt_counter is unique per
         // attempt regardless of version, so no such collision is
         // possible. See design doc §3 (data-file writes need no
         // conflict information to proceed) — this counter is what makes
         // that safe to do outside the lock at all.
-        let attempt_id = self
-            .write_attempt_counter
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let mut new_data_files = Vec::new();
-        let deltas = Self::write_pending_batches(
-            &self.pending,
-            &data_dir,
-            attempt_id,
-            &self.next_row_id_counter,
-            &mut new_data_files,
-        )?;
-        // Fsyncing each data file's *content* (already done inside
-        // write_batch) is not sufficient — the new directory entries
-        // themselves must also be fsynced, or a real power-loss crash can
-        // leave a file's bytes durable while the file itself is absent.
-        // Must happen before the graph update/manifest commit below.
-        strata_storage::sync_dir(&data_dir)?;
+        //
+        // Skipped entirely when there's nothing to insert: a delete-only
+        // transaction writes no new files, so there's no new directory
+        // entry to create or fsync and no attempt_id needs reserving.
+        // `Dataset::create`/`open` already ensure `data_dir` exists once
+        // per `Dataset` lifetime; recreating it on every single commit
+        // regardless of whether it had anything to write was redundant.
+        let (new_data_files, deltas) = if self.pending.is_empty() {
+            (Vec::new(), Vec::new())
+        } else {
+            std::fs::create_dir_all(&data_dir)?;
+            // SeqCst ordering justification (this site and its sibling in
+            // write_pending_batches, both pre-lock fetch_adds): the only
+            // property either needs is per-atomic RMW uniqueness — no two
+            // fetch_adds on the same AtomicU64 ever return the same value
+            // — which every atomic's own total modification order already
+            // guarantees regardless of the chosen Ordering, even Relaxed.
+            // commit_lock plays no role here; these run *before* it's
+            // acquired. (The *load* sites further down, which persist
+            // these counters' values into the manifest, have a different
+            // justification — see the comment there.) SeqCst is kept
+            // anyway as the simple, always-correct default: the cost
+            // difference against this function's dominant work (fsync,
+            // JSON serialization) is immaterial, and isn't worth the
+            // reduced auditability of proving a weaker ordering correct
+            // per site. See `.claude/rules/concurrency-txn-layer.md`.
+            let attempt_id = self
+                .write_attempt_counter
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut new_data_files = Vec::new();
+            let deltas = Self::write_pending_batches(
+                &self.pending,
+                &data_dir,
+                attempt_id,
+                &self.next_row_id_counter,
+                &mut new_data_files,
+            )?;
+            // Fsyncing each data file's *content* (already done inside
+            // write_batch) is not sufficient — the new directory entries
+            // themselves must also be fsynced, or a real power-loss crash
+            // can leave a file's bytes durable while the file itself is
+            // absent. Must happen before the graph update/manifest commit
+            // below.
+            strata_storage::sync_dir(&data_dir)?;
+            (new_data_files, deltas)
+        };
         validate_delta_dimensions(&deltas, &self.graph)?;
 
         // Everything from here is the tightly-scoped critical section:
@@ -468,13 +558,14 @@ impl Transaction {
         // Conflict detection MUST run before any mutation of the shared
         // graph: a transaction that turns out to conflict must leave the
         // graph completely untouched.
-        match commit_log.conflicts_with(self.base_manifest.version, latest_version, &self.write_set)
-        {
+        match commit_log.conflicts_with(self.base_version, latest_version, &self.write_set) {
             ConflictCheck::Clean => {}
             ConflictCheck::Conflict(contested_row_ids) => {
                 return Err(TxnError::Conflict { contested_row_ids });
             }
             ConflictCheck::InsufficientHistory => {
+                self.insufficient_history_conflicts
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Err(TxnError::Conflict {
                     contested_row_ids: self.write_set.clone(),
                 });
@@ -503,10 +594,6 @@ impl Transaction {
                 }
             }
         }
-        for row_id in &self.pending_tombstones {
-            tombstones.insert(*row_id);
-        }
-
         // The new manifest is likewise built from the latest snapshot's
         // manifest: this transaction's new data files are *appended* to
         // the latest file list (never substituted for it wholesale —
@@ -515,6 +602,19 @@ impl Transaction {
         let mut manifest = latest_snapshot.manifest.as_ref().clone();
         manifest.version = new_version;
         manifest.data_files.extend(new_data_files);
+        // SeqCst ordering justification for both `.load()`s below (distinct
+        // from the pre-lock fetch_adds' justification above): each must
+        // observe a value at least as large as every commit that landed
+        // before this one, including this transaction's own prior
+        // fetch_add — not just its own thread's value. That's guaranteed
+        // by commit_lock's Acquire/Release chain across successive lock
+        // holders, transitively carrying each earlier committer's
+        // program-order-prior fetch_add forward to every later committer's
+        // load — a property of the Mutex, not of the fetch_add/load calls'
+        // own Ordering (Relaxed on both ends would be equally sound here).
+        // SeqCst is kept as the simple, always-correct default; see the
+        // fetch_add comment above for why the negligible cost isn't worth
+        // trading for reduced auditability.
         manifest.next_row_id = self
             .next_row_id_counter
             .load(std::sync::atomic::Ordering::SeqCst);
@@ -526,9 +626,20 @@ impl Transaction {
         manifest.next_attempt_id = self
             .write_attempt_counter
             .load(std::sync::atomic::Ordering::SeqCst);
-        manifest
-            .tombstones
-            .extend(self.pending_tombstones.iter().copied());
+        // Dedup against both the current in-memory tombstone set and
+        // duplicates within this same transaction's own pending_tombstones
+        // (e.g. two delete() calls on the same row): without this check,
+        // an idempotent re-delete of an already-tombstoned row would grow
+        // the *persisted* manifest.tombstones Vec unboundedly (cloned,
+        // JSON-serialized, and fsynced on every future commit; replayed on
+        // every open), even though the in-memory im::HashSet below already
+        // dedupes for free.
+        for row_id in &self.pending_tombstones {
+            if !tombstones.contains(row_id) {
+                manifest.tombstones.push(*row_id);
+            }
+            tombstones.insert(*row_id);
+        }
 
         commit_manifest(&self.dir, &manifest)?;
 
@@ -562,7 +673,7 @@ impl Transaction {
     /// `Dataset.write_attempt_counter` — **not** a manifest version. It
     /// exists only so concurrent callers never write to the same path;
     /// see `Transaction::commit` (Task 6) for why it can't be derived
-    /// from `base_manifest.version` instead.
+    /// from `base_version` instead.
     ///
     /// # Errors
     ///
@@ -586,6 +697,10 @@ impl Transaction {
             let stats = compute_stats(batch);
 
             let num_rows = u64::try_from(batch.num_rows())?;
+            // SeqCst: see the ordering-justification comment on
+            // Transaction::commit's write_attempt_counter.fetch_add — the
+            // same reasoning applies here (this is the sibling counter for
+            // row-ids rather than filenames).
             let row_id_base =
                 row_id_counter.fetch_add(num_rows, std::sync::atomic::Ordering::SeqCst);
             // fetch_add already advanced the counter before this check —
@@ -888,6 +1003,16 @@ mod tests {
     use strata_storage::read_batch;
 
     use super::*;
+
+    /// Small `CommitLog` capacity used only by the wraparound/
+    /// `InsufficientHistory` regression tests below, via
+    /// `Dataset::create_with_commit_log_capacity`. The eviction *logic*
+    /// under test doesn't care what the capacity's magnitude is, only that
+    /// eviction happens once it's exceeded — so proving it at 8 is exactly
+    /// as rigorous as proving it at the real `COMMIT_LOG_CAPACITY` (2048),
+    /// without paying that capacity's fill cost (see
+    /// `create_with_commit_log_capacity`'s doc comment).
+    const TEST_COMMIT_LOG_CAPACITY: usize = 8;
 
     /// Locks in `AtomicU64::fetch_add`'s contract in isolation — before
     /// `next_row_id_counter` is wired into `Dataset`/`write_pending_batches`
@@ -2013,6 +2138,61 @@ mod tests {
     }
 
     #[test]
+    fn redeleting_an_already_tombstoned_row_does_not_duplicate_it_in_the_persisted_manifest() {
+        let dir = temp_dir("tombstone-dedup-cross-txn");
+        let ds = Dataset::create(&dir).unwrap();
+
+        let batch = vector_batch(vec![1i64], cluster_vectors(1, [0.0, 0.0, 0.0], 0.0));
+        let mut setup = ds.begin();
+        setup.insert(batch);
+        setup.commit().unwrap();
+
+        let mut txn_a = ds.begin();
+        txn_a.delete(0);
+        txn_a.commit().unwrap();
+        assert_eq!(ds.snapshot().manifest.tombstones.len(), 1);
+
+        // A second, later transaction re-deleting the same already-tombstoned
+        // row is Clean (no write-set overlap with anything that committed in
+        // between) and must not grow the persisted tombstones list, even
+        // though it's a genuinely separate commit.
+        let mut txn_b = ds.begin();
+        txn_b.delete(0);
+        txn_b.commit().unwrap();
+        assert_eq!(
+            ds.snapshot().manifest.tombstones.len(),
+            1,
+            "re-deleting an already-tombstoned row in a later transaction must not duplicate it"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn deleting_the_same_row_twice_in_one_transaction_does_not_duplicate_persisted_tombstone() {
+        let dir = temp_dir("tombstone-dedup-intra-txn");
+        let ds = Dataset::create(&dir).unwrap();
+
+        let batch = vector_batch(vec![1i64], cluster_vectors(1, [0.0, 0.0, 0.0], 0.0));
+        let mut setup = ds.begin();
+        setup.insert(batch);
+        setup.commit().unwrap();
+
+        let mut txn = ds.begin();
+        txn.delete(0);
+        txn.delete(0); // duplicate delete() call within the same transaction
+        txn.commit().unwrap();
+
+        assert_eq!(
+            ds.snapshot().manifest.tombstones.len(),
+            1,
+            "calling delete() twice on the same row within one transaction must not duplicate it"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn update_tombstones_old_row_and_makes_new_row_visible() {
         let dir = temp_dir("update-basic");
         let ds = Dataset::create(&dir).unwrap();
@@ -2489,32 +2669,31 @@ mod tests {
     }
 
     #[test]
-    // COMMIT_LOG_CAPACITY (256) comfortably fits in i64/i16 for this loop's
+    // TEST_COMMIT_LOG_CAPACITY comfortably fits in i64/i16 for this loop's
     // small range (capacity + 2), matching the existing cast-allow precedent
     // on `cluster_vectors` above.
     #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
     fn a_transaction_whose_history_has_aged_out_of_the_commit_log_conflicts_conservatively() {
-        // COMMIT_LOG_CAPACITY is 256 in production; committing that many
-        // transactions here to force wraparound is wasteful but the most
-        // direct way to exercise the real end-to-end path without adding
-        // a test-only constructor parameter for capacity. Kept small
-        // enough (log capacity + a few) to run quickly.
+        // Uses TEST_COMMIT_LOG_CAPACITY (not the real, much larger
+        // production COMMIT_LOG_CAPACITY) via
+        // create_with_commit_log_capacity — see that constant's doc
+        // comment for why this is exactly as rigorous a test.
         let dir = temp_dir("commit-log-wraparound-e2e");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create_with_commit_log_capacity(&dir, TEST_COMMIT_LOG_CAPACITY).unwrap();
         let batch = vector_batch(vec![1i64], cluster_vectors(1, [0.0, 0.0, 0.0], 0.0));
         let mut setup = ds.begin();
         setup.insert(batch);
         setup.commit().unwrap();
 
         // txn begins here, before every filler commit below — its
-        // base_manifest.version stays fixed at whatever ds.current_version()
+        // base_version stays fixed at whatever ds.current_version()
         // is right now.
         let mut txn = ds.begin();
         txn.delete(0);
 
         // Commit enough disjoint no-op-ish filler transactions to push the
         // CommitLog's oldest retained entry past txn's read-version.
-        for i in 0..(super::COMMIT_LOG_CAPACITY as i64 + 2) {
+        for i in 0..(TEST_COMMIT_LOG_CAPACITY as i64 + 2) {
             let filler = vector_batch(
                 vec![100 + i],
                 cluster_vectors(1, [f32::from(i as i16), 0.0, 0.0], 0.0),
@@ -2524,10 +2703,21 @@ mod tests {
             filler_txn.commit().unwrap();
         }
 
+        assert_eq!(
+            ds.insufficient_history_conflict_count(),
+            0,
+            "no InsufficientHistory conflict should have fired yet"
+        );
+
         let result = txn.commit();
         assert!(
             matches!(result, Err(TxnError::Conflict { .. })),
             "expected a conservative conflict once history aged out, got {result:?}"
+        );
+        assert_eq!(
+            ds.insufficient_history_conflict_count(),
+            1,
+            "the aged-out commit should have incremented the observability counter exactly once"
         );
 
         // Same PID-reuse collision risk as
@@ -2546,12 +2736,12 @@ mod tests {
         // conflict" rule, an empty write-set can never conflict with
         // anything, regardless of how much commit history has aged out of
         // the bounded CommitLog — this must succeed even when its
-        // base_manifest.version has aged out of the ring buffer.
+        // base_version has aged out of the ring buffer.
         let dir = temp_dir("commit-log-wraparound-insert-only-e2e");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create_with_commit_log_capacity(&dir, TEST_COMMIT_LOG_CAPACITY).unwrap();
 
         // txn begins here, before every filler commit below — its
-        // base_manifest.version stays fixed at whatever ds.current_version()
+        // base_version stays fixed at whatever ds.current_version()
         // is right now.
         let mut txn = ds.begin();
         let insert_only_batch =
@@ -2560,7 +2750,7 @@ mod tests {
 
         // Commit enough disjoint filler transactions to push the
         // CommitLog's oldest retained entry past txn's read-version.
-        for i in 0..(super::COMMIT_LOG_CAPACITY as i64 + 2) {
+        for i in 0..(TEST_COMMIT_LOG_CAPACITY as i64 + 2) {
             let filler = vector_batch(
                 vec![100 + i],
                 cluster_vectors(1, [f32::from(i as i16), 0.0, 0.0], 0.0),
