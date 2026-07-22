@@ -9,6 +9,7 @@ members = [
     "crates/cli",
     "crates/chaos-worker",
     "bench",
+    "tests/sim",
 ]
 
 [workspace.package]
