@@ -34,3 +34,6 @@ im = "15"
 
 [dev-dependencies]
 loom = "0.7"
+
+[features]
+chaos-injection = ["strata-storage/chaos-injection"]

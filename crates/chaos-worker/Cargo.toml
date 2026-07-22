@@ -1,0 +1,19 @@
+[package]
+name = "strata-chaos-worker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "chaos-worker"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+strata-txn = { path = "../txn", features = ["chaos-injection"] }
+strata-storage = { path = "../storage", features = ["chaos-injection"] }
+rand = "0.9"
+rand_chacha = "0.9"

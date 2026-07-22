@@ -7,6 +7,7 @@ members = [
     "crates/query",
     "crates/bindings",
     "crates/cli",
+    "crates/chaos-worker",
     "bench",
 ]
 
