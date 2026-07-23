@@ -3,7 +3,11 @@
 //! `docs/superpowers/specs/2026-07-23-single-allocation-hnsw-node-layout-design.md`.
 
 use std::alloc::Layout;
-use std::sync::atomic::AtomicU64;
+
+#[cfg(loom)]
+use loom::sync::atomic::{AtomicU8, AtomicU64};
+#[cfg(not(loom))]
+use std::sync::atomic::{AtomicU8, AtomicU64};
 
 use crate::slot_array::EMPTY;
 
@@ -18,7 +22,7 @@ pub(crate) struct NodeHeader {
     pub(crate) level: u8,
     pub(crate) mmax0: u16,
     pub(crate) mmax: u16,
-    pub(crate) deleted: std::sync::atomic::AtomicU8,
+    pub(crate) deleted: AtomicU8,
 }
 
 #[allow(dead_code)]
@@ -119,7 +123,7 @@ pub(crate) unsafe fn alloc_node(
                 level: u8::try_from(level).expect("level must fit in u8 (see graph.rs LEVEL_MASK)"),
                 mmax0: u16::try_from(mmax0).expect("mmax0 must fit in u16"),
                 mmax: u16::try_from(mmax).expect("mmax must fit in u16"),
-                deleted: std::sync::atomic::AtomicU8::new(0),
+                deleted: AtomicU8::new(0),
             },
         );
     }
@@ -162,7 +166,7 @@ pub(crate) unsafe fn alloc_node(
     ptr
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 // `cast_ptr_alignment`: the test reads back through the same
 // provably-aligned offsets `compute_node_layout` produced (see the allow
 // on `alloc_node` above).
