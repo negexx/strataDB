@@ -1012,8 +1012,21 @@ regression guard for alloc_node's publication path."
 
 `graph.rs` already has `concurrent_inserts_are_all_findable_afterward`
 (16 threads × 20 inserts each, then every row queried back). Add a second
-version that also exercises deletion and re-reading vectors, since Task 3
-changed how `vector()` locates its data (via the header's `dim` field):
+version that also exercises re-reading vectors, since Task 3 changed how
+`vector()` locates its data (via the header's `dim` field).
+
+**Scope note (recorded during execution):** the brief's own draft title
+below mentioned deletion, but its body and this design's actual testing
+requirement (`docs/superpowers/specs/2026-07-23-single-allocation-hnsw-node-layout-design.md`,
+testing strategy section) only ask for post-establishment concurrent
+insert + vector-content read-back, not concurrent deletion — single-
+threaded deletion is already covered elsewhere in `graph.rs`
+(`search_layer_excludes_a_deleted_node_from_results` etc.). Task 5's
+implementer correctly built to the actual requirement and renamed the
+test to `concurrent_inserts_after_dimension_established_are_findable_and_vector_readable`
+rather than the mismatched draft title below — treat the code sample
+below as illustrative of the ORIGINAL (flawed) sketch, superseded by
+what actually shipped:
 
 ```rust
     #[test]
