@@ -70,6 +70,60 @@ pub(crate) fn compute_node_layout(
     )
 }
 
+/// Non-allocating equivalent of `compute_node_layout(..).1.vector_offset`,
+/// for `Node::vector`'s hot path (called once per candidate distance
+/// evaluation in `search_layer`). `dim` is unused today — a field's offset
+/// depends only on what precedes it — but is kept for symmetry with
+/// `layer_byte_offset` and in case `NodeHeader` ever grows a
+/// dim-dependent prefix. Guarded against drift from `compute_node_layout`
+/// by `byte_offset_helpers_match_compute_node_layout` below.
+// `expect_used`: same impossible-overflow guard as `compute_node_layout`.
+#[allow(clippy::expect_used)]
+pub(crate) fn vector_byte_offset(dim: usize) -> usize {
+    let (_, vector_offset) = Layout::new::<NodeHeader>()
+        .extend(Layout::array::<f32>(dim).expect("dim*4 bytes must not overflow isize"))
+        .expect("header+vector layout must not overflow isize");
+    vector_offset
+}
+
+/// Non-allocating equivalent of
+/// `compute_node_layout(..).1.layer_offsets[lc]`, for `Node::layer`'s hot
+/// path. Walks the same `Layout::extend` sequence as `compute_node_layout`
+/// but stops at layer `lc` without building a `Vec`. Panics if
+/// `lc > level`, matching `Node::layer`'s bounds contract. Guarded against
+/// drift by `byte_offset_helpers_match_compute_node_layout` below.
+// `expect_used`: same impossible-overflow guard as `compute_node_layout`.
+#[allow(clippy::expect_used)]
+pub(crate) fn layer_byte_offset(
+    dim: usize,
+    level: usize,
+    mmax0: usize,
+    mmax: usize,
+    lc: usize,
+) -> usize {
+    assert!(
+        lc <= level,
+        "layer {lc} requested but node's level is {level}"
+    );
+    let (mut layout, _) = Layout::new::<NodeHeader>()
+        .extend(Layout::array::<f32>(dim).expect("dim*4 bytes must not overflow isize"))
+        .expect("header+vector layout must not overflow isize");
+    for current in 0..=lc {
+        let capacity = if current == 0 { mmax0 + 1 } else { mmax + 1 };
+        let (extended, layer_offset) = layout
+            .extend(
+                Layout::array::<AtomicU64>(capacity)
+                    .expect("slot array bytes must not overflow isize"),
+            )
+            .expect("layer layout must not overflow isize");
+        if current == lc {
+            return layer_offset;
+        }
+        layout = extended;
+    }
+    unreachable!("loop always returns at current == lc")
+}
+
 /// Allocates and fully initializes a single raw block for a node: header,
 /// vector, and every layer's slots preset to `EMPTY`. The returned
 /// pointer is never freed or moved for the caller's process lifetime,
@@ -185,6 +239,36 @@ mod tests {
         assert!(offsets.layer_offsets[1] >= offsets.layer_offsets[0] + 33 * 8);
         // The whole layout must be 8-byte aligned (AtomicU64's requirement) at minimum.
         assert_eq!(layout.align() % 8, 0);
+    }
+
+    #[test]
+    fn byte_offset_helpers_match_compute_node_layout() {
+        for &(dim, level, mmax0, mmax) in &[
+            (1usize, 0usize, 16usize, 16usize),
+            (3, 1, 32, 16),
+            (512, 7, 32, 16),
+            (768, 0, 256, 256),
+        ] {
+            let (_, offsets) = compute_node_layout(dim, level, mmax0, mmax);
+            assert_eq!(
+                vector_byte_offset(dim),
+                offsets.vector_offset,
+                "vector offset drifted for (dim={dim}, level={level}, mmax0={mmax0}, mmax={mmax})"
+            );
+            for lc in 0..=level {
+                assert_eq!(
+                    layer_byte_offset(dim, level, mmax0, mmax, lc),
+                    offsets.layer_offsets[lc],
+                    "layer {lc} offset drifted for (dim={dim}, level={level}, mmax0={mmax0}, mmax={mmax})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "layer 2 requested but node's level is 1")]
+    fn layer_byte_offset_panics_when_lc_exceeds_level() {
+        layer_byte_offset(3, 1, 32, 16, 2);
     }
 
     #[test]

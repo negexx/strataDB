@@ -7,7 +7,7 @@ use loom::sync::atomic::{AtomicU64, Ordering};
 #[cfg(not(loom))]
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::node_layout::{NodeHeader, alloc_node, compute_node_layout};
+use crate::node_layout::{NodeHeader, alloc_node, layer_byte_offset, vector_byte_offset};
 use crate::slot_array::SlotArray;
 
 /// A thin, `Copy` handle to a single raw-allocated node block. Never
@@ -83,18 +83,17 @@ impl Node {
     #[allow(clippy::cast_ptr_alignment)]
     pub(crate) fn vector(&self) -> &[f32] {
         let header = self.header();
-        let (_, offsets) = compute_node_layout(
-            header.dim as usize,
-            usize::from(header.level),
-            usize::from(header.mmax0),
-            usize::from(header.mmax),
-        );
+        // `vector_byte_offset` is the non-allocating twin of the
+        // `compute_node_layout` call `alloc_node` used to build this block
+        // (drift-guarded by a test in node_layout.rs) -- this accessor sits
+        // on `search_layer`'s hot path and must not allocate.
+        let vector_offset = vector_byte_offset(header.dim as usize);
         // SAFETY: `[vector_offset, vector_offset + dim * 4)` was reserved
         // and fully initialized by `alloc_node` using this same
         // `header.dim`.
         unsafe {
             std::slice::from_raw_parts(
-                self.0.as_ptr().add(offsets.vector_offset).cast::<f32>(),
+                self.0.as_ptr().add(vector_offset).cast::<f32>(),
                 header.dim as usize,
             )
         }
@@ -116,18 +115,22 @@ impl Node {
             "layer {lc} requested but node's level is {}",
             header.level
         );
-        let (_, offsets) = compute_node_layout(
+        // Non-allocating twin of the `compute_node_layout` call `alloc_node`
+        // used to build this block (drift-guarded by a test in
+        // node_layout.rs) -- hot-path accessor, must not allocate.
+        let start = layer_byte_offset(
             header.dim as usize,
             usize::from(header.level),
             usize::from(header.mmax0),
             usize::from(header.mmax),
+            lc,
         );
-        let start = offsets.layer_offsets[lc];
         let capacity = Self::layer_capacity(header, lc);
         // SAFETY: `[start, start + capacity * size_of::<AtomicU64>())` is
         // exactly the byte range `alloc_node` reserved and initialized
         // (every slot set to `EMPTY`) for layer `lc`, per the same
-        // `compute_node_layout` call.
+        // layout arithmetic (`layer_byte_offset` mirrors
+        // `compute_node_layout`, drift-guarded by test).
         let slots = unsafe {
             std::slice::from_raw_parts(self.0.as_ptr().add(start).cast::<AtomicU64>(), capacity)
         };
