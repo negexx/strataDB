@@ -168,9 +168,11 @@ impl<T> NodeTable<T> {
         if value_ptr.is_null() {
             return None;
         }
-        // SAFETY: `value_ptr` is non-null, so it was published by
-        // `insert`'s `store` and is never freed or moved afterward (Stage
-        // 1 never removes a node once inserted).
+        // SAFETY: `value_ptr` is non-null, so it was published by the
+        // `store` in `insert` (or `insert_ptr`, its currently-unused
+        // raw-pointer sibling — same publication contract) and is never
+        // freed or moved afterward (Stage 1 never removes a node once
+        // inserted).
         Some(unsafe { &*value_ptr })
     }
 }

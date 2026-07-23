@@ -30,6 +30,19 @@ pub(crate) struct NodeLayoutOffsets {
     pub(crate) layer_offsets: Vec<usize>,
 }
 
+/// The single source of truth for a layer's physical slot count: layer 0
+/// gets `mmax0 + 1` slots, every other layer gets `mmax + 1` (the `+ 1`
+/// is one slot of transient headroom — see `Node::layer_capacity`'s doc
+/// comment in node.rs for why it exists at all). `compute_node_layout`,
+/// `layer_byte_offset`, and `Node::layer_capacity` must all size layers
+/// through this one function: if any of them diverged, `Node::layer`'s
+/// `slice::from_raw_parts` could read past the region actually reserved
+/// for the last layer — undefined behavior, not just a wrong answer.
+/// Drift-guarded by `byte_offset_helpers_match_compute_node_layout`.
+pub(crate) fn layer_slot_count(mmax0: usize, mmax: usize, lc: usize) -> usize {
+    if lc == 0 { mmax0 + 1 } else { mmax + 1 }
+}
+
 // The `expect`s here guard only `Layout` arithmetic overflowing `isize`,
 // which is unreachable for any real node (dim and slot counts are bounded
 // far below `isize::MAX / 8` by upstream validation) — a `Result` return
@@ -50,7 +63,7 @@ pub(crate) fn compute_node_layout(
     layout = extended;
 
     for lc in 0..=level {
-        let capacity = if lc == 0 { mmax0 + 1 } else { mmax + 1 };
+        let capacity = layer_slot_count(mmax0, mmax, lc);
         let (extended, layer_offset) = layout
             .extend(
                 Layout::array::<AtomicU64>(capacity)
@@ -109,7 +122,7 @@ pub(crate) fn layer_byte_offset(
         .extend(Layout::array::<f32>(dim).expect("dim*4 bytes must not overflow isize"))
         .expect("header+vector layout must not overflow isize");
     for current in 0..=lc {
-        let capacity = if current == 0 { mmax0 + 1 } else { mmax + 1 };
+        let capacity = layer_slot_count(mmax0, mmax, current);
         let (extended, layer_offset) = layout
             .extend(
                 Layout::array::<AtomicU64>(capacity)
@@ -133,9 +146,11 @@ pub(crate) fn layer_byte_offset(
 /// # Safety
 /// The caller must ensure the returned pointer is eventually published
 /// (made reachable to other threads) via a `Release`-or-stronger store,
-/// since this function performs no synchronization itself -- see
-/// `NodeTable::insert_ptr` (Task 3), which is this function's only
-/// production caller.
+/// since this function performs no synchronization itself. Today's
+/// production chain is `Node::new` -> `NodeTable::insert`, whose
+/// `AtomicPtr::store` provides that publication; `NodeTable::insert_ptr`
+/// is the intended future consumer (Task 10's arena work) but is not yet
+/// called from any production path.
 // `expect_used`: the `try_from`s are caller-contract guards on parameters
 // upstream code already bounds (`level` is clamped to `LEVEL_MASK` in
 // graph.rs; `mmax0`/`mmax` are small tuning constants) — violating them is
@@ -156,10 +171,12 @@ pub(crate) unsafe fn alloc_node(
     let (layout, offsets) = compute_node_layout(vector.len(), level, mmax0, mmax);
     // SAFETY: `layout` has non-zero size (NodeHeader alone is non-zero-sized).
     let ptr = unsafe { std::alloc::alloc(layout) };
-    assert!(
-        !ptr.is_null(),
-        "node allocation failed (layout: {layout:?})"
-    );
+    if ptr.is_null() {
+        // Not `assert!`: formatting a panic message would itself allocate,
+        // during the very OOM condition being reported --
+        // `handle_alloc_error` is built to run while allocation is failing.
+        std::alloc::handle_alloc_error(layout);
+    }
 
     // SAFETY: `ptr` was just allocated with exactly `layout`, which
     // reserves space for one `NodeHeader` at offset 0 with correct
@@ -196,21 +213,17 @@ pub(crate) unsafe fn alloc_node(
     // NOT alloc_zeroed: EMPTY is u64::MAX, not 0 -- every slot must be
     // explicitly written, or a zeroed slot would be silently misread as
     // an edge to row-id 0.
-    for &layer_offset in &offsets.layer_offsets {
-        let capacity_bytes_start = layer_offset;
-        let slot_count = if layer_offset == offsets.layer_offsets[0] {
-            mmax0 + 1
-        } else {
-            mmax + 1
-        };
+    for (lc, &layer_offset) in offsets.layer_offsets.iter().enumerate() {
+        let slot_count = layer_slot_count(mmax0, mmax, lc);
         for i in 0..slot_count {
-            // SAFETY: each slot's address (`capacity_bytes_start + i *
+            // SAFETY: each slot's address (`layer_offset + i *
             // size_of::<AtomicU64>()`) is within the region
             // `compute_node_layout` reserved for this layer via
-            // `Layout::array::<AtomicU64>(capacity)`, and no other write
-            // targets this address.
+            // `Layout::array::<AtomicU64>(capacity)` -- the same
+            // `layer_slot_count(mmax0, mmax, lc)` slots being written
+            // here -- and no other write targets this address.
             unsafe {
-                let slot_ptr = ptr.add(capacity_bytes_start).cast::<AtomicU64>().add(i);
+                let slot_ptr = ptr.add(layer_offset).cast::<AtomicU64>().add(i);
                 std::ptr::write(slot_ptr, AtomicU64::new(EMPTY));
             }
         }
@@ -249,17 +262,36 @@ mod tests {
             (512, 7, 32, 16),
             (768, 0, 256, 256),
         ] {
-            let (_, offsets) = compute_node_layout(dim, level, mmax0, mmax);
+            let (layout, offsets) = compute_node_layout(dim, level, mmax0, mmax);
             assert_eq!(
                 vector_byte_offset(dim),
                 offsets.vector_offset,
                 "vector offset drifted for (dim={dim}, level={level}, mmax0={mmax0}, mmax={mmax})"
             );
+            // A real node built with the same parameters: `Node::layer`'s
+            // `slice::from_raw_parts` capacity must exactly match the
+            // inter-offset spacing `compute_node_layout` reserved — if
+            // `Node::layer_capacity` ever sized a layer larger than its
+            // reservation, the last layer's slice would read past the
+            // allocation itself (UB), so this drift is guarded here
+            // alongside the offset checks.
+            let node = crate::node::Node::new(0, vec![0.0; dim], level, mmax0, mmax);
             for lc in 0..=level {
                 assert_eq!(
                     layer_byte_offset(dim, level, mmax0, mmax, lc),
                     offsets.layer_offsets[lc],
                     "layer {lc} offset drifted for (dim={dim}, level={level}, mmax0={mmax0}, mmax={mmax})"
+                );
+                let reserved_bytes = if lc < level {
+                    offsets.layer_offsets[lc + 1] - offsets.layer_offsets[lc]
+                } else {
+                    layout.size() - offsets.layer_offsets[lc]
+                };
+                assert_eq!(
+                    node.layer(lc).capacity() * std::mem::size_of::<AtomicU64>(),
+                    reserved_bytes,
+                    "Node::layer_capacity drifted from compute_node_layout's reservation \
+                     for (dim={dim}, level={level}, mmax0={mmax0}, mmax={mmax}, lc={lc})"
                 );
             }
         }
@@ -292,9 +324,16 @@ mod tests {
             let vector_ptr = ptr.add(offsets.vector_offset).cast::<f32>();
             assert_eq!(std::slice::from_raw_parts(vector_ptr, 3), &[1.0, 2.0, 3.0]);
 
-            for &layer_offset in &offsets.layer_offsets {
-                let slot_ptr = ptr.add(layer_offset).cast::<AtomicU64>();
-                assert_eq!((*slot_ptr).load(std::sync::atomic::Ordering::SeqCst), EMPTY);
+            for (lc, &layer_offset) in offsets.layer_offsets.iter().enumerate() {
+                let slot_count = layer_slot_count(32, 16, lc);
+                for i in 0..slot_count {
+                    let slot_ptr = ptr.add(layer_offset).cast::<AtomicU64>().add(i);
+                    assert_eq!(
+                        (*slot_ptr).load(std::sync::atomic::Ordering::SeqCst),
+                        EMPTY,
+                        "layer {lc} slot {i} must start EMPTY"
+                    );
+                }
             }
         }
         // Deliberately leaked -- matches this crate's existing "nodes are

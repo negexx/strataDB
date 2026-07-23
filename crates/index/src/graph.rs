@@ -386,7 +386,18 @@ impl<D: Distance> Graph<D> {
     ) -> Result<(), crate::hnsw::IndexError> {
         self.check_or_establish_dimension(vector.len())?;
 
-        let level = assign_level(m_l, unif);
+        // Clamped to the same ceiling `pack` enforces (see `pack`'s doc
+        // comment): `assign_level`'s contract permits draws that produce
+        // an enormous level (up to `usize::MAX` for `unif == 0.0`, or a
+        // pathological `m_l` from `MaxConnections(1)`), which would
+        // overflow `compute_node_layout`'s per-layer arithmetic in
+        // `Node::new` — a deterministic panic. Clamping degrades that to a
+        // valid max-level node instead, consistent with `pack`'s own
+        // "clamp, never trust blindly" treatment of out-of-range levels.
+        // `cast_possible_truncation`: `LEVEL_MASK` is 255, which fits in
+        // `usize` on every supported target.
+        #[allow(clippy::cast_possible_truncation)]
+        let level = assign_level(m_l, unif).min(LEVEL_MASK as usize);
         let node = Node::new(row_id, vector, level, mmax0, mmax);
         self.nodes.insert(row_id, node);
 

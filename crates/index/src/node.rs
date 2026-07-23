@@ -7,7 +7,9 @@ use loom::sync::atomic::{AtomicU64, Ordering};
 #[cfg(not(loom))]
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::node_layout::{NodeHeader, alloc_node, layer_byte_offset, vector_byte_offset};
+use crate::node_layout::{
+    NodeHeader, alloc_node, layer_byte_offset, layer_slot_count, vector_byte_offset,
+};
 use crate::slot_array::SlotArray;
 
 /// A thin, `Copy` handle to a single raw-allocated node block. Never
@@ -144,14 +146,12 @@ impl Node {
     /// `SlotArray::claim` just fails once full and the shrink step is
     /// structurally unreachable (Task 8 review finding; see
     /// `insert_shrinks_a_full_neighbor_list_to_keep_the_closer_candidate`
-    /// in graph.rs). Must stay in lockstep with `compute_node_layout`'s
-    /// identical `+ 1` sizing.
+    /// in graph.rs). Delegates to `layer_slot_count` — the same rule
+    /// `compute_node_layout` used to reserve this block — so the two can
+    /// never diverge (drift-guarded by
+    /// `byte_offset_helpers_match_compute_node_layout` in `node_layout.rs`).
     fn layer_capacity(header: &NodeHeader, lc: usize) -> usize {
-        if lc == 0 {
-            usize::from(header.mmax0) + 1
-        } else {
-            usize::from(header.mmax) + 1
-        }
+        layer_slot_count(usize::from(header.mmax0), usize::from(header.mmax), lc)
     }
 
     pub(crate) fn is_deleted(self) -> bool {
