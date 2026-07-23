@@ -4,11 +4,11 @@
 //! `docs/superpowers/specs/2026-07-18-lockfree-hnsw-rewrite-design.md`.
 
 #[cfg(loom)]
-use loom::sync::atomic::{AtomicBool, Ordering};
+use loom::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(not(loom))]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::slot_array::SlotArray;
+use crate::slot_array::{EMPTY, SlotArray};
 
 pub(crate) struct Node {
     // See `row_id()`'s doc comment below — not read by any production code
@@ -16,9 +16,11 @@ pub(crate) struct Node {
     #[allow(dead_code)]
     row_id: u64,
     vector: Vec<f32>,
-    /// One `SlotArray` per layer `0..=level`: index 0 has physical
-    /// capacity `mmax0 + 1`, every other index has physical capacity
-    /// `mmax + 1`. The `+ 1` is one slot of transient headroom above the
+    /// All layers' slots concatenated: layer 0's `mmax0+1` slots, then
+    /// layer 1's `mmax+1` slots, etc. `layer_offsets[lc]` is where layer
+    /// `lc`'s slots start within this Vec.
+    ///
+    /// The `+ 1` per layer is one slot of transient headroom above the
     /// steady-state target (`mmax0`/`mmax`), not a change to the target
     /// itself: `Graph::insert`'s shrink step (Algorithm 1 lines 12-16)
     /// gathers a neighbor's occupied slots and re-runs
@@ -31,7 +33,8 @@ pub(crate) struct Node {
     /// improved by a later, closer candidate). See
     /// `insert_shrinks_a_full_neighbor_list_to_keep_the_closer_candidate`
     /// in `graph.rs` for the regression test.
-    layers: Vec<SlotArray>,
+    slots: Vec<AtomicU64>,
+    layer_offsets: Vec<usize>,
     deleted: AtomicBool,
 }
 
@@ -43,13 +46,18 @@ impl Node {
         mmax0: usize,
         mmax: usize,
     ) -> Self {
-        let layers = (0..=level)
-            .map(|lc| SlotArray::new(if lc == 0 { mmax0 + 1 } else { mmax + 1 }))
-            .collect();
+        let mut slots = Vec::new();
+        let mut layer_offsets = Vec::with_capacity(level + 1);
+        for lc in 0..=level {
+            layer_offsets.push(slots.len());
+            let capacity = if lc == 0 { mmax0 + 1 } else { mmax + 1 };
+            slots.extend((0..capacity).map(|_| AtomicU64::new(EMPTY)));
+        }
         Self {
             row_id,
             vector,
-            layers,
+            slots,
+            layer_offsets,
             deleted: AtomicBool::new(false),
         }
     }
@@ -71,14 +79,20 @@ impl Node {
 
     /// This node's highest layer — it participates in layers `0..=level()`.
     pub(crate) fn level(&self) -> usize {
-        self.layers.len() - 1
+        self.layer_offsets.len() - 1
     }
 
-    /// The `SlotArray` for layer `lc`. Panics if `lc > self.level()` —
+    /// The `SlotArray` view for layer `lc`. Panics if `lc > self.level()` —
     /// callers must never traverse a node at a layer it doesn't
     /// participate in (checked by `Graph`'s traversal logic, not here).
-    pub(crate) fn layer(&self, lc: usize) -> &SlotArray {
-        &self.layers[lc]
+    pub(crate) fn layer(&self, lc: usize) -> SlotArray<'_> {
+        let start = self.layer_offsets[lc];
+        let end = self
+            .layer_offsets
+            .get(lc + 1)
+            .copied()
+            .unwrap_or(self.slots.len());
+        SlotArray::new(&self.slots[start..end])
     }
 
     pub(crate) fn is_deleted(&self) -> bool {
