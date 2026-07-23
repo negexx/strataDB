@@ -11,21 +11,19 @@ use std::sync::atomic::{AtomicU8, AtomicU64};
 
 use crate::slot_array::EMPTY;
 
-// The `dead_code` allows throughout this module: nothing outside this
-// module's own tests consumes it yet — the next task wires `alloc_node`,
-// `NodeHeader`, and `NodeLayoutOffsets` into `Node`/`NodeTable` (same
-// pattern as the not-yet-consumed accessors in `node.rs`).
-#[allow(dead_code)]
 #[repr(C)]
 pub(crate) struct NodeHeader {
     pub(crate) row_id: u64,
+    /// The vector's element count, stored here (mirroring `mmax0`/`mmax`)
+    /// so `Node::vector`/`Node::layer` can recompute this block's layout
+    /// without threading `dim` as a parameter through every accessor.
+    pub(crate) dim: u32,
     pub(crate) level: u8,
     pub(crate) mmax0: u16,
     pub(crate) mmax: u16,
     pub(crate) deleted: AtomicU8,
 }
 
-#[allow(dead_code)]
 pub(crate) struct NodeLayoutOffsets {
     pub(crate) vector_offset: usize,
     /// `layer_offsets[lc]` is the byte offset of layer `lc`'s first slot.
@@ -36,7 +34,7 @@ pub(crate) struct NodeLayoutOffsets {
 // which is unreachable for any real node (dim and slot counts are bounded
 // far below `isize::MAX / 8` by upstream validation) — a `Result` return
 // would force every caller to handle an impossible error.
-#[allow(dead_code, clippy::expect_used)]
+#[allow(clippy::expect_used)]
 pub(crate) fn compute_node_layout(
     dim: usize,
     level: usize,
@@ -93,7 +91,7 @@ pub(crate) fn compute_node_layout(
 // header contains a `u64`), and every offset comes from `Layout::extend`,
 // which aligns each region to its own type's alignment; the SAFETY comment
 // at each cast site restates the specific guarantee.
-#[allow(dead_code, clippy::expect_used, clippy::cast_ptr_alignment)]
+#[allow(clippy::expect_used, clippy::cast_ptr_alignment)]
 pub(crate) unsafe fn alloc_node(
     row_id: u64,
     vector: &[f32],
@@ -120,6 +118,7 @@ pub(crate) unsafe fn alloc_node(
             ptr.cast::<NodeHeader>(),
             NodeHeader {
                 row_id,
+                dim: u32::try_from(vector.len()).expect("dim must fit in u32"),
                 level: u8::try_from(level).expect("level must fit in u8 (see graph.rs LEVEL_MASK)"),
                 mmax0: u16::try_from(mmax0).expect("mmax0 must fit in u16"),
                 mmax: u16::try_from(mmax).expect("mmax must fit in u16"),
@@ -199,6 +198,7 @@ mod tests {
         unsafe {
             let header = &*ptr.cast::<NodeHeader>();
             assert_eq!(header.row_id, 7);
+            assert_eq!(header.dim, 3);
             assert_eq!(header.level, 1);
             assert_eq!(header.mmax0, 32);
             assert_eq!(header.mmax, 16);

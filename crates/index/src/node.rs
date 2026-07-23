@@ -1,44 +1,39 @@
-//! A graph node: its vector, one `SlotArray` per layer it participates in
-//! (packed into a single `Vec`, not one allocation per layer — see design
-//! doc §2/§4), and its deleted flag. See
-//! `docs/superpowers/specs/2026-07-18-lockfree-hnsw-rewrite-design.md`.
+//! A graph node: its vector, one slot region per layer it participates
+//! in, and its deleted flag, all packed into a single raw allocation. See
+//! `docs/superpowers/specs/2026-07-23-single-allocation-hnsw-node-layout-design.md`.
 
 #[cfg(loom)]
-use loom::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use loom::sync::atomic::{AtomicU64, Ordering};
 #[cfg(not(loom))]
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::slot_array::{EMPTY, SlotArray};
+use crate::node_layout::{NodeHeader, alloc_node, compute_node_layout};
+use crate::slot_array::SlotArray;
 
-pub(crate) struct Node {
-    // See `row_id()`'s doc comment below — not read by any production code
-    // path yet, kept for a future consumer.
-    #[allow(dead_code)]
-    row_id: u64,
-    vector: Vec<f32>,
-    /// All layers' slots concatenated: layer 0's `mmax0+1` slots, then
-    /// layer 1's `mmax+1` slots, etc. `layer_offsets[lc]` is where layer
-    /// `lc`'s slots start within this Vec.
-    ///
-    /// The `+ 1` per layer is one slot of transient headroom above the
-    /// steady-state target (`mmax0`/`mmax`), not a change to the target
-    /// itself: `Graph::insert`'s shrink step (Algorithm 1 lines 12-16)
-    /// gathers a neighbor's occupied slots and re-runs
-    /// `SELECT-NEIGHBORS-HEURISTIC` only when `occupied.len()` exceeds the
-    /// target, then evicts the losers back down to it. Without this
-    /// headroom, a `SlotArray` sized to exactly the target can never be
-    /// observed over capacity — `claim` just fails once full — so the
-    /// shrink step was structurally unreachable dead code (Task 8 review
-    /// finding: once a node's neighbor list filled up, it could never be
-    /// improved by a later, closer candidate). See
-    /// `insert_shrinks_a_full_neighbor_list_to_keep_the_closer_candidate`
-    /// in `graph.rs` for the regression test.
-    slots: Vec<AtomicU64>,
-    layer_offsets: Vec<usize>,
-    deleted: AtomicBool,
-}
+/// A thin, `Copy` handle to a single raw-allocated node block. Never
+/// freed or moved once constructed -- see `alloc_node`'s doc comment.
+#[derive(Clone, Copy)]
+pub(crate) struct Node(std::ptr::NonNull<u8>);
+
+// SAFETY: every field this type's methods read is either immutable after
+// construction (header's row_id/dim/level/mmax0/mmax, the vector bytes) or
+// an atomic (deleted flag, edge slots) -- concurrent shared access through
+// `&Node`/`Node` (it's `Copy`) is exactly what those atomics are for.
+unsafe impl Send for Node {}
+// SAFETY: same reasoning as the `Send` impl above.
+unsafe impl Sync for Node {}
 
 impl Node {
+    // `expect_used`: `alloc_node` asserts its result is non-null before
+    // returning (allocation failure panics there), so the `NonNull::new`
+    // failure arm is unreachable -- a loud message beats threading an
+    // impossible error to every caller.
+    //
+    // `needless_pass_by_value`: `Node::new`'s exact pre-existing signature
+    // (taking the `Vec` by value) is deliberately preserved for its
+    // callers; the contents are copied into the single block and the `Vec`
+    // is dropped here -- ownership hand-off is the intended contract.
+    #[allow(clippy::expect_used, clippy::needless_pass_by_value)]
     pub(crate) fn new(
         row_id: u64,
         vector: Vec<f32>,
@@ -46,57 +41,118 @@ impl Node {
         mmax0: usize,
         mmax: usize,
     ) -> Self {
-        let mut slots = Vec::new();
-        let mut layer_offsets = Vec::with_capacity(level + 1);
-        for lc in 0..=level {
-            layer_offsets.push(slots.len());
-            let capacity = if lc == 0 { mmax0 + 1 } else { mmax + 1 };
-            slots.extend((0..capacity).map(|_| AtomicU64::new(EMPTY)));
-        }
-        Self {
-            row_id,
-            vector,
-            slots,
-            layer_offsets,
-            deleted: AtomicBool::new(false),
-        }
+        // SAFETY: `alloc_node`'s only contract is that its result is
+        // published via a synchronizing store before any other thread
+        // reads it -- the caller (`Graph::insert`, handing this `Node` to
+        // `NodeTable::insert`) does so through that table's
+        // `AtomicPtr::store`, which publishes the boxed handle and,
+        // transitively, the block it points to.
+        let ptr = unsafe { alloc_node(row_id, &vector, level, mmax0, mmax) };
+        Self(
+            std::ptr::NonNull::new(ptr)
+                .expect("alloc_node never returns null (it asserts internally)"),
+        )
+    }
+
+    // `cast_ptr_alignment` (here and in `vector`/`layer` below): every cast
+    // is provably aligned -- `alloc_node` returns a pointer aligned to the
+    // whole block layout's alignment, and every offset comes from the same
+    // `compute_node_layout` `Layout::extend` arithmetic that aligned each
+    // region to its own type's alignment (see the matching allow on
+    // `alloc_node` itself).
+    #[allow(clippy::cast_ptr_alignment)]
+    fn header(&self) -> &NodeHeader {
+        // SAFETY: `self.0` was produced by `alloc_node`, which reserves
+        // and initializes a `NodeHeader` at offset 0 (see
+        // `compute_node_layout`) before returning; this `Node` is never
+        // constructed from any other pointer.
+        unsafe { &*self.0.as_ptr().cast::<NodeHeader>() }
     }
 
     // Not read by any production code path yet — `Graph`'s own methods key
     // everything off the caller-supplied `row_id` parameter directly rather
     // than reading it back off a resolved `Node`. Kept as a natural
-    // companion accessor to `vector()`/`level()`/`layer()` above for a
-    // future consumer (and exercised by this module's own
+    // companion accessor to `vector()`/`level()`/`layer()` for a future
+    // consumer (and exercised by this module's own
     // `vector_and_row_id_are_preserved` test).
     #[allow(dead_code)]
-    pub(crate) fn row_id(&self) -> u64 {
-        self.row_id
+    pub(crate) fn row_id(self) -> u64 {
+        self.header().row_id
     }
 
+    #[allow(clippy::cast_ptr_alignment)]
     pub(crate) fn vector(&self) -> &[f32] {
-        &self.vector
+        let header = self.header();
+        let (_, offsets) = compute_node_layout(
+            header.dim as usize,
+            usize::from(header.level),
+            usize::from(header.mmax0),
+            usize::from(header.mmax),
+        );
+        // SAFETY: `[vector_offset, vector_offset + dim * 4)` was reserved
+        // and fully initialized by `alloc_node` using this same
+        // `header.dim`.
+        unsafe {
+            std::slice::from_raw_parts(
+                self.0.as_ptr().add(offsets.vector_offset).cast::<f32>(),
+                header.dim as usize,
+            )
+        }
     }
 
     /// This node's highest layer — it participates in layers `0..=level()`.
-    pub(crate) fn level(&self) -> usize {
-        self.layer_offsets.len() - 1
+    pub(crate) fn level(self) -> usize {
+        usize::from(self.header().level)
     }
 
     /// The `SlotArray` view for layer `lc`. Panics if `lc > self.level()` —
     /// callers must never traverse a node at a layer it doesn't
     /// participate in (checked by `Graph`'s traversal logic, not here).
+    #[allow(clippy::cast_ptr_alignment)]
     pub(crate) fn layer(&self, lc: usize) -> SlotArray<'_> {
-        let start = self.layer_offsets[lc];
-        let end = self
-            .layer_offsets
-            .get(lc + 1)
-            .copied()
-            .unwrap_or(self.slots.len());
-        SlotArray::new(&self.slots[start..end])
+        let header = self.header();
+        assert!(
+            lc <= usize::from(header.level),
+            "layer {lc} requested but node's level is {}",
+            header.level
+        );
+        let (_, offsets) = compute_node_layout(
+            header.dim as usize,
+            usize::from(header.level),
+            usize::from(header.mmax0),
+            usize::from(header.mmax),
+        );
+        let start = offsets.layer_offsets[lc];
+        let capacity = Self::layer_capacity(header, lc);
+        // SAFETY: `[start, start + capacity * size_of::<AtomicU64>())` is
+        // exactly the byte range `alloc_node` reserved and initialized
+        // (every slot set to `EMPTY`) for layer `lc`, per the same
+        // `compute_node_layout` call.
+        let slots = unsafe {
+            std::slice::from_raw_parts(self.0.as_ptr().add(start).cast::<AtomicU64>(), capacity)
+        };
+        SlotArray::new(slots)
     }
 
-    pub(crate) fn is_deleted(&self) -> bool {
-        self.deleted.load(Ordering::SeqCst)
+    /// Physical slot count for layer `lc`: the steady-state target
+    /// (`mmax0` at layer 0, `mmax` above) plus one slot of transient
+    /// headroom, so `Graph::insert`'s shrink step (Algorithm 1 lines
+    /// 12-16) can ever observe an over-target list at all -- without it,
+    /// `SlotArray::claim` just fails once full and the shrink step is
+    /// structurally unreachable (Task 8 review finding; see
+    /// `insert_shrinks_a_full_neighbor_list_to_keep_the_closer_candidate`
+    /// in graph.rs). Must stay in lockstep with `compute_node_layout`'s
+    /// identical `+ 1` sizing.
+    fn layer_capacity(header: &NodeHeader, lc: usize) -> usize {
+        if lc == 0 {
+            usize::from(header.mmax0) + 1
+        } else {
+            usize::from(header.mmax) + 1
+        }
+    }
+
+    pub(crate) fn is_deleted(self) -> bool {
+        self.header().deleted.load(Ordering::SeqCst) != 0
     }
 
     // Only called from `Graph::delete`, itself not yet wired into
@@ -105,8 +161,8 @@ impl Node {
     // this module's own `mark_deleted_is_observed_by_is_deleted` test and
     // `graph.rs`'s deletion tests.
     #[allow(dead_code)]
-    pub(crate) fn mark_deleted(&self) {
-        self.deleted.store(true, Ordering::SeqCst);
+    pub(crate) fn mark_deleted(self) {
+        self.header().deleted.store(1, Ordering::SeqCst);
     }
 }
 

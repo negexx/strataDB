@@ -126,6 +126,31 @@ impl<T> NodeTable<T> {
         chunk.slots[offset].store(value_ptr, Ordering::SeqCst);
     }
 
+    /// Registers an already-allocated `value` at `row_id`, storing the
+    /// given pointer directly instead of boxing a fresh copy the way
+    /// [`Self::insert`] does. Same single-registration contract as
+    /// `insert` (must only be called once per `row_id`). Exists so a
+    /// caller that already produced a raw, fully-initialized pointer
+    /// (e.g. `crate::node_layout::alloc_node`) doesn't pay for a second,
+    /// redundant allocation just to hand it to this table.
+    ///
+    /// # Safety
+    /// `ptr` must be non-null, must point to a validly initialized `T`,
+    /// and must never be freed or mutated through any other handle for
+    /// the table's lifetime (this table never reclaims it, matching
+    /// every other pointer this table stores).
+    // Not called by any production code path yet — reserved for Stage B's
+    // `NodeArena` (Task 10 of the single-allocation-node plan), where it
+    // removes a real, large per-node allocation. Exercised today by this
+    // module's own `insert_ptr_then_get_round_trips` test (same pattern as
+    // the not-yet-consumed accessors in `node.rs`/`slot_array.rs`).
+    #[allow(dead_code)]
+    pub(crate) unsafe fn insert_ptr(&self, row_id: u64, ptr: *mut T) {
+        let (chunk_idx, offset) = Self::chunk_index(row_id);
+        let chunk = self.get_or_create_chunk(chunk_idx);
+        chunk.slots[offset].store(ptr, Ordering::SeqCst);
+    }
+
     /// Looks up the value at `row_id`. Returns `None` if `row_id` has
     /// never been inserted (including if its chunk hasn't been allocated
     /// yet at all).
@@ -165,6 +190,16 @@ mod tests {
     fn insert_then_get_round_trips() {
         let table = NodeTable::new(100);
         table.insert(5, 42u32);
+        assert_eq!(table.get(5), Some(&42));
+    }
+
+    #[test]
+    fn insert_ptr_then_get_round_trips() {
+        let table: NodeTable<u32> = NodeTable::new(100);
+        let boxed: *mut u32 = Box::into_raw(Box::new(42u32));
+        // SAFETY: `boxed` is non-null, points to a validly initialized
+        // u32, and is never freed elsewhere in this test.
+        unsafe { table.insert_ptr(5, boxed) };
         assert_eq!(table.get(5), Some(&42));
     }
 
