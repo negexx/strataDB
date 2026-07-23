@@ -125,16 +125,26 @@ pub(crate) fn data_subdir(dir: &Path) -> PathBuf {
 /// already-durable legacy filename, and `write_batch`'s `File::create`
 /// would silently truncate it. Migrate by seeding one past the highest
 /// attempt-id-shaped numeric prefix already used in `data_files`.
-fn seed_write_attempt_counter(manifest: &Manifest) -> u64 {
+fn seed_write_attempt_counter(manifest: &Manifest) -> Result<u64> {
     if manifest.next_attempt_id != 0 || manifest.data_files.is_empty() {
-        return manifest.next_attempt_id;
+        return Ok(manifest.next_attempt_id);
     }
-    manifest
+    let highest = manifest
         .data_files
         .iter()
-        .filter_map(|entry| parse_attempt_id_prefix(&entry.name))
-        .max()
-        .map_or(0, |highest| highest.saturating_add(1))
+        .filter_map(|entry| parse_attempt_id_prefix(&entry.name));
+    match highest.max() {
+        // No entry parsed as an attempt-id-shaped prefix, so no existing
+        // filename occupies that numeric namespace at all — seeding at 0
+        // cannot collide with any of them, even though 0 looks like the
+        // vulnerable value at a glance. Only reachable via a corrupt/
+        // hostile manifest; every filename this codebase itself generates
+        // parses.
+        None => Ok(0),
+        Some(highest) => highest.checked_add(1).ok_or_else(|| {
+            TxnError::ManifestOverflow(format!("legacy attempt-id prefix {highest} + 1"))
+        }),
+    }
 }
 
 /// Parses the leading `{prefix}-{i}.ext` numeric prefix from a data-file
@@ -282,7 +292,8 @@ impl Dataset {
         // collision-and-silent-truncation bug against those legacy files.
         // `seed_write_attempt_counter` detects and migrates this case; see
         // its own doc comment.
-        let write_attempt_counter = Arc::new(AtomicU64::new(seed_write_attempt_counter(&manifest)));
+        let write_attempt_counter =
+            Arc::new(AtomicU64::new(seed_write_attempt_counter(&manifest)?));
         let snapshot = Snapshot {
             dir: dir.clone(),
             version: manifest.version,
