@@ -1384,6 +1384,87 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_inserts_after_dimension_established_are_findable_and_vector_readable() {
+        use std::sync::Arc;
+
+        const THREADS: u64 = 16;
+        // THREADS + 1 is a small compile-time constant (17), nowhere near
+        // usize::MAX on any real target.
+        #[allow(clippy::cast_possible_truncation)]
+        let graph = Arc::new(Graph::new(crate::distance::L2, (THREADS + 1) as usize));
+        let m_l = 1.0 / (16f64).ln();
+
+        // Establish dimension 3 single-threaded first, so every concurrent
+        // insert below hits `check_or_establish_dimension`'s
+        // already-established fast path deterministically, rather than
+        // racing to establish it -- this test targets ordering *after*
+        // establishment, distinct from the pre-existing stress test above
+        // (which lets the first insert to land establish the dimension).
+        graph
+            .insert(
+                0,
+                vec![0.0, 0.0, 0.0],
+                16,
+                32,
+                16,
+                100,
+                m_l,
+                1.0,
+                test_unif(0),
+            )
+            .unwrap();
+
+        let handles: Vec<_> = (1..=THREADS)
+            .map(|row_id| {
+                let graph = Arc::clone(&graph);
+                std::thread::spawn(move || {
+                    graph
+                        .insert(
+                            row_id,
+                            vec![row_id as f32, 0.0, 0.0],
+                            16,
+                            32,
+                            16,
+                            100,
+                            m_l,
+                            1.0,
+                            test_unif(row_id),
+                        )
+                        .unwrap();
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        for row_id in 0..=THREADS {
+            // Vector read-back: every node's single-block storage must
+            // report its own vector correctly, keyed off the header's `dim`
+            // field that Task 3 introduced (see `node.rs`'s `vector()`) --
+            // not just be findable via search.
+            let node = graph.nodes.get(row_id).unwrap_or_else(|| {
+                panic!("row {row_id} must exist in the node table after concurrent insertion")
+            });
+            assert_eq!(
+                node.vector(),
+                &[row_id as f32, 0.0, 0.0],
+                "row {row_id}'s vector must read back correctly from single-block storage"
+            );
+
+            let results = graph
+                .k_nn_search(&[row_id as f32, 0.0, 0.0], 1, 200, |_| true)
+                .unwrap();
+            assert_eq!(
+                results.len(),
+                1,
+                "row {row_id} must be findable after concurrent insertion into single-block storage"
+            );
+            assert_eq!(results[0].0, row_id);
+        }
+    }
+
+    #[test]
     fn insert_batch_inserts_every_row() {
         let graph = Graph::new(crate::distance::L2, 10);
         let m_l = 1.0 / (16f64).ln();
