@@ -261,3 +261,52 @@ mod tests {
         );
     }
 }
+
+/// Run with: `cargo rustc -p strata-index --lib --profile test -- --cfg loom`
+/// (never a workspace-wide `RUSTFLAGS` — see
+/// `.claude/rules/concurrency-txn-layer.md`).
+#[cfg(loom)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod loom_tests {
+    use super::*;
+
+    /// A thread that only observes a node through a published `AtomicPtr`
+    /// must see the WHOLE node fully initialized -- header, vector, and
+    /// every slot preset to EMPTY -- never a partially-constructed node.
+    /// This is the test most likely to catch a release/acquire ordering
+    /// mistake in `alloc_node`'s publication path.
+    #[test]
+    fn full_node_publish_is_completely_visible_to_a_reader() {
+        loom::model(|| {
+            let published: loom::sync::Arc<loom::sync::atomic::AtomicPtr<Node>> =
+                loom::sync::Arc::new(loom::sync::atomic::AtomicPtr::new(std::ptr::null_mut()));
+
+            let writer_published = loom::sync::Arc::clone(&published);
+            let writer = loom::thread::spawn(move || {
+                let node = Node::new(7, vec![1.0, 2.0, 3.0], 1, 32, 16);
+                let boxed = Box::into_raw(Box::new(node));
+                writer_published.store(boxed, loom::sync::atomic::Ordering::SeqCst);
+            });
+
+            let reader_published = loom::sync::Arc::clone(&published);
+            let reader = loom::thread::spawn(move || {
+                let ptr = reader_published.load(loom::sync::atomic::Ordering::SeqCst);
+                if !ptr.is_null() {
+                    // SAFETY: a non-null `ptr` was published by the
+                    // writer's store above, after Node::new's alloc_node
+                    // call fully returned.
+                    let node = unsafe { &*ptr };
+                    assert_eq!(node.vector(), &[1.0, 2.0, 3.0]);
+                    assert_eq!(node.level(), 1);
+                    assert!(!node.is_deleted());
+                    for lc in 0..=node.level() {
+                        assert!(node.layer(lc).occupied().is_empty());
+                    }
+                }
+            });
+
+            writer.join().unwrap();
+            reader.join().unwrap();
+        });
+    }
+}
