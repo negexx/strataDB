@@ -388,7 +388,23 @@ impl<D: Distance> Graph<D> {
 
         let level = assign_level(m_l, unif);
         let node = Node::new(row_id, vector, level, mmax0, mmax);
-        self.nodes.insert(row_id, node);
+        // A `row_id` past the node table's addressable range is rejected here
+        // rather than panicking on an out-of-bounds directory index. Zero
+        // graph *structure* is mutated — no node stored, entry point and
+        // edges untouched — since everything below this line is still
+        // unrun. (The one exception is `check_or_establish_dimension` above:
+        // if this were the graph's first-ever insert, it will already have
+        // locked in the vector dimension. That is an index-global property,
+        // not per-node state, and the pre-existing code established it and
+        // then panicked, so this is not a regression.) The `crates/txn`
+        // commit path already refuses such row-ids upstream; this makes the
+        // `pub` index self-defending for any other caller.
+        self.nodes
+            .insert(row_id, node)
+            .map_err(|e| crate::hnsw::IndexError::RowIdOutOfRange {
+                row_id,
+                capacity: e.capacity,
+            })?;
 
         let Some((mut entry, mut entry_level)) = self.entry_point.get() else {
             // First node in the graph: it IS the entry point, no

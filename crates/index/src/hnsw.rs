@@ -38,6 +38,8 @@ pub enum IndexError {
     MaxConnectionTooLarge(usize),
     #[error("query has {query_len} dimensions, but the index expects {expected}")]
     DimensionMismatch { query_len: usize, expected: usize },
+    #[error("row_id {row_id} is beyond the index's addressable capacity of {capacity} rows")]
+    RowIdOutOfRange { row_id: u64, capacity: u64 },
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("delta log entry serialization error: {0}")]
