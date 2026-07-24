@@ -438,7 +438,13 @@ Group commit rises to the top of the list on the same evidence: with an empty ma
 still costs ~12 ms of essentially pure fsync, so fsync batching wins at *every* scale, independent
 of history.
 
-## MEASURED (2026-07-23) — filtered vector search is ~1,500x slower than unfiltered
+## MEASURED (2026-07-23) — filtered vector search is ~1,500x slower than unfiltered, and the bottleneck is not what the audit guessed
+
+> The numbers in the table just below are the *first-pass* figures and are contaminated by machine
+> drift; the corrected same-session A/B and the located bottleneck are in the "UPDATE" at the end of
+> this section. The ~1,500x order-of-magnitude gap between filtered and unfiltered is real and holds;
+> what changed is the *cause* (a full-file re-read, not the embedding copy) and the *size of the fix
+> applied here* (−13%, not order-of-magnitude).
 
 With the benchmark dataset downloaded (100k real 512-dim OpenAI embeddings, recall@10 = 0.985):
 
@@ -464,12 +470,45 @@ Only step 3's `ef·M` ≈ 6,400 probes are actual search work; steps 1–3 are a
 the traversal starts.
 
 **This reorders the whole document.** The manifest O(F) growth was ranked #1 and does not bite until
-~2000–3000 files; this is a ~1,500x factor on a core operation at 100k rows, today. Fixing it needs
-no format change and no design decision — it is the `mask()`-only extraction in #5 plus a dense
-bitset in #4, both already specified above.
+~2000–3000 files; this is a ~1,500x factor on a core operation at 100k rows, today.
 
-Note the earlier `live_ids` sort-vs-`HashSet` debate (see "Conflicts resolved") is a rounding error
-at this scale: whichever side of that boundary is optimized, step 1 still copies 20 MB per query.
+### UPDATE — the fix was applied and measured, and the audit's prediction here was wrong
+
+Findings #4 and #5 were implemented (`7a675cd`): `mask()` added to `crates/query`, `row_ids_matching`
+applies it to the `_row_id` column alone, `search_filtered` uses a dense bitset, and the dead
+`live_ids.sort_unstable()` is gone. Result, measured back-to-back on one machine state (stash / bench
+/ restore / bench):
+
+| | before | after | change |
+|---|---|---|---|
+| filtered top-10 | 147.02 ms | 127.92 ms | **−13.0%** (CI −16.0…−10.3, p=0.00) |
+
+**Two corrections to what is written above:**
+
+1. **The numbers in the table above (96.95 µs / 152.88 ms) and the "−28.6%/−29.8%" figures from the
+   first runs of this fix are contaminated.** They were computed against a baseline captured hours
+   earlier, and this machine drifted enough over the session to move *unchanged* unfiltered search
+   from 89 µs to 168 µs. The honest, same-session A/B number is **−13%**, and it supersedes them.
+
+2. **The audit predicted this fix would be an "order-of-magnitude" win (finding #5). It was not, and
+   phase instrumentation shows why.** Within one run: `row_ids_matching` 133–157 ms, `widen_ef` 9 µs,
+   `search_filtered` 1.3–1.8 ms. Resolving the row-ids is ~99% of the path, and that cost is **not**
+   the 20 MB embedding *copy* the fix removed — it is re-reading the whole ~205 MB data file per query.
+   Arrow IPC stores a record batch as one contiguous body and `FileReader` reads all of it before
+   decoding, so column projection (also added, `read_batch_columns`) skips array *construction* but
+   not the *read* — worth only ~2 ms of ~109 ms. The 20 MB copy and the `HashSet`/sort were real
+   waste and worth removing, but they were never the bottleneck.
+
+**The real bottleneck, now located:** ~205 MB re-read from page cache at ~1.5 GB/s on every filtered
+query. Removing it needs either a per-snapshot cache of resolved row-ids (snapshots are immutable, so
+sound — a memory/latency tradeoff to decide deliberately) or a genuinely column-chunked file format
+(the format change `datafile.rs`'s module doc already defers). Both are design decisions, documented
+at the call site in `snapshot.rs`. This, not the `mask`/bitset work already landed, is the item that
+would actually collapse filtered-search latency.
+
+The earlier `live_ids` sort-vs-`HashSet` debate (see "Conflicts resolved") is settled and moot: the
+bitset is order-insensitive, so both the sort and the hash are gone — but it was always a rounding
+error next to the file read.
 
 ---
 
