@@ -451,31 +451,33 @@ impl Transaction {
     /// vector column contains a `NaN`/`Infinity` component — checked, and
     /// rejected, before any file for that batch is written to disk. Also
     /// returns an error if any pending batch fails to dictionary-encode, if
-    /// applying this commit's new deltas to the graph fails (e.g. a
-    /// dimension mismatch), or if the manifest commit's atomic rename
-    /// fails. Delta-application runs before the manifest commit, so any of
-    /// these failures leaves the manifest unadvanced — the new data/delta-log
-    /// files are orphaned on disk but never made visible.
+    /// this commit's deltas fail dimension validation, or if the manifest
+    /// commit's atomic rename fails. Every one of these failures leaves the
+    /// manifest unadvanced *and* the shared graph untouched — the new
+    /// data/delta-log files are orphaned on disk but never made visible.
     ///
-    /// **Formerly a known limitation, now closed:** earlier, a commit whose
-    /// pending batches had inconsistent vector dimensions across batches
-    /// could partially mutate the shared graph before failing — `Insert`
-    /// deltas were applied to the graph in pending-batch order, so a later
-    /// batch's dimension mismatch was only caught after an earlier batch's
-    /// deltas had already landed in the live, shared `HnswIndex` (which has
-    /// no node-removal API to undo an insert). [`validate_delta_dimensions`]
-    /// now runs before any delta is applied, rejecting the entire commit —
-    /// with zero graph mutation — the moment any two pending batches (or a
-    /// pending batch and the graph's already-established dimension)
-    /// disagree. `HnswIndex::insert`'s only fallible path is dimension
-    /// validation (the underlying `hnsw_rs` call itself never fails), so
-    /// this closes the practical trigger for this class of hazard
-    /// entirely, not just narrows it. A residual, more exotic concern
-    /// remains out of scope here: if a future change ever gives graph
-    /// mutation additional failure modes beyond dimension mismatch, this
-    /// same partial-mutation risk could reopen for those. (Phase 6's
-    /// conflict check did not add such a mode — it runs, and returns,
-    /// strictly before the first delta is applied.)
+    /// **The ordering that makes that true:** this commit's `Insert` deltas
+    /// reach the shared `HnswIndex` only *after* `commit_manifest` has made
+    /// the new version durable. The graph is append-only with no
+    /// node-removal API, so an insert applied before the durability point
+    /// could never be taken back when a later step failed: that
+    /// transaction's vectors would stay in the live graph while its data
+    /// file remained referenced by no manifest, and the next successful
+    /// commit would advance the watermark past those orphaned row-ids,
+    /// making them pass `Snapshot::is_visible` and surface from an
+    /// unfiltered vector search as hits that no scan could resolve.
+    ///
+    /// `validate_delta_dimensions` accordingly runs twice. The call
+    /// before the lock is a cheap early-out only; the call *inside* the
+    /// lock is the load-bearing one. When the graph has no dimension
+    /// established yet, that check derives the expected dimension from the
+    /// transaction's own deltas and so accepts any value — meaning two
+    /// concurrent insert-only transactions carrying different dimensions
+    /// both pass it, and they never conflict with one another either, since
+    /// an empty write-set short-circuits to `Clean`. The in-lock re-check
+    /// rejects the loser of that race before anything durable is written,
+    /// which is what keeps a dimension mismatch from producing a durable
+    /// manifest that was never published.
     pub fn commit(self) -> Result<()> {
         let data_dir = data_subdir(&self.dir);
 
@@ -572,28 +574,62 @@ impl Transaction {
             }
         }
 
+        // Re-validate dimensions *under the lock*. The identical call before
+        // the lock is only a cheap early-out and is NOT sufficient on its
+        // own: `HnswIndex::established_dimension()` returns 0 for a graph
+        // that has never been inserted into, so `validate_delta_dimensions`
+        // establishes `expected` from this transaction's own deltas and
+        // accepts any dimension. Two concurrent insert-only transactions
+        // carrying different dimensions therefore both pass the pre-lock
+        // check — and they never conflict with each other either, because an
+        // empty write-set short-circuits to `Clean` (see
+        // `CommitLog::conflicts_with`). Whichever acquires the lock first
+        // establishes the graph's dimension; without this re-check the
+        // second would not discover the mismatch until the apply loop below,
+        // which now runs *after* `commit_manifest` — leaving a durable
+        // manifest that was never published, listing a data file whose
+        // delta log `replay_index` cannot load into the same graph, i.e. a
+        // dataset that no future `Dataset::open` can ever open.
+        //
+        // Validating here — before any durable write — restores the
+        // pre-existing contract that a dimension mismatch aborts with the
+        // manifest unadvanced and the shared graph untouched. Under the
+        // lock the established dimension cannot then move between this
+        // check and the apply loop, because this is the only
+        // `HnswIndex::insert` call site outside `Dataset::open`'s
+        // fresh-graph replay. Regression test:
+        // `tests/failed_commit_index_residue.rs`.
+        validate_delta_dimensions(&deltas, &self.graph)?;
+
         let new_version = latest_version
             .checked_add(1)
             .ok_or_else(|| TxnError::ManifestOverflow(format!("version {latest_version} + 1")))?;
 
-        // Apply only this commit's new deltas to the shared graph — the
-        // fix for the O(historical)-per-commit regression. `HnswIndex`'s
-        // graph only ever grows (hnsw_rs has no node-removal API), so
-        // extending the same Arc'd instance every commit is safe and
-        // matches what every existing/future Snapshot's Arc<HnswIndex>
-        // already points at. Tombstones layer on top of the *latest*
-        // snapshot's set (not this transaction's stale begin()-time view),
-        // so a clean commit composes with everything that landed in
-        // between.
+        // Tombstones layer on top of the *latest* snapshot's set (not this
+        // transaction's stale begin()-time view), so a clean commit composes
+        // with everything that landed in between. This set is a local,
+        // unpublished value until the snapshot swap below, so building it
+        // here costs nothing if a later step fails — unlike the shared
+        // graph, whose inserts are deferred until after durability (see the
+        // apply loop after `commit_manifest`).
+        //
+        // Every tombstone comes from `self.pending_tombstones` below:
+        // `deltas` holds `Insert` entries only, because
+        // `build_delta_entries` is the sole producer of this vector and
+        // never constructs a `DeltaEntry::Tombstone`. (`replay_index` still
+        // handles the `Tombstone` variant, since a delta log read back from
+        // disk is not covered by that invariant.)
+        // Both delta loops below match with `if let` rather than an
+        // exhaustive `match`, so a new `DeltaEntry` variant would be silently
+        // ignored at each. This restores that tripwire: if the invariant
+        // above stops holding, decide explicitly what each loop should do.
+        debug_assert!(
+            deltas
+                .iter()
+                .all(|d| matches!(d, DeltaEntry::Insert { .. })),
+            "`deltas` is expected to hold Insert entries only"
+        );
         let mut tombstones = latest_snapshot.tombstones.as_ref().clone();
-        for delta in &deltas {
-            match delta {
-                DeltaEntry::Insert { row_id, vector } => self.graph.insert(*row_id, vector)?,
-                DeltaEntry::Tombstone { row_id } => {
-                    tombstones.insert(*row_id);
-                }
-            }
-        }
         // The new manifest is likewise built from the latest snapshot's
         // manifest: this transaction's new data files are *appended* to
         // the latest file list (never substituted for it wholesale —
@@ -642,6 +678,43 @@ impl Transaction {
         }
 
         commit_manifest(&self.dir, &manifest)?;
+
+        // Only now — with the commit durable and nothing fallible left
+        // before the swap — may this transaction's vectors reach the
+        // *shared* graph. The graph only ever grows (there is no
+        // node-removal API), so extending the same Arc'd instance is what
+        // every existing/future Snapshot's `Arc<HnswIndex>` already points
+        // at; but that also means an insert applied before durability can
+        // never be taken back. Applying these any earlier left a *failed*
+        // commit's vectors permanently in the graph while its data file
+        // stayed referenced by no manifest, and the next successful commit
+        // then advanced `next_row_id` — and so the watermark — past those
+        // orphaned row-ids, making them pass `Snapshot::is_visible` and
+        // surface from an unfiltered `vector_search` as hits that no `scan`
+        // could resolve. Regression test:
+        // `tests/failed_commit_index_residue.rs`.
+        //
+        // This loop cannot return `Err`: `Graph::insert`'s only error path
+        // is its dimension check, and `validate_delta_dimensions` re-ran
+        // that check under *this* lock acquisition (see the call above the
+        // version bump), so no concurrent writer can have established a
+        // different dimension in between. That in-lock re-check — not the
+        // pre-lock one — is what makes applying after durability safe; the
+        // commit therefore cannot end up durable-but-unpublished.
+        //
+        // Known residual, deliberately not addressed here: `NodeTable`
+        // indexes its chunk directory with a plain slice index sized for
+        // `MAX_ROW_ID_CAPACITY`, which is enforced only on the
+        // `Dataset::open` replay path, so a session committing past that
+        // ceiling would panic — and post-durability now, rather than
+        // pre-durability. That ceiling needs enforcing on the write path
+        // (or the index needs a checked lookup); tracked separately, since
+        // it is a pre-existing gap in a different crate.
+        for delta in &deltas {
+            if let DeltaEntry::Insert { row_id, vector } = delta {
+                self.graph.insert(*row_id, vector)?;
+            }
+        }
 
         commit_log.push(new_version, self.write_set);
 
@@ -708,9 +781,29 @@ impl Transaction {
             // doc comment), so an abandoned gap from a failed batch is
             // harmless, and there is no atomic way to "undo" a fetch_add if
             // we checked first instead.
-            row_id_base.checked_add(num_rows).ok_or_else(|| {
+            let row_id_end = row_id_base.checked_add(num_rows).ok_or_else(|| {
                 TxnError::ManifestOverflow(format!("next_row_id {row_id_base} + {num_rows}"))
             })?;
+            // Enforce on the write path the same ceiling `replay_index`
+            // enforces on open. `NodeTable` sizes its chunk directory from
+            // this constant and indexes it with a plain slice index, so a
+            // row-id beyond the directory's addressable range panics inside
+            // the index instead of returning an error. (The directory rounds
+            // up to a whole chunk, so it actually addresses slightly past the
+            // ceiling — holding to the documented ceiling keeps every assigned
+            // row-id comfortably inside it rather than relying on that
+            // rounding slack.) Because deltas are now applied *after*
+            // `commit_manifest`, such a panic would unwind after the commit
+            // was already durable — so reject here, while the failure is still
+            // typed and pre-durability. Checking `row_id_end`, the exclusive
+            // upper bound, mirrors `replay_index`'s check on
+            // `manifest.next_row_id`.
+            if row_id_end > MAX_REASONABLE_ROW_ID_CAPACITY {
+                return Err(TxnError::UnreasonableCapacity(
+                    row_id_end,
+                    MAX_REASONABLE_ROW_ID_CAPACITY,
+                ));
+            }
 
             let deltas = build_delta_entries(batch, row_id_base)?;
             let with_row_id = append_row_id_column(batch, row_id_base, num_rows)?;
@@ -2947,6 +3040,110 @@ mod loom_tests {
             assert!(thread_b.join().unwrap().is_ok());
 
             std::fs::remove_dir_all(&dir).ok();
+        });
+    }
+
+    /// A one-row batch whose `"vector"` column has `dim` dimensions.
+    fn loom_vector_batch(id: i64, dim: usize) -> arrow::array::RecordBatch {
+        let dim_i32 = i32::try_from(dim).unwrap();
+        let item = StdArc::new(arrow::datatypes::Field::new(
+            "item",
+            arrow::datatypes::DataType::Float32,
+            false,
+        ));
+        let schema = StdArc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+            arrow::datatypes::Field::new(
+                "vector",
+                arrow::datatypes::DataType::FixedSizeList(StdArc::clone(&item), dim_i32),
+                false,
+            ),
+        ]));
+        let values = StdArc::new(arrow::array::Float32Array::from(vec![1.0_f32; dim]));
+        let vectors = arrow::array::FixedSizeListArray::new(item, dim_i32, values, None);
+        arrow::array::RecordBatch::try_new(
+            schema,
+            vec![
+                StdArc::new(arrow::array::Int64Array::from(vec![id])),
+                StdArc::new(vectors),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// Concurrent **non-conflicting** writers — the interleaving class
+    /// `.claude/rules/concurrency-txn-layer.md` requires alongside the
+    /// conflicting and reader-race cases above.
+    ///
+    /// Both transactions are insert-only, so their write-sets are empty and
+    /// `CommitLog::conflicts_with` short-circuits to `Clean` — they can never
+    /// conflict with each other. They carry *different* vector dimensions, so
+    /// exactly one may establish the graph's dimension, and whatever the
+    /// interleaving the durable state must stay loadable.
+    ///
+    /// **What this test does not prove.** It does not discriminate whether
+    /// the dimension re-check inside `commit_lock` is present — it passes
+    /// unchanged when that check is deleted (verified by deleting it and
+    /// re-running). Only `Mutex` is swapped for loom's equivalent under
+    /// `cfg(loom)`; the row-id counter and the graph stay plain `std` types,
+    /// so `commit`'s only loom yield point is the lock acquisition. A thread
+    /// therefore runs its entire pre-lock section *and* its entire critical
+    /// section before the other is scheduled, so the loser's pre-lock
+    /// `validate_delta_dimensions` always observes an already-established
+    /// dimension and is rejected there. The interleaving that actually
+    /// requires the in-lock re-check — both threads clearing pre-lock
+    /// validation against a still-empty graph, then racing for the lock — is
+    /// unreachable under this instrumentation. Making it reachable would mean
+    /// shimming `next_row_id_counter` (and the graph) onto loom's atomics too,
+    /// which is a much larger change than this fix.
+    ///
+    /// What it does cover is the mandated interleaving class itself: two
+    /// concurrent non-conflicting commits must not deadlock, panic, or publish
+    /// torn state. The in-lock re-check is guarded instead by the stress test
+    /// in `tests/failed_commit_index_residue.rs`, which asserts that it
+    /// genuinely raced rather than trusting the scheduler.
+    #[test]
+    fn two_threads_inserting_different_dimensions_leave_reopenable_state() {
+        loom::model(|| {
+            let dir = std::env::temp_dir().join(format!(
+                "strata-loom-dims-{}-{:?}",
+                std::process::id(),
+                loom::thread::current().id()
+            ));
+            std::fs::remove_dir_all(&dir).ok();
+            let ds = crate::Dataset::create(&dir).unwrap();
+
+            let ds_a = ds.clone();
+            let ds_b = ds.clone();
+            let thread_a = loom::thread::spawn(move || {
+                let mut txn = ds_a.begin();
+                txn.insert(loom_vector_batch(1, 3));
+                txn.commit()
+            });
+            let thread_b = loom::thread::spawn(move || {
+                let mut txn = ds_b.begin();
+                txn.insert(loom_vector_batch(2, 5));
+                txn.commit()
+            });
+
+            let result_a = thread_a.join().unwrap();
+            let result_b = thread_b.join().unwrap();
+            let successes = [&result_a, &result_b].iter().filter(|r| r.is_ok()).count();
+            assert_eq!(
+                successes, 1,
+                "exactly one of two mismatched dimensions may establish the graph"
+            );
+
+            // The load-bearing assertion: whatever the interleaving, the
+            // durable state must still be loadable.
+            drop(ds);
+            let reopen_err = crate::Dataset::open(&dir).err().map(|e| e.to_string());
+            std::fs::remove_dir_all(&dir).ok();
+            assert!(
+                reopen_err.is_none(),
+                "the rejected transaction left durable state that cannot be \
+                 replayed — Dataset::open failed with {reopen_err:?}"
+            );
         });
     }
 }
