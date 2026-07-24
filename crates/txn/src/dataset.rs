@@ -32,6 +32,7 @@ use strata_storage::{
 
 use crate::commit_log::{CommitLog, ConflictCheck};
 use crate::error::{Result, TxnError};
+use crate::row_id::{RowIdAllocator, RowIdClaim};
 use crate::snapshot::Snapshot;
 
 /// The hidden internal row-id column every committed batch carries
@@ -72,18 +73,30 @@ const COMMIT_LOG_CAPACITY: usize = 2048;
 pub struct Dataset {
     dir: PathBuf,
     current: Arc<ArcSwap<Snapshot>>,
-    next_row_id_counter: Arc<AtomicU64>,
+    /// Hands out row-id ranges *and* tracks which of them belong to
+    /// transactions still in flight, so a published watermark can exclude
+    /// them. Replaces the bare `AtomicU64` counter this used to be: the
+    /// counter advance and the in-flight registration have to be one atomic
+    /// step, or a publisher can observe a bound that covers a claim the
+    /// registry does not yet list. See [`crate::row_id`].
+    row_ids: Arc<RowIdAllocator>,
     /// Monotonic counter whose sole job is generating a collision-free
     /// filename prefix for each commit *attempt*'s data/delta-log files —
-    /// deliberately independent of both `next_row_id_counter` and the real
+    /// deliberately independent of both the row-id allocator and the real
     /// manifest version. See `Transaction::commit` for why filenames must
     /// not be derived from `base_version`.
     write_attempt_counter: Arc<AtomicU64>,
     /// Serializes the conflict-check → graph-apply → manifest-commit →
     /// snapshot-swap critical section of `Transaction::commit`, and guards
-    /// the recent-write-set history that check reads. This is the only
-    /// lock in the crate, acquired at exactly one site, so there is no
-    /// lock-ordering concern.
+    /// the recent-write-set history that check reads. Acquired at exactly
+    /// one site (`Transaction::commit`).
+    ///
+    /// **Lock order: this, then `row_ids`' internal lock — never the
+    /// reverse.** It is the outer of the crate's two locks: `commit`
+    /// acquires `row_ids`' lock (via `claim`/`visibility_bound_excluding`/
+    /// `RowIdClaim::release`) both before taking this one and while holding
+    /// it, but nothing ever reaches for this one from inside `row_ids`. See
+    /// [`crate::row_id`]'s module doc.
     commit_lock: Arc<Mutex<CommitLog>>,
     /// Counts every commit that hit `ConflictCheck::InsufficientHistory` —
     /// its read-version aged out of `COMMIT_LOG_CAPACITY` before it could
@@ -168,12 +181,14 @@ impl Dataset {
         let manifest = Manifest::empty();
         commit_manifest(&dir, &manifest)?;
         let graph = new_hnsw_index(0)?;
-        let next_row_id_counter = Arc::new(AtomicU64::new(manifest.next_row_id));
+        let row_ids = Arc::new(RowIdAllocator::new(manifest.next_row_id));
         let write_attempt_counter = Arc::new(AtomicU64::new(manifest.next_attempt_id));
         let snapshot = Snapshot {
             dir: dir.clone(),
             version: manifest.version,
             watermark: manifest.next_row_id.saturating_sub(1),
+            // A freshly created dataset has no transaction in flight.
+            in_flight: Vec::new().into(),
             manifest: Arc::new(manifest),
             graph: Arc::new(graph),
             tombstones: Arc::new(imbl::HashSet::new()),
@@ -181,7 +196,7 @@ impl Dataset {
         Ok(Self {
             dir,
             current: Arc::new(ArcSwap::new(Arc::new(snapshot))),
-            next_row_id_counter,
+            row_ids,
             write_attempt_counter,
             commit_lock: Arc::new(Mutex::new(CommitLog::new(commit_log_capacity))),
             insufficient_history_conflicts: Arc::new(AtomicU64::new(0)),
@@ -220,7 +235,7 @@ impl Dataset {
         let dir = dir.into();
         let manifest = read_current(&dir)?.ok_or_else(|| TxnError::NotFound(dir.clone()))?;
         let (graph, tombstones) = replay_index(&dir, &manifest)?;
-        let next_row_id_counter = Arc::new(AtomicU64::new(manifest.next_row_id));
+        let row_ids = Arc::new(RowIdAllocator::new(manifest.next_row_id));
         // The real fix for the cross-session filename-collision bug: seed
         // from the persisted `manifest.next_attempt_id`, not 0. Without
         // this, a reopened dataset would regenerate the same
@@ -230,12 +245,20 @@ impl Dataset {
         // already-durable data. See `Manifest.next_attempt_id`'s doc
         // comment and `Transaction::commit`, which persists this counter's
         // value forward on every commit the same way it does
-        // `next_row_id_counter` -> `manifest.next_row_id`.
+        // the row-id allocator -> `manifest.next_row_id`.
         let write_attempt_counter = Arc::new(AtomicU64::new(manifest.next_attempt_id));
         let snapshot = Snapshot {
             dir: dir.clone(),
             version: manifest.version,
             watermark: manifest.next_row_id.saturating_sub(1),
+            // Nothing is in flight in a process that has just opened this
+            // dataset. A *prior* session's abandoned claims need no entry
+            // either: `manifest.next_row_id` may cover them, but their data
+            // files never entered a manifest and their delta logs are not
+            // replayed, so nothing exists at those ids to be found. That is
+            // why this hazard was only ever transient, never survivable
+            // across a restart.
+            in_flight: Vec::new().into(),
             manifest: Arc::new(manifest),
             graph: Arc::new(graph),
             tombstones: Arc::new(tombstones),
@@ -243,7 +266,7 @@ impl Dataset {
         Ok(Self {
             dir,
             current: Arc::new(ArcSwap::new(Arc::new(snapshot))),
-            next_row_id_counter,
+            row_ids,
             write_attempt_counter,
             commit_lock: Arc::new(Mutex::new(CommitLog::new(COMMIT_LOG_CAPACITY))),
             insufficient_history_conflicts: Arc::new(AtomicU64::new(0)),
@@ -288,12 +311,16 @@ impl Dataset {
             pending_tombstones: Vec::new(),
             write_set: Vec::new(),
             current: Arc::clone(&self.current),
-            next_row_id_counter: Arc::clone(&self.next_row_id_counter),
+            row_ids: Arc::clone(&self.row_ids),
             write_attempt_counter: Arc::clone(&self.write_attempt_counter),
             commit_lock: Arc::clone(&self.commit_lock),
             insufficient_history_conflicts: Arc::clone(&self.insufficient_history_conflicts),
             #[cfg(any(test, loom))]
             inject_manifest_commit_failure: false,
+            #[cfg(test)]
+            pause_after_row_id_claim: None,
+            #[cfg(test)]
+            pause_after_graph_apply: None,
         }
     }
 
@@ -332,7 +359,7 @@ pub struct Transaction {
     /// against every transaction that committed after this one began.
     write_set: Vec<u64>,
     current: Arc<ArcSwap<Snapshot>>,
-    next_row_id_counter: Arc<AtomicU64>,
+    row_ids: Arc<RowIdAllocator>,
     write_attempt_counter: Arc<AtomicU64>,
     commit_lock: Arc<Mutex<CommitLog>>,
     insufficient_history_conflicts: Arc<AtomicU64>,
@@ -346,6 +373,100 @@ pub struct Transaction {
     /// flag armed for one transaction be consumed by another.
     #[cfg(any(test, loom))]
     inject_manifest_commit_failure: bool,
+    /// Test-only: stops this commit at the instant its row-ids have been
+    /// claimed but nothing shared has been touched yet. See [`Checkpoint`].
+    #[cfg(test)]
+    pause_after_row_id_claim: Option<Checkpoint>,
+    /// Test-only: stops this commit at the instant its vectors are in the
+    /// shared graph but the commit is not yet durable. See [`Checkpoint`].
+    #[cfg(test)]
+    pause_after_graph_apply: Option<Checkpoint>,
+}
+
+/// Test-only rendezvous that stops a [`Transaction::commit`] at an exact
+/// instant so another thread can observe the shared state *as of that
+/// instant*, then releases it.
+///
+/// The windows this crate's snapshot-isolation regression tests care about
+/// are a single `fsync` wide, so racing them with sleeps would be flaky in
+/// both directions — a missed window silently passes. A checkpoint turns
+/// the race into a deterministic schedule: the committing thread blocks
+/// until the observing thread has looked.
+///
+/// Gated on `cfg(test)` alone, unlike
+/// [`Transaction::inject_manifest_commit_failure`]'s `cfg(any(test,
+/// loom))` — not an oversight. `--cfg loom` is layered *on top of* the test
+/// profile (see `.claude/rules/concurrency-txn-layer.md`'s `cargo rustc
+/// -p strata-txn --lib --profile test -- --cfg loom` recipe), so `test` is
+/// set in a loom build too and these still compile there. The wider gate on
+/// the injector exists because a loom model uses it; nothing here needs to
+/// widen until a loom model blocks on a rendezvous — which it must not,
+/// since loom schedules the threads itself.
+#[cfg(test)]
+pub(crate) struct Checkpoint {
+    reached: std::sync::mpsc::SyncSender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+/// The test side of a [`Checkpoint`] — see [`checkpoint_pair`].
+#[cfg(test)]
+pub(crate) struct CheckpointControl {
+    reached: std::sync::mpsc::Receiver<()>,
+    resume: std::sync::mpsc::SyncSender<()>,
+}
+
+#[cfg(test)]
+impl Checkpoint {
+    /// Announces that the committing thread has reached this point and
+    /// blocks until the test releases it. Both halves are deliberately
+    /// infallible-by-ignoring: if the test side has been dropped, a commit
+    /// that would otherwise hang forever simply runs on.
+    fn arrive(&self) {
+        let _ = self.reached.send(());
+        let _ = self.resume.recv();
+    }
+}
+
+// A test rig deadlocking or losing its peer is a test bug, and panicking
+// at the exact call is the most useful place to learn about it — the
+// alternative is a hang with no output. Same rationale as `mod tests`'
+// blanket allow; this type only exists under `cfg(test)`.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+impl CheckpointControl {
+    /// Blocks until the committing thread reaches its checkpoint.
+    fn wait(&self) {
+        self.reached
+            .recv()
+            .expect("committing thread dropped before reaching the checkpoint");
+    }
+
+    /// Lets the committing thread continue past its checkpoint.
+    fn release(&self) {
+        self.resume
+            .send(())
+            .expect("committing thread dropped before it could be released");
+    }
+}
+
+/// Builds a linked [`Checkpoint`]/[`CheckpointControl`] pair. Rendezvous
+/// channels rather than a `Barrier` so the observing side controls *both*
+/// edges: it learns when the commit arrived, looks at whatever it needs to,
+/// and only then lets the commit proceed.
+#[cfg(test)]
+pub(crate) fn checkpoint_pair() -> (Checkpoint, CheckpointControl) {
+    let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+    (
+        Checkpoint {
+            reached: reached_tx,
+            resume: resume_rx,
+        },
+        CheckpointControl {
+            reached: reached_rx,
+            resume: resume_tx,
+        },
+    )
 }
 
 /// Undoes this commit's in-memory graph inserts if the commit never reaches
@@ -359,7 +480,7 @@ pub struct Transaction {
 /// any failure between the first `graph.insert` and a successful
 /// `commit_manifest` leaves that transaction's vectors in the shared graph
 /// with no manifest entry backing them. Their row-ids were already claimed
-/// by `write_pending_batches`, so the *next* successful commit persists a
+/// by `write_phase`, so the *next* successful commit persists a
 /// `manifest.next_row_id` past them and publishes a `watermark` covering
 /// them — at which point [`crate::Snapshot::is_visible`] starts passing and
 /// `vector_search` returns them as dangling hits: rows `scan` can never
@@ -379,25 +500,25 @@ pub struct Transaction {
 /// released, rather than leaving residue live for the next committer to
 /// build on.
 ///
-/// **What this closes, and what it does not.** It guarantees no *permanent*
-/// residue: once the failing committer returns, nothing it inserted is
-/// reachable by any later search. It does **not** close a narrower,
-/// pre-existing window in which a residue row-id is transiently both live
-/// and visible. Row-ids are claimed *before* the lock, in
-/// `write_pending_batches`, while the watermark is published from
-/// `next_row_id_counter.load()` inside some *other* transaction's critical
-/// section — so a concurrent commit can publish a watermark that already
-/// covers a row-id this transaction has claimed but not yet inserted.
-/// Between this transaction's `graph.insert` and either its
-/// `commit_manifest` or this guard firing, a reader (which never takes
-/// `commit_lock`) can therefore observe it. That window is not introduced
-/// here and exists on the *success* path too — its root cause is that
-/// row-id allocation happens outside the manifest CAS, contrary to spec §8
-/// ("The counter is claimed as part of §3 step 4 (the atomic manifest
-/// CAS)"), and a scalar `watermark = next_row_id - 1` cannot express
-/// "committed" once allocation order can diverge from commit order.
-/// Closing it needs visibility keyed on committed row-id ranges rather than
-/// a high-water mark, which is a separate change.
+/// **What this closes, and what covers the rest.** This guard is what
+/// guarantees no *permanent* residue: once the failing committer returns,
+/// nothing it inserted is reachable by any later search. It is deliberately
+/// not what keeps a residue row-id invisible *while* the failing commit is
+/// still running — between its `graph.insert` and this guard firing, the
+/// row is physically in the shared graph, and readers take no
+/// `commit_lock`. That narrower window is [`crate::row_id`]'s job: the
+/// row-ids were claimed before the lock and stay registered as in-flight
+/// until this transaction reaches its durability point, so every snapshot
+/// published in the meantime excludes them. The two compose — the
+/// exclusion set hides the residue while the commit is in flight, and this
+/// guard removes it before the claim is released, so there is no instant at
+/// which the row is both un-excluded and still in the graph.
+///
+/// The same in-flight exclusion also covers the *success* path, which this
+/// guard never touched: before it existed, a reader could see a row between
+/// another transaction's `graph.insert` and its `commit_manifest` even when
+/// that commit went on to succeed — a plain violation of spec §2's "not
+/// visible to any other transaction until commit succeeds."
 struct GraphResidueGuard {
     /// Its own `Arc` clone rather than a borrow of `Transaction::graph`, so
     /// `commit` can still move that field into the new `Snapshot`.
@@ -496,6 +617,24 @@ impl Transaction {
     #[cfg(any(test, loom))]
     pub(crate) fn inject_manifest_commit_failure(&mut self) {
         self.inject_manifest_commit_failure = true;
+    }
+
+    /// Test-only: stops [`Self::commit`] once this transaction's row-ids
+    /// have been claimed and its data files written, but *before* it
+    /// acquires `commit_lock` — so a concurrent committer can run to
+    /// completion while this transaction's claim is outstanding.
+    #[cfg(test)]
+    pub(crate) fn pause_after_row_id_claim(&mut self, checkpoint: Checkpoint) {
+        self.pause_after_row_id_claim = Some(checkpoint);
+    }
+
+    /// Test-only: stops [`Self::commit`] once its vectors are in the shared
+    /// graph but `commit_manifest` has not yet made them durable — the
+    /// instant at which an uncommitted row is physically reachable by a
+    /// reader that takes no lock.
+    #[cfg(test)]
+    pub(crate) fn pause_after_graph_apply(&mut self, checkpoint: Checkpoint) {
+        self.pause_after_graph_apply = Some(checkpoint);
     }
 
     /// Tombstones `row_id` and inserts `batch` as its replacement, within
@@ -617,74 +756,27 @@ impl Transaction {
     pub fn commit(self) -> Result<()> {
         let data_dir = data_subdir(&self.dir);
 
-        // Data-file writes happen before the lock — they touch only
-        // files unique to this transaction and never collide with a
-        // concurrent transaction's own writes. The filename prefix comes
-        // from write_attempt_counter, NOT base_version + 1: two
-        // truly concurrent transactions can share the same stale
-        // base_version, which would make them compute the same
-        // "next version" and collide on the same filename before either
-        // reaches commit_lock. write_attempt_counter is unique per
-        // attempt regardless of version, so no such collision is
-        // possible. See design doc §3 (data-file writes need no
-        // conflict information to proceed) — this counter is what makes
-        // that safe to do outside the lock at all.
-        //
-        // Skipped entirely when there's nothing to insert: a delete-only
-        // transaction writes no new files, so there's no new directory
-        // entry to create or fsync and no attempt_id needs reserving.
-        // `Dataset::create`/`open` already ensure `data_dir` exists once
-        // per `Dataset` lifetime; recreating it on every single commit
-        // regardless of whether it had anything to write was redundant.
-        let (new_data_files, deltas) = if self.pending.is_empty() {
-            (Vec::new(), Vec::new())
-        } else {
-            std::fs::create_dir_all(&data_dir)?;
-            // SeqCst ordering justification (this site and its sibling in
-            // write_pending_batches, both pre-lock fetch_adds): the only
-            // property either needs is per-atomic RMW uniqueness — no two
-            // fetch_adds on the same AtomicU64 ever return the same value
-            // — which every atomic's own total modification order already
-            // guarantees regardless of the chosen Ordering, even Relaxed.
-            // commit_lock plays no role here; these run *before* it's
-            // acquired. (The *load* sites further down, which persist
-            // these counters' values into the manifest, have a different
-            // justification — see the comment there.) SeqCst is kept
-            // anyway as the simple, always-correct default: the cost
-            // difference against this function's dominant work (fsync,
-            // JSON serialization) is immaterial, and isn't worth the
-            // reduced auditability of proving a weaker ordering correct
-            // per site. See `.claude/rules/concurrency-txn-layer.md`.
-            let attempt_id = self
-                .write_attempt_counter
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let mut new_data_files = Vec::new();
-            let deltas = Self::write_pending_batches(
-                &self.pending,
-                &data_dir,
-                attempt_id,
-                &self.next_row_id_counter,
-                &mut new_data_files,
-            )?;
-            // Fsyncing each data file's *content* (already done inside
-            // write_batch) is not sufficient — the new directory entries
-            // themselves must also be fsynced, or a real power-loss crash
-            // can leave a file's bytes durable while the file itself is
-            // absent. Must happen before the graph update/manifest commit
-            // below.
-            strata_storage::sync_dir(&data_dir)?;
-            (new_data_files, deltas)
-        };
+        let (new_data_files, deltas, mut claim) = self.write_phase(&data_dir)?;
         validate_delta_dimensions(&deltas, &self.graph)?;
+
+        // Test-only rendezvous: row-ids claimed, data files written, but
+        // `commit_lock` not yet acquired and the shared graph not yet
+        // touched. Absent entirely from production builds.
+        #[cfg(test)]
+        if let Some(checkpoint) = &self.pause_after_row_id_claim {
+            checkpoint.arrive();
+        }
 
         // Everything from here is the tightly-scoped critical section:
         // re-read latest state, conflict-check, apply, commit, swap. See
-        // design doc §5. This is the crate's only lock, acquired at
-        // exactly this one site, so no lock-ordering concern exists; a
-        // poisoned lock (a prior committer panicked) is recovered rather
-        // than propagated — the CommitLog is only ever mutated by `push`
-        // as the final in-memory step after a durable commit, so it can't
-        // be observed half-updated.
+        // design doc §5. This is the crate's *outer* lock and its only
+        // acquisition site; the row-id allocator's lock is the inner one
+        // and is taken below while this is held (never the reverse — see
+        // `Dataset::commit_lock`'s doc and `crate::row_id`). A poisoned
+        // lock (a prior committer panicked) is recovered rather than
+        // propagated — the CommitLog is only ever mutated by `push` as the
+        // final in-memory step after a durable commit, so it can't be
+        // observed half-updated.
         let mut commit_log = self
             .commit_lock
             .lock()
@@ -734,6 +826,14 @@ impl Transaction {
         // released on any early return or panic below. Tombstone deltas
         // need no compensation: they only touch the `tombstones` local,
         // which is discarded unless the new `Snapshot` is published.
+        //
+        // It must equally be declared *after* `claim`, for the same reason
+        // in the other direction: reverse-declaration drop order then
+        // scrubs the graph before the claim is released, so a residue
+        // row-id is never simultaneously un-excluded and still in the
+        // graph. Rebinding `claim` below this line would silently reopen
+        // the very window this whole mechanism closes, with every test
+        // still green — see [`GraphResidueGuard`]'s doc.
         let mut residue_guard = GraphResidueGuard::new(Arc::clone(&self.graph));
         for delta in &deltas {
             match delta {
@@ -746,6 +846,14 @@ impl Transaction {
                 }
             }
         }
+        // Test-only rendezvous: this commit's vectors are physically in the
+        // shared graph, but `commit_manifest` below has not yet made them
+        // durable. Absent entirely from production builds.
+        #[cfg(test)]
+        if let Some(checkpoint) = &self.pause_after_graph_apply {
+            checkpoint.arrive();
+        }
+
         // The new manifest is likewise built from the latest snapshot's
         // manifest: this transaction's new data files are *appended* to
         // the latest file list (never substituted for it wholesale —
@@ -754,8 +862,22 @@ impl Transaction {
         let mut manifest = latest_snapshot.manifest.as_ref().clone();
         manifest.version = new_version;
         manifest.data_files.extend(new_data_files);
-        // SeqCst ordering justification for both `.load()`s below (distinct
-        // from the pre-lock fetch_adds' justification above): each must
+        // The bound and the exclusion set this commit's snapshot will carry,
+        // read as one unit under the allocator lock so they cannot disagree
+        // — the disagreement being precisely the bug this closes. Every
+        // *other* transaction's outstanding claim is excluded; this one's
+        // own is not, because it is about to become durable and an
+        // acknowledged write must be immediately visible.
+        //
+        // Read here, while `commit_lock` is held, so no other transaction
+        // can publish a snapshot between this read and the store below.
+        // `next_row_id` is the allocation high-water mark, which is what
+        // the manifest must persist for restart safety (a reopened dataset
+        // must never reuse an id, committed or abandoned — spec §8).
+        let visibility = self.row_ids.visibility_bound_excluding(claim.as_ref());
+        manifest.next_row_id = visibility.next_row_id;
+        // SeqCst ordering justification for the `.load()` below (distinct
+        // from the pre-lock fetch_add's justification in `write_phase`): it must
         // observe a value at least as large as every commit that landed
         // before this one, including this transaction's own prior
         // fetch_add — not just its own thread's value. That's guaranteed
@@ -767,12 +889,9 @@ impl Transaction {
         // SeqCst is kept as the simple, always-correct default; see the
         // fetch_add comment above for why the negligible cost isn't worth
         // trading for reduced auditability.
-        manifest.next_row_id = self
-            .next_row_id_counter
-            .load(std::sync::atomic::Ordering::SeqCst);
-        // Mirrors next_row_id_counter -> manifest.next_row_id immediately
-        // above: persist the counter's current value (already past this
-        // commit's own attempt_id, via the fetch_add above) so a future
+        //
+        // Persist the counter's current value (already past this commit's
+        // own attempt_id, via `write_phase`'s fetch_add) so a future
         // Dataset::open never regenerates a filename this session already
         // committed. See Manifest.next_attempt_id's doc comment.
         manifest.next_attempt_id = self
@@ -813,6 +932,18 @@ impl Transaction {
         // them, even if a later step were to fail.
         residue_guard.disarm();
 
+        // Same instant, same reason: these row-ids are committed, so they
+        // must stop being excluded from *later* commits' snapshots. Doing
+        // it explicitly here rather than leaving it to the claim's `Drop`
+        // keeps the release inside `commit_lock`, so no other transaction
+        // can publish a snapshot between the durability point and the
+        // release and briefly hide rows that are already durable. On any
+        // earlier return the `Drop` still fires and the ids simply become
+        // permanent gaps, which spec §8 explicitly allows.
+        if let Some(claim) = &mut claim {
+            claim.release();
+        }
+
         commit_log.push(new_version, self.write_set);
 
         // Only after commit_manifest succeeds does the new state become
@@ -825,6 +956,7 @@ impl Transaction {
             manifest: Arc::new(manifest),
             graph: self.graph,
             watermark,
+            in_flight: visibility.in_flight,
             tombstones: Arc::new(tombstones),
         };
         self.current.store(Arc::new(snapshot));
@@ -832,8 +964,100 @@ impl Transaction {
         Ok(())
     }
 
+    /// Spec §3 step 3's durable write, run *before* `commit_lock` is
+    /// acquired. Claims this transaction's row-ids, writes its data and
+    /// delta-log files, and fsyncs them — none of which needs conflict
+    /// information to proceed, and none of which can collide with a
+    /// concurrent transaction's own writes, because every path it touches
+    /// is unique to this attempt.
+    ///
+    /// The filename prefix comes from `write_attempt_counter`, **not**
+    /// `base_version + 1`: two truly concurrent transactions can share the
+    /// same stale `base_version`, which would make them compute the same
+    /// "next version" and collide on the same filename before either
+    /// reaches `commit_lock`. `write_attempt_counter` is unique per attempt
+    /// regardless of version, which is what makes doing any of this outside
+    /// the lock safe at all.
+    ///
+    /// Returns the new `DataFileEntry`s, this commit's delta entries, and
+    /// the row-id claim to hold until the commit reaches its durability
+    /// point (`None` for a delete-only transaction, which inserts no rows,
+    /// claims no row-ids, and has nothing to hide from concurrent readers).
+    ///
+    /// # Errors
+    ///
+    /// Same conditions as [`Transaction::commit`]'s own doc comment:
+    /// dictionary-encoding failure, a non-finite vector component, an I/O
+    /// failure writing or fsyncing a file, or [`TxnError::ManifestOverflow`]
+    /// if the row-id range would run past `u64::MAX`.
+    fn write_phase(
+        &self,
+        data_dir: &Path,
+    ) -> Result<(Vec<DataFileEntry>, Vec<DeltaEntry>, Option<RowIdClaim>)> {
+        // Skipped entirely when there's nothing to insert: a delete-only
+        // transaction writes no new files, so there's no new directory
+        // entry to create or fsync and no attempt_id needs reserving.
+        // `Dataset::create`/`open` already ensure `data_dir` exists once
+        // per `Dataset` lifetime; recreating it on every single commit
+        // regardless of whether it had anything to write was redundant.
+        if self.pending.is_empty() {
+            return Ok((Vec::new(), Vec::new(), None));
+        }
+        std::fs::create_dir_all(data_dir)?;
+        // SeqCst ordering justification (this pre-lock fetch_add): the
+        // only property it needs is per-atomic RMW uniqueness — no two
+        // fetch_adds on the same AtomicU64 ever return the same value
+        // — which every atomic's own total modification order already
+        // guarantees regardless of the chosen Ordering, even Relaxed.
+        // commit_lock plays no role here; this runs *before* it's
+        // acquired. (The *load* site in `commit`, which persists this
+        // counter's value into the manifest, has a different
+        // justification — see the comment there.) SeqCst is kept
+        // anyway as the simple, always-correct default: the cost
+        // difference against this function's dominant work (fsync,
+        // JSON serialization) is immaterial, and isn't worth the
+        // reduced auditability of proving a weaker ordering correct
+        // per site. See `.claude/rules/concurrency-txn-layer.md`.
+        //
+        // Row-ids are *not* handed out this way. They need the counter
+        // advance and the in-flight registration to happen as one
+        // atomic step, which no lone atomic can give — see
+        // `crate::row_id` and `RowIdAllocator::claim`.
+        let attempt_id = self
+            .write_attempt_counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // One claim for the whole transaction, spec §8's "a commit writing
+        // N rows atomically claims the contiguous range `[next_row_id,
+        // next_row_id + N)`" — rather than the per-pending-batch claim this
+        // replaces, which could interleave one transaction's batches with
+        // another's under concurrency and would put one exclusion entry per
+        // batch into every concurrent snapshot.
+        let total_rows = self.pending.iter().try_fold(0u64, |total, batch| {
+            let rows = u64::try_from(batch.num_rows())?;
+            total
+                .checked_add(rows)
+                .ok_or_else(|| TxnError::ManifestOverflow(format!("pending rows {total} + {rows}")))
+        })?;
+        let claim = self.row_ids.claim(total_rows)?;
+        let mut new_data_files = Vec::new();
+        let deltas = Self::write_pending_batches(
+            &self.pending,
+            data_dir,
+            attempt_id,
+            &claim,
+            &mut new_data_files,
+        )?;
+        // Fsyncing each data file's *content* (already done inside
+        // write_batch) is not sufficient — the new directory entries
+        // themselves must also be fsynced, or a real power-loss crash
+        // can leave a file's bytes durable while the file itself is
+        // absent. Must happen before the graph update/manifest commit.
+        strata_storage::sync_dir(data_dir)?;
+        Ok((new_data_files, deltas, Some(claim)))
+    }
+
     /// Writes every pending batch's data file and delta-log file to
-    /// `data_dir`, assigning row-ids from `row_id_counter` and appending
+    /// `data_dir`, assigning row-ids out of `claim` and appending
     /// each batch's `DataFileEntry` to `data_files` in place. Returns every
     /// `DeltaEntry` produced across all pending batches, in order —
     /// `Transaction::commit` applies these directly to the shared graph
@@ -845,20 +1069,32 @@ impl Transaction {
     /// see `Transaction::commit` (Task 6) for why it can't be derived
     /// from `base_version` instead.
     ///
+    /// `claim` is the transaction's single, already-registered row-id
+    /// range, sized to hold every pending batch's rows. Batches are laid
+    /// out consecutively inside it, so the ids of one transaction's batches
+    /// are contiguous even under concurrency — the per-batch `fetch_add`
+    /// this replaces could interleave two transactions' batches. The claim
+    /// stays outstanding for as long as it is borrowed here and beyond, up
+    /// to this commit's durability point, which is what keeps these
+    /// not-yet-committed ids invisible to concurrent readers; see
+    /// [`crate::row_id`].
+    ///
     /// # Errors
     ///
     /// Returns an error under the same conditions as [`Transaction::commit`]'s
     /// own doc comment (dictionary-encoding failure, non-finite vector
-    /// component, I/O failure writing a data/delta-log file, or a
-    /// [`TxnError::ManifestOverflow`] if row-id assignment would overflow).
+    /// component, or an I/O failure writing a data/delta-log file). Row-id
+    /// overflow is no longer possible here — the whole range was bounds-checked
+    /// when it was claimed.
     fn write_pending_batches(
         pending: &[RecordBatch],
         data_dir: &Path,
         attempt_id: u64,
-        row_id_counter: &AtomicU64,
+        claim: &RowIdClaim,
         data_files: &mut Vec<DataFileEntry>,
     ) -> Result<Vec<DeltaEntry>> {
         let mut all_deltas = Vec::new();
+        let mut row_id_base = claim.base();
         for (i, batch) in pending.iter().enumerate() {
             // Stats computed on the original, pre-encoding, pre-row-id batch — see
             // .claude/docs/design/phase-3-query-refinement-spec.md §1 for why
@@ -867,20 +1103,6 @@ impl Transaction {
             let stats = compute_stats(batch);
 
             let num_rows = u64::try_from(batch.num_rows())?;
-            // SeqCst: see the ordering-justification comment on
-            // Transaction::commit's write_attempt_counter.fetch_add — the
-            // same reasoning applies here (this is the sibling counter for
-            // row-ids rather than filenames).
-            let row_id_base =
-                row_id_counter.fetch_add(num_rows, std::sync::atomic::Ordering::SeqCst);
-            // fetch_add already advanced the counter before this check —
-            // intentional. Row-ids are never reused (see Manifest.next_row_id's
-            // doc comment), so an abandoned gap from a failed batch is
-            // harmless, and there is no atomic way to "undo" a fetch_add if
-            // we checked first instead.
-            row_id_base.checked_add(num_rows).ok_or_else(|| {
-                TxnError::ManifestOverflow(format!("next_row_id {row_id_base} + {num_rows}"))
-            })?;
 
             let deltas = build_delta_entries(batch, row_id_base)?;
             let with_row_id = append_row_id_column(batch, row_id_base, num_rows)?;
@@ -898,7 +1120,24 @@ impl Transaction {
                 delta_log: delta_file_name,
             });
             all_deltas.extend(deltas);
+            // Cannot overflow: `write_phase` sized the claim as the checked
+            // sum of every pending batch's row count, and the claim itself
+            // was bounds-checked against `u64::MAX` before it was handed
+            // out.
+            row_id_base += num_rows;
         }
+        // `pending` and `claim` arrive as separate parameters, so nothing in
+        // the type system ties the claim's size to the rows about to be
+        // laid out inside it. If they ever diverge, this hands out row-ids
+        // *past* the claimed range — ids no snapshot's exclusion set covers,
+        // which is exactly the un-hidden-uncommitted-row hazard `claim`
+        // exists to prevent, and it would fail silently. Cheap to assert at
+        // the one place being wrong is invisible.
+        debug_assert_eq!(
+            row_id_base,
+            claim.base() + claim.len(),
+            "every claimed row-id must be consumed, and none beyond them"
+        );
         Ok(all_deltas)
     }
 }
@@ -1195,24 +1434,29 @@ mod tests {
     /// `create_with_commit_log_capacity`'s doc comment).
     const TEST_COMMIT_LOG_CAPACITY: usize = 8;
 
-    /// Locks in `AtomicU64::fetch_add`'s contract in isolation — before
-    /// `next_row_id_counter` is wired into `Dataset`/`write_pending_batches`
-    /// (below), this is what proves 8 concurrent `fetch_add(10)`s hand out
-    /// non-overlapping, contiguous ranges. Uses `std::thread::scope` rather
-    /// than `unsafe { transmute }` to borrow the stack-local `counter`
-    /// safely — see Task 5's brief for why the `transmute` draft was
-    /// rejected (this workspace's "safe Rust by default" convention).
+    /// Proves 8 concurrent claims hand out non-overlapping, contiguous
+    /// ranges, and that every one of them is registered as in-flight while
+    /// it is held. Previously asserted this of a bare
+    /// `AtomicU64::fetch_add`, which is no longer how row-ids are
+    /// allocated — a `fetch_add` cannot advance the counter and register
+    /// the claim as one step, which is the whole point of
+    /// [`crate::row_id::RowIdAllocator`]. Uses `std::thread::scope` rather
+    /// than `unsafe { transmute }` to borrow the stack-local safely — see
+    /// Task 5's brief for why the `transmute` draft was rejected (this
+    /// workspace's "safe Rust by default" convention).
     #[test]
-    fn row_id_counter_hands_out_non_overlapping_ranges_under_concurrent_fetch_add() {
-        use std::sync::atomic::{AtomicU64, Ordering};
+    fn concurrent_claims_hand_out_non_overlapping_ranges_and_all_register() {
+        use crate::row_id::RowIdAllocator;
 
-        let counter = AtomicU64::new(0);
-        let mut bases: Vec<u64> = std::thread::scope(|scope| {
+        let allocator = Arc::new(RowIdAllocator::new(0));
+        let claims: Vec<_> = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..8)
-                .map(|_| scope.spawn(|| counter.fetch_add(10, Ordering::SeqCst)))
+                .map(|_| scope.spawn(|| allocator.claim(10).unwrap()))
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
+
+        let mut bases: Vec<u64> = claims.iter().map(super::RowIdClaim::base).collect();
         bases.sort_unstable();
         for (i, base) in bases.iter().enumerate() {
             assert_eq!(
@@ -1221,6 +1465,26 @@ mod tests {
                 "ranges must be contiguous, non-overlapping"
             );
         }
+
+        // Every claim is still held, so every one must be excluded from a
+        // snapshot published now — the property a bare counter can't give.
+        let bound = allocator.visibility_bound_excluding(None);
+        assert_eq!(bound.next_row_id, 80);
+        for base in &bases {
+            assert!(
+                bound.in_flight.iter().any(|range| range.contains(*base)),
+                "row-id {base} is claimed but not committed, so it must be excluded"
+            );
+        }
+
+        drop(claims);
+        assert!(
+            allocator
+                .visibility_bound_excluding(None)
+                .in_flight
+                .is_empty(),
+            "and released once every claim is dropped"
+        );
     }
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -1315,7 +1579,7 @@ mod tests {
         // than were ever committed (3 destroyed, 1 new double-counted via
         // the duplicate manifest entry, netting 2 instead of 4). The fix
         // persists the counter in `Manifest.next_attempt_id`, seeded on
-        // `open` the same way `next_row_id_counter` is seeded from
+        // `open` the same way the row-id allocator is seeded from
         // `manifest.next_row_id`.
         let dir = temp_dir("reopen-no-filename-collision");
         let schema = test_schema();
@@ -2858,7 +3122,7 @@ mod tests {
         // by `inject_manifest_commit_failure`, injected at exactly that
         // step — the failed transaction's vector is left in the shared graph
         // with no manifest entry backing it, and its row-id was already
-        // allocated by `write_pending_batches`. A *later* successful commit
+        // allocated by `write_phase`. A *later* successful commit
         // then persists `manifest.next_row_id` past that residue row-id and
         // publishes `watermark = next_row_id - 1`, so `Snapshot::is_visible`
         // starts passing for the residue id. With no manifest-membership
@@ -2960,6 +3224,154 @@ mod tests {
             2,
             "only the seed and the later commit are durably committed; the \
              failed commit's row must never appear in a scan"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_concurrent_reader_never_sees_an_in_flight_commits_vector() {
+        // Regression test for the snapshot-isolation window spec §2 rules
+        // out: "a transaction's writes are never visible to any other
+        // transaction until commit succeeds."
+        //
+        // Row-ids are claimed *before* `commit_lock`, in
+        // `write_phase`. The visibility watermark, though, is
+        // published from the *global* row-id counter inside some *other*
+        // transaction's critical section — so that other transaction's
+        // watermark covers row-ids this transaction has claimed but not
+        // committed. Between this transaction's `graph.insert` and its
+        // `commit_manifest`, its vector is therefore both physically in the
+        // shared `Arc<HnswIndex>` and (pre-fix) passing `is_visible` on the
+        // currently published snapshot. Readers take no `commit_lock`
+        // (`Snapshot::vector_search`), so nothing stops one observing it —
+        // a search hit for a row no `scan` can see, roughly one
+        // `commit_manifest` fsync wide.
+        //
+        // Unlike `a_failed_commits_vector_is_never_searchable_...` above,
+        // this is the *success* path: the slow transaction goes on to
+        // commit cleanly. `GraphResidueGuard` deliberately does not close
+        // this (see its doc comment) — it closes the permanent-residue case.
+        //
+        // The window is one fsync wide, so the schedule is made
+        // deterministic with `Checkpoint`s rather than raced with sleeps: a
+        // sleep-based version would pass vacuously whenever it missed.
+        let dir = temp_dir("in-flight-commit-not-visible-to-reader");
+        let ds = Dataset::create(&dir).unwrap();
+
+        // Seed row-id 0: establishes the graph's dimension and gives the
+        // pre-existing watermark a meaningful value.
+        let mut seed = ds.begin();
+        seed.insert(vector_batch(
+            vec![1i64],
+            cluster_vectors(1, [0.0, 0.0, 0.0], 0.0),
+        ));
+        seed.commit().unwrap();
+
+        let (claim_point, claimed) = checkpoint_pair();
+        let (apply_point, applied) = checkpoint_pair();
+
+        // The slow transaction: inserts at distinctive, never-reused
+        // coordinates so a hit for it is unambiguous.
+        let mut slow = ds.begin();
+        slow.insert(vector_batch(
+            vec![2i64],
+            cluster_vectors(1, [900.0, 900.0, 900.0], 0.0),
+        ));
+        slow.pause_after_row_id_claim(claim_point);
+        slow.pause_after_graph_apply(apply_point);
+        let slow_thread = std::thread::spawn(move || slow.commit());
+
+        // Step 1: the slow transaction has claimed row-id 1 and written its
+        // data files, but holds no lock and has touched nothing shared.
+        claimed.wait();
+
+        // Step 2: an unrelated transaction commits. It claims row-id 2 and
+        // publishes `manifest.next_row_id = 3` — read from the global
+        // counter, which already includes the slow transaction's claim — so
+        // its watermark (2) covers the slow transaction's uncommitted
+        // row-id 1. An insert-only transaction has an empty write-set, so
+        // this cannot conflict with the slow one.
+        let mut other = ds.begin();
+        other.insert(vector_batch(
+            vec![3i64],
+            cluster_vectors(1, [500.0, 500.0, 500.0], 0.0),
+        ));
+        other.commit().unwrap();
+
+        // Step 3: release the slow transaction as far as the shared graph,
+        // and stop it before `commit_manifest`. The window is now open.
+        claimed.release();
+        applied.wait();
+
+        // Step 4: a reader thread races the apply loop. It takes no
+        // `commit_lock`, so it runs freely while the slow commit is parked
+        // mid-critical-section.
+        let reader_ds = ds.clone();
+        let (version, results) = std::thread::spawn(move || {
+            let snapshot = reader_ds.snapshot();
+            let results = snapshot
+                .vector_search(&[900.0, 900.0, 900.0], 1, None)
+                .unwrap();
+            (snapshot.version, results)
+        })
+        .join()
+        .unwrap();
+
+        assert_eq!(
+            version, 2,
+            "precondition: the reader must see the unrelated commit's version, \
+             not the slow transaction's (which has not committed yet)"
+        );
+
+        // The discriminating assertion. Pre-fix the slow transaction's
+        // vector is in the graph and `is_visible(1)` passes, so row-id 1
+        // comes back at ~0 squared distance. Asserted on the row-id rather
+        // than a distance threshold, so it can't pass on an empty result
+        // set — visibility is filtered *during* traversal, so a miss here
+        // would otherwise be indistinguishable from a broken search.
+        assert_ne!(
+            results.first().map(|m| m.row_id),
+            Some(1),
+            "an in-flight transaction's vector must not be visible to any other \
+             transaction before its commit succeeds (spec §2/§3 step 5): {results:?}"
+        );
+
+        // Positive controls, so "not found" above means *excluded* rather
+        // than "search is broken" or "the exclusion set over-hides". The
+        // first is the other direction of the invariant at `Dataset` level:
+        // the concurrent committer's own row must be visible in the very
+        // snapshot it published, even with another claim outstanding.
+        assert_eq!(
+            results.first().map(|m| m.row_id),
+            Some(2),
+            "the nearest committed row must still come back — only the in-flight \
+             claim may be hidden: {results:?}"
+        );
+        let committed_hit = ds
+            .snapshot()
+            .vector_search(&[0.0, 0.0, 0.0], 1, None)
+            .unwrap();
+        assert_eq!(
+            committed_hit.first().map(|m| m.row_id),
+            Some(0),
+            "the durably committed seed row must still be searchable: {committed_hit:?}"
+        );
+
+        // Step 5: let the slow transaction finish. Its row is committed now,
+        // so it must become visible — the fix must hide in-flight rows, not
+        // committed ones.
+        applied.release();
+        slow_thread.join().unwrap().unwrap();
+
+        let after = ds
+            .snapshot()
+            .vector_search(&[900.0, 900.0, 900.0], 1, None)
+            .unwrap();
+        assert_eq!(
+            after.first().map(|m| m.row_id),
+            Some(1),
+            "once its commit succeeds, the same row must be searchable: {after:?}"
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -3117,6 +3529,67 @@ mod tests {
 mod loom_tests {
     use std::sync::Arc as StdArc;
 
+    /// Stack for any loom thread that runs a full `Transaction::commit`.
+    ///
+    /// **Not a tuning knob — omitting it segfaults.** loom runs each model
+    /// thread on a `generator` coroutine whose default stack is
+    /// `generator::DEFAULT_STACK_SIZE` (`0x1000`), and `Stack::new`
+    /// multiplies that by `size_of::<usize>()` — so the default is 32 KiB on
+    /// a 64-bit target, not the megabytes a real thread gets. `commit` runs
+    /// Arrow encoding, manifest JSON serialization and an HNSW insert, which
+    /// overruns that, and a coroutine stack overflow is an access violation
+    /// with no backtrace, not a clean `stack overflow` abort. The
+    /// `two_threads_deleting_*` models below had fit until this change (they
+    /// are sized now regardless); the vector path never had much headroom,
+    /// and the row-id allocator's frames removed what was left.
+    ///
+    /// Only *spawned* threads can be sized (`loom::thread::Builder`); the
+    /// model's own root thread always gets the 32 KiB default and loom
+    /// exposes no way to change it. So the rule for these models is: the
+    /// root thread does setup and assertions only, and every `commit` runs
+    /// on a thread spawned through [`spawn_committer`].
+    ///
+    /// "Setup and assertions" is an empirical boundary, not a safe one. The
+    /// root still runs `Dataset::create` (serde_json serialize + write +
+    /// fsync, plus `new_hnsw_index`) and, in the residue model,
+    /// `Snapshot::vector_search` (HNSW candidate heaps at
+    /// `EF_SEARCH_DEFAULT`) — the same *class* of work that just overran 32
+    /// KiB, only smaller. Those two are the next suspects if a model here
+    /// ever exits 139 again.
+    ///
+    /// **Spawning is not free: loom caps threads at 5 *created* per
+    /// execution** (`loom::MAX_THREADS`), and terminated threads never free
+    /// their slot — `rt::thread::new_thread` asserts against the total ever
+    /// created. The cap is not raisable either; it sizes fixed-length arrays
+    /// inside loom (`FirstSeen([u16; MAX_THREADS])`), so a larger
+    /// `model::Builder::max_threads` indexes out of bounds. All three
+    /// commit-running models sit at 4 of 5 (root + 3). One more
+    /// `spawn_committer` in any of them trips an assert inside loom, so a
+    /// commit that only needs the stack — not the concurrency — still costs
+    /// a hard-capped slot.
+    ///
+    /// loom documents this value as bytes while `generator` consumes it as
+    /// words, so the real stack is 8 MiB today. Left uncompensated on
+    /// purpose: `1 << 20` is ample under *both* readings (1 MiB if that
+    /// discrepancy is ever fixed, which still far exceeds what `commit`
+    /// needs), whereas dividing by 8 to hit a byte target would hard-code a
+    /// transitive dependency's undocumented unit and break on exactly that
+    /// fix. The measured cost of the over-provision is nil.
+    const COMMIT_STACK_SIZE: usize = 1 << 20;
+
+    /// Spawns a loom thread with a stack that can actually hold a
+    /// `Transaction::commit`. See [`COMMIT_STACK_SIZE`].
+    fn spawn_committer<F, T>(f: F) -> loom::thread::JoinHandle<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        loom::thread::Builder::new()
+            .stack_size(COMMIT_STACK_SIZE)
+            .spawn(f)
+            .expect("loom thread spawn")
+    }
+
     #[test]
     fn one_writer_store_races_safely_with_many_readers_load() {
         loom::model(|| {
@@ -3165,9 +3638,17 @@ mod loom_tests {
                 vec![StdArc::new(arrow::array::Int64Array::from(vec![1]))],
             )
             .unwrap();
-            let mut setup = ds.begin();
-            setup.insert(batch);
-            setup.commit().unwrap();
+            // Spawned for the stack, not the concurrency — the model root
+            // thread cannot hold a `commit` (see `COMMIT_STACK_SIZE`).
+            let ds_setup = ds.clone();
+            spawn_committer(move || {
+                let mut setup = ds_setup.begin();
+                setup.insert(batch);
+                setup.commit()
+            })
+            .join()
+            .unwrap()
+            .unwrap();
 
             let ds_a = ds.clone();
             let ds_b = ds.clone();
@@ -3189,8 +3670,8 @@ mod loom_tests {
             let mut txn_b = ds_b.begin();
             txn_b.delete(0);
 
-            let thread_a = loom::thread::spawn(move || txn_a.commit());
-            let thread_b = loom::thread::spawn(move || txn_b.commit());
+            let thread_a = spawn_committer(move || txn_a.commit());
+            let thread_b = spawn_committer(move || txn_b.commit());
 
             let result_a = thread_a.join().unwrap();
             let result_b = thread_b.join().unwrap();
@@ -3223,18 +3704,26 @@ mod loom_tests {
                 vec![StdArc::new(arrow::array::Int64Array::from(vec![1, 2]))],
             )
             .unwrap();
-            let mut setup = ds.begin();
-            setup.insert(batch);
-            setup.commit().unwrap();
+            // Spawned for the stack, not the concurrency — the model root
+            // thread cannot hold a `commit` (see `COMMIT_STACK_SIZE`).
+            let ds_setup = ds.clone();
+            spawn_committer(move || {
+                let mut setup = ds_setup.begin();
+                setup.insert(batch);
+                setup.commit()
+            })
+            .join()
+            .unwrap()
+            .unwrap();
 
             let ds_a = ds.clone();
             let ds_b = ds.clone();
-            let thread_a = loom::thread::spawn(move || {
+            let thread_a = spawn_committer(move || {
                 let mut txn = ds_a.begin();
                 txn.delete(0);
                 txn.commit()
             });
-            let thread_b = loom::thread::spawn(move || {
+            let thread_b = spawn_committer(move || {
                 let mut txn = ds_b.begin();
                 txn.delete(1);
                 txn.commit()
@@ -3244,6 +3733,120 @@ mod loom_tests {
             assert!(thread_b.join().unwrap().is_ok());
 
             std::fs::remove_dir_all(&dir).ok();
+        });
+    }
+
+    #[test]
+    fn a_published_bound_never_covers_another_transactions_outstanding_claim() {
+        // The interleaving proof for the snapshot-isolation fix, and the
+        // `loom` test `.claude/rules/concurrency-txn-layer.md` requires for
+        // the counter-advance step (spec §8 names it explicitly: "the
+        // counter-bump-plus-CAS step needs a `loom` interleaving test
+        // proving it is genuinely atomic under concurrent commit
+        // attempts").
+        //
+        // The hazard is a *torn pair*: if a claim could ever be observed
+        // after its row-ids were reflected in `next_row_id` but before it
+        // appeared in the in-flight registry, a publisher reading that
+        // instant would stamp a watermark covering an uncommitted row-id
+        // with nothing excluding it — which is exactly the bug being
+        // closed. `RowIdAllocator` makes the advance and the registration
+        // one locked step; this asserts no interleaving can pull them
+        // apart.
+        //
+        // Modelled on the allocator directly rather than through
+        // `Dataset::commit`: the pair's atomicity is the whole property,
+        // and a model with no filesystem I/O in it explores exhaustively in
+        // a fraction of the time. The end-to-end consequence is covered
+        // deterministically by
+        // `dataset::tests::a_concurrent_reader_never_sees_an_in_flight_commits_vector`.
+        loom::model(|| {
+            let allocator = StdArc::new(crate::row_id::RowIdAllocator::new(0));
+
+            // Thread A models a transaction between its pre-lock row-id
+            // claim and its commit: it claims and *keeps* the claim, so it
+            // is still in flight when the assertions below run.
+            let a_allocator = StdArc::clone(&allocator);
+            // Unsized on purpose — see `COMMIT_STACK_SIZE`. This model and
+            // the next touch only a `Mutex`, an integer add and a tiny
+            // `Vec`; no `commit`, so no Arrow/serde/HNSW frames, and 32 KiB
+            // is ample. Sizing them would burn 8 MiB per thread per
+            // execution for nothing and blur the rule into "size
+            // everything", losing why it exists.
+            let in_flight = loom::thread::spawn(move || a_allocator.claim(1).unwrap());
+
+            // Thread B models a committer publishing a snapshot: claim,
+            // then read the bound it will stamp into that snapshot,
+            // excluding only its own about-to-be-durable claim.
+            let b_allocator = StdArc::clone(&allocator);
+            let publisher = loom::thread::spawn(move || {
+                let claim = b_allocator.claim(1).unwrap();
+                let bound = b_allocator.visibility_bound_excluding(Some(&claim));
+                (claim, bound)
+            });
+
+            let in_flight_claim = in_flight.join().unwrap();
+            let (published_claim, bound) = publisher.join().unwrap();
+
+            // `Snapshot::is_visible` is `row_id <= watermark`, and
+            // `watermark` is `next_row_id - 1` — so "covered by the bound"
+            // is exactly `id < next_row_id`.
+            let covered = |id: u64| id < bound.next_row_id;
+            let excluded = |id: u64| bound.in_flight.iter().any(|range| range.contains(id));
+
+            assert!(
+                covered(published_claim.base()) && !excluded(published_claim.base()),
+                "a publisher must never hide its own rows: an acknowledged write is \
+                 immediately visible"
+            );
+            assert!(
+                !covered(in_flight_claim.base()) || excluded(in_flight_claim.base()),
+                "no interleaving may publish a bound that covers a still-outstanding \
+                 claim without excluding it — that is a row visible before its commit \
+                 succeeded (spec §2)"
+            );
+        });
+    }
+
+    #[test]
+    fn no_interleaving_strands_a_claim_in_the_registry() {
+        // The other half of the property: exclusion must be *temporary*.
+        // A claim that outlived its transaction would blind every later
+        // reader to that stretch of row-ids permanently — turning a
+        // too-visible bug into a too-invisible one. `RowIdClaim`'s `Drop`
+        // is what guarantees it, so this exercises both exit paths (an
+        // explicit `release` on the durable path, a bare drop on the
+        // abandoned path) against each other.
+        loom::model(|| {
+            let allocator = StdArc::new(crate::row_id::RowIdAllocator::new(0));
+
+            let committed_allocator = StdArc::clone(&allocator);
+            let committed = loom::thread::spawn(move || {
+                let mut claim = committed_allocator.claim(2).unwrap();
+                claim.release();
+            });
+
+            let abandoned_allocator = StdArc::clone(&allocator);
+            let abandoned = loom::thread::spawn(move || {
+                // Dropped without releasing — an early `?` out of `commit`.
+                let _claim = abandoned_allocator.claim(3).unwrap();
+            });
+
+            committed.join().unwrap();
+            abandoned.join().unwrap();
+
+            let bound = allocator.visibility_bound_excluding(None);
+            assert!(
+                bound.in_flight.is_empty(),
+                "every claim must be released by the time its transaction returns, \
+                 under every interleaving: {:?}",
+                bound.in_flight
+            );
+            assert_eq!(
+                bound.next_row_id, 5,
+                "both claims consumed their ids regardless of outcome — gaps are \
+                 safe, reuse is forbidden (spec §8)"
+            );
         });
     }
 
@@ -3304,13 +3907,19 @@ mod loom_tests {
         //
         // The property under test is a quiescent one: once both committers
         // have returned, no schedule leaves the failed commit's vector
-        // reachable by a search. It deliberately does NOT claim the stronger
-        // "never transiently visible" property — there is no reader thread
-        // racing the apply loop here, and such a window does exist for
-        // reasons predating this guard (see `GraphResidueGuard`'s doc). What
-        // this pins down is that `GraphResidueGuard` fires on the error path
-        // under every interleaving of the two committers, rather than only
-        // in the single order the deterministic sibling test fixes.
+        // reachable by a search. What it pins down is that
+        // `GraphResidueGuard` fires on the error path under every
+        // interleaving of the two committers, rather than only in the
+        // single order the deterministic sibling test fixes.
+        //
+        // The complementary *transient* property — that a row is never
+        // visible before its commit succeeds, whether or not that commit
+        // eventually does — belongs to the in-flight claim registry, and is
+        // covered by
+        // `a_published_bound_never_covers_another_transactions_outstanding_claim`
+        // below (interleavings) and
+        // `dataset::tests::a_concurrent_reader_never_sees_an_in_flight_commits_vector`
+        // (a real reader thread racing the apply loop end-to-end).
         //
         // Deliberately minimal: only the failing transaction inserts a
         // vector (one HNSW node), and the concurrent committer uses a
@@ -3333,13 +3942,13 @@ mod loom_tests {
             let ds_failing = ds.clone();
             let ds_ok = ds.clone();
 
-            let failing = loom::thread::spawn(move || {
+            let failing = spawn_committer(move || {
                 let mut txn = ds_failing.begin();
                 txn.insert(loom_vector_batch(1, [900.0, 900.0, 900.0]));
                 txn.inject_manifest_commit_failure();
                 txn.commit()
             });
-            let succeeding = loom::thread::spawn(move || {
+            let succeeding = spawn_committer(move || {
                 let mut txn = ds_ok.begin();
                 txn.insert(loom_plain_batch(2));
                 txn.commit()
@@ -3358,9 +3967,20 @@ mod loom_tests {
             // commit claimed, in *every* interleaving — without this, the
             // schedules where it claimed a row-id above the watermark would
             // satisfy the assertion below vacuously.
-            let mut final_txn = ds.begin();
-            final_txn.insert(loom_plain_batch(3));
-            final_txn.commit().unwrap();
+            //
+            // Spawned rather than run inline for the stack, not the
+            // concurrency: the root thread's 32 KiB cannot hold a `commit`
+            // (see `COMMIT_STACK_SIZE`). It is joined immediately, so the
+            // schedule is unaffected.
+            let ds_final = ds.clone();
+            spawn_committer(move || {
+                let mut final_txn = ds_final.begin();
+                final_txn.insert(loom_plain_batch(3));
+                final_txn.commit()
+            })
+            .join()
+            .unwrap()
+            .unwrap();
 
             let results = ds
                 .snapshot()
