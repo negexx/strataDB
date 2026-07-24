@@ -73,8 +73,8 @@ impl SlotArray {
     // `Graph`'s two hot-loop call sites (`search_layer`'s per-popped-
     // candidate neighbor lookup, `insert`'s shrink step) now call
     // `occupied_into` directly with a reused scratch buffer; this
-    // owned-return form is kept for this module's own tests and
-    // `node.rs`'s headroom tests, which don't need scratch reuse.
+    // owned-return form is kept for this module's own tests and for
+    // `graph.rs`'s tests, which don't need scratch reuse.
     #[allow(dead_code)]
     pub(crate) fn occupied(&self) -> Vec<u64> {
         let mut out = Vec::new();
@@ -162,16 +162,19 @@ mod tests {
     }
 
     #[test]
-    fn occupied_into_matches_occupied() {
+    fn occupied_into_reports_every_claimed_value() {
         let arr = SlotArray::new(4);
         arr.claim(5);
         arr.claim(6);
         let mut out = Vec::new();
         arr.occupied_into(&mut out);
-        let mut expected = arr.occupied();
         out.sort_unstable();
-        expected.sort_unstable();
-        assert_eq!(out, expected);
+        assert_eq!(
+            out,
+            vec![5, 6],
+            "occupied_into must report exactly the claimed values, not compared against \
+             occupied() (which is now itself implemented in terms of occupied_into)"
+        );
     }
 
     #[test]

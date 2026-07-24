@@ -147,20 +147,24 @@ impl Ord for Candidate {
     }
 }
 
-/// Per-thread reusable scratch space for `search_layer`, avoiding a
-/// fresh `HashSet`/two `BinaryHeap`s/two more `HashSet`s on every call.
-/// Safe as plain `RefCell` (not a `Mutex`/atomic): `search_layer` is
-/// never called reentrantly on the same thread -- every caller
-/// (`Graph::insert`'s two call sites, `Graph::k_nn_search`'s two call
-/// sites) calls it sequentially and lets each call fully return before
-/// starting the next, so a nested `borrow_mut()` can never happen. This
-/// also depends on every caller-supplied `filter` closure (threaded
-/// through from `HnswIndex::search`/`search_filtered`'s public,
-/// caller-controlled `impl Fn(u64) -> bool`) being a pure membership/
-/// visibility predicate that never itself calls back into this graph's
-/// search path -- every filter passed anywhere in this codebase today
-/// is, but this is an invariant on the caller, not something the type
-/// system enforces.
+/// Per-thread reusable scratch space, avoiding a fresh allocation on every
+/// call. Originally just `search_layer`'s own heap/hashset fields; now also
+/// holds `occupied_buf`/`heuristic_working`, borrowed directly by
+/// `Graph::insert`'s connection-selection and shrink steps (not only via
+/// `search_layer`). Safe as plain `RefCell` (not a `Mutex`/atomic): nothing
+/// that borrows `SEARCH_SCRATCH` is ever called reentrantly on the same
+/// thread -- every borrow (`search_layer`'s own use, `Graph::insert`'s two
+/// direct uses, `Graph::k_nn_search`'s two call sites into `search_layer`)
+/// runs to completion and releases before the next one starts, so a nested
+/// `borrow_mut()` can never happen. This also depends on every closure run
+/// while a borrow is live -- `search_layer`'s caller-supplied `filter`
+/// (threaded through from `HnswIndex::search`/`search_filtered`'s public,
+/// caller-controlled `impl Fn(u64) -> bool`), and `insert`'s own
+/// `pairwise_distance`-based closures passed to
+/// `select_neighbors_heuristic_into` -- never calling back into anything
+/// that itself borrows `SEARCH_SCRATCH`. Every closure passed anywhere in
+/// this codebase today satisfies this, but it's an invariant on the
+/// caller, not something the type system enforces.
 #[derive(Default)]
 struct SearchScratch {
     visited: std::collections::HashSet<u64>,
@@ -289,14 +293,13 @@ impl<D: Distance> Graph<D> {
                     continue;
                 }
                 node.layer(lc).occupied_into(&mut scratch.occupied_buf);
-                // Index-based, not `for x in &scratch.occupied_buf`: an
-                // iterator borrow of `occupied_buf` would otherwise live
-                // across the loop body, which also needs to mutate the
-                // sibling `visited`/`candidates`/`result` fields of the
-                // same scratch struct. Indexing reads one `u64` (Copy) and
-                // drops the borrow immediately, before those mutations.
-                for idx in 0..scratch.occupied_buf.len() {
-                    let neighbor_id = scratch.occupied_buf[idx];
+                // `occupied_buf` and `visited`/`candidates`/`result` are
+                // disjoint fields of the same `&mut SearchScratch` — the
+                // borrow checker splits them, so iterating one while
+                // mutating the others compiles cleanly (verified: this is
+                // not the same restriction a method call on `&mut self`
+                // would hit).
+                for &neighbor_id in &scratch.occupied_buf {
                     if scratch.visited.contains(&neighbor_id) {
                         continue;
                     }
@@ -1049,7 +1052,11 @@ mod tests {
     }
 
     #[test]
-    fn select_neighbors_heuristic_into_matches_the_owned_variant() {
+    fn select_neighbors_heuristic_into_prunes_a_dominated_candidate() {
+        // Same fixture as select_neighbors_heuristic_prunes_a_candidate_dominated_by_an_already_picked_neighbor
+        // above, but asserted against a pinned literal rather than the
+        // owned wrapper — that wrapper is now itself implemented in terms
+        // of this function, so comparing against it would be tautological.
         let candidates = vec![(2, 1.0), (3, 3.0), (4, 3.1)];
         let pairwise = |a: u64, b: u64| -> f32 {
             match (a, b) {
@@ -1058,12 +1065,10 @@ mod tests {
                 _ => 0.0,
             }
         };
-        let expected = select_neighbors_heuristic(&candidates, 2, 1.0, pairwise);
-
         let mut working = Vec::new();
         let mut out = Vec::new();
         select_neighbors_heuristic_into(&candidates, 2, 1.0, pairwise, &mut working, &mut out);
-        assert_eq!(out, expected);
+        assert_eq!(out, vec![2, 4]);
     }
 
     #[test]
