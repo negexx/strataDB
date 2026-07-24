@@ -294,11 +294,10 @@ impl Snapshot {
         // genuinely column-chunked file format so a single column can be
         // read without its neighbours — the format change `datafile.rs`'s
         // module doc already defers. Neither is a drive-by change.
-        let projection: Vec<&str> = if predicate.column() == ROW_ID_COLUMN {
-            vec![ROW_ID_COLUMN]
-        } else {
-            vec![predicate.column(), ROW_ID_COLUMN]
-        };
+        let mut projection: Vec<&str> = predicate.columns();
+        projection.push(ROW_ID_COLUMN);
+        projection.sort_unstable();
+        projection.dedup();
         let per_file_ids =
             self.read_surviving_files(Some(predicate), Some(&projection), |batch| {
                 // Apply the selection mask to the row-id column *only*. Using
