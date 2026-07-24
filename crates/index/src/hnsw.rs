@@ -161,8 +161,10 @@ impl HnswIndex {
     /// own a freshly-deserialized/freshly-built `Vec<f32>` at their call
     /// site — routing through `insert`'s `&[f32]` there would force a
     /// wasted clone of the full 512-dim embedding on every insert, on top
-    /// of the two copies already paid getting the vector out of Arrow (or
-    /// out of the delta log) in the first place.
+    /// of the one copy already paid getting the vector out of Arrow (or
+    /// out of the delta log) in the first place. `Graph::insert` moves
+    /// `vector` into `Node::new` from there, not a further copy — so this
+    /// takes the vector from two copies down to one, not three to two.
     ///
     /// # Errors
     ///
