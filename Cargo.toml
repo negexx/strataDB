@@ -26,21 +26,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 
-# Cargo's release defaults are `codegen-units = 16` and `lto = false`, which
-# block inlining across codegen units and across crates. This workspace has
-# heavy cross-crate call traffic on its hot paths — `strata-txn` calls into
-# `strata-index` and `strata-storage` per commit, and the HNSW distance kernel
-# (`anndists::DistL2::eval`) is a non-generic, non-`#[inline]` function in a
-# separate crate, so it cannot be inlined into the search loop without LTO.
-# `thin` rather than `fat`: nearly all of the win at a fraction of the link
-# time. Deliberately NOT setting `target-cpu`, which would trade binary
-# portability for autovectorization — note the distance kernels already reach
-# AVX2 via `anndists`' runtime dispatch (`is_x86_feature_detected!`), so that
-# trade would buy far less than it appears to.
-[profile.release]
-lto = "thin"
-codegen-units = 1
-
 # NOTE: crates/index/Cargo.toml cannot use `[lints] workspace = true` like
 # every other crate here — it needs a local `unexpected_cfgs` addition for
 # its `cfg(loom)` shim, and Cargo forbids combining workspace-inherited
