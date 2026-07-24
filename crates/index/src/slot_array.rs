@@ -70,12 +70,34 @@ impl SlotArray {
     /// neighbor-ids — not a true atomic snapshot across slots, which is
     /// fine since HNSW is already an approximate algorithm (see design doc
     /// §2).
+    // `Graph`'s two hot-loop call sites (`search_layer`'s per-popped-
+    // candidate neighbor lookup, `insert`'s shrink step) now call
+    // `occupied_into` directly with a reused scratch buffer; this
+    // owned-return form is kept for this module's own tests and
+    // `node.rs`'s headroom tests, which don't need scratch reuse.
+    #[allow(dead_code)]
     pub(crate) fn occupied(&self) -> Vec<u64> {
-        self.slots
-            .iter()
-            .map(|s| s.load(Ordering::SeqCst))
-            .filter(|&v| v != EMPTY)
-            .collect()
+        let mut out = Vec::new();
+        self.occupied_into(&mut out);
+        out
+    }
+
+    /// Same snapshot as [`Self::occupied`], written into a caller-supplied
+    /// buffer instead of a freshly allocated `Vec` — lets a hot loop that
+    /// calls this once per popped candidate (`Graph::search_layer`'s
+    /// construction-time traversal) or per chosen neighbor (the shrink
+    /// step in `Graph::insert`) reuse one buffer's allocation across every
+    /// call instead of paying a fresh allocation each time. `out` is
+    /// cleared first, so any stale contents from a previous call never
+    /// leak into the refill.
+    pub(crate) fn occupied_into(&self, out: &mut Vec<u64>) {
+        out.clear();
+        out.extend(
+            self.slots
+                .iter()
+                .map(|s| s.load(Ordering::SeqCst))
+                .filter(|&v| v != EMPTY),
+        );
     }
 }
 
@@ -137,6 +159,43 @@ mod tests {
         arr.clear_matching(&[1]);
         assert!(arr.claim(2), "the freed slot must now be claimable");
         assert_eq!(arr.occupied(), vec![2]);
+    }
+
+    #[test]
+    fn occupied_into_matches_occupied() {
+        let arr = SlotArray::new(4);
+        arr.claim(5);
+        arr.claim(6);
+        let mut out = Vec::new();
+        arr.occupied_into(&mut out);
+        let mut expected = arr.occupied();
+        out.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn occupied_into_clears_stale_contents_from_a_reused_buffer() {
+        let arr = SlotArray::new(4);
+        arr.claim(9);
+        let mut out = vec![111, 222, 333]; // stale data from a prior call
+        arr.occupied_into(&mut out);
+        assert_eq!(out, vec![9], "stale entries must not leak into the refill");
+    }
+
+    #[test]
+    fn occupied_into_reuses_the_buffers_existing_capacity() {
+        let arr = SlotArray::new(4);
+        arr.claim(1);
+        arr.claim(2);
+        let mut out = Vec::with_capacity(16);
+        let cap_before = out.capacity();
+        arr.occupied_into(&mut out);
+        assert_eq!(
+            out.capacity(),
+            cap_before,
+            "occupied_into must not reallocate when the buffer already has enough capacity"
+        );
     }
 }
 
