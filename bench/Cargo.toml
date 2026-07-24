@@ -47,3 +47,7 @@ harness = false
 [[bench]]
 name = "lifecycle_bench"
 harness = false
+
+[[bench]]
+name = "segment_recall_bench"
+harness = false

@@ -7,13 +7,19 @@
 > Rationale is **not** duplicated here — each item links to where it's argued. The point of this file
 > is a single place that answers "is X in scope?" with "no, and here's why, don't relitigate it."
 
-## The one thing that is NOT deferred — DECIDED
+## Decided / "do now" (not deferred)
 
 - **Segmented immutable index layout — adopted** ([ADR 0008](decisions/0008-adopt-segmented-index-layout.md),
-  Accepted). Branching is mandatory, and it's only possible on a segmented index. This decides the
-  *layout* now (so index-storage work must not harden the monolithic design); the branching *features*
-  below still wait for Phase 6/7. **Before the segment format is committed, run the recall-vs-segment
-  prototype (§6 Q2 below)** — it's on the critical path and could dictate the compaction strategy.
+  Accepted). Branching is mandatory, and it's only possible on a segmented index. Decides the *layout*
+  now (index-storage work must not harden the monolithic design); the branching *features* below wait
+  for Phase 6/7. The gating de-risk **already ran** (`bench/benches/segment_recall_bench.rs`): recall
+  is segment-count-safe, the cost is latency (~linear in K), so compaction bounds latency not recall —
+  ADR 0008 has the numbers.
+- **Per-segment zone maps** ([addendum §1.2](scope-addendum-v2.md)) — v1 companion to the layout.
+  Per-segment min/max (timestamp + low-cardinality columns) in the manifest → temporal/filtered
+  predicates become segment pruning. ~100 lines, nearly free given the layout, impossible without it.
+  Not yet built; the segment format must reserve manifest room for it. A pruning primitive, not a
+  temporal data model.
 
 ## Deferred (post-Phase-6, in order)
 
@@ -42,9 +48,18 @@ Full rationale in [Addendum §4](scope-addendum-v1.md) and §5. These are also r
 - **Extreme multi-tenancy (fork)** — an architectural fork, not a feature. Escape hatch: ship
   embeddable and million-tenant is ~free (run N instances) — an independent argument for
   embeddable-first (open question, [Addendum §6 Q4](scope-addendum-v1.md)).
+- **Neural databases (NeuroDB / SNH / NGDB)** — approximate range-aggregate query processing over a
+  fixed distribution; a technique, not a database class, orthogonal to Strata. [Addendum §4](scope-addendum-v2.md)
 - **Agent memory as a product** — memory is the *reference application*, Strata is the *substrate*.
   Build the engine, then a thin memory layer on top as the demo; don't become "startup sixteen" in a
-  crowded market competing on the axis where the advantage is smallest. [Addendum §5](scope-addendum-v1.md)
+  crowded market competing on the axis where the advantage is smallest. [Addendum §5](scope-addendum-v2.md)
+
+## Read later, don't build
+
+- **Learned indexes** (v4+, [addendum §3.2](scope-addendum-v2.md)) — the delta-segment + background-
+  compaction shape shows up again here (Sig2Model: pre-allocate for writes, adjust locally, defer the
+  global rebuild), which is useful confirmation the §1.1 instinct generalises. But learned indexes are
+  weakest exactly where Strata is heaviest (writes), and it's a 2025 preprint. Reading, not a work item.
 
 ## Open questions that gate the above
 

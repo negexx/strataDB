@@ -102,13 +102,14 @@ The transaction/conflict layer is an explicit, load-bearing architectural compon
 
 **Flagship milestone — "v0.3: concurrent multi-agent write slice"** (end of Phase 6): N simulated agents issue concurrent transactions (some conflicting, some not) against one shared dataset; every acknowledged write is durable and visible to the next reader; conflicting transactions get a typed error identifying contested rows; a transaction writing a row + updating the index commits both atomically or neither; a reader's open snapshot never sees a partial write from a later commit; the scenario re-runs under randomized process kills for many iterations with zero invariant violations.
 
-### Post-MVP direction (Scope Addendum v1)
+### Post-MVP direction (Scope Addendum v2)
 
-See [`scope-addendum-v1.md`](scope-addendum-v1.md) for the full argument and [`FUTURE.md`](FUTURE.md) for the parking lot.
+See [`scope-addendum-v2.md`](scope-addendum-v2.md) for the full argument and [`FUTURE.md`](FUTURE.md) for the parking lot.
 
-- **DECIDED — segmented immutable index layout** ([ADR 0008](decisions/0008-adopt-segmented-index-layout.md), Accepted 2026-07-24). Branching is a mandatory capability, and it is only possible on a segmented index, so the vector index moves from today's monolithic mutable HNSW to immutable segments + manifest. This decides the *layout*, not the features — **v1 still ships zero branching.** The `lifecycle_bench` recovery cost (full graph rebuild ≈ ingest cost) is a second, already-measured reason. **Gating de-risk before the segment format is committed:** the recall-vs-segment-count curve (addendum §6 Q2), cheap to prototype against the existing `crates/index` graph.
+- **DECIDED — segmented immutable index layout** ([ADR 0008](decisions/0008-adopt-segmented-index-layout.md), Accepted 2026-07-24). Branching is a mandatory capability, and it is only possible on a segmented index, so the vector index moves from today's monolithic mutable HNSW to immutable segments + manifest. Decides the *layout*, not the features — **v1 still ships zero branching.** The gating de-risk (recall-vs-segment-count, addendum §7.2) **has been run** — `bench/benches/segment_recall_bench.rs`: recall is segment-count-safe (0.974 → 0.998 across K=1→64), the cost is latency (~linear, 34× at K=64), so compaction bounds *latency* not *recall*. Result and design implications in ADR 0008.
+- **v1 companion — per-segment zone maps** (addendum §1.2). Store per-segment min/max for a timestamp + low-cardinality filter columns in the manifest, turning temporal/filtered predicates into segment pruning. ~100 lines, nearly free *given* the segmented layout and impossible without it — so the layout must reserve manifest room for it. A pruning primitive, **not** a temporal data model.
 - **v2 — Branching (the thesis):** fork → fast abort → branch read isolation → merge. "The storage engine an agent can fork." Built *after* Phase 6/7, on the segmented layout. See `FUTURE.md`.
-- **v3 — Small storage primitives:** staleness tracking on derived columns, verifiable deletion, budget-shaped ANN (`recall ≥ 0.9 OR cost ≤ X`). Each stops deliberately short of the system that would consume it.
+- **v3 — Small storage primitives:** staleness tracking on derived columns, verifiable deletion, budget-shaped ANN (`recall ≥ 0.9 OR cost ≤ X`). Each stops deliberately short of the system that would consume it. (Learned indexes: read, don't build — v4+, addendum §3.2.)
 
 ## Non-Goals (cut list — revisit only after Phase 7)
 
@@ -124,10 +125,11 @@ See [`scope-addendum-v1.md`](scope-addendum-v1.md) for the full argument and [`F
 | Object storage as the primary backend | Local disk first; cloud backend is Phase 9 |
 | Derivation engine (IVM over model calls) | That's an orchestrator + separate product; ship the staleness *primitive* and stop — [addendum §4](scope-addendum-v1.md) |
 | Probe optimiser / cost-quality query planning | Requires a query optimiser → a query language; Strata is a storage engine (category error) |
-| Belief semantics (bi-temporal validity, confidence, retraction cascades) | A *data model*; the moment the engine holds opinions about a "claim" it stops being a storage engine — build it *on* Strata |
+| Belief semantics (bi-temporal validity, confidence, retraction cascades) | A *data model*; the moment the engine holds opinions about a "claim" it stops being a storage engine — build it *on* Strata (zone maps make temporal *filtering* fast; that's the storage boundary) |
+| Neural databases (NeuroDB / SNH / NGDB) | Approximate range-aggregate query processing over a fixed distribution — a technique, not a database class, orthogonal to Strata ([addendum §4](scope-addendum-v2.md)) |
 | Extreme multi-tenancy (fork) | Architectural fork, not a feature; embeddable-first makes million-tenant ~free (run N instances) |
 
-The four rows above come from [Scope Addendum v1](scope-addendum-v1.md) §4 — refused deliberately and recorded so they aren't relitigated as the space moves. Deferred (not refused) items live in [`FUTURE.md`](FUTURE.md).
+The rows above come from [Scope Addendum v2](scope-addendum-v2.md) §4 — refused deliberately and recorded so they aren't relitigated as the space moves. Deferred (not refused) items live in [`FUTURE.md`](FUTURE.md).
 
 ## What this doc is NOT
 

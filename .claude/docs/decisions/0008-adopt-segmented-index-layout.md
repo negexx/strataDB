@@ -46,6 +46,46 @@ urgent. From addendum §6:
   references) is the hard, still-unsolved part of the design that follows.
 - **Q3 — whether fast abort scales** at the vector-index layer, not with segments-touched.
 
+## Measured result — the gating de-risk (Q2) has been run: GO
+
+`bench/benches/segment_recall_bench.rs` ran the §7.2 experiment on the real dataset (20k × 512-dim,
+Strata's production HNSW params M=16 / ef_construction=200 / ef_search=32, k=10, recall@10 vs exact
+brute-force ground truth). K contiguous segments, fan-out search, merge top-k:
+
+| K | recall@10 | µs/query | latency vs K=1 |
+|---|---|---|---|
+| 1 (monolithic, = today) | 0.974 | 274 | 1× |
+| 2 | 0.975 | 682 | 2.5× |
+| 8 | 0.990 | 1,901 | 6.9× |
+| 32 | 0.996 | 4,967 | 18× |
+| 64 | 0.998 | 9,390 | 34× |
+
+**Verdict: recall is segment-count-safe; the cost is latency, ~linear in K.** Recall does not fall as
+segments accumulate — it rises (0.974 → 0.998), because fan-out over-fetches k candidates per segment
+and each small segment is searched near-exhaustively at fixed ef. That over-fetch *is* the latency
+cost, which is why latency grows ~linearly.
+
+**Why this is the good outcome for this decision.** The feared failure was recall collapsing with
+segment count — which would make compaction *load-bearing for correctness*: a lagging compactor would
+silently return worse answers. That did not happen. Instead compaction only needs to bound *latency*,
+which it does by construction (fewer segments → less fan-out). A lagging compactor makes queries
+slower, never wrong. Q2 does not invalidate the segmented layout.
+
+**Honest caveats (don't over-read the recall rise):**
+- The recall *increase* is an over-fetch artifact, not evidence that "more segments = better search." A
+  latency-matched comparison (shrink ef per segment as K grows) would show recall roughly flat, not
+  rising. The load-bearing claim is only "no recall cliff," which holds.
+- 34× at K=64 is a real cost, but bounded in practice: compaction keeps K small (at K=2–8, latency is
+  2.5–7× and absolute latency stays ~1–2 ms), and zone maps (addendum §1.2) prune most segments for
+  filtered/temporal queries before any search.
+
+**Design implications for the segment format / compaction policy:**
+1. Compaction targets a **latency** SLA (bounded K), not a recall floor — a much easier constraint.
+2. The search path should over-fetch per segment (it already helps recall here); a latency-budgeted
+   variant (ef shrinking with K) is a follow-up if a query is latency-bound, not a v1 requirement.
+3. Zone-map pruning (§1.2) is complementary and worth building alongside, since it attacks the same
+   fan-out cost from the other side.
+
 ## Empirical support already in hand
 
 `bench/benches/lifecycle_bench.rs` (25k rows × 512-dim) measured monolithic recovery — a full HNSW

@@ -1,5 +1,10 @@
 # Strata — Scope Addendum v1
 
+> **SUPERSEDED by [`scope-addendum-v2.md`](scope-addendum-v2.md)** (2026-07-24). v2 adds zone maps
+> (§1.2), a learned-index note (§3.2), neural databases to the refused list (§4), and a research
+> triage filter (§6); the branching thesis, refusals, and memory positioning are unchanged. Read v2.
+> This file is kept for history.
+
 **Status:** Proposal. Nothing here is decided until you decide it.
 **Context:** Written after a landscape review of open database gaps (mid-2026). This does not replace the existing MVP spec — it amends it in exactly one place and defers everything else.
 
