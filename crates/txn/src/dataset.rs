@@ -586,11 +586,13 @@ impl Transaction {
         // so a clean commit composes with everything that landed in
         // between.
         let mut tombstones = latest_snapshot.tombstones.as_ref().clone();
-        for delta in &deltas {
+        for delta in deltas {
             match delta {
-                DeltaEntry::Insert { row_id, vector } => self.graph.insert(*row_id, vector)?,
+                DeltaEntry::Insert { row_id, vector } => {
+                    self.graph.insert_owned(row_id, vector)?;
+                }
                 DeltaEntry::Tombstone { row_id } => {
-                    tombstones.insert(*row_id);
+                    tombstones.insert(row_id);
                 }
             }
         }
@@ -788,7 +790,7 @@ fn replay_index(dir: &Path, manifest: &Manifest) -> Result<(HnswIndex, imbl::Has
     for entry in &manifest.data_files {
         for delta in read_delta_log(&safe_join(&data_dir, &entry.delta_log)?)? {
             match delta {
-                DeltaEntry::Insert { row_id, vector } => index.insert(row_id, &vector)?,
+                DeltaEntry::Insert { row_id, vector } => index.insert_owned(row_id, vector)?,
                 DeltaEntry::Tombstone { row_id } => {
                     tombstones.insert(row_id);
                 }
