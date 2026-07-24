@@ -59,8 +59,10 @@ impl Distance for Cosine {
 /// trigger. Verified against the installed `anndists-0.1.5` source
 /// (`dist/distances.rs`) and confirmed empirically (a throwaway probe
 /// crate run at dim=768 across 200k trials): `DistDot::eval`'s `f32` impl
-/// (`scalar_dot_f32`, the default non-SIMD path — `simdeez_f`/`stdsimd`
-/// are off by default and not enabled anywhere in this workspace)
+/// (`scalar_dot_f32`, the default non-SIMD path — this investigation
+/// predates this workspace enabling the `simdeez_f` feature, see
+/// `Cargo.toml`; `Dot::eval` below never calls into `anndists` at all, so
+/// this finding is unaffected either way)
 /// computes `1.0 - dot_product` and then `assert!(dot >= 0.0)` with *zero*
 /// tolerance (unlike `DistCosine`'s analogous internal assert, which has a
 /// `-0.00002` margin). Floating-point rounding during L2 normalization

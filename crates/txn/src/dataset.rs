@@ -117,6 +117,57 @@ pub(crate) fn data_subdir(dir: &Path) -> PathBuf {
     dir.join("data")
 }
 
+/// Determines the correct starting value for `write_attempt_counter` on
+/// `Dataset::open`.
+///
+/// Normally this is simply `manifest.next_attempt_id`, persisted forward on
+/// every commit (see `Manifest.next_attempt_id`'s doc comment). A manifest
+/// that genuinely went through the current commit path always has
+/// `next_attempt_id >= 1` after its very first commit — the counter is
+/// `fetch_add`'d before every data/delta-log file write and persisted
+/// forward every time.
+///
+/// A manifest written BEFORE `next_attempt_id` existed as a field
+/// deserializes it as 0 via `#[serde(default)]`, even though `data_files`
+/// may already hold legacy, VERSION-prefixed filenames
+/// (`{version:020}-{i}.arrow`, from before the attempt-id naming scheme
+/// replaced version-based naming). So `next_attempt_id == 0` together with
+/// a non-empty `data_files` is an unambiguous signal this is a legacy
+/// manifest needing migration — seeding at 0 would let the next commit's
+/// *second* write reuse an attempt id that collides byte-for-byte with an
+/// already-durable legacy filename, and `write_batch`'s `File::create`
+/// would silently truncate it. Migrate by seeding one past the highest
+/// attempt-id-shaped numeric prefix already used in `data_files`.
+fn seed_write_attempt_counter(manifest: &Manifest) -> Result<u64> {
+    if manifest.next_attempt_id != 0 || manifest.data_files.is_empty() {
+        return Ok(manifest.next_attempt_id);
+    }
+    let highest = manifest
+        .data_files
+        .iter()
+        .filter_map(|entry| parse_attempt_id_prefix(&entry.name));
+    match highest.max() {
+        // No entry parsed as an attempt-id-shaped prefix, so no existing
+        // filename occupies that numeric namespace at all — seeding at 0
+        // cannot collide with any of them, even though 0 looks like the
+        // vulnerable value at a glance. Only reachable via a corrupt/
+        // hostile manifest; every filename this codebase itself generates
+        // parses.
+        None => Ok(0),
+        Some(highest) => highest.checked_add(1).ok_or_else(|| {
+            TxnError::ManifestOverflow(format!("legacy attempt-id prefix {highest} + 1"))
+        }),
+    }
+}
+
+/// Parses the leading `{prefix}-{i}.ext` numeric prefix from a data-file
+/// name, if present. Used only by [`seed_write_attempt_counter`]'s legacy-
+/// manifest migration path — every filename this codebase itself ever
+/// generates (version-prefixed or attempt-id-prefixed) matches this shape.
+fn parse_attempt_id_prefix(file_name: &str) -> Option<u64> {
+    file_name.split('-').next()?.parse().ok()
+}
+
 impl Dataset {
     /// Creates a brand-new, empty dataset at `dir`. Errors if one already
     /// exists there.
@@ -246,7 +297,18 @@ impl Dataset {
         // comment and `Transaction::commit`, which persists this counter's
         // value forward on every commit the same way it does
         // the row-id allocator -> `manifest.next_row_id`.
-        let write_attempt_counter = Arc::new(AtomicU64::new(manifest.next_attempt_id));
+        //
+        // A second, narrower case `next_attempt_id` alone doesn't cover: a
+        // manifest written BEFORE this field existed deserializes it as 0
+        // via `#[serde(default)]`, even though `data_files` may already
+        // hold legacy, VERSION-prefixed filenames (`{version:020}-{i}...`,
+        // from before the attempt-id naming scheme replaced version-based
+        // naming). Seeding at 0 in that case reproduces the exact same
+        // collision-and-silent-truncation bug against those legacy files.
+        // `seed_write_attempt_counter` detects and migrates this case; see
+        // its own doc comment.
+        let write_attempt_counter =
+            Arc::new(AtomicU64::new(seed_write_attempt_counter(&manifest)?));
         let snapshot = Snapshot {
             dir: dir.clone(),
             version: manifest.version,
@@ -1621,6 +1683,108 @@ mod tests {
             "all rows from both sessions must be present — the first \
              session's committed data file must not be silently truncated \
              by the second session reusing its filename"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn opening_a_legacy_pre_attempt_id_manifest_does_not_destroy_its_data_files() {
+        // Regression test for a bug found via an external optimization
+        // report's audit (Section 2 of the pipeline docs): before this
+        // fix, `write_attempt_counter` seeded straight from
+        // `manifest.next_attempt_id` (see `Dataset::open` above) -- correct
+        // for any manifest produced by the current commit path, since that
+        // path always persists `next_attempt_id >= 1` after its very first
+        // commit. But a manifest written BEFORE `next_attempt_id` existed
+        // as a field deserializes it as 0 via `#[serde(default)]`, even
+        // though `data_files` may already hold legacy, VERSION-prefixed
+        // filenames (`{version:020}-{i}.arrow`, from before the
+        // attempt-id naming scheme replaced version-based naming). Seeding
+        // the counter at 0 in that case means the next commit's first
+        // *fetch_add* returns 0 (harmless -- legacy version 0 has no data
+        // file), but its *second* commit uses attempt id 1, colliding
+        // byte-for-byte with the legacy version-1 data file's name.
+        // `write_batch` uses `File::create`, which truncates -- silently
+        // destroying that already-durable file.
+        //
+        // This test simulates that legacy manifest directly (bypassing the
+        // normal create/commit path, which can no longer produce this
+        // shape) via `strata_storage::commit_manifest`, matching the
+        // existing hostile-manifest test pattern in this file.
+        let dir = temp_dir("legacy-manifest-migration");
+        let versions_dir_data = dir.join("data");
+        std::fs::create_dir_all(&versions_dir_data).unwrap();
+
+        // Simulate two legacy commits' worth of already-durable data files,
+        // named the OLD way: prefixed by their own commit's version number.
+        let legacy_batch_v1 = arrow::array::Int64Array::from(vec![1, 2, 3]);
+        let file_v1 = versions_dir_data.join(format!("{:020}-0.arrow", 1u64));
+        strata_storage::write_batch(
+            &file_v1,
+            &RecordBatch::try_new(test_schema(), vec![Arc::new(legacy_batch_v1)]).unwrap(),
+        )
+        .unwrap();
+
+        // A legacy manifest: data_files references the version-1 file, but
+        // (matching every manifest written before this field existed)
+        // carries no next_attempt_id -- it deserializes to 0.
+        let legacy_manifest = Manifest {
+            version: 1,
+            data_files: vec![DataFileEntry {
+                name: format!("{:020}-0.arrow", 1u64),
+                stats: std::collections::HashMap::new(),
+                delta_log: format!("{:020}-0.deltalog", 1u64),
+            }],
+            next_row_id: 3,
+            tombstones: Vec::new(),
+            next_attempt_id: 0, // <-- the exact legacy-deserialize shape
+        };
+        // The delta log referenced above must exist too (replay_index reads
+        // it on open), but can be empty -- this test's batch has no vector
+        // column, so no Insert deltas were ever produced for it.
+        strata_index::write_delta_log(
+            &versions_dir_data.join(format!("{:020}-0.deltalog", 1u64)),
+            &[],
+        )
+        .unwrap();
+        strata_storage::commit_manifest(&dir, &legacy_manifest).unwrap();
+
+        // Open (must migrate the attempt-id counter away from 0) and commit
+        // twice -- the second commit is the one that would use attempt id 1
+        // under the old, buggy seeding.
+        let reopened = Dataset::open(&dir).unwrap();
+        let schema = test_schema();
+        for value in [4i64, 5i64] {
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from(vec![value]))],
+            )
+            .unwrap();
+            let mut txn = reopened.begin();
+            txn.insert(batch);
+            txn.commit().unwrap();
+        }
+
+        // The legacy file must survive untouched, AND all rows (legacy +
+        // both new commits) must be visible -- neither silently destroyed
+        // nor silently double-counted via a reused manifest entry name.
+        assert!(
+            file_v1.exists(),
+            "the legacy version-1 data file must not have been overwritten"
+        );
+        let scanned = reopened.snapshot().scan(&schema).unwrap();
+        let ids = scanned
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let mut got: Vec<i64> = (0..ids.len()).map(|i| ids.value(i)).collect();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec![1, 2, 3, 4, 5],
+            "legacy rows plus both post-migration commits must all be present"
         );
 
         std::fs::remove_dir_all(&dir).ok();
