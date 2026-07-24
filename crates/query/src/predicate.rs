@@ -48,8 +48,8 @@ impl Predicate {
 ///
 /// # Errors
 ///
-/// Returns an [`ArrowError`] if `predicate`'s column doesn't exist, or if
-/// its value's type doesn't match the column's actual Arrow type (the
+/// Returns an [`ArrowError`] if any of `predicate`'s columns doesn't exist,
+/// or if its value's type doesn't match the column's actual Arrow type (the
 /// underlying comparison kernel enforces this).
 pub fn filter(batch: &RecordBatch, predicate: &Predicate) -> Result<RecordBatch, ArrowError> {
     let selection = mask(batch, predicate)?;
@@ -67,9 +67,16 @@ pub fn filter(batch: &RecordBatch, predicate: &Predicate) -> Result<RecordBatch,
 ///
 /// # Errors
 ///
-/// Same as [`filter`]: the predicate's column must exist and its value's type
-/// must match the column's Arrow type.
+/// Same as [`filter`]: any of `predicate`'s columns must exist and its
+/// value's type must match the column's Arrow type.
 pub fn mask(batch: &RecordBatch, predicate: &Predicate) -> Result<BooleanArray, ArrowError> {
+    // Kleene (three-valued) composition: `or_kleene` is load-bearing for
+    // nullable columns (plain `or` would drop a row that matches only via
+    // a non-null disjunct - see `mask_or_with_kleene_semantics_...` test
+    // below). `and_kleene` is used for consistency, not necessity - for
+    // `And`, Kleene and non-Kleene always produce the same row-selection
+    // outcome once `filter`/`filter_record_batch` treat both false and
+    // null as "don't take."
     match predicate {
         Predicate::And(l, r) => Ok(and_kleene(&mask(batch, l)?, &mask(batch, r)?)?),
         Predicate::Or(l, r) => Ok(or_kleene(&mask(batch, l)?, &mask(batch, r)?)?),
@@ -130,6 +137,14 @@ fn compare(array: &ArrayRef, predicate: &Predicate) -> Result<BooleanArray, Arro
 /// whenever it can't prove otherwise — see
 /// `.claude/docs/design/phase-3-query-refinement-spec.md` §2. Pure
 /// function, zero I/O.
+///
+/// For a compound predicate: an `And` can prune the file if *either* side
+/// alone proves no match is possible (both conjuncts must be satisfiable
+/// for the AND to be satisfiable). An `Or` can only prune if *both* sides
+/// prove no match is possible (either disjunct being satisfiable is enough
+/// for the OR to be satisfiable). This is the same fail-open direction as
+/// the leaf case: `should_scan_file` never says "skip" unless it can prove
+/// the skip is safe.
 #[must_use]
 #[allow(clippy::implicit_hasher)]
 pub fn should_scan_file(stats: &HashMap<String, ColumnStats>, predicate: &Predicate) -> bool {
