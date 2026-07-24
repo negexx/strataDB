@@ -1550,7 +1550,11 @@ mod tests {
     }
 
     fn temp_dir(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("strata-txn-test-{label}-{}", std::process::id()))
+        tempfile::Builder::new()
+            .prefix(&format!("strata-txn-test-{label}-"))
+            .tempdir()
+            .unwrap()
+            .keep()
     }
 
     fn test_schema() -> Arc<Schema> {
@@ -3053,10 +3057,11 @@ mod tests {
     #[test]
     #[allow(clippy::cast_precision_loss)]
     fn commit_applies_only_its_own_new_deltas_not_the_full_history() {
-        let dir = std::env::temp_dir().join(format!(
-            "strata-replay-cost-regression-{}",
-            std::process::id()
-        ));
+        let dir = tempfile::Builder::new()
+            .prefix("strata-replay-cost-regression-")
+            .tempdir()
+            .unwrap()
+            .keep();
         Dataset::create(&dir).unwrap();
         let dataset = Dataset::open(&dir).unwrap();
 
@@ -3788,11 +3793,15 @@ mod loom_tests {
     #[test]
     fn two_threads_deleting_the_same_row_exactly_one_conflicts() {
         loom::model(|| {
-            let dir = std::env::temp_dir().join(format!(
-                "strata-loom-conflict-{}-{:?}",
-                std::process::id(),
-                loom::thread::current().id()
-            ));
+            let dir = tempfile::Builder::new()
+                .prefix(&format!(
+                    "strata-loom-conflict-{}-{:?}-",
+                    std::process::id(),
+                    loom::thread::current().id()
+                ))
+                .tempdir()
+                .unwrap()
+                .keep();
             let ds = crate::Dataset::create(&dir).unwrap();
             let schema = StdArc::new(arrow::datatypes::Schema::new(vec![
                 arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
@@ -3854,11 +3863,15 @@ mod loom_tests {
     #[test]
     fn two_threads_deleting_disjoint_rows_both_succeed() {
         loom::model(|| {
-            let dir = std::env::temp_dir().join(format!(
-                "strata-loom-disjoint-{}-{:?}",
-                std::process::id(),
-                loom::thread::current().id()
-            ));
+            let dir = tempfile::Builder::new()
+                .prefix(&format!(
+                    "strata-loom-disjoint-{}-{:?}-",
+                    std::process::id(),
+                    loom::thread::current().id()
+                ))
+                .tempdir()
+                .unwrap()
+                .keep();
             let ds = crate::Dataset::create(&dir).unwrap();
             let schema = StdArc::new(arrow::datatypes::Schema::new(vec![
                 arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
@@ -4091,11 +4104,15 @@ mod loom_tests {
         // interleaving, and every run does real filesystem I/O, so keeping
         // per-run work down is what makes the model tractable.
         loom::model(|| {
-            let dir = std::env::temp_dir().join(format!(
-                "strata-loom-residue-{}-{:?}",
-                std::process::id(),
-                loom::thread::current().id()
-            ));
+            let dir = tempfile::Builder::new()
+                .prefix(&format!(
+                    "strata-loom-residue-{}-{:?}-",
+                    std::process::id(),
+                    loom::thread::current().id()
+                ))
+                .tempdir()
+                .unwrap()
+                .keep();
             // Also cleaned up-front: a previous model iteration that
             // panicked would otherwise leave a dataset here and make the
             // next iteration fail with `AlreadyExists`, masking the real

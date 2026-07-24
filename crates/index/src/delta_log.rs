@@ -71,10 +71,12 @@ mod tests {
     use super::*;
 
     fn temp_path(label: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "strata-delta-log-test-{label}-{}.jsonl",
-            std::process::id()
-        ))
+        tempfile::Builder::new()
+            .prefix(&format!("strata-delta-log-test-{label}-"))
+            .tempdir()
+            .unwrap()
+            .keep()
+            .join("delta.jsonl")
     }
 
     #[test]
