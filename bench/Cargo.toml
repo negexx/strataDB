@@ -43,3 +43,7 @@ harness = false
 [[bench]]
 name = "segment_recall_bench"
 harness = false
+
+[[bench]]
+name = "ef_construction_sweep_bench"
+harness = false
