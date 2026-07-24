@@ -98,7 +98,7 @@ mod tests {
         let read_back = read_delta_log(&path).unwrap();
 
         assert_eq!(read_back, entries);
-        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     #[test]
@@ -106,5 +106,6 @@ mod tests {
         let path = temp_path("missing");
         let result = read_delta_log(&path);
         assert!(result.is_err());
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 }

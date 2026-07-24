@@ -4113,11 +4113,6 @@ mod loom_tests {
                 .tempdir()
                 .unwrap()
                 .keep();
-            // Also cleaned up-front: a previous model iteration that
-            // panicked would otherwise leave a dataset here and make the
-            // next iteration fail with `AlreadyExists`, masking the real
-            // assertion failure.
-            std::fs::remove_dir_all(&dir).ok();
             let ds = crate::Dataset::create(&dir).unwrap();
 
             let ds_failing = ds.clone();

@@ -24,8 +24,8 @@ hnsw_rs = "0.3"
 pyo3 = { version = "0.29", features = ["extension-module"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-thiserror = "2"
 tempfile = "3"
+thiserror = "2"
 
 # NOTE: crates/index/Cargo.toml cannot use `[lints] workspace = true` like
 # every other crate here — it needs a local `unexpected_cfgs` addition for

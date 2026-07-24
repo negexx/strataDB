@@ -12,21 +12,12 @@ arrow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-# Optional + gated by `chaos-injection`: `tests/bin/chaos_checkpoint_helper.rs`
-# is a `[[bin]]` target (not a test/example/bench), so it can't see
-# `[dev-dependencies]` — it needs `tempfile` as a real (if optional) crate
-# dependency. Gating it behind the feature that already restricts this bin's
-# `required-features` keeps a plain, feature-less `cargo build -p
-# strata-storage` free of it, matching this crate's existing chaos-injection
-# isolation story. Unit tests get `tempfile` unconditionally via the
-# `[dev-dependencies]` entry below regardless of this feature.
-tempfile = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 
 [features]
-chaos-injection = ["dep:tempfile"]
+chaos-injection = []
 
 [[bin]]
 name = "chaos_checkpoint_helper"
