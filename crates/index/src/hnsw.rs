@@ -257,8 +257,25 @@ impl HnswIndex {
         // row deep in the graph is never missed just because it fell
         // outside some pre-guessed widened candidate window, since the
         // predicate is evaluated as part of the same search, not after it.
-        let live: std::collections::HashSet<u64> = live_ids.iter().map(|&id| id as u64).collect();
-        let filter = move |id: u64| live.contains(&id) && is_visible(id);
+        // A dense bitset rather than a `HashSet`. Row-ids are dense and
+        // monotonic (see `NodeTable`'s own contract), so membership is one
+        // indexed load plus a shift instead of a `SipHash` probe, and the
+        // whole structure is `max_row_id / 8` bytes rather than roughly 24
+        // per entry — ~12KB instead of ~1MB at 100k live ids. Building it is
+        // O(live_ids) with no hashing and no rehash growth.
+        //
+        // `live_ids` need not be sorted: the bitset is order-insensitive.
+        let max_id = live_ids.iter().copied().max().unwrap_or(0);
+        let mut live = vec![0_u64; max_id / 64 + 1];
+        for &id in live_ids {
+            live[id / 64] |= 1_u64 << (id % 64);
+        }
+        let filter = move |id: u64| {
+            // An id past the end of the bitset simply isn't live, which is
+            // also what makes the empty-`live_ids` case behave correctly.
+            let word = usize::try_from(id / 64).unwrap_or(usize::MAX);
+            word < live.len() && (live[word] >> (id % 64)) & 1 == 1 && is_visible(id)
+        };
         let raw = self.graph.k_nn_search(query, k, ef_search, filter)?;
         Ok(raw
             .into_iter()

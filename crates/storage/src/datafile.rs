@@ -75,6 +75,40 @@ pub fn read_batch(path: &Path) -> Result<RecordBatch> {
     Ok(batch)
 }
 
+/// Reads the first `RecordBatch` from an Arrow IPC file, decoding **only**
+/// the named columns.
+///
+/// Arrow IPC lays each column's buffers out separately, so a projected read
+/// never touches the bodies of the columns it wasn't asked for. For a table
+/// carrying a wide embedding column that is the difference between decoding
+/// the entire dataset and decoding a couple of scalar columns — at 100k rows
+/// of 512-dim `f32`, ~204MB versus ~1.6MB.
+///
+/// [`read_batch`] reads everything and stays the right default; this is for
+/// callers that provably need a subset, such as resolving the row-ids
+/// matching a predicate without materialising the vectors alongside them.
+///
+/// The footer is read twice — once to resolve names to indices, once to apply
+/// the projection — but the footer is metadata only, so the first open
+/// decodes no record-batch body.
+///
+/// # Errors
+///
+/// As [`read_batch`], plus an error if any name in `columns` is not a field
+/// of this file's schema.
+pub fn read_batch_columns(path: &Path, columns: &[&str]) -> Result<RecordBatch> {
+    let schema = FileReader::try_new(File::open(path)?, None)?.schema();
+    let projection = columns
+        .iter()
+        .map(|name| schema.index_of(name))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut reader = FileReader::try_new(File::open(path)?, Some(projection))?;
+    let batch = reader
+        .next()
+        .ok_or_else(|| StorageError::EmptyDataFile(path.to_path_buf()))??;
+    Ok(batch)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
