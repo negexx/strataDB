@@ -2,7 +2,7 @@
 name: plan
 description: Produce an implementation plan before touching code. Required for any change spanning 3+ files or introducing new architecture.
 argument-hint: "<feature or task description>"
-model: fable
+model: opus
 ---
 
 # /plan — Implementation planning
@@ -47,7 +47,7 @@ Produce a plan, not code. The plan should be the kind of thing a competent teamm
 
 ## When to escalate the model
 
-This command runs on Fable 5 by default — planning and architecture is exactly the tier it's for. If Fable 5 isn't available in this environment, fall back to Opus 4.8.
+This command runs on Opus 5 by default — planning and architecture is exactly the tier it's for.
 
 If the plan additionally involves:
 - Architectural decisions (isolation level, conflict granularity, on-disk format changes)

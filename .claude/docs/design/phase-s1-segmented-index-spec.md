@@ -189,7 +189,7 @@ the now-redundant mechanism, each step gated by the loom tests and the chaos har
 "a failed transaction leaves neither the row nor the index behind" must hold at every commit of the
 migration, not just at the end.
 
-## 7. Open questions to resolve during design (invoke brainstorming / Fable-tier review)
+## 7. Open questions to resolve during design (invoke brainstorming / Opus 5-tier review)
 
 1. **Delta log's residual role.** Once segments are the durable built result, is the per-commit delta
    log removed entirely (segment file *is* the record), or kept as a write-ahead log for a segment not
@@ -233,7 +233,7 @@ migration, not just at the end.
 ## 10. Process
 
 - Brainstorm the segment format + migration approach *before* writing code; the segment format and the
-  W3 cutover are architectural — design them at the Fable/Opus tier, review before implementing.
+  W3 cutover are architectural — design them at the Opus 5 tier, review before implementing.
 - `writing-plans` for the multi-PR migration; `test-driven-development` for the logic;
   `verification-before-completion` before any "done" claim.
 - PRs only, never push to `main`. One workstream per PR, in the §5 order.

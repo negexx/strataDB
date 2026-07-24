@@ -1,6 +1,6 @@
 # Review of the OCC / Conflict-Resolution Proposal Document
 
-> Date: 2026-07-23 · Reviewer: Fable 5 (deep-analysis tier), independently re-verified against
+> Date: 2026-07-23 · Reviewer: Opus 5 (deep-analysis tier), independently re-verified against
 > source by the main session · Subject: an externally-supplied audit proposal for the `crates/txn`
 > transaction subsystem.
 >

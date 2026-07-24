@@ -15,7 +15,7 @@
 - `chaos-injection` is off by default for every crate — must never affect the real `strata` binary, `strata-txn`, or any published-consumer build.
 - Full workspace gate before any task is done: `cargo build --workspace`, `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`.
 - Every task gets reviewed by the Opus reviewer subagent before being marked done, per this project's CLAUDE.md — not optional, regardless of which model implemented it.
-- This is the flagship correctness-proof subsystem; escalate to Fable 5/Opus 4.8 for the architecturally significant tasks (the checkpoint mechanism, the orchestrator's invariant logic).
+- This is the flagship correctness-proof subsystem; escalate to Opus 5 for the architecturally significant tasks (the checkpoint mechanism, the orchestrator's invariant logic).
 
 ---
 

@@ -83,10 +83,10 @@ Pick the tier that matches the task's complexity, not the biggest model availabl
 |------|-------|
 | Trivial — search, read, copy, simple lookups | Haiku 4.5 |
 | Implementation — basic to medium complexity (DEFAULT) | Sonnet 5 |
-| In-depth planning, architecture, highly complex implementation | Fable 5 — fall back to Opus 5 if Fable 5 isn't available |
+| In-depth planning, architecture, highly complex implementation | Opus 5 |
 | Review — every completed task, before it's marked done | Opus 5 (mandatory, not an escalation) |
 
-**Escalate** Sonnet 5 → Fable 5 (→ Opus 5 if Fable 5 is unavailable) when: the task is architectural, security-critical, the approach is genuinely unclear, or a wrong call here is expensive to undo. Given this project's flagship subsystem (Phase 6 concurrency engine) is exactly that kind of work by design, escalate liberally when touching `crates/txn/`.
+**Escalate** Sonnet 5 → Opus 5 when: the task is architectural, security-critical, the approach is genuinely unclear, or a wrong call here is expensive to undo. Given this project's flagship subsystem (Phase 6 concurrency engine) is exactly that kind of work by design, escalate liberally when touching `crates/txn/`.
 
 **Downgrade** back to Sonnet 5 once the approach is settled and the remaining work is mechanical.
 
