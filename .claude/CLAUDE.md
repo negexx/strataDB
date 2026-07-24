@@ -60,6 +60,8 @@ Unit tests live inline per crate (`#[cfg(test)] mod tests`) — idiomatic Rust, 
 
 Full phase-by-phase roadmap and the full architecture diagram: `.claude/docs/architecture.md`. Phase 0's deliverable — the precise definitions of "conflict" and "transaction boundary," and the file format — is done: `.claude/docs/design/phase-0-transaction-and-format-spec.md`. Read it before writing anything real in `crates/txn/` or `crates/storage/`; don't improvise a definition that contradicts it.
 
+Post-MVP scope is proposed (not adopted) in `.claude/docs/scope-addendum-v1.md`, with deferred/refused items in `.claude/docs/FUTURE.md`. **One open decision gates index-storage work:** segmented-immutable vs. today's monolithic-mutable HNSW layout — `.claude/docs/decisions/0007-segmented-vs-monolithic-index-layout.md` (Proposed). It's not retrofittable, so before making a `crates/index`/`crates/storage` change that would harden the monolithic layout against a later segmented migration, check that ADR first.
+
 ## Conventions
 
 Non-obvious patterns only — see `.claude/docs/conventions.md` for the full Rust style guide.
