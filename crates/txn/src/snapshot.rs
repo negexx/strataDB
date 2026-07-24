@@ -15,6 +15,7 @@ use strata_storage::{DataFileEntry, Manifest, read_batch, read_batch_columns};
 
 use crate::dataset::{ROW_ID_COLUMN, cast_batch_to_schema, data_subdir, safe_join};
 use crate::error::{Result, TxnError};
+use crate::row_id::RowIdRange;
 
 pub struct Snapshot {
     pub(crate) dir: PathBuf,
@@ -22,6 +23,11 @@ pub struct Snapshot {
     pub(crate) manifest: Arc<Manifest>,
     pub(crate) graph: Arc<HnswIndex>,
     pub(crate) watermark: u64,
+    /// Row-id ranges claimed by transactions that had not yet committed
+    /// when this snapshot was published — subtracted from `watermark`'s
+    /// coverage by [`Snapshot::is_visible`]. See [`crate::row_id`] for why a
+    /// scalar watermark alone cannot express "committed".
+    pub(crate) in_flight: Arc<[RowIdRange]>,
     pub(crate) tombstones: Arc<imbl::HashSet<u64>>,
 }
 
@@ -66,8 +72,25 @@ impl Snapshot {
     /// was built (immediately after the commit that produced it), not from
     /// a stored version per tombstone entry. See the design doc's
     /// "Tombstone mechanism" section.
+    ///
+    /// "Committed" is `watermark` *minus* `in_flight`, not `watermark`
+    /// alone. The watermark comes from the global row-id counter, which
+    /// advances when a transaction *claims* its ids — before the commit
+    /// lock, and so before it commits — so on its own it also covers
+    /// row-ids belonging to transactions still in flight. Those are exactly
+    /// the ones spec §2 says must stay invisible "until commit succeeds",
+    /// and `in_flight` is what subtracts them. See [`crate::row_id`].
+    ///
+    /// This runs once per candidate during HNSW graph traversal, so the
+    /// order of the three checks is the order of their cost: an integer
+    /// compare, then a scan of a set that is empty unless another
+    /// transaction was mid-commit when this snapshot was published (and
+    /// holds one entry per such transaction when it is not), then the hash
+    /// lookup.
     pub(crate) fn is_visible(&self, row_id: u64) -> bool {
-        row_id <= self.watermark && !self.tombstones.contains(&row_id)
+        row_id <= self.watermark
+            && !self.in_flight.iter().any(|range| range.contains(row_id))
+            && !self.tombstones.contains(&row_id)
     }
 
     /// Data file entries (name + per-column stats) belonging to this
@@ -314,6 +337,14 @@ mod tests {
     use super::*;
 
     fn test_snapshot(watermark: u64, tombstoned: &[u64]) -> Snapshot {
+        test_snapshot_with_in_flight(watermark, tombstoned, &[])
+    }
+
+    fn test_snapshot_with_in_flight(
+        watermark: u64,
+        tombstoned: &[u64],
+        in_flight: &[RowIdRange],
+    ) -> Snapshot {
         Snapshot {
             dir: PathBuf::from("unused-in-these-tests"),
             version: 1,
@@ -328,6 +359,7 @@ mod tests {
                 .unwrap(),
             ),
             watermark,
+            in_flight: in_flight.into(),
             tombstones: Arc::new(tombstoned.iter().copied().collect()),
         }
     }
@@ -350,5 +382,40 @@ mod tests {
         let snapshot = test_snapshot(10, &[5]);
         assert!(!snapshot.is_visible(5));
         assert!(snapshot.is_visible(6));
+    }
+
+    #[test]
+    fn in_flight_row_at_or_below_watermark_is_not_visible() {
+        // The watermark comes from the global row-id counter, so it covers
+        // ids claimed by transactions that have not committed. `in_flight`
+        // is what keeps spec §2's "not visible until commit succeeds" true
+        // for them.
+        let snapshot = test_snapshot_with_in_flight(10, &[], &[RowIdRange { base: 4, len: 3 }]);
+        assert!(snapshot.is_visible(3), "below the claimed range");
+        assert!(!snapshot.is_visible(4), "first id of the claimed range");
+        assert!(!snapshot.is_visible(6), "last id of the claimed range");
+        assert!(
+            snapshot.is_visible(7),
+            "the range is half-open — 7 is past its end"
+        );
+    }
+
+    #[test]
+    fn several_concurrent_claims_are_all_excluded() {
+        let snapshot = test_snapshot_with_in_flight(
+            10,
+            &[8],
+            &[
+                RowIdRange { base: 2, len: 1 },
+                RowIdRange { base: 5, len: 2 },
+            ],
+        );
+        assert!(snapshot.is_visible(0));
+        assert!(!snapshot.is_visible(2));
+        assert!(snapshot.is_visible(4), "between two claimed ranges");
+        assert!(!snapshot.is_visible(5));
+        assert!(!snapshot.is_visible(6));
+        assert!(snapshot.is_visible(7));
+        assert!(!snapshot.is_visible(8), "tombstones still apply");
     }
 }

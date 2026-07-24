@@ -190,6 +190,51 @@ impl HnswIndex {
         )
     }
 
+    /// Soft-deletes `row_id`: it is excluded from every subsequent
+    /// [`Self::search`]/[`Self::search_filtered`] result by the graph's own
+    /// deleted-flag check, independent of any caller-supplied visibility
+    /// predicate. Its node physically remains as a traversal waypoint, so
+    /// other rows stay reachable through it, until Phase 8 compaction. A
+    /// no-op if `row_id` was never inserted, and irreversible — nothing
+    /// clears the flag.
+    ///
+    /// **Sole intended use: undoing an insert that never became durable.**
+    /// `crates/txn`'s commit path calls this to drop a transaction's
+    /// vectors back out of the shared graph when that transaction failed
+    /// before its manifest commit (see that crate's `GraphResidueGuard`).
+    /// That is sound precisely because such a row-id was never committed in
+    /// *any* version, so no snapshot should ever observe it, and because
+    /// row-ids are never reused
+    /// (`.claude/docs/design/phase-0-transaction-and-format-spec.md` §8) —
+    /// a soft-deleted id can never legitimately reappear.
+    ///
+    /// **Do not use this to implement a user-level DELETE.** That is
+    /// `crates/txn`'s versioned `Snapshot::tombstones` set, which is
+    /// per-version and replayed from the manifest. This flag is global and
+    /// unversioned: applying it to a committed row would hide that row from
+    /// *already-open* snapshots taken before the delete, breaking the
+    /// snapshot isolation those readers are promised.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use strata_index::{EfConstruction, HnswIndex, MaxConnections, MaxElements, MaxLayers};
+    ///
+    /// let index = HnswIndex::new(
+    ///     MaxConnections(16), MaxElements(100), MaxLayers(16), EfConstruction(200),
+    /// )?;
+    /// index.insert(0, &[0.0, 0.0, 0.0])?;
+    /// index.insert(1, &[10.0, 10.0, 10.0])?;
+    ///
+    /// index.remove(0);
+    /// let results = index.search(&[0.0, 0.0, 0.0], 1, 50, |_| true)?;
+    /// assert_eq!(results[0].row_id, 1, "the removed row is never returned");
+    /// # Ok::<(), strata_index::IndexError>(())
+    /// ```
+    pub fn remove(&self, row_id: u64) {
+        self.graph.delete(row_id);
+    }
+
     /// The vector dimension established by the first-ever [`Self::insert`]
     /// call, or `0` if no vector has been inserted yet. Read-only — never
     /// establishes a dimension itself. Exposed so callers (e.g.
