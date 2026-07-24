@@ -43,3 +43,7 @@ harness = false
 [[bench]]
 name = "conflict_check_bench"
 harness = false
+
+[[bench]]
+name = "lifecycle_bench"
+harness = false

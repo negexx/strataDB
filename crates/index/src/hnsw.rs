@@ -306,10 +306,19 @@ impl HnswIndex {
         // predicate is evaluated as part of the same search, not after it.
         // A dense bitset rather than a `HashSet`. Row-ids are dense and
         // monotonic (see `NodeTable`'s own contract), so membership is one
-        // indexed load plus a shift instead of a `SipHash` probe, and the
-        // whole structure is `max_row_id / 8` bytes rather than roughly 24
-        // per entry — ~12KB instead of ~1MB at 100k live ids. Building it is
-        // O(live_ids) with no hashing and no rehash growth.
+        // indexed load plus a shift instead of a `SipHash` probe, and no
+        // hashing or rehash growth is paid while building it.
+        //
+        // Sizing note: the bitset is `max_row_id / 8` bytes — proportional to
+        // the largest live row-id, *not* to `live_ids.len()`. For a dense
+        // low-selectivity filter that is a large win over the ~24-bytes/entry
+        // `HashSet` (~12KB vs ~1MB at 100k live ids). For a *highly selective*
+        // predicate over a very large dataset it can be the other way round —
+        // a handful of matches with a max row-id near 1e8 still allocates
+        // ~12MB here where the `HashSet` would have been tiny. Both are dwarfed
+        // by the in-memory graph and by the whole-file re-read `row_ids_matching`
+        // already pays per query, so this is not the term that matters — but
+        // it is not unconditionally smaller.
         //
         // `live_ids` need not be sorted: the bitset is order-insensitive.
         let max_id = live_ids.iter().copied().max().unwrap_or(0);
