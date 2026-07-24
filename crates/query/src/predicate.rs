@@ -6,6 +6,7 @@ use std::collections::HashMap;
 
 use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow::compute::filter_record_batch;
+use arrow::compute::kernels::boolean::{and, or};
 use arrow::compute::kernels::cmp::{eq, gt, gt_eq, lt, lt_eq};
 use arrow::error::ArrowError;
 use strata_storage::{ColumnStats, Value};
@@ -17,28 +18,28 @@ pub enum Predicate {
     LtEq(String, Value),
     Gt(String, Value),
     GtEq(String, Value),
+    And(Box<Predicate>, Box<Predicate>),
+    Or(Box<Predicate>, Box<Predicate>),
 }
 
 impl Predicate {
+    /// Every column this predicate reads from, in tree order. A leaf
+    /// contributes one column; `And`/`Or` contribute their children's
+    /// columns in order. May contain duplicates (e.g. `a = 1 OR a = 2`) —
+    /// callers building a projection list should dedup the result.
     #[must_use]
-    pub fn column(&self) -> &str {
+    pub fn columns(&self) -> Vec<&str> {
         match self {
             Predicate::Eq(c, _)
             | Predicate::Lt(c, _)
             | Predicate::LtEq(c, _)
             | Predicate::Gt(c, _)
-            | Predicate::GtEq(c, _) => c,
-        }
-    }
-
-    #[must_use]
-    pub fn value(&self) -> &Value {
-        match self {
-            Predicate::Eq(_, v)
-            | Predicate::Lt(_, v)
-            | Predicate::LtEq(_, v)
-            | Predicate::Gt(_, v)
-            | Predicate::GtEq(_, v) => v,
+            | Predicate::GtEq(c, _) => vec![c.as_str()],
+            Predicate::And(l, r) | Predicate::Or(l, r) => {
+                let mut cols = l.columns();
+                cols.extend(r.columns());
+                cols
+            }
         }
     }
 }
@@ -69,9 +70,19 @@ pub fn filter(batch: &RecordBatch, predicate: &Predicate) -> Result<RecordBatch,
 /// Same as [`filter`]: the predicate's column must exist and its value's type
 /// must match the column's Arrow type.
 pub fn mask(batch: &RecordBatch, predicate: &Predicate) -> Result<BooleanArray, ArrowError> {
-    let idx = batch.schema_ref().index_of(predicate.column())?;
-    let array = batch.column(idx);
-    compare(array, predicate)
+    match predicate {
+        Predicate::And(l, r) => Ok(and(&mask(batch, l)?, &mask(batch, r)?)?),
+        Predicate::Or(l, r) => Ok(or(&mask(batch, l)?, &mask(batch, r)?)?),
+        Predicate::Eq(c, _)
+        | Predicate::Lt(c, _)
+        | Predicate::LtEq(c, _)
+        | Predicate::Gt(c, _)
+        | Predicate::GtEq(c, _) => {
+            let idx = batch.schema_ref().index_of(c)?;
+            let array = batch.column(idx);
+            compare(array, predicate)
+        }
+    }
 }
 
 fn compare(array: &ArrayRef, predicate: &Predicate) -> Result<BooleanArray, ArrowError> {
@@ -84,8 +95,21 @@ fn compare(array: &ArrayRef, predicate: &Predicate) -> Result<BooleanArray, Arro
         Predicate::LtEq(..) => lt_eq,
         Predicate::Gt(..) => gt,
         Predicate::GtEq(..) => gt_eq,
+        Predicate::And(..) | Predicate::Or(..) => {
+            unreachable!("compare() is only reachable from mask()'s leaf arm")
+        }
     };
-    match predicate.value() {
+    let value = match predicate {
+        Predicate::Eq(_, v)
+        | Predicate::Lt(_, v)
+        | Predicate::LtEq(_, v)
+        | Predicate::Gt(_, v)
+        | Predicate::GtEq(_, v) => v,
+        Predicate::And(..) | Predicate::Or(..) => {
+            unreachable!("compare() is only reachable from mask()'s leaf arm")
+        }
+    };
+    match value {
         Value::Int64(v) => {
             let scalar = Int64Array::new_scalar(*v);
             cmp_fn(array, &scalar)
@@ -109,23 +133,35 @@ fn compare(array: &ArrayRef, predicate: &Predicate) -> Result<BooleanArray, Arro
 #[must_use]
 #[allow(clippy::implicit_hasher)]
 pub fn should_scan_file(stats: &HashMap<String, ColumnStats>, predicate: &Predicate) -> bool {
-    let Some(col_stats) = stats.get(predicate.column()) else {
-        return true; // no stats for this column - fail open, must scan
-    };
-    let value = predicate.value();
-    // A mismatched Value variant (e.g. a Utf8 predicate value against an
-    // Int64 column's stats) can't be proven to miss - fail open rather
-    // than trust derived PartialOrd's cross-variant ordering, which
-    // compares by declaration order, not value semantics.
-    if std::mem::discriminant(value) != std::mem::discriminant(&col_stats.min) {
-        return true;
-    }
     match predicate {
-        Predicate::Eq(..) => *value >= col_stats.min && *value <= col_stats.max,
-        Predicate::Lt(..) => *value > col_stats.min,
-        Predicate::LtEq(..) => *value >= col_stats.min,
-        Predicate::Gt(..) => *value < col_stats.max,
-        Predicate::GtEq(..) => *value <= col_stats.max,
+        Predicate::And(l, r) => should_scan_file(stats, l) && should_scan_file(stats, r),
+        Predicate::Or(l, r) => should_scan_file(stats, l) || should_scan_file(stats, r),
+        Predicate::Eq(c, v)
+        | Predicate::Lt(c, v)
+        | Predicate::LtEq(c, v)
+        | Predicate::Gt(c, v)
+        | Predicate::GtEq(c, v) => {
+            let Some(col_stats) = stats.get(c) else {
+                return true; // no stats for this column - fail open, must scan
+            };
+            // A mismatched Value variant (e.g. a Utf8 predicate value against an
+            // Int64 column's stats) can't be proven to miss - fail open rather
+            // than trust derived PartialOrd's cross-variant ordering, which
+            // compares by declaration order, not value semantics.
+            if std::mem::discriminant(v) != std::mem::discriminant(&col_stats.min) {
+                return true;
+            }
+            match predicate {
+                Predicate::Eq(..) => *v >= col_stats.min && *v <= col_stats.max,
+                Predicate::Lt(..) => *v > col_stats.min,
+                Predicate::LtEq(..) => *v >= col_stats.min,
+                Predicate::Gt(..) => *v < col_stats.max,
+                Predicate::GtEq(..) => *v <= col_stats.max,
+                Predicate::And(..) | Predicate::Or(..) => {
+                    unreachable!("handled by outer match")
+                }
+            }
+        }
     }
 }
 
@@ -197,6 +233,139 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.num_rows(), 1);
+    }
+
+    #[test]
+    fn mask_and_combines_two_leaf_conditions() {
+        let batch = sample_batch(); // id: [10, 20, 30], name: ["a", "b", "c"]
+        let predicate = Predicate::And(
+            Box::new(Predicate::GtEq("id".to_string(), Value::Int64(20))),
+            Box::new(Predicate::Eq(
+                "name".to_string(),
+                Value::Utf8("b".to_string()),
+            )),
+        );
+        let result = filter(&batch, &predicate).unwrap();
+        assert_eq!(result.num_rows(), 1);
+        let ids = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(ids.value(0), 20);
+    }
+
+    #[test]
+    fn mask_or_combines_two_leaf_conditions() {
+        let batch = sample_batch(); // id: [10, 20, 30], name: ["a", "b", "c"]
+        let predicate = Predicate::Or(
+            Box::new(Predicate::Eq("id".to_string(), Value::Int64(10))),
+            Box::new(Predicate::Eq("id".to_string(), Value::Int64(30))),
+        );
+        let result = filter(&batch, &predicate).unwrap();
+        assert_eq!(result.num_rows(), 2);
+        let ids = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let mut got: Vec<i64> = (0..result.num_rows()).map(|i| ids.value(i)).collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![10, 30]);
+    }
+
+    fn naive_eval(predicate: &Predicate, id: i64, name: &str) -> bool {
+        let actual_for = |column: &str| -> Value {
+            match column {
+                "id" => Value::Int64(id),
+                "name" => Value::Utf8(name.to_string()),
+                other => panic!("naive_eval: unknown column {other}"),
+            }
+        };
+        match predicate {
+            Predicate::Eq(c, v) => actual_for(c) == *v,
+            Predicate::Lt(c, v) => actual_for(c) < *v,
+            Predicate::LtEq(c, v) => actual_for(c) <= *v,
+            Predicate::Gt(c, v) => actual_for(c) > *v,
+            Predicate::GtEq(c, v) => actual_for(c) >= *v,
+            Predicate::And(l, r) => naive_eval(l, id, name) && naive_eval(r, id, name),
+            Predicate::Or(l, r) => naive_eval(l, id, name) || naive_eval(r, id, name),
+        }
+    }
+
+    #[test]
+    fn mask_matches_naive_reference_over_compound_predicates() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let ids = vec![1i64, 2, 3, 4, 5, 6];
+        let names = vec!["a", "b", "a", "c", "b", "a"];
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(ids.clone())),
+                Arc::new(StringArray::from(names.clone())),
+            ],
+        )
+        .unwrap();
+
+        let leaves = [
+            Predicate::GtEq("id".to_string(), Value::Int64(3)),
+            Predicate::Lt("id".to_string(), Value::Int64(5)),
+            Predicate::Eq("name".to_string(), Value::Utf8("a".to_string())),
+        ];
+
+        let mut compounds = Vec::new();
+        for i in 0..leaves.len() {
+            for j in 0..leaves.len() {
+                if i == j {
+                    continue;
+                }
+                compounds.push(Predicate::And(
+                    Box::new(leaves[i].clone()),
+                    Box::new(leaves[j].clone()),
+                ));
+                compounds.push(Predicate::Or(
+                    Box::new(leaves[i].clone()),
+                    Box::new(leaves[j].clone()),
+                ));
+            }
+        }
+
+        for predicate in &compounds {
+            let selection = mask(&batch, predicate).unwrap();
+            for row in 0..ids.len() {
+                let expected = naive_eval(predicate, ids[row], names[row]);
+                assert_eq!(
+                    selection.value(row),
+                    expected,
+                    "predicate {predicate:?} row {row} (id={}, name={}): mask()={} naive={}",
+                    ids[row],
+                    names[row],
+                    selection.value(row),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn columns_collects_every_leaf_column_in_a_compound_predicate() {
+        let predicate = Predicate::And(
+            Box::new(Predicate::GtEq("timestamp".to_string(), Value::Int64(100))),
+            Box::new(Predicate::Eq(
+                "category".to_string(),
+                Value::Utf8("x".to_string()),
+            )),
+        );
+        assert_eq!(predicate.columns(), vec!["timestamp", "category"]);
+    }
+
+    #[test]
+    fn columns_on_a_leaf_predicate_returns_one_column() {
+        let predicate = Predicate::Eq("id".to_string(), Value::Int64(1));
+        assert_eq!(predicate.columns(), vec!["id"]);
     }
 
     #[test]
