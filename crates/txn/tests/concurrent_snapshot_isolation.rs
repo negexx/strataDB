@@ -214,7 +214,7 @@ fn an_old_snapshots_vector_search_never_leaks_a_later_commits_rows() {
     // the real `Dataset`/`Transaction`/`commit` path (not `HnswIndex`
     // directly), and therefore through `Snapshot::vector_search`'s
     // no-predicate branch's PRODUCTION HNSW parameters
-    // (`HNSW_MAX_NB_CONNECTION=16`, `HNSW_EF_CONSTRUCTION=200`,
+    // (`HNSW_MAX_NB_CONNECTION=16`, `HNSW_EF_CONSTRUCTION`,
     // `EF_SEARCH_DEFAULT=32` in `crates/txn/src/dataset.rs` /
     // `crates/txn/src/snapshot.rs`) — weaker than the elevated test-only
     // parameters `crates/index/src/hnsw.rs`'s own unit tests use.

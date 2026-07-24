@@ -739,16 +739,18 @@ const HNSW_MAX_NB_CONNECTION: usize = 16;
 const HNSW_MAX_LAYER: usize = 16;
 // ef_construction is the build-cost dial: the insert-time saturation
 // early-exit is disabled, so every build traversal runs the full beam and
-// cost is near-linear in this value. Lowered from 200 -> 100 per the
-// 2026-07-24 ingest+recovery performance audit's ef_construction sweep
-// (bench/benches/ef_construction_sweep_bench.rs):
-//   - isolated HnswIndex build, 25k rows, M=16, ef_search=32 (3 repeated
-//     runs): recall@10 ~0.985 at ef=100 vs ~0.986-0.987 at ef=200.
-//   - end-to-end via lifecycle_bench (25k rows, production commit path):
-//     ingest+commit 37.30s -> 21.17s, recovery 36.12s -> 19.41s (~1.8x both).
-//   - production-path recall via vector_search_bench (100k rows, real
-//     Dataset): recall@10 = 0.9850 (ef=200) -> 0.9800 (ef=100), a 0.5pp
-//     drop well within the audit's stated headroom.
+// cost is near-linear in this value. Lowered 200 -> 100 based on
+// bench/benches/ef_construction_sweep_bench.rs (run it to reproduce; the
+// numbers below are its default 100k-row / 200-query configuration, the
+// same scale as vector_search_bench):
+//   - recall@10: 0.9855 (ef=200) -> 0.9820 (ef=100), a 0.35pp drop, still
+//     well clear of this project's recall@10 >= 0.9 ship floor.
+//   - build time: 225.15s (ef=200) -> 101.26s (ef=100), a 2.2x speedup.
+//   - cross-checked two other ways: production-path recall via
+//     vector_search_bench (100k rows, real Dataset) gives the same
+//     direction and magnitude (0.9850 -> 0.9800); end-to-end ingest+commit
+//     and recovery wall time via lifecycle_bench (25k rows, real commit
+//     path) both drop ~1.8x (37.30s -> 21.17s, 36.12s -> 19.41s).
 const HNSW_EF_CONSTRUCTION: usize = 100;
 
 fn new_hnsw_index(capacity: usize) -> Result<HnswIndex> {

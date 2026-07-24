@@ -7,7 +7,7 @@
 //! This measures that penalty directly, against Strata's own `crates/index`
 //! graph and the real 100k 512-dim OpenAI embedding dataset.
 //!
-//! Method, holding Strata's production HNSW params (M=16, ef_construction=200,
+//! Method, holding Strata's production HNSW params (M=16, ef_construction=100,
 //! ef_search=32, k=10) fixed:
 //!   - K=1 is the monolithic baseline — literally what Strata builds today.
 //!   - For each K, the same N vectors are split into K contiguous segments
@@ -92,7 +92,7 @@ const DIM: usize = 512;
 
 // Strata production HNSW defaults (crates/txn/src/dataset.rs).
 const M: usize = 16;
-const EF_CONSTRUCTION: usize = 200;
+const EF_CONSTRUCTION: usize = 100;
 const MAX_LAYER: usize = 16;
 const EF_SEARCH: usize = 32;
 const K: usize = 10;
