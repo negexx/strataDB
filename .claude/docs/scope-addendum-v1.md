@@ -4,10 +4,12 @@
 **Context:** Written after a landscape review of open database gaps (mid-2026). This does not replace the existing MVP spec — it amends it in exactly one place and defers everything else.
 
 > Filed into the project docs 2026-07-24. This page is the canonical statement of the proposal.
-> Its one time-sensitive decision is tracked as [ADR 0007](decisions/0007-segmented-vs-monolithic-index-layout.md)
-> (status: Proposed — not yet decided). The deferred and refused items are indexed in
-> [`FUTURE.md`](FUTURE.md). The roadmap and Non-Goals in [`architecture.md`](architecture.md) point
-> here rather than duplicating the rationale.
+> **UPDATE 2026-07-24: §1's decision is made.** Branching was declared mandatory, so the segmented
+> immutable index layout is adopted — [ADR 0008](decisions/0008-adopt-segmented-index-layout.md)
+> (Accepted), superseding [ADR 0007](decisions/0007-segmented-vs-monolithic-index-layout.md). The
+> §2 branching thesis is now a committed post-Phase-6 direction, not a proposal. §3–§5 stances are
+> unchanged. Deferred/refused items are indexed in [`FUTURE.md`](FUTURE.md); the roadmap and Non-Goals
+> in [`architecture.md`](architecture.md) point here rather than duplicating rationale.
 
 ---
 

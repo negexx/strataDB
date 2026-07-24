@@ -102,12 +102,12 @@ The transaction/conflict layer is an explicit, load-bearing architectural compon
 
 **Flagship milestone — "v0.3: concurrent multi-agent write slice"** (end of Phase 6): N simulated agents issue concurrent transactions (some conflicting, some not) against one shared dataset; every acknowledged write is durable and visible to the next reader; conflicting transactions get a typed error identifying contested rows; a transaction writing a row + updating the index commits both atomically or neither; a reader's open snapshot never sees a partial write from a later commit; the scenario re-runs under randomized process kills for many iterations with zero invariant violations.
 
-### Proposed extensions (Scope Addendum v1 — NOT committed)
+### Post-MVP direction (Scope Addendum v1)
 
-See [`scope-addendum-v1.md`](scope-addendum-v1.md) for the full argument and [`FUTURE.md`](FUTURE.md) for the parking lot. These are proposals, not planned phases — none is adopted until decided.
+See [`scope-addendum-v1.md`](scope-addendum-v1.md) for the full argument and [`FUTURE.md`](FUTURE.md) for the parking lot.
 
-- **One time-sensitive decision, not yet made:** the vector index's **storage layout** — segmented immutable index files vs. today's monolithic mutable HNSW. It is the one addendum item that is *not retrofittable* (it forecloses a forkable index), so it must be settled before more index-storage work. Tracked as [ADR 0007](decisions/0007-segmented-vs-monolithic-index-layout.md) (**Proposed**). The `lifecycle_bench` recovery cost (full graph rebuild ≈ ingest cost) is the empirical case for it.
-- **v2 — Branching (the thesis):** fork → fast abort → branch read isolation → merge. Unlocked *only* by the segmented layout. "The storage engine an agent can fork." Gated on ADR 0007.
+- **DECIDED — segmented immutable index layout** ([ADR 0008](decisions/0008-adopt-segmented-index-layout.md), Accepted 2026-07-24). Branching is a mandatory capability, and it is only possible on a segmented index, so the vector index moves from today's monolithic mutable HNSW to immutable segments + manifest. This decides the *layout*, not the features — **v1 still ships zero branching.** The `lifecycle_bench` recovery cost (full graph rebuild ≈ ingest cost) is a second, already-measured reason. **Gating de-risk before the segment format is committed:** the recall-vs-segment-count curve (addendum §6 Q2), cheap to prototype against the existing `crates/index` graph.
+- **v2 — Branching (the thesis):** fork → fast abort → branch read isolation → merge. "The storage engine an agent can fork." Built *after* Phase 6/7, on the segmented layout. See `FUTURE.md`.
 - **v3 — Small storage primitives:** staleness tracking on derived columns, verifiable deletion, budget-shaped ANN (`recall ≥ 0.9 OR cost ≤ X`). Each stops deliberately short of the system that would consume it.
 
 ## Non-Goals (cut list — revisit only after Phase 7)

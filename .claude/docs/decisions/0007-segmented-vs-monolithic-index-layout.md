@@ -1,6 +1,8 @@
 # ADR 0007 — Segmented immutable index layout vs. monolithic mutable HNSW
 
-**Status:** Proposed — needs a human decision. Not implemented.
+**Status:** Superseded by [ADR 0008](0008-adopt-segmented-index-layout.md) — decision made 2026-07-24
+(branching is mandatory → segmented layout adopted). This ADR is retained as the framing of the
+question; the decision and its consequences live in 0008.
 **Date:** 2026-07-24
 **Source:** [Scope Addendum v1](../scope-addendum-v1.md) §1. Read it for the full argument; this ADR
 is the tracked decision point.

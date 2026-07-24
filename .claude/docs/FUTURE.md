@@ -7,18 +7,19 @@
 > Rationale is **not** duplicated here — each item links to where it's argued. The point of this file
 > is a single place that answers "is X in scope?" with "no, and here's why, don't relitigate it."
 
-## The one thing that is NOT deferred
+## The one thing that is NOT deferred — DECIDED
 
-- **Segmented vs. monolithic index layout** — time-sensitive, not retrofittable. Tracked as
-  [ADR 0007](decisions/0007-segmented-vs-monolithic-index-layout.md) (Proposed). This is the only
-  addendum item that must be decided *now*, because it forecloses everything in the Branching line
-  below. Everything else on this page genuinely waits.
+- **Segmented immutable index layout — adopted** ([ADR 0008](decisions/0008-adopt-segmented-index-layout.md),
+  Accepted). Branching is mandatory, and it's only possible on a segmented index. This decides the
+  *layout* now (so index-storage work must not harden the monolithic design); the branching *features*
+  below still wait for Phase 6/7. **Before the segment format is committed, run the recall-vs-segment
+  prototype (§6 Q2 below)** — it's on the critical path and could dictate the compaction strategy.
 
 ## Deferred (post-Phase-6, in order)
 
 | Item | Target | Precondition | Notes |
 |---|---|---|---|
-| Fork (branch) | v2 | ADR 0007 = segmented | O(segments) manifest copy. The differentiated thesis — "the storage engine an agent can fork." [Addendum §2](scope-addendum-v1.md) |
+| Fork (branch) | v2 | segmented layout (ADR 0008 ✓) + Phase 6/7 done | O(segments) manifest copy. The differentiated thesis — "the storage engine an agent can fork." [Addendum §2](scope-addendum-v1.md) |
 | Abort (fast discard) | v2 | Fork | O(mutations); the agentic *hot path*, unlike a traditional DB. |
 | Branch read isolation | v2 | Fork | Snapshot-consistent ANN across a branch's segment set. |
 | Merge | v2.1 | Fork + abort | Correct-but-slow is acceptable for ~a year. Replay the branch's logical insert/delete set, rebuild affected segments. **Do not optimise before someone complains.** |
