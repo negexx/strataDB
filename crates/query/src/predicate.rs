@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow::compute::filter_record_batch;
-use arrow::compute::kernels::boolean::{and, or};
+use arrow::compute::kernels::boolean::{and_kleene, or_kleene};
 use arrow::compute::kernels::cmp::{eq, gt, gt_eq, lt, lt_eq};
 use arrow::error::ArrowError;
 use strata_storage::{ColumnStats, Value};
@@ -71,8 +71,8 @@ pub fn filter(batch: &RecordBatch, predicate: &Predicate) -> Result<RecordBatch,
 /// must match the column's Arrow type.
 pub fn mask(batch: &RecordBatch, predicate: &Predicate) -> Result<BooleanArray, ArrowError> {
     match predicate {
-        Predicate::And(l, r) => Ok(and(&mask(batch, l)?, &mask(batch, r)?)?),
-        Predicate::Or(l, r) => Ok(or(&mask(batch, l)?, &mask(batch, r)?)?),
+        Predicate::And(l, r) => Ok(and_kleene(&mask(batch, l)?, &mask(batch, r)?)?),
+        Predicate::Or(l, r) => Ok(or_kleene(&mask(batch, l)?, &mask(batch, r)?)?),
         Predicate::Eq(c, _)
         | Predicate::Lt(c, _)
         | Predicate::LtEq(c, _)
@@ -272,6 +272,36 @@ mod tests {
         let mut got: Vec<i64> = (0..result.num_rows()).map(|i| ids.value(i)).collect();
         got.sort_unstable();
         assert_eq!(got, vec![10, 30]);
+    }
+
+    #[test]
+    fn mask_or_with_kleene_semantics_keeps_a_row_matched_only_via_a_null_leaf_column() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, true), // nullable
+            Field::new("b", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![None, Some(1)])),
+                Arc::new(Int64Array::from(vec![2, 2])),
+            ],
+        )
+        .unwrap();
+        // Row 0: a=NULL, b=2. Row 1: a=1, b=2.
+        // Or(Eq(a,1), Eq(b,2)): row 0 doesn't match on "a" (unknown, not false)
+        // but DOES match on "b=2" - Kleene OR must keep it. Row 1 matches both.
+        let predicate = Predicate::Or(
+            Box::new(Predicate::Eq("a".to_string(), Value::Int64(1))),
+            Box::new(Predicate::Eq("b".to_string(), Value::Int64(2))),
+        );
+        let result = filter(&batch, &predicate).unwrap();
+        assert_eq!(
+            result.num_rows(),
+            2,
+            "both rows match via the b=2 leaf, even though a is NULL in row 0 - \
+             a non-Kleene OR would incorrectly drop row 0"
+        );
     }
 
     fn naive_eval(predicate: &Predicate, id: i64, name: &str) -> bool {
@@ -600,5 +630,77 @@ mod tests {
             &stats,
             &Predicate::Lt("price".to_string(), Value::Float64(15.0))
         ));
+    }
+
+    #[test]
+    fn should_scan_file_and_prunes_using_either_operand_even_if_the_other_could_match() {
+        let mut stats = HashMap::new();
+        stats.insert(
+            "a".to_string(),
+            ColumnStats {
+                min: Value::Int64(0),
+                max: Value::Int64(10),
+            },
+        );
+        stats.insert(
+            "b".to_string(),
+            ColumnStats {
+                min: Value::Int64(20),
+                max: Value::Int64(30),
+            },
+        );
+
+        // a=5 is in [0,10] - a single leaf on "a" alone cannot prune.
+        let leaf_a = Predicate::Eq("a".to_string(), Value::Int64(5));
+        // b=999 is outside [20,30] - this leaf alone already prunes.
+        let leaf_b = Predicate::Eq("b".to_string(), Value::Int64(999));
+        let compound = Predicate::And(Box::new(leaf_a.clone()), Box::new(leaf_b));
+
+        assert!(
+            should_scan_file(&stats, &leaf_a),
+            "a single leaf (a=5) can't prove this file has no match"
+        );
+        assert!(
+            !should_scan_file(&stats, &compound),
+            "the AND must prune using leaf_b's information, which a single leaf (a=5) alone couldn't"
+        );
+    }
+
+    #[test]
+    fn should_scan_file_or_requires_both_operands_to_prune() {
+        let mut stats = HashMap::new();
+        stats.insert(
+            "a".to_string(),
+            ColumnStats {
+                min: Value::Int64(0),
+                max: Value::Int64(10),
+            },
+        );
+        stats.insert(
+            "b".to_string(),
+            ColumnStats {
+                min: Value::Int64(20),
+                max: Value::Int64(30),
+            },
+        );
+
+        let out_of_range_a = Predicate::Eq("a".to_string(), Value::Int64(999));
+        let out_of_range_b = Predicate::Eq("b".to_string(), Value::Int64(999));
+        let in_range_b = Predicate::Eq("b".to_string(), Value::Int64(25));
+
+        assert!(
+            !should_scan_file(
+                &stats,
+                &Predicate::Or(Box::new(out_of_range_a.clone()), Box::new(out_of_range_b))
+            ),
+            "OR of two out-of-range leaves must prune - neither side could match"
+        );
+        assert!(
+            should_scan_file(
+                &stats,
+                &Predicate::Or(Box::new(out_of_range_a), Box::new(in_range_b))
+            ),
+            "OR must scan if either side could still match"
+        );
     }
 }
