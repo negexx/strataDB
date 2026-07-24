@@ -292,6 +292,8 @@ impl Dataset {
             write_attempt_counter: Arc::clone(&self.write_attempt_counter),
             commit_lock: Arc::clone(&self.commit_lock),
             insufficient_history_conflicts: Arc::clone(&self.insufficient_history_conflicts),
+            #[cfg(any(test, loom))]
+            inject_manifest_commit_failure: false,
         }
     }
 
@@ -334,6 +336,106 @@ pub struct Transaction {
     write_attempt_counter: Arc<AtomicU64>,
     commit_lock: Arc<Mutex<CommitLog>>,
     insufficient_history_conflicts: Arc<AtomicU64>,
+    /// Test-only fault injection: makes [`Transaction::commit`]'s durability
+    /// step fail, modelling a recoverable I/O error (e.g. ENOSPC) *after*
+    /// this commit's deltas have already reached the shared graph. See
+    /// [`Transaction::inject_manifest_commit_failure`].
+    ///
+    /// Scoped to one `Transaction` rather than a thread-local because
+    /// `loom` multiplexes its model threads, which would let a thread-local
+    /// flag armed for one transaction be consumed by another.
+    #[cfg(any(test, loom))]
+    inject_manifest_commit_failure: bool,
+}
+
+/// Undoes this commit's in-memory graph inserts if the commit never reaches
+/// its durability point.
+///
+/// [`Transaction::commit`] applies each `Insert` delta's vector to the
+/// shared `Arc<HnswIndex>` *before* `commit_manifest` makes the commit
+/// durable — a Phase 5 optimization (apply only this commit's own new
+/// deltas instead of replaying all history) layered on top of the spec's
+/// disk-based model, which has no such in-memory step. Without this guard,
+/// any failure between the first `graph.insert` and a successful
+/// `commit_manifest` leaves that transaction's vectors in the shared graph
+/// with no manifest entry backing them. Their row-ids were already claimed
+/// by `write_pending_batches`, so the *next* successful commit persists a
+/// `manifest.next_row_id` past them and publishes a `watermark` covering
+/// them — at which point [`crate::Snapshot::is_visible`] starts passing and
+/// `vector_search` returns them as dangling hits: rows `scan` can never
+/// see, because their data files never entered the manifest. Row-id gaps
+/// from a failed attempt are explicitly safe (spec §8); a *searchable* gap
+/// is not, and is exactly what the "no silently stale vector search
+/// results" claim rules out.
+///
+/// On drop this soft-deletes every row-id it recorded, unless
+/// [`Self::disarm`] was called — which happens only once `commit_manifest`
+/// has succeeded and those rows are genuinely committed. Being a `Drop`
+/// impl rather than an `if let Err(..)` arm, it fires on **both** an early
+/// `?` return and a panic unwinding out of the apply loop.
+///
+/// It must be declared *after* `commit`'s `commit_lock` guard, so
+/// reverse-declaration drop order runs this compensation before the lock is
+/// released, rather than leaving residue live for the next committer to
+/// build on.
+///
+/// **What this closes, and what it does not.** It guarantees no *permanent*
+/// residue: once the failing committer returns, nothing it inserted is
+/// reachable by any later search. It does **not** close a narrower,
+/// pre-existing window in which a residue row-id is transiently both live
+/// and visible. Row-ids are claimed *before* the lock, in
+/// `write_pending_batches`, while the watermark is published from
+/// `next_row_id_counter.load()` inside some *other* transaction's critical
+/// section — so a concurrent commit can publish a watermark that already
+/// covers a row-id this transaction has claimed but not yet inserted.
+/// Between this transaction's `graph.insert` and either its
+/// `commit_manifest` or this guard firing, a reader (which never takes
+/// `commit_lock`) can therefore observe it. That window is not introduced
+/// here and exists on the *success* path too — its root cause is that
+/// row-id allocation happens outside the manifest CAS, contrary to spec §8
+/// ("The counter is claimed as part of §3 step 4 (the atomic manifest
+/// CAS)"), and a scalar `watermark = next_row_id - 1` cannot express
+/// "committed" once allocation order can diverge from commit order.
+/// Closing it needs visibility keyed on committed row-id ranges rather than
+/// a high-water mark, which is a separate change.
+struct GraphResidueGuard {
+    /// Its own `Arc` clone rather than a borrow of `Transaction::graph`, so
+    /// `commit` can still move that field into the new `Snapshot`.
+    graph: Arc<HnswIndex>,
+    applied: Vec<u64>,
+    armed: bool,
+}
+
+impl GraphResidueGuard {
+    fn new(graph: Arc<HnswIndex>) -> Self {
+        Self {
+            graph,
+            applied: Vec::new(),
+            armed: true,
+        }
+    }
+
+    /// Records a row-id whose vector has just entered the shared graph.
+    fn record(&mut self, row_id: u64) {
+        self.applied.push(row_id);
+    }
+
+    /// Marks this commit as past its durability point: the recorded row-ids
+    /// are genuinely committed now and must survive this guard's drop.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for GraphResidueGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        for &row_id in &self.applied {
+            self.graph.remove(row_id);
+        }
+    }
 }
 
 impl Transaction {
@@ -379,6 +481,21 @@ impl Transaction {
     pub fn delete(&mut self, row_id: u64) {
         self.pending_tombstones.push(row_id);
         self.write_set.push(row_id);
+    }
+
+    /// Test-only: makes this transaction's [`Self::commit`] fail at its
+    /// durability step, *after* its deltas have already been applied to the
+    /// shared graph. Models a recoverable I/O failure (e.g. ENOSPC writing
+    /// the manifest) — the one failure shape that leaves the process alive
+    /// and therefore exposes the dangling-search-hit hazard
+    /// [`GraphResidueGuard`] closes. The `chaos-injection` harness cannot
+    /// stand in for this: its `chaos_checkpoint` calls
+    /// `std::process::abort()`, and the restart that forces *heals* the
+    /// hazard, since `replay_index` rebuilds only from manifest-listed
+    /// delta logs.
+    #[cfg(any(test, loom))]
+    pub(crate) fn inject_manifest_commit_failure(&mut self) {
+        self.inject_manifest_commit_failure = true;
     }
 
     /// Tombstones `row_id` and inserts `batch` as its replacement, within
@@ -452,30 +569,51 @@ impl Transaction {
     /// rejected, before any file for that batch is written to disk. Also
     /// returns an error if any pending batch fails to dictionary-encode, if
     /// applying this commit's new deltas to the graph fails (e.g. a
-    /// dimension mismatch), or if the manifest commit's atomic rename
-    /// fails. Delta-application runs before the manifest commit, so any of
-    /// these failures leaves the manifest unadvanced — the new data/delta-log
-    /// files are orphaned on disk but never made visible.
+    /// dimension mismatch), or if the manifest commit's atomic rename fails.
+    ///
+    /// **Every one of these leaves the dataset with nothing this transaction
+    /// wrote reachable by any later reader.** The manifest stays unadvanced,
+    /// so the new data/delta-log files are orphaned on disk and invisible to
+    /// [`crate::Snapshot::scan`], which reads only manifest-listed files.
+    /// That much has always held. What it does *not* cover on its own is the
+    /// shared in-memory graph: delta-application runs before the manifest
+    /// commit, so a failure after it would otherwise leave this
+    /// transaction's vectors physically in the graph, and a later commit's
+    /// watermark would eventually make them visible to
+    /// [`crate::Snapshot::vector_search`] — a hit `scan` could never
+    /// corroborate. [`GraphResidueGuard`] soft-deletes them on the way out
+    /// (on an early return *or* a panic), which is what makes "invisible"
+    /// true for the search path too, not just for `scan`. See that type for
+    /// the one narrower, pre-existing window this does not close.
+    ///
+    /// Three in-memory traces do outlive a failed commit, none of them
+    /// reachable as data: the row-ids it claimed (never recycled — a row-id
+    /// gap is explicitly safe, a *searchable* gap is not, spec §8); the
+    /// soft-deleted nodes themselves, which stay physically present as
+    /// traversal waypoints until Phase 8 compaction, so repeated failures
+    /// accumulate memory until restart; and, if this was the first-ever
+    /// vector commit, the graph's established dimension, which
+    /// `check_or_establish_dimension` sets permanently and no removal
+    /// resets. That last one means a retry at a *different* dimension stays
+    /// rejected for the rest of the session and then succeeds after a
+    /// restart (`replay_index` rebuilds from manifest-listed logs only) — a
+    /// typed error, never a wrong answer.
     ///
     /// **Formerly a known limitation, now closed:** earlier, a commit whose
     /// pending batches had inconsistent vector dimensions across batches
     /// could partially mutate the shared graph before failing — `Insert`
-    /// deltas were applied to the graph in pending-batch order, so a later
+    /// deltas are applied to the graph in pending-batch order, so a later
     /// batch's dimension mismatch was only caught after an earlier batch's
-    /// deltas had already landed in the live, shared `HnswIndex` (which has
-    /// no node-removal API to undo an insert). [`validate_delta_dimensions`]
-    /// now runs before any delta is applied, rejecting the entire commit —
-    /// with zero graph mutation — the moment any two pending batches (or a
-    /// pending batch and the graph's already-established dimension)
-    /// disagree. `HnswIndex::insert`'s only fallible path is dimension
-    /// validation (the underlying `hnsw_rs` call itself never fails), so
-    /// this closes the practical trigger for this class of hazard
-    /// entirely, not just narrows it. A residual, more exotic concern
-    /// remains out of scope here: if a future change ever gives graph
-    /// mutation additional failure modes beyond dimension mismatch, this
-    /// same partial-mutation risk could reopen for those. (Phase 6's
-    /// conflict check did not add such a mode — it runs, and returns,
-    /// strictly before the first delta is applied.)
+    /// deltas had already landed in the live, shared `HnswIndex`.
+    /// [`validate_delta_dimensions`] now runs before any delta is applied,
+    /// rejecting the entire commit — with zero graph mutation — the moment
+    /// any two pending batches (or a pending batch and the graph's
+    /// already-established dimension) disagree. The residual cases that
+    /// pre-validation alone cannot cover — a failure *after* the first delta
+    /// has landed, whether from a concurrent first-insert establishing a
+    /// different dimension between the pre-lock check and the in-lock apply,
+    /// an I/O failure in the manifest commit, or a panic mid-loop — are
+    /// covered by [`GraphResidueGuard`] instead.
     pub fn commit(self) -> Result<()> {
         let data_dir = data_subdir(&self.dir);
 
@@ -577,18 +715,32 @@ impl Transaction {
             .ok_or_else(|| TxnError::ManifestOverflow(format!("version {latest_version} + 1")))?;
 
         // Apply only this commit's new deltas to the shared graph — the
-        // fix for the O(historical)-per-commit regression. `HnswIndex`'s
-        // graph only ever grows (hnsw_rs has no node-removal API), so
-        // extending the same Arc'd instance every commit is safe and
-        // matches what every existing/future Snapshot's Arc<HnswIndex>
-        // already points at. Tombstones layer on top of the *latest*
+        // fix for the O(historical)-per-commit regression. Extending the
+        // same Arc'd instance every commit matches what every
+        // existing/future Snapshot's Arc<HnswIndex> already points at; what
+        // makes that safe is that a node is only ever *added* here, and
+        // `is_visible`'s watermark decides whether readers may see it. The
+        // graph does have a removal API (`HnswIndex::remove`, a soft-delete
+        // — the backend is `crates/index`'s own lock-free graph, not
+        // `hnsw_rs`), but its only use on this path is
+        // `GraphResidueGuard`'s undo of a commit that never became durable.
+        // Tombstones layer on top of the *latest*
         // snapshot's set (not this transaction's stale begin()-time view),
         // so a clean commit composes with everything that landed in
         // between.
         let mut tombstones = latest_snapshot.tombstones.as_ref().clone();
+        // Declared after `commit_log` above, so reverse-declaration drop
+        // order compensates the shared graph *before* the commit lock is
+        // released on any early return or panic below. Tombstone deltas
+        // need no compensation: they only touch the `tombstones` local,
+        // which is discarded unless the new `Snapshot` is published.
+        let mut residue_guard = GraphResidueGuard::new(Arc::clone(&self.graph));
         for delta in &deltas {
             match delta {
-                DeltaEntry::Insert { row_id, vector } => self.graph.insert(*row_id, vector)?,
+                DeltaEntry::Insert { row_id, vector } => {
+                    self.graph.insert(*row_id, vector)?;
+                    residue_guard.record(*row_id);
+                }
                 DeltaEntry::Tombstone { row_id } => {
                     tombstones.insert(*row_id);
                 }
@@ -641,7 +793,25 @@ impl Transaction {
             tombstones.insert(*row_id);
         }
 
+        // Test-only fault injection modelling a recoverable I/O failure
+        // (e.g. ENOSPC) of the durability step below, occurring *after* this
+        // commit's deltas have already been applied to the shared graph.
+        // Absent entirely from production builds.
+        #[cfg(any(test, loom))]
+        if self.inject_manifest_commit_failure {
+            return Err(TxnError::Io(std::io::Error::other(
+                "injected manifest-commit failure (test fault injection)",
+            )));
+        }
+
         commit_manifest(&self.dir, &manifest)?;
+
+        // Past the durability point: this commit's graph inserts are now
+        // genuinely committed and must survive the guard's drop. Disarmed
+        // here rather than after the snapshot swap because *this* is the
+        // instant the rows become committed — nothing after it may undo
+        // them, even if a later step were to fail.
+        residue_guard.disarm();
 
         commit_log.push(new_version, self.write_set);
 
@@ -749,14 +919,23 @@ fn new_hnsw_index(capacity: usize) -> Result<HnswIndex> {
     )?)
 }
 
-/// Sane ceiling for a manifest's `next_row_id` before it's used to size an
-/// eager HNSW allocation. `hnsw_rs::Hnsw::new`'s `max_elements` parameter
-/// drives a `Vec::with_capacity` sized proportionally to it (verified
-/// against the installed `hnsw_rs-0.3.4` source) — an unvalidated,
-/// manifest-controlled value near `u64::MAX` would attempt an
-/// unreasonably large allocation on open of a corrupted/hostile dataset
-/// instead of returning a typed error. One billion rows is far beyond any
-/// realistic embedded dataset today; revisit if a real workload needs more.
+/// Sane ceiling for a manifest's `next_row_id`, enforced at open before any
+/// row-id from that manifest can reach the index.
+///
+/// This is a **panic-safety bound, not an allocation-size guard**.
+/// `crates/index`'s `NodeTable` sizes its chunk-pointer directory for
+/// exactly this ceiling (its own `MAX_ROW_ID_CAPACITY` is documented as
+/// matching this constant) and then indexes into that directory directly,
+/// so a row-id past the ceiling would be an out-of-bounds index rather than
+/// a typed error. [`HnswIndex::new`]'s `max_elements` argument does *not*
+/// drive it: `NodeTable::new` takes that hint for API symmetry and ignores
+/// it, because `MaxElements` is documented as a sizing hint and explicitly
+/// "not a hard cap". A corrupted or hostile manifest claiming a
+/// `next_row_id` near `u64::MAX` therefore has to be rejected here.
+///
+/// One billion rows is far beyond any realistic embedded dataset today;
+/// revisit if a real workload needs more — and change both constants
+/// together, since the two crates' values must stay equal.
 const MAX_REASONABLE_ROW_ID_CAPACITY: u64 = 1_000_000_000;
 
 /// Rebuilds a fresh `HnswIndex` plus its tombstone set by replaying every
@@ -865,12 +1044,14 @@ fn build_delta_entries(batch: &RecordBatch, row_id_base: u64) -> Result<Vec<Delt
 /// consistent vector dimension — both against each other, and against
 /// `graph`'s already-established dimension (if any) — before any of them
 /// are applied. `HnswIndex::insert`'s only fallible path is dimension
-/// validation (the underlying `hnsw_rs` call itself never fails), so this
-/// closes the real trigger for a partial-graph-mutation-then-fail
+/// validation (the graph insert underneath it is infallible), so this
+/// closes the common trigger for a partial-graph-mutation-then-fail
 /// scenario: without it, `Insert` deltas are applied to the shared graph
 /// in pending-batch order, and a later batch's dimension mismatch is only
 /// caught after an earlier batch's deltas have already mutated the shared
-/// graph.
+/// graph. It is a pre-lock fast path, not the last line of defence —
+/// [`GraphResidueGuard`] is what undoes an already-applied delta when a
+/// commit fails after this check has passed.
 ///
 /// # Errors
 ///
@@ -2669,6 +2850,122 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_commits_vector_is_never_searchable_after_a_later_commit_advances_the_watermark() {
+        // Regression test for the dangling-search-hit hazard. `commit`
+        // applies this transaction's HNSW `Insert` deltas to the shared
+        // `Arc<HnswIndex>` *before* `commit_manifest` makes the commit
+        // durable. If `commit_manifest` fails (e.g. ENOSPC) — modelled here
+        // by `inject_manifest_commit_failure`, injected at exactly that
+        // step — the failed transaction's vector is left in the shared graph
+        // with no manifest entry backing it, and its row-id was already
+        // allocated by `write_pending_batches`. A *later* successful commit
+        // then persists `manifest.next_row_id` past that residue row-id and
+        // publishes `watermark = next_row_id - 1`, so `Snapshot::is_visible`
+        // starts passing for the residue id. With no manifest-membership
+        // cross-check on the search path, `vector_search` would then return
+        // the residue as a dangling hit — a row `scan` can never see —
+        // violating the flagship "no silently stale vector search results"
+        // claim. The fix soft-deletes a failed commit's graph inserts on the
+        // error path (see `GraphResidueGuard`), so this must hold.
+        let dir = temp_dir("failed-commit-no-dangling-search-hit");
+        let ds = Dataset::create(&dir).unwrap();
+
+        // Seed: one durable row (system row-id 0), far from the residue's
+        // distinctive coordinates. Establishes the graph's dimension and
+        // gives the post-seed watermark a meaningful value of 0.
+        let mut seed = ds.begin();
+        seed.insert(vector_batch(
+            vec![1i64],
+            cluster_vectors(1, [0.0, 0.0, 0.0], 0.0),
+        ));
+        seed.commit().unwrap();
+
+        // T1: insert a vector at distinctive, never-reused coordinates, then
+        // fail at the manifest-commit step (after the delta has already
+        // reached the shared graph). Its row-id (1) is allocated but never
+        // committed.
+        let mut failing = ds.begin();
+        failing.insert(vector_batch(
+            vec![2i64],
+            cluster_vectors(1, [900.0, 900.0, 900.0], 0.0),
+        ));
+        failing.inject_manifest_commit_failure();
+        let failing_result = failing.commit();
+        assert!(
+            failing_result.is_err(),
+            "the injected manifest-commit failure must make T1 fail, else this \
+             test proves nothing: {failing_result:?}"
+        );
+        assert_eq!(
+            ds.snapshot().version,
+            1,
+            "a failed commit must not advance the visible version"
+        );
+
+        // T2: an unrelated successful commit at its own distinctive
+        // location. This advances `next_row_id` past the residue row-id 1
+        // and publishes a watermark (2) that now covers it — the trigger
+        // that makes the residue visible to `is_visible`.
+        let mut later = ds.begin();
+        later.insert(vector_batch(
+            vec![3i64],
+            cluster_vectors(1, [500.0, 500.0, 500.0], 0.0),
+        ));
+        later.commit().unwrap();
+
+        let snapshot = ds.snapshot();
+        assert!(
+            snapshot.is_visible(1),
+            "precondition: the later commit must have advanced the watermark \
+             past the residue row-id, or this test isn't exercising the hazard"
+        );
+
+        // The discriminating assertion: searching at T1's distinctive
+        // coordinates must not return its residue vector. Pre-fix, the
+        // residue (row-id 1 at [900,900,900]) is both physically in the graph
+        // and now visible, so it comes back with ~0 squared distance.
+        // Post-fix it was soft-deleted on T1's error path, so the nearest
+        // live match is the far-away seed/T2 data.
+        let results = snapshot
+            .vector_search(&[900.0, 900.0, 900.0], 1, None)
+            .unwrap();
+        assert!(
+            results.is_empty() || results[0].squared_distance > 1000.0,
+            "a failed commit's vector must never be searchable, even after a \
+             later commit advances the watermark past its row-id: {results:?}"
+        );
+
+        // Positive controls, so the assertion above can't pass vacuously.
+        // The failed transaction really did reach the graph (it established
+        // the dimension, which no removal resets), and search itself really
+        // is working on this snapshot — so "not found" above means
+        // *excluded*, not "nothing was ever inserted" or "search is broken".
+        assert_eq!(
+            snapshot.graph.established_dimension(),
+            3,
+            "the failed commit's vector must genuinely have reached the graph"
+        );
+        let seed_hit = snapshot.vector_search(&[0.0, 0.0, 0.0], 1, None).unwrap();
+        assert_eq!(
+            seed_hit.first().map(|m| m.row_id),
+            Some(0),
+            "the durably committed seed row must still be searchable: {seed_hit:?}"
+        );
+
+        // Cross-check the search/scan consistency directly: only the seed and
+        // the later commit are durably in the manifest, so a scan sees
+        // exactly 2 rows — the residue is not among them.
+        assert_eq!(
+            snapshot.scan(&vector_test_schema()).unwrap().num_rows(),
+            2,
+            "only the seed and the later commit are durably committed; the \
+             failed commit's row must never appear in a scan"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     // TEST_COMMIT_LOG_CAPACITY comfortably fits in i64/i16 for this loop's
     // small range (capacity + 2), matching the existing cast-allow precedent
     // on `cluster_vectors` above.
@@ -2945,6 +3242,135 @@ mod loom_tests {
 
             assert!(thread_a.join().unwrap().is_ok());
             assert!(thread_b.join().unwrap().is_ok());
+
+            std::fs::remove_dir_all(&dir).ok();
+        });
+    }
+
+    /// One row, one 3-d vector, in the shape `build_delta_entries` expects.
+    /// Defined locally rather than reusing `dataset::tests`' `vector_batch`
+    /// so this module stays compilable under `--cfg loom` regardless of
+    /// whether `cfg(test)` is also set for that build.
+    fn loom_vector_batch(id: i64, vector: [f32; 3]) -> arrow::array::RecordBatch {
+        let item = || {
+            StdArc::new(arrow::datatypes::Field::new(
+                "item",
+                arrow::datatypes::DataType::Float32,
+                false,
+            ))
+        };
+        let schema = StdArc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+            arrow::datatypes::Field::new(
+                "vector",
+                arrow::datatypes::DataType::FixedSizeList(item(), 3),
+                false,
+            ),
+        ]));
+        let ids = StdArc::new(arrow::array::Int64Array::from(vec![id]));
+        let values = StdArc::new(arrow::array::Float32Array::from(vector.to_vec()));
+        let vectors = StdArc::new(arrow::array::FixedSizeListArray::new(
+            item(),
+            3,
+            values,
+            None,
+        ));
+        arrow::array::RecordBatch::try_new(schema, vec![ids, vectors]).unwrap()
+    }
+
+    /// One row, no `"vector"` column — so `build_delta_entries` yields no
+    /// entries and the commit does zero HNSW work while still claiming a
+    /// row-id and advancing the watermark. Used for the committers whose
+    /// only job here is to move the watermark, keeping the loom model
+    /// small enough to explore.
+    fn loom_plain_batch(id: i64) -> arrow::array::RecordBatch {
+        let schema = StdArc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+        ]));
+        arrow::array::RecordBatch::try_new(
+            schema,
+            vec![StdArc::new(arrow::array::Int64Array::from(vec![id]))],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_failed_commits_graph_residue_is_never_searchable_under_concurrent_commits() {
+        // The interleaving counterpart to
+        // `dataset::tests::a_failed_commits_vector_is_never_searchable_after_a_later_commit_advances_the_watermark`.
+        // That test fixes the order (fail, then commit); this one lets loom
+        // explore every order in which a *compensating* committer and a
+        // *succeeding* committer reach and release the commit lock.
+        //
+        // The property under test is a quiescent one: once both committers
+        // have returned, no schedule leaves the failed commit's vector
+        // reachable by a search. It deliberately does NOT claim the stronger
+        // "never transiently visible" property — there is no reader thread
+        // racing the apply loop here, and such a window does exist for
+        // reasons predating this guard (see `GraphResidueGuard`'s doc). What
+        // this pins down is that `GraphResidueGuard` fires on the error path
+        // under every interleaving of the two committers, rather than only
+        // in the single order the deterministic sibling test fixes.
+        //
+        // Deliberately minimal: only the failing transaction inserts a
+        // vector (one HNSW node), and the concurrent committer uses a
+        // vector-free batch. `loom::model` re-runs this closure once per
+        // interleaving, and every run does real filesystem I/O, so keeping
+        // per-run work down is what makes the model tractable.
+        loom::model(|| {
+            let dir = std::env::temp_dir().join(format!(
+                "strata-loom-residue-{}-{:?}",
+                std::process::id(),
+                loom::thread::current().id()
+            ));
+            // Also cleaned up-front: a previous model iteration that
+            // panicked would otherwise leave a dataset here and make the
+            // next iteration fail with `AlreadyExists`, masking the real
+            // assertion failure.
+            std::fs::remove_dir_all(&dir).ok();
+            let ds = crate::Dataset::create(&dir).unwrap();
+
+            let ds_failing = ds.clone();
+            let ds_ok = ds.clone();
+
+            let failing = loom::thread::spawn(move || {
+                let mut txn = ds_failing.begin();
+                txn.insert(loom_vector_batch(1, [900.0, 900.0, 900.0]));
+                txn.inject_manifest_commit_failure();
+                txn.commit()
+            });
+            let succeeding = loom::thread::spawn(move || {
+                let mut txn = ds_ok.begin();
+                txn.insert(loom_plain_batch(2));
+                txn.commit()
+            });
+
+            assert!(
+                failing.join().unwrap().is_err(),
+                "the injected manifest-commit failure must make this commit fail"
+            );
+            assert!(
+                succeeding.join().unwrap().is_ok(),
+                "an insert-only transaction has an empty write-set and cannot conflict"
+            );
+
+            // Guarantees the watermark covers whatever row-id the failed
+            // commit claimed, in *every* interleaving — without this, the
+            // schedules where it claimed a row-id above the watermark would
+            // satisfy the assertion below vacuously.
+            let mut final_txn = ds.begin();
+            final_txn.insert(loom_plain_batch(3));
+            final_txn.commit().unwrap();
+
+            let results = ds
+                .snapshot()
+                .vector_search(&[900.0, 900.0, 900.0], 1, None)
+                .unwrap();
+            assert!(
+                results.is_empty(),
+                "the failed commit's vector was the only one ever inserted, and it \
+                 must never be searchable under any interleaving: {results:?}"
+            );
 
             std::fs::remove_dir_all(&dir).ok();
         });
