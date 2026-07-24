@@ -141,9 +141,11 @@ deltas too early, one 25-iteration concurrent test for validating too early. Bot
 negative control — with the in-lock validation removed, the concurrent test fails on iteration 0 with
 `Dataset::open failed with "query has 5 dimensions, but the index expects 3"`.
 
-**Known residual, deliberately not fixed here:** `NodeTable` indexes its chunk directory with a plain
-slice index sized for `MAX_ROW_ID_CAPACITY`, and that ceiling is enforced only on the `Dataset::open`
-replay path (`dataset.rs:799`) — never on the write path. A session committing past it panics, and
-post-change that panic unwinds *after* durability rather than before. Pre-existing, in a different
-crate, and requires ~1e9 row-ids in one session; needs either a commit-time cap or a checked lookup
-in `crates/index`.
+**Known residual — now fixed (`10621e9`).** `NodeTable` indexed its chunk directory with a plain slice
+index sized for `MAX_ROW_ID_CAPACITY`, panicking for any row-id past it, and that ceiling was enforced
+only on the `Dataset::open` replay path — never on the write path. Two fixes landed: the commit-time
+cap (`dataset.rs`, in the atomicity change) *and* the checked lookup in `crates/index` — `NodeTable`'s
+directory accesses now use `.get()`, `insert` returns `Result<(), CapacityExceeded>` mapped to
+`IndexError::RowIdOutOfRange`, so the `pub` `HnswIndex::insert` is self-defending regardless of caller
+rather than relying on the txn-layer convention. Opus-reviewed APPROVE; existing `crates/index` loom
+coverage still passes.
