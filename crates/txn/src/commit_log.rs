@@ -26,6 +26,32 @@ pub enum ConflictCheck {
     InsufficientHistory,
 }
 
+/// Write-set size above which [`CommitLog::conflicts_with`] hashes the
+/// committing transaction's row-ids instead of scanning them linearly for
+/// each candidate row.
+///
+/// Hashing only pays for itself once the write-set is large enough to
+/// amortize a `SipHash` probe per candidate row against a linear scan of a
+/// short slice. Measured with `bench/benches/conflict_check_bench.rs` against
+/// a full 2048-entry log (20,480 row-ids in range), on the clean path:
+///
+/// ```text
+/// write-set      linear       hashed
+///         1     57.0 us     300.2 us    linear 5.3x faster
+///         4     52.6 us     322.1 us    linear 6.1x faster
+///        16    127.7 us     236.0 us    linear 1.9x faster
+///        64    421.7 us     260.7 us    hashed 1.6x faster
+///      1024     5.81 ms     358.5 us    hashed  16x faster
+///    10_000    33.93 ms     611.5 us    hashed  55x faster
+/// ```
+///
+/// Single-row deletes are the common case, so hashing unconditionally is a
+/// large regression exactly where it matters most. The crossover sits between
+/// 16 and 64; 32 is the midpoint, and it matches the naive cost model — a
+/// well-predicted compare is far under a nanosecond while a `SipHash` of a
+/// `u64` is on the order of 10ns, so they break even around n = 32.
+const HASH_WRITE_SET_ABOVE: usize = 32;
+
 pub struct CommitLog {
     capacity: usize,
     entries: VecDeque<(u64, Vec<u64>)>,
@@ -102,18 +128,51 @@ impl CommitLog {
         // Semantics are unchanged, including the output contract: each
         // contested row-id appears exactly once, in first-encountered order
         // (entries in version order, row-ids in their stored order).
-        let mine: HashSet<u64> = write_set.iter().copied().collect();
+        // Binary-searching the range start is a pure win at every size and is
+        // kept unconditionally: `entries` is strictly version-ascending, so a
+        // transaction whose base version is recent no longer walks the whole
+        // retained log just to skip it (5.36 us -> 218 ns for a 1-entry range).
         let start = self
             .entries
             .partition_point(|(version, _)| *version <= since_version);
+
+        // Pick the membership strategy once, *outside* the scan, and let the
+        // scan monomorphize over it. Branching per candidate row instead —
+        // matching an `Option<HashSet>` inside the loop — measured 20-60%
+        // slower at small write-sets, which is precisely the size this branch
+        // exists to keep fast.
+        if write_set.len() > HASH_WRITE_SET_ABOVE {
+            let hashed: HashSet<u64> = write_set.iter().copied().collect();
+            self.scan_for_contested(start, up_to_version, |row_id| hashed.contains(row_id))
+        } else {
+            self.scan_for_contested(start, up_to_version, |row_id| write_set.contains(row_id))
+        }
+    }
+
+    /// Walks entries from `start` while their version stays within
+    /// `up_to_version`, collecting every row-id for which `touches` holds —
+    /// each once, in first-encountered order.
+    ///
+    /// Generic over `touches` so the membership strategy is resolved at
+    /// compile time; see [`HASH_WRITE_SET_ABOVE`] for why there are two.
+    fn scan_for_contested<F: Fn(&u64) -> bool>(
+        &self,
+        start: usize,
+        up_to_version: u64,
+        touches: F,
+    ) -> ConflictCheck {
         let mut contested: Vec<u64> = Vec::new();
+        // `seen` is only touched on the conflict path, and `HashSet::new` does
+        // not allocate until its first insert, so a clean check pays nothing
+        // for it while a large conflict still avoids the old quadratic
+        // `contested` rescan.
         let mut seen: HashSet<u64> = HashSet::new();
         for (version, entry_write_set) in self.entries.range(start..) {
             if *version > up_to_version {
                 break;
             }
             for row_id in entry_write_set {
-                if mine.contains(row_id) && seen.insert(*row_id) {
+                if touches(row_id) && seen.insert(*row_id) {
                     contested.push(*row_id);
                 }
             }
