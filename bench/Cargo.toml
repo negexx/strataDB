@@ -35,3 +35,15 @@ harness = false
 [[bench]]
 name = "concurrent_commit_bench"
 harness = false
+
+[[bench]]
+name = "manifest_growth_bench"
+harness = false
+
+[[bench]]
+name = "conflict_check_bench"
+harness = false
+
+[[bench]]
+name = "lifecycle_bench"
+harness = false

@@ -10,8 +10,8 @@ use arrow::array::{Array, RecordBatch, UInt64Array};
 use arrow::compute::concat_batches;
 use arrow::datatypes::SchemaRef;
 use strata_index::HnswIndex;
-use strata_query::{Predicate, filter, should_scan_file};
-use strata_storage::{DataFileEntry, Manifest, read_batch};
+use strata_query::{Predicate, filter, mask, should_scan_file};
+use strata_storage::{DataFileEntry, Manifest, read_batch, read_batch_columns};
 
 use crate::dataset::{ROW_ID_COLUMN, cast_batch_to_schema, data_subdir, safe_join};
 use crate::error::{Result, TxnError};
@@ -107,9 +107,14 @@ impl Snapshot {
     /// via [`safe_join`], and applies `process` to each raw batch. Shared
     /// by [`Snapshot::scan`], [`Snapshot::scan_with_predicate`], and
     /// [`Snapshot::row_ids_matching`].
+    /// `columns`, when `Some`, restricts the Arrow IPC read to those columns
+    /// so the rest are never decoded. Callers that need whole rows pass
+    /// `None`; callers that only need a couple of scalar columns out of a
+    /// table carrying wide embeddings should not.
     fn read_surviving_files<T>(
         &self,
         predicate: Option<&Predicate>,
+        columns: Option<&[&str]>,
         mut process: impl FnMut(RecordBatch) -> Result<T>,
     ) -> Result<Vec<T>> {
         let data_dir = data_subdir(&self.dir);
@@ -118,7 +123,11 @@ impl Snapshot {
             .iter()
             .filter(|entry| predicate.is_none_or(|p| should_scan_file(&entry.stats, p)))
             .map(|entry| {
-                let batch = read_batch(&safe_join(&data_dir, &entry.name)?)?;
+                let path = safe_join(&data_dir, &entry.name)?;
+                let batch = match columns {
+                    Some(cols) => read_batch_columns(&path, cols)?,
+                    None => read_batch(&path)?,
+                };
                 process(batch)
             })
             .collect()
@@ -138,7 +147,7 @@ impl Snapshot {
     /// the cast batches can't be concatenated against `schema`.
     pub fn scan(&self, schema: &SchemaRef) -> Result<RecordBatch> {
         let batches =
-            self.read_surviving_files(None, |batch| cast_batch_to_schema(&batch, schema))?;
+            self.read_surviving_files(None, None, |batch| cast_batch_to_schema(&batch, schema))?;
         Ok(concat_batches(schema, &batches)?)
     }
 
@@ -178,7 +187,7 @@ impl Snapshot {
         schema: &SchemaRef,
         predicate: &Predicate,
     ) -> Result<RecordBatch> {
-        let batches = self.read_surviving_files(Some(predicate), |batch| {
+        let batches = self.read_surviving_files(Some(predicate), None, |batch| {
             let cast = cast_batch_to_schema(&batch, schema)?;
             Ok(filter(&cast, predicate)?)
         })?;
@@ -249,8 +258,15 @@ impl Snapshot {
                 .search(query, k, EF_SEARCH_DEFAULT, |id| self.is_visible(id))?);
         };
 
-        let mut live_ids = self.row_ids_matching(predicate)?;
-        live_ids.sort_unstable();
+        // Not sorted: `search_filtered` builds an order-insensitive bitset
+        // from these, so sorting them was pure work with no consumer.
+        //
+        // Measured phase split on a 100k-row, 512-dim dataset with a 1-in-10
+        // predicate: `row_ids_matching` 133-157ms, `widen_ef` 9us,
+        // `search_filtered` 1.3-1.8ms. This path is ~99% the cost of
+        // resolving `live_ids`, and that cost is dominated by re-reading the
+        // whole data file per query — see `row_ids_matching`'s own comment.
+        let live_ids = self.row_ids_matching(predicate)?;
         let ef = widen_ef(EF_SEARCH_DEFAULT, self, predicate);
         Ok(self
             .graph
@@ -261,24 +277,54 @@ impl Snapshot {
     /// surviving (per `should_scan_file`) file's raw on-disk batch
     /// directly — not through the public `scan_with_predicate`.
     fn row_ids_matching(&self, predicate: &Predicate) -> Result<Vec<usize>> {
-        let per_file_ids = self.read_surviving_files(Some(predicate), |batch| {
-            let matched = filter(&batch, predicate)?;
-            let row_id_idx = matched.schema_ref().index_of(ROW_ID_COLUMN)?;
-            let row_ids = matched
-                .column(row_id_idx)
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .ok_or_else(|| {
-                    TxnError::Arrow(arrow::error::ArrowError::CastError(format!(
-                        "{ROW_ID_COLUMN} column must be UInt64"
-                    )))
-                })?;
-            #[allow(clippy::cast_possible_truncation)]
-            let ids: Vec<usize> = (0..row_ids.len())
-                .map(|i| row_ids.value(i) as usize)
-                .collect();
-            Ok(ids)
-        })?;
+        // Decode only the predicate's own column and the row-id column, so
+        // the embedding column is never turned into an Arrow array.
+        //
+        // Be clear about what this does *not* buy: Arrow IPC stores a record
+        // batch as one contiguous message body, and `FileReader` reads that
+        // whole body off disk before decoding anything. Projection therefore
+        // skips array *construction*, not the read. Measured, this was worth
+        // only ~2ms of a ~109ms call — the remaining ~105ms is re-reading
+        // ~205MB (100k rows x 512-dim f32) from the page cache on *every*
+        // query, at ~1.5GB/s.
+        //
+        // Eliminating that needs one of: a per-snapshot cache of the
+        // resolved row-ids (snapshots are immutable, so this is sound but is
+        // a memory/latency tradeoff worth deciding deliberately), or a
+        // genuinely column-chunked file format so a single column can be
+        // read without its neighbours — the format change `datafile.rs`'s
+        // module doc already defers. Neither is a drive-by change.
+        let projection: Vec<&str> = if predicate.column() == ROW_ID_COLUMN {
+            vec![ROW_ID_COLUMN]
+        } else {
+            vec![predicate.column(), ROW_ID_COLUMN]
+        };
+        let per_file_ids =
+            self.read_surviving_files(Some(predicate), Some(&projection), |batch| {
+                // Apply the selection mask to the row-id column *only*. Using
+                // `filter` here instead would materialise a whole filtered
+                // `RecordBatch` — every column, including the embedding column —
+                // and then read one `u64` from it. At 512 dimensions that is
+                // ~2KB copied and discarded per matched row; on a 100k-row
+                // dataset with a 1-in-10 predicate it was ~20MB per query, and
+                // it dominated filtered `vector_search` end to end.
+                let selection = mask(&batch, predicate)?;
+                let row_id_idx = batch.schema_ref().index_of(ROW_ID_COLUMN)?;
+                let matched = arrow::compute::filter(batch.column(row_id_idx), &selection)?;
+                let row_ids = matched
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or_else(|| {
+                        TxnError::Arrow(arrow::error::ArrowError::CastError(format!(
+                            "{ROW_ID_COLUMN} column must be UInt64"
+                        )))
+                    })?;
+                // Bulk-read the values buffer rather than calling `value(i)` per
+                // row, which re-bounds-checks each access.
+                #[allow(clippy::cast_possible_truncation)]
+                let ids: Vec<usize> = row_ids.values().iter().map(|&id| id as usize).collect();
+                Ok(ids)
+            })?;
         Ok(per_file_ids.into_iter().flatten().collect())
     }
 }
