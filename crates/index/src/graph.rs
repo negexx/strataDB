@@ -614,13 +614,10 @@ impl<D: Distance> Graph<D> {
     /// to serve as a live traversal waypoint for other queries (Stage 1's
     /// tombstone-flag-only scope — see design doc §1/§3). A no-op if
     /// `row_id` was never inserted.
-    // Not yet called from `HnswIndex` — the pre-rewrite `HnswIndex` never
-    // had a `delete` method (soft-delete lives at `crates/txn`'s
-    // conflict-resolution layer today), and Task 14's API-preservation
-    // constraint forbids adding new public surface here. This is Stage 1's
-    // tombstone primitive for a future `crates/txn` consumer; exercised
-    // today only by this module's own tests below.
-    #[allow(dead_code)]
+    // Reachable in production through `HnswIndex::remove`, which
+    // `crates/txn`'s commit path calls to undo an in-memory insert whose
+    // transaction failed before durably committing (see that crate's
+    // `GraphResidueGuard`).
     pub(crate) fn delete(&self, row_id: u64) {
         if let Some(node) = self.nodes.get(row_id) {
             node.mark_deleted();

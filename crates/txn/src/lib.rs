@@ -7,6 +7,7 @@ pub mod commit_log;
 pub mod dataset;
 pub mod error;
 pub mod mvp_fixtures;
+pub(crate) mod row_id;
 pub mod snapshot;
 
 pub use arrow;

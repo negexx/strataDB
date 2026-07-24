@@ -158,12 +158,12 @@ impl Node {
         self.header().deleted.load(Ordering::SeqCst) != 0
     }
 
-    // Only called from `Graph::delete`, itself not yet wired into
-    // `HnswIndex` (see `Graph::delete`'s doc comment in graph.rs) — hence
-    // the transitively-unused warning here too. Exercised today by both
-    // this module's own `mark_deleted_is_observed_by_is_deleted` test and
-    // `graph.rs`'s deletion tests.
-    #[allow(dead_code)]
+    // Called from `Graph::delete`, which is now reachable in production
+    // through `HnswIndex::remove` (see `Graph::delete`'s doc comment in
+    // graph.rs) — so this is no longer transitively dead and needs no
+    // `#[allow(dead_code)]`. Also exercised by this module's own
+    // `mark_deleted_is_observed_by_is_deleted` test and `graph.rs`'s
+    // deletion tests.
     pub(crate) fn mark_deleted(self) {
         self.header().deleted.store(1, Ordering::SeqCst);
     }
