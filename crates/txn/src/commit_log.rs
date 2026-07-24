@@ -6,7 +6,7 @@
 //! touch my rows" needs its own structure independent of `Snapshot`'s
 //! lifetime.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 /// Outcome of [`CommitLog::conflicts_with`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,13 +85,35 @@ impl CommitLog {
             return ConflictCheck::InsufficientHistory;
         }
 
+        // Hash the committing write-set once, rather than paying a linear
+        // `write_set.contains` per candidate row — that made the scan
+        // O(rows-in-range * write-set-size), so a bulk delete of n rows
+        // against a full log cost on the order of n * retained-rows
+        // comparisons *while holding the global commit lock*. `seen`
+        // replaces the second linear scan (`!contested.contains`) that
+        // deduplicated the output.
+        //
+        // `entries` is strictly version-ascending — `push` is only ever
+        // called under `commit_lock` with `latest_version + 1` — so the
+        // range start is binary-searchable instead of scanning (and
+        // skipping) every retained entry, and the loop can `break` at the
+        // upper bound instead of running to the end.
+        //
+        // Semantics are unchanged, including the output contract: each
+        // contested row-id appears exactly once, in first-encountered order
+        // (entries in version order, row-ids in their stored order).
+        let mine: HashSet<u64> = write_set.iter().copied().collect();
+        let start = self
+            .entries
+            .partition_point(|(version, _)| *version <= since_version);
         let mut contested: Vec<u64> = Vec::new();
-        for (version, entry_write_set) in &self.entries {
-            if *version <= since_version || *version > up_to_version {
-                continue;
+        let mut seen: HashSet<u64> = HashSet::new();
+        for (version, entry_write_set) in self.entries.range(start..) {
+            if *version > up_to_version {
+                break;
             }
             for row_id in entry_write_set {
-                if write_set.contains(row_id) && !contested.contains(row_id) {
+                if mine.contains(row_id) && seen.insert(*row_id) {
                     contested.push(*row_id);
                 }
             }
