@@ -266,7 +266,26 @@ Correctness is unaffected by a hasher swap: `Row<'_>`'s `Eq` is exact byte equal
   column of every surviving row is cast then discarded. Filter first, cast the smaller result.
   `row_ids_matching:242` already proves raw-batch filtering works.
 
-### 12. Build profile — free, zero code change — **Corroborated**
+### 12. Build profile — **MEASURED AND REJECTED. Do not apply.**
+
+> **This finding was wrong.** It was ranked as a free win on static reasoning; measuring it refuted
+> that. `lto = "thin"` + `codegen-units = 1` makes **unfiltered vector search ~70% slower**:
+> 96.95 µs → 163.91 µs and 164.47 µs across two runs, both with tight CIs, against a 100k×512
+> real-embedding index. Even the pessimistic end of the baseline's interval (105.7 µs) leaves a 55%
+> gap, so this does not depend on baseline noise. Filtered search was neutral (−6.2%, then +0.2%).
+>
+> Group-by *did* improve ~11–16% on its stable cases, which is what made this look good before the
+> vector path was measurable — but trading ~70% on the core vector search path for that is a bad
+> deal in a vector database. Applied in `7ebedb4`, reverted in `6892d25`.
+>
+> The specific mechanism claimed below — that LTO is needed to inline `DistL2::eval` across the
+> crate boundary into the search loop — is exactly what the measurement contradicts. Inlining the
+> AVX2 kernel into the hot loop appears to cost more than the call it removes. Mechanism not
+> investigated further; the direction is reproducible and that was enough to reject it.
+>
+> The original static reasoning is left below unedited, as a record of how confident and wrong it read.
+
+
 
 The workspace has **no `[profile.release]` and no `.cargo/config.toml`**, so release builds use
 `codegen-units = 16` and `lto = false`. With heavy cross-crate traffic (`strata-txn` → `strata-index`
@@ -419,6 +438,39 @@ Group commit rises to the top of the list on the same evidence: with an empty ma
 still costs ~12 ms of essentially pure fsync, so fsync batching wins at *every* scale, independent
 of history.
 
+## MEASURED (2026-07-23) — filtered vector search is ~1,500x slower than unfiltered
+
+With the benchmark dataset downloaded (100k real 512-dim OpenAI embeddings, recall@10 = 0.985):
+
+| Operation | Cost |
+|---|---|
+| `vector_search` unfiltered, top-10 | **96.95 µs** |
+| `vector_search` filtered, top-10, 1-of-10 categories | **152.88 ms** |
+| A full durable commit, for scale | ~12 ms |
+
+**A single filtered top-10 costs more than twelve sequential durable commits.** This is the largest
+effect measured anywhere in this audit, and nothing in the original ranking put it near the top.
+
+It is the predicted cost of findings #5 and #8 compounding, now with a number attached. Per query,
+against R ≈ 10,000 matching rows:
+
+1. `row_ids_matching` (`snapshot.rs:242`) calls `filter` on the whole `RecordBatch`, materializing
+   **every column including the 512-dim embeddings** — ~20 MB copied and discarded — to read one
+   `u64` column.
+2. `live_ids.sort_unstable()` (`snapshot.rs:230`) sorts 10k ids.
+3. `search_filtered` (`hnsw.rs:260`) builds a fresh 10k-entry `HashSet` per query.
+
+Only step 3's `ef·M` ≈ 6,400 probes are actual search work; steps 1–3 are all O(R) setup paid before
+the traversal starts.
+
+**This reorders the whole document.** The manifest O(F) growth was ranked #1 and does not bite until
+~2000–3000 files; this is a ~1,500x factor on a core operation at 100k rows, today. Fixing it needs
+no format change and no design decision — it is the `mask()`-only extraction in #5 plus a dense
+bitset in #4, both already specified above.
+
+Note the earlier `live_ids` sort-vs-`HashSet` debate (see "Conflicts resolved") is a rounding error
+at this scale: whichever side of that boundary is optimized, step 1 still copies 20 MB per query.
+
 ---
 
 ## Benchmark coverage gap — the headline finding is currently unmeasurable
@@ -456,7 +508,13 @@ before doing the expensive work.**
 **1. Close the benchmark gap above.** Highest leverage in this document, because either result
 removes work. Purely additive — a new bench file, no production code.
 
-**2. Take the free win, and calibrate the measurement loop while doing it.**
+**2. ~~Take the free win~~ — DONE AND REJECTED. Do not repeat this step.**
+
+Measured and reverted: it costs ~70% on unfiltered vector search. See finding #12. What follows was
+the original reasoning, kept because the *calibration* advice in it turned out to be the valuable
+part — running a change against the benchmarks before trusting it is exactly what caught this.
+
+
 
 ```toml
 [profile.release]
