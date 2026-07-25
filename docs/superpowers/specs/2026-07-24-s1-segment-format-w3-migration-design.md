@@ -1,5 +1,12 @@
 # Phase S1 — Segment Format & W3 Migration — Design
 
+> **Amended 2026-07-25:** see
+> [`2026-07-25-s1-w3-design-amendment.md`](2026-07-25-s1-w3-design-amendment.md) before implementing.
+> §2's `neighbor_buf`/latency-improvement claim, the `NodeSource` deleted-flag gap, §7's
+> "delete `delta_log.rs`" instruction, and the segment writer's crate ownership are all corrected there
+> against the code as it stands after merging `main`'s graph-construction-cost perf work. The text below
+> is left as originally approved; the amendment takes precedence where the two disagree.
+
 **Date:** 2026-07-24
 **Trigger:** [`phase-s1-segmented-index-spec.md`](../../../.claude/docs/design/phase-s1-segmented-index-spec.md) §7
 and §10 mandate a brainstorm-then-Opus-review pass on the concrete segment format and the W3 cutover
