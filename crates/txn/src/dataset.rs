@@ -27,7 +27,8 @@ use strata_index::{
     write_delta_log,
 };
 use strata_storage::{
-    DataFileEntry, Manifest, commit_manifest, compute_stats, read_current, write_batch,
+    ColumnStats, DataFileEntry, Manifest, Value, commit_manifest, compute_stats, read_current,
+    write_batch,
 };
 
 use crate::commit_log::{CommitLog, ConflictCheck};
@@ -50,6 +51,15 @@ use crate::snapshot::Snapshot;
 /// going through the public schema-based API. See
 /// `.claude/docs/design/phase-0-transaction-and-format-spec.md` §8.
 pub const ROW_ID_COLUMN: &str = "_row_id";
+
+/// The hidden internal commit-time column every committed batch carries
+/// alongside its logical columns and `_row_id` — see
+/// `docs/superpowers/specs/2026-07-25-s1-w2-timestamp-column-design.md`.
+/// Every row in one transaction shares one value: microseconds since the
+/// Unix epoch, captured once per commit. Unlike `_row_id`, this column
+/// *does* get a `should_scan_file`-visible stats entry — see
+/// `write_pending_batches`.
+pub const TIMESTAMP_COLUMN: &str = "_timestamp";
 
 /// Bounded capacity of the in-memory [`CommitLog`] ring buffer — generous
 /// enough that ordinary workloads never evict history still needed by an
@@ -140,10 +150,9 @@ pub(crate) fn data_subdir(dir: &Path) -> PathBuf {
 /// epoch overflows `i64` (not reachable before the year 292471, but
 /// checked rather than assumed).
 ///
-/// Not yet called outside this module's own tests — `Transaction::commit`
-/// wiring it in to stamp each committed row's `_timestamp` column is a
-/// later task in this workstream, hence the otherwise-unused warning.
-#[allow(dead_code)]
+/// Called once at the top of [`Transaction::commit`], before `write_phase`,
+/// to stamp every row this commit writes with the single shared
+/// `_timestamp` value.
 fn issue_timestamp(last_issued: &AtomicI64) -> Result<i64> {
     let now_us = i64::try_from(
         std::time::SystemTime::now()
@@ -468,10 +477,8 @@ pub struct Transaction {
     write_attempt_counter: Arc<AtomicU64>,
     commit_lock: Arc<Mutex<CommitLog>>,
     insufficient_history_conflicts: Arc<AtomicU64>,
-    /// Not yet read outside `begin`'s construction of this field —
-    /// `Transaction::commit` consuming it via `issue_timestamp` is a later
-    /// task in this workstream, hence the otherwise-unused warning.
-    #[allow(dead_code)]
+    /// Consumed by [`Transaction::commit`] via `issue_timestamp`, as the
+    /// very first step of `commit`, before `write_phase` runs.
     last_issued_timestamp: Arc<AtomicI64>,
     /// Test-only fault injection: makes [`Transaction::commit`]'s durability
     /// step fail, modelling a recoverable I/O error (e.g. ENOSPC) *after*
@@ -864,9 +871,10 @@ impl Transaction {
     /// an I/O failure in the manifest commit, or a panic mid-loop — are
     /// covered by [`GraphResidueGuard`] instead.
     pub fn commit(self) -> Result<()> {
+        let ts = issue_timestamp(&self.last_issued_timestamp)?;
         let data_dir = data_subdir(&self.dir);
 
-        let (new_data_files, deltas, mut claim) = self.write_phase(&data_dir)?;
+        let (new_data_files, deltas, mut claim) = self.write_phase(&data_dir, ts)?;
         validate_delta_dimensions(&deltas, &self.graph)?;
 
         // Test-only rendezvous: row-ids claimed, data files written, but
@@ -1007,6 +1015,12 @@ impl Transaction {
         manifest.next_attempt_id = self
             .write_attempt_counter
             .load(std::sync::atomic::Ordering::SeqCst);
+        // Non-decreasing across versions by construction: this is a running
+        // max computed under commit_lock, decoupled from any individual
+        // row's own captured value — see
+        // docs/superpowers/specs/2026-07-25-s1-w2-timestamp-column-design.md
+        // §4 for why that decoupling is deliberate, not a gap.
+        manifest.commit_time_high_water = manifest.commit_time_high_water.max(ts);
         // Dedup against both the current in-memory tombstone set and
         // duplicates within this same transaction's own pending_tombstones
         // (e.g. two delete() calls on the same row): without this check,
@@ -1103,6 +1117,7 @@ impl Transaction {
     fn write_phase(
         &self,
         data_dir: &Path,
+        ts: i64,
     ) -> Result<(Vec<DataFileEntry>, Vec<DeltaEntry>, Option<RowIdClaim>)> {
         // Skipped entirely when there's nothing to insert: a delete-only
         // transaction writes no new files, so there's no new directory
@@ -1155,6 +1170,7 @@ impl Transaction {
             data_dir,
             attempt_id,
             &claim,
+            ts,
             &mut new_data_files,
         )?;
         // Fsyncing each data file's *content* (already done inside
@@ -1201,23 +1217,35 @@ impl Transaction {
         data_dir: &Path,
         attempt_id: u64,
         claim: &RowIdClaim,
+        ts: i64,
         data_files: &mut Vec<DataFileEntry>,
     ) -> Result<Vec<DeltaEntry>> {
         let mut all_deltas = Vec::new();
         let mut row_id_base = claim.base();
         for (i, batch) in pending.iter().enumerate() {
-            // Stats computed on the original, pre-encoding, pre-row-id batch — see
-            // .claude/docs/design/phase-3-query-refinement-spec.md §1 for why
-            // (logical values, no dictionary-decode step needed later; _row_id is
-            // an internal column, not a user column subject to file-pruning stats).
-            let stats = compute_stats(batch);
+            // Stats computed on the original, pre-encoding, pre-hidden-column
+            // batch — see .claude/docs/design/phase-3-query-refinement-spec.md
+            // §1 for why (logical values, no dictionary-decode step needed
+            // later). _row_id gets no stats entry (nothing predicates on it);
+            // _timestamp DOES, inserted explicitly below, since every row in
+            // this batch shares one value and it exists specifically to be
+            // predicated on and pruned by — see design doc §7.
+            let mut stats = compute_stats(batch);
+            stats.insert(
+                TIMESTAMP_COLUMN.to_string(),
+                ColumnStats {
+                    min: Value::Int64(ts),
+                    max: Value::Int64(ts),
+                },
+            );
 
             let num_rows = u64::try_from(batch.num_rows())?;
 
             let deltas = build_delta_entries(batch, row_id_base)?;
             let with_row_id = append_row_id_column(batch, row_id_base, num_rows)?;
+            let with_timestamp = append_timestamp_column(&with_row_id, ts, num_rows)?;
 
-            let encoded = strata_storage::encode_batch(&with_row_id)?;
+            let encoded = strata_storage::encode_batch(&with_timestamp)?;
             let file_name = format!("{attempt_id:020}-{i}.arrow");
             write_batch(&data_dir.join(&file_name), &encoded)?;
 
@@ -1523,6 +1551,30 @@ fn append_row_id_column(
     Ok(RecordBatch::try_new(schema, columns)?)
 }
 
+/// Appends a `_timestamp: Int64` column to `batch`, every row sharing the
+/// single value `ts` — microseconds since the Unix epoch, captured once per
+/// transaction by `issue_timestamp`. See
+/// `docs/superpowers/specs/2026-07-25-s1-w2-timestamp-column-design.md` §2-3.
+fn append_timestamp_column(batch: &RecordBatch, ts: i64, num_rows: u64) -> Result<RecordBatch> {
+    let num_rows = usize::try_from(num_rows)?;
+    let timestamps: Vec<i64> = vec![ts; num_rows];
+    let timestamp_array: ArrayRef = Arc::new(arrow::array::Int64Array::from(timestamps));
+
+    let mut fields: Vec<Field> = batch
+        .schema_ref()
+        .fields()
+        .iter()
+        .map(|f| f.as_ref().clone())
+        .collect();
+    fields.push(Field::new(TIMESTAMP_COLUMN, DataType::Int64, false));
+
+    let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
+    columns.push(timestamp_array);
+
+    let schema = Arc::new(Schema::new(fields));
+    Ok(RecordBatch::try_new(schema, columns)?)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -1632,6 +1684,192 @@ mod tests {
 
     fn test_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]))
+    }
+
+    #[test]
+    fn every_row_in_one_transaction_shares_the_identical_timestamp() {
+        let dir = temp_dir("timestamp-shared-per-txn");
+        let ds = Dataset::create(&dir).unwrap();
+
+        let mut txn = ds.begin();
+        txn.insert(
+            RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![1, 2]))])
+                .unwrap(),
+        );
+        txn.insert(
+            RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![3, 4]))])
+                .unwrap(),
+        );
+        txn.commit().unwrap();
+
+        let snapshot = ds.snapshot();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(TIMESTAMP_COLUMN, DataType::Int64, false),
+        ]));
+        let batch = snapshot.scan(&schema).unwrap();
+        let timestamps = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        let first = timestamps.value(0);
+        assert_eq!(batch.num_rows(), 4);
+        for i in 0..batch.num_rows() {
+            assert_eq!(
+                timestamps.value(i),
+                first,
+                "every row across both pending batches in one transaction must share one timestamp"
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_delete_only_commit_still_advances_commit_time_high_water() {
+        let dir = temp_dir("timestamp-delete-only-advances");
+        let ds = Dataset::create(&dir).unwrap();
+
+        let mut txn = ds.begin();
+        txn.insert(
+            RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![1]))]).unwrap(),
+        );
+        txn.commit().unwrap();
+        let after_insert = ds.snapshot().manifest.commit_time_high_water;
+        assert!(after_insert > 0);
+
+        // Sleep-free: two distinct clock reads are only guaranteed distinct
+        // if enough wall-clock time actually elapses, which isn't
+        // guaranteed in a fast test - so this asserts non-decreasing
+        // (`>=`), matching the spec's own "non-decreasing" wording, not
+        // strictly increasing.
+        let mut txn = ds.begin();
+        txn.delete(0);
+        txn.commit().unwrap();
+        let after_delete = ds.snapshot().manifest.commit_time_high_water;
+        assert!(
+            after_delete >= after_insert,
+            "a delete-only commit must still advance (or at least not regress) the high-water mark"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn commit_time_high_water_is_non_decreasing_across_several_commits() {
+        let dir = temp_dir("timestamp-high-water-monotonic");
+        let ds = Dataset::create(&dir).unwrap();
+
+        let mut last = 0i64;
+        for i in 0..5 {
+            let mut txn = ds.begin();
+            txn.insert(
+                RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![i]))])
+                    .unwrap(),
+            );
+            txn.commit().unwrap();
+            let current = ds.snapshot().manifest.commit_time_high_water;
+            assert!(
+                current >= last,
+                "commit {i}: high-water mark regressed from {last} to {current}"
+            );
+            last = current;
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn commit_time_high_water_does_not_regress_when_a_smaller_timestamp_commits_later() {
+        // Deterministic concurrency, not a race: constructs the exact
+        // adversarial interleaving design doc §1/§3 accepts as possible - a
+        // transaction that captured an EARLIER (smaller) timestamp reaches
+        // commit_lock and actually commits AFTER a transaction that
+        // captured a LATER (larger) one. Proves Layer 2 (the manifest's
+        // commit_time_high_water) stays non-decreasing across versions even
+        // though the current committer's own captured value is smaller
+        // than what a concurrent commit already published. Uses this
+        // file's existing `checkpoint_pair`/`pause_after_row_id_claim`
+        // mechanism (see `in-flight-commit-not-visible-to-reader`-style
+        // tests elsewhere in this module for the same pattern), not a
+        // sleep-raced schedule - only the wall-clock *value* gap uses a
+        // short sleep below, not the interleaving itself.
+        let dir = temp_dir("timestamp-high-water-concurrent-non-regression");
+        let ds = Dataset::create(&dir).unwrap();
+
+        let (claim_point, claimed) = checkpoint_pair();
+
+        // "slow": captures its timestamp first (small - issue_timestamp
+        // runs at the very top of commit(), before write_phase, which is
+        // what pause_after_row_id_claim pauses after), then parks before
+        // acquiring commit_lock.
+        let mut slow = ds.begin();
+        slow.insert(
+            RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![1]))]).unwrap(),
+        );
+        slow.pause_after_row_id_claim(claim_point);
+        let slow_thread = std::thread::spawn(move || slow.commit());
+
+        claimed.wait();
+
+        // Not racing an observation window (this file's other
+        // Checkpoint-based tests correctly avoid that) - only guaranteeing
+        // "fast"'s own clock read is strictly later in wall-clock time,
+        // which real elapsed time already all but guarantees at
+        // microsecond resolution; this removes any doubt.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        // "fast": captures a strictly later (larger) timestamp and commits
+        // to completion, uncontested, while "slow" is parked.
+        let mut fast = ds.begin();
+        fast.insert(
+            RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![2]))]).unwrap(),
+        );
+        fast.commit().unwrap();
+        let high_water_after_fast = ds.snapshot().manifest.commit_time_high_water;
+        assert!(high_water_after_fast > 0);
+
+        // Release "slow" - it builds its manifest from "fast"'s
+        // already-published snapshot (commit_time_high_water ==
+        // high_water_after_fast), then applies `.max(its own smaller
+        // timestamp)` on top of that.
+        claimed.release();
+        slow_thread.join().unwrap().unwrap();
+
+        let high_water_after_slow = ds.snapshot().manifest.commit_time_high_water;
+        assert_eq!(
+            high_water_after_slow, high_water_after_fast,
+            "a later-committing transaction with an EARLIER captured timestamp must not \
+             regress commit_time_high_water below what an already-published concurrent \
+             commit established"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn should_scan_file_prunes_using_timestamp_stats() {
+        let dir = temp_dir("timestamp-file-pruning");
+        let ds = Dataset::create(&dir).unwrap();
+
+        let mut txn = ds.begin();
+        txn.insert(
+            RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![1]))]).unwrap(),
+        );
+        txn.commit().unwrap();
+
+        let files = ds.data_files();
+        assert_eq!(files.len(), 1);
+        let stats = files[0].stats.get(TIMESTAMP_COLUMN).expect(
+            "_timestamp must have a stats entry (unlike _row_id, which deliberately has none)",
+        );
+        assert_eq!(
+            stats.min, stats.max,
+            "every row in one file shares one timestamp"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
