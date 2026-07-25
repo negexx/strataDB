@@ -154,6 +154,24 @@ impl HnswIndex {
     /// `check_or_establish_dimension` call) so a corrupted delta-log entry
     /// with a wrong-length vector can never reach the distance function.
     pub fn insert(&self, row_id: u64, vector: &[f32]) -> Result<(), IndexError> {
+        self.insert_owned(row_id, vector.to_vec())
+    }
+
+    /// Same as [`Self::insert`], but takes ownership of `vector` and moves
+    /// it straight into the graph instead of cloning a borrowed slice.
+    /// `crates/txn`'s commit-apply loop and recovery replay both already
+    /// own a freshly-deserialized/freshly-built `Vec<f32>` at their call
+    /// site — routing through `insert`'s `&[f32]` there would force a
+    /// wasted clone of the full 512-dim embedding on every insert, on top
+    /// of the one copy already paid getting the vector out of Arrow (or
+    /// out of the delta log) in the first place. `Graph::insert` moves
+    /// `vector` into `Node::new` from there, not a further copy — so this
+    /// takes the vector from two copies down to one, not three to two.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::insert`].
+    pub fn insert_owned(&self, row_id: u64, vector: Vec<f32>) -> Result<(), IndexError> {
         // A deterministic-but-varying draw per insert, avoiding a new RNG
         // dependency: derived from a monotonically-advancing counter run
         // through a fixed hash, mapped into (0, 1). This is NOT
@@ -179,7 +197,7 @@ impl HnswIndex {
 
         self.graph.insert(
             row_id,
-            vector.to_vec(),
+            vector,
             self.m,
             self.mmax0,
             self.mmax,
@@ -445,6 +463,50 @@ mod tests {
                 && results[1].squared_distance <= results[2].squared_distance,
             "results must be ranked by increasing distance: {results:?}"
         );
+    }
+
+    #[test]
+    fn insert_owned_makes_a_vector_findable_by_search() {
+        let index = HnswIndex::new(
+            MaxConnections(TEST_MAX_NB_CONNECTION),
+            MaxElements(100),
+            MaxLayers(TEST_MAX_LAYER),
+            EfConstruction(TEST_EF_CONSTRUCTION),
+        )
+        .unwrap();
+        index.insert_owned(0, vec![0.0, 0.0, 0.0]).unwrap();
+        index.insert_owned(1, vec![1000.0, 0.0, 0.0]).unwrap();
+
+        let results = index
+            .search(&[0.0, 0.0, 0.0], 1, TEST_EF_SEARCH, |_| true)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].row_id, 0);
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(results[0].squared_distance, 0.0);
+        }
+    }
+
+    #[test]
+    fn insert_owned_errors_on_dimension_mismatch_with_previously_inserted_vectors() {
+        let index = HnswIndex::new(
+            MaxConnections(16),
+            MaxElements(100),
+            MaxLayers(16),
+            EfConstruction(200),
+        )
+        .unwrap();
+        index.insert_owned(0, vec![0.0, 0.0, 0.0]).unwrap();
+
+        let result = index.insert_owned(1, vec![0.0, 0.0]);
+        assert!(matches!(
+            result,
+            Err(IndexError::DimensionMismatch {
+                query_len: 2,
+                expected: 3
+            })
+        ));
     }
 
     #[test]
