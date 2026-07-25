@@ -9,7 +9,7 @@
 //! the `levels` section rather than assumed equal to `max_level`.
 //!
 //! This module is the single source of truth shared by
-//! [`crate::segment_writer`] and [`crate::segment_reader`]: if a constant
+//! [`crate::segment_writer`] and `crate::segment_reader`: if a constant
 //! here changes, both sides change together by construction.
 
 // The format is little-endian by definition, and both the writer and the

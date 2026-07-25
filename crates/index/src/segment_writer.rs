@@ -98,6 +98,12 @@ pub(crate) fn encode_segment<S: NodeSource>(
                 expected: dim,
             });
         }
+        debug_assert!(
+            !source.is_deleted(local),
+            "encode_segment must only ever see a fresh, per-commit index that has never had a \
+             delete applied -- node {local} is tombstoned, which would bake a dead node into an \
+             immutable, un-fixable-later segment"
+        );
         levels.push(level);
     }
     let max_level = usize::from(levels.iter().copied().max().unwrap_or(0));
@@ -324,7 +330,11 @@ fn write_at(out: &mut [u8], at: usize, src: &[u8]) -> Result<(), IndexError> {
 mod tests {
     use super::*;
     use crate::hnsw::{EfConstruction, HnswIndex, MaxConnections, MaxElements, MaxLayers};
-    use crate::segment_format::{OFF_HEADER_CRC, SECTION_ADJACENCY, SECTION_VECTORS};
+    use crate::node_source::NodeSource;
+    use crate::segment_format::{
+        OFF_HEADER_CRC, SECTION_ADJACENCY, SECTION_LEVELS, SECTION_VECTORS,
+    };
+    use std::collections::BTreeSet;
 
     /// A fresh index keyed by segment-local ordinals `0..n`, exactly as
     /// `crates/txn`'s segment builder will key it. Quasi-random,
@@ -453,8 +463,136 @@ mod tests {
         let row_ids: Vec<u64> = vec![7, 11, 13, 5_000_000, 5_000_001];
         let bytes = index.to_segment_bytes(&row_ids).unwrap();
         let off = read_u64(&bytes, OFF_SECTION_OFF) as usize;
-        let decoded: &[u64] = bytemuck::cast_slice(&bytes[off..off + 5 * 8]);
-        assert_eq!(decoded, row_ids.as_slice());
+        // `read_u64` (not `bytemuck::cast_slice`) deliberately: `bytes` is a
+        // `Box<[u8]>` with only the global allocator's alignment guarantee,
+        // not `AlignedBytes`'s 64-byte one, so a direct `u8 -> u64` cast
+        // would be an environment-dependent gamble on 8-byte alignment.
+        let decoded: Vec<u64> = (0..row_ids.len())
+            .map(|i| read_u64(&bytes, off + i * 8))
+            .collect();
+        assert_eq!(decoded, row_ids);
+    }
+
+    /// `local_keyed_index`'s deterministic level draw (see
+    /// `HnswIndex::insert_owned`'s doc comment on its counter-derived
+    /// `unif`) puts nodes 0 and 1 at level 0 and nodes 2 and 3 at level 1
+    /// for `n == 4` -- verified empirically, not assumed -- so `n == 4` is
+    /// the smallest size in this family that exercises a real multi-layer
+    /// (`max_level > 0`) adjacency section below.
+    const MULTI_LAYER_N: usize = 4;
+
+    #[test]
+    fn levels_section_matches_the_source_graphs_per_node_level() {
+        let index = local_keyed_index(MULTI_LAYER_N);
+        let row_ids: Vec<u64> = (0..MULTI_LAYER_N as u64).collect();
+        let bytes = index.to_segment_bytes(&row_ids).unwrap();
+
+        let node_count = read_u32(&bytes, OFF_NODE_COUNT) as usize;
+        let max_level = read_u32(&bytes, OFF_MAX_LEVEL) as usize;
+        assert!(
+            max_level > 0,
+            "this test's whole point is exercising a node above level 0"
+        );
+        let off_levels = read_u64(&bytes, OFF_SECTION_OFF + SECTION_LEVELS * 8) as usize;
+
+        for local in 0..node_count as u64 {
+            // `local_keyed_index` keys the graph 0..n directly (`local` IS
+            // the node's row-id, per `NodeSource::row_id`'s identity
+            // contract for `Graph<D>`), and `encode_segment` addresses
+            // `source` by that same local ordinal -- so no translation is
+            // needed between the segment's node index and the source
+            // graph's local id here.
+            let expected = u8::try_from(index.graph.level(local).unwrap()).unwrap();
+            assert_eq!(
+                bytes[off_levels + local as usize],
+                expected,
+                "node {local}'s encoded level"
+            );
+        }
+    }
+
+    #[test]
+    fn adjacency_section_matches_the_source_graphs_neighbor_lists_per_layer() {
+        let index = local_keyed_index(MULTI_LAYER_N);
+        let row_ids: Vec<u64> = (0..MULTI_LAYER_N as u64).collect();
+        let bytes = index.to_segment_bytes(&row_ids).unwrap();
+
+        let node_count = read_u32(&bytes, OFF_NODE_COUNT) as usize;
+        let max_level = read_u32(&bytes, OFF_MAX_LEVEL) as usize;
+        let off_adjacency = read_u64(&bytes, OFF_SECTION_OFF + SECTION_ADJACENCY * 8) as usize;
+
+        let mut cursor = off_adjacency;
+        let mut buf: Vec<u64> = Vec::new();
+        for layer in 0..=max_level {
+            let offsets: Vec<u32> = (0..=node_count)
+                .map(|i| read_u32(&bytes, cursor + i * 4))
+                .collect();
+            cursor += (node_count + 1) * 4;
+
+            assert_eq!(offsets[0], 0, "layer {layer}'s offsets must start at 0");
+            assert!(
+                offsets.windows(2).all(|w| w[0] <= w[1]),
+                "layer {layer}'s offsets must be non-decreasing"
+            );
+
+            let neighbor_count = offsets[node_count] as usize;
+            let neighbors: Vec<u32> = (0..neighbor_count)
+                .map(|i| read_u32(&bytes, cursor + i * 4))
+                .collect();
+            cursor += neighbor_count * 4;
+            assert_eq!(
+                offsets[node_count] as usize,
+                neighbors.len(),
+                "layer {layer}'s final offset must equal its declared neighbor-array length"
+            );
+
+            for local in 0..node_count {
+                let start = offsets[local] as usize;
+                let end = offsets[local + 1] as usize;
+                let decoded: BTreeSet<u32> = neighbors[start..end].iter().copied().collect();
+                for &neighbor in &decoded {
+                    assert!(
+                        (neighbor as usize) < node_count,
+                        "layer {layer} node {local}'s neighbor {neighbor} is out of bounds"
+                    );
+                }
+
+                // Same identity-mapping note as the levels test above:
+                // `local` (the segment's node index) is also the source
+                // graph's own local id.
+                index.graph.neighbors_into(local as u64, layer, &mut buf);
+                let expected: BTreeSet<u32> = buf.iter().map(|&n| n as u32).collect();
+                assert_eq!(
+                    decoded, expected,
+                    "layer {layer} node {local}'s neighbor set"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn vectors_section_matches_the_source_graphs_per_node_vector() {
+        let index = local_keyed_index(MULTI_LAYER_N);
+        let row_ids: Vec<u64> = (0..MULTI_LAYER_N as u64).collect();
+        let bytes = index.to_segment_bytes(&row_ids).unwrap();
+
+        let node_count = read_u32(&bytes, OFF_NODE_COUNT) as usize;
+        let dim = read_u32(&bytes, OFF_DIM) as usize;
+        let off_vectors = read_u64(&bytes, OFF_SECTION_OFF + SECTION_VECTORS * 8) as usize;
+
+        for local in 0..node_count {
+            let expected = index.graph.vector(local as u64).unwrap();
+            let start = off_vectors + local * dim * 4;
+            let decoded: Vec<f32> = (0..dim)
+                .map(|d| {
+                    let at = start + d * 4;
+                    let mut buf = [0_u8; 4];
+                    buf.copy_from_slice(&bytes[at..at + 4]);
+                    f32::from_le_bytes(buf)
+                })
+                .collect();
+            assert_eq!(decoded, expected, "node {local}'s encoded vector");
+        }
     }
 
     #[test]
