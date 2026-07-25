@@ -836,26 +836,42 @@ fn build_delta_entries(batch: &RecordBatch, row_id_base: u64) -> Result<Vec<Delt
             ))
         })?;
 
+    // Downcast the flattened child array once, before the per-row loop,
+    // instead of calling `vectors.value(i)` (a fresh sliced ArrayRef + Arc
+    // allocation) and re-downcasting the result on every row -- the
+    // concrete child type is invariant per column, only the row index
+    // changes (mirrors the fix already applied in group_by.rs). Every row's
+    // slice is then a plain `i * value_length` index into the flat buffer:
+    // `FixedSizeListArray::offset()` and `Float32Array::offset()` are both
+    // hardcoded to 0 in arrow-array 58.3.0 (`slice()` bakes any logical
+    // offset directly into a new, already-adjusted `values` buffer rather
+    // than tracking a separate offset field -- confirmed against the
+    // installed source), so no extra offset arithmetic is needed here.
+    let value_length = usize::try_from(vectors.value_length()).unwrap_or(0);
+    let flat: &arrow::array::Float32Array =
+        vectors.values().as_any().downcast_ref().ok_or_else(|| {
+            TxnError::Arrow(arrow::error::ArrowError::CastError(
+                "vector column's inner type must be Float32".to_string(),
+            ))
+        })?;
+    let flat_values = flat.values();
+
     let mut entries = Vec::with_capacity(vectors.len());
     for i in 0..vectors.len() {
         if vectors.is_null(i) {
             continue;
         }
-        let row = vectors.value(i);
-        let row: &arrow::array::Float32Array = row.as_any().downcast_ref().ok_or_else(|| {
-            TxnError::Arrow(arrow::error::ArrowError::CastError(
-                "vector column's inner type must be Float32".to_string(),
-            ))
-        })?;
+        let start = i * value_length;
+        let row = &flat_values[start..start + value_length];
         let row_id = row_id_base.checked_add(u64::try_from(i)?).ok_or_else(|| {
             TxnError::ManifestOverflow(format!("row_id_base {row_id_base} + {i}"))
         })?;
-        if row.values().iter().any(|component| !component.is_finite()) {
+        if row.iter().any(|component| !component.is_finite()) {
             return Err(TxnError::NonFiniteVectorComponent { row_id });
         }
         entries.push(DeltaEntry::Insert {
             row_id,
-            vector: row.values().to_vec(),
+            vector: row.to_vec(),
         });
     }
     Ok(entries)
@@ -2014,6 +2030,42 @@ mod tests {
             DeltaEntry::Insert { row_id, .. } => assert_eq!(*row_id, 0),
             DeltaEntry::Tombstone { .. } => panic!("expected an Insert entry"),
         }
+    }
+
+    #[test]
+    fn build_delta_entries_produces_the_correct_vector_per_row() {
+        // Distinct, easily-distinguishable vectors per row -- a flat-buffer
+        // indexing bug (e.g. an off-by-one in row * value_length, or
+        // accidentally reading a neighboring row's slice) would surface as
+        // a row getting the wrong vector, which a row_id-only assertion
+        // (as the other build_delta_entries tests use) would never catch.
+        let ids = Arc::new(Int64Array::from(vec![10, 11, 12]));
+        let item_field = Arc::new(Field::new("item", DataType::Float32, false));
+        let values = Arc::new(arrow::array::Float32Array::from(vec![
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0,
+        ]));
+        let vectors = Arc::new(arrow::array::FixedSizeListArray::new(
+            item_field, 3, values, None,
+        ));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 3),
+                false,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![ids, vectors]).unwrap();
+
+        let deltas = build_delta_entries(&batch, 100).unwrap();
+        assert_eq!(deltas.len(), 3);
+        let as_insert = |d: &DeltaEntry| match d {
+            DeltaEntry::Insert { row_id, vector } => (*row_id, vector.clone()),
+            DeltaEntry::Tombstone { .. } => panic!("expected an Insert entry"),
+        };
+        assert_eq!(as_insert(&deltas[0]), (100, vec![1.0, 2.0, 3.0]));
+        assert_eq!(as_insert(&deltas[1]), (101, vec![4.0, 5.0, 6.0]));
+        assert_eq!(as_insert(&deltas[2]), (102, vec![7.0, 8.0, 9.0]));
     }
 
     #[test]

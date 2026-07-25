@@ -455,9 +455,17 @@ impl<D: Distance> Graph<D> {
                     // Shrink the neighbor's list if it now exceeds capacity.
                     let occupied = neighbor_node.layer(lc).occupied();
                     if occupied.len() > capacity {
+                        // `neighbor_node` (and so its vector) is already in
+                        // scope from the lookup a few lines up and is the
+                        // same node for every element of `occupied` here —
+                        // `distance_to` takes the vector directly and looks
+                        // up only the varying `id` side, instead of
+                        // `pairwise_distance(neighbor_id, id)` re-fetching
+                        // `neighbor_id`'s node on every iteration of a loop
+                        // where it never changes.
                         let with_dists: Vec<(u64, f32)> = occupied
                             .iter()
-                            .map(|&id| (id, self.pairwise_distance(neighbor_id, id)))
+                            .map(|&id| (id, self.distance_to(neighbor_node.vector(), id)))
                             .collect();
                         let keep =
                             select_neighbors_heuristic(&with_dists, capacity, alpha, |a, b| {
