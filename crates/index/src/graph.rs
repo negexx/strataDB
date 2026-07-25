@@ -493,20 +493,9 @@ impl<D: Distance> Graph<D> {
         }
     }
 
-    /// Algorithm 5, `K-NN-SEARCH`. Descends layers `L..1` with `ef=1`
-    /// greedy search, then one real `SEARCH-LAYER` at layer 0 with the
-    /// caller's actual `ef`. Returns `(row_id, distance)` pairs,
-    /// nearest-first, capped at `k`. `filter` is threaded through every
-    /// `search_layer` call in both phases — matching `hnsw_rs`'s own
-    /// behavior of applying one filter predicate throughout the whole
-    /// search, not just the final layer — so a caller's membership
-    /// predicate (e.g. `HnswIndex::search_filtered`'s `live_ids`) can
-    /// never be silently missed by routing through a node the coarse ef=1
-    /// descent excluded from ITS results (excluding from results never
-    /// blocks traversal — see `search_layer_generic`'s own doc comment — so this
-    /// is safe: the ef=1 phase still finds a good entry point even
-    /// through filtered-out nodes, it just never returns one as that
-    /// phase's own single "nearest" pick unless it passes the filter).
+    /// Thin wrapper delegating to `k_nn_search_generic` with `self` as the
+    /// `NodeSource`. See that function's doc comment for the actual
+    /// algorithm, including the filter-threading rationale.
     ///
     /// # Errors
     ///
@@ -746,6 +735,16 @@ fn search_layer_generic<S: NodeSource, D: Distance>(
 /// Algorithm 5, `K-NN-SEARCH`. Descends layers `L..1` with `ef=1` greedy
 /// search, then one real `SEARCH-LAYER` at layer 0 with the caller's actual
 /// `ef`. Returns `(row_id, distance)` pairs, nearest-first, capped at `k`.
+/// `filter` is threaded through every `search_layer_generic` call in both
+/// phases — matching `hnsw_rs`'s own behavior of applying one filter
+/// predicate throughout the whole search, not just the final layer — so a
+/// caller's membership predicate (e.g. `HnswIndex::search_filtered`'s
+/// `live_ids`) can never be silently missed by routing through a node the
+/// coarse ef=1 descent excluded from ITS results (excluding from results
+/// never blocks traversal — see `search_layer_generic`'s own doc comment —
+/// so this is safe: the ef=1 phase still finds a good entry point even
+/// through filtered-out nodes, it just never returns one as that phase's
+/// own single "nearest" pick unless it passes the filter).
 /// Generic over `NodeSource` — see `search_layer_generic`'s doc comment for
 /// the local-id-vs-row-id note, which applies identically here.
 ///
