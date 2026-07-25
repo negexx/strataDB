@@ -953,14 +953,14 @@ impl Transaction {
         // the very window this whole mechanism closes, with every test
         // still green — see [`GraphResidueGuard`]'s doc.
         let mut residue_guard = GraphResidueGuard::new(Arc::clone(&self.graph));
-        for delta in &deltas {
+        for delta in deltas {
             match delta {
                 DeltaEntry::Insert { row_id, vector } => {
-                    self.graph.insert(*row_id, vector)?;
-                    residue_guard.record(*row_id);
+                    self.graph.insert_owned(row_id, vector)?;
+                    residue_guard.record(row_id);
                 }
                 DeltaEntry::Tombstone { row_id } => {
-                    tombstones.insert(*row_id);
+                    tombstones.insert(row_id);
                 }
             }
         }
@@ -1287,12 +1287,25 @@ impl Transaction {
     }
 }
 
-// HNSW parameter defaults — small, correctness-only values for now.
-// Task 7's benchmark is what tunes the real production defaults; see
-// .claude/rules/vector-index.md ("tuned via benchmarks, not guessed").
+// HNSW parameter defaults — tuned via benchmarks, not guessed, per
+// .claude/rules/vector-index.md.
 const HNSW_MAX_NB_CONNECTION: usize = 16;
 const HNSW_MAX_LAYER: usize = 16;
-const HNSW_EF_CONSTRUCTION: usize = 200;
+// ef_construction is the build-cost dial: the insert-time saturation
+// early-exit is disabled, so every build traversal runs the full beam and
+// cost is near-linear in this value. Lowered 200 -> 100 based on
+// bench/benches/ef_construction_sweep_bench.rs (run it to reproduce; the
+// numbers below are its default 100k-row / 200-query configuration, the
+// same scale as vector_search_bench):
+//   - recall@10: 0.9855 (ef=200) -> 0.9820 (ef=100), a 0.35pp drop, still
+//     well clear of this project's recall@10 >= 0.9 ship floor.
+//   - build time: 225.15s (ef=200) -> 101.26s (ef=100), a 2.2x speedup.
+//   - cross-checked two other ways: production-path recall via
+//     vector_search_bench (100k rows, real Dataset) gives the same
+//     direction and magnitude (0.9850 -> 0.9800); end-to-end ingest+commit
+//     and recovery wall time via lifecycle_bench (25k rows, real commit
+//     path) both drop ~1.8x (37.30s -> 21.17s, 36.12s -> 19.41s).
+const HNSW_EF_CONSTRUCTION: usize = 100;
 
 fn new_hnsw_index(capacity: usize) -> Result<HnswIndex> {
     Ok(HnswIndex::new(
@@ -1351,7 +1364,7 @@ fn replay_index(dir: &Path, manifest: &Manifest) -> Result<(HnswIndex, imbl::Has
     for entry in &manifest.data_files {
         for delta in read_delta_log(&safe_join(&data_dir, &entry.delta_log)?)? {
             match delta {
-                DeltaEntry::Insert { row_id, vector } => index.insert(row_id, &vector)?,
+                DeltaEntry::Insert { row_id, vector } => index.insert_owned(row_id, vector)?,
                 DeltaEntry::Tombstone { row_id } => {
                     tombstones.insert(row_id);
                 }
@@ -1399,26 +1412,42 @@ fn build_delta_entries(batch: &RecordBatch, row_id_base: u64) -> Result<Vec<Delt
             ))
         })?;
 
+    // Downcast the flattened child array once, before the per-row loop,
+    // instead of calling `vectors.value(i)` (a fresh sliced ArrayRef + Arc
+    // allocation) and re-downcasting the result on every row -- the
+    // concrete child type is invariant per column, only the row index
+    // changes (mirrors the fix already applied in group_by.rs). Every row's
+    // slice is then a plain `i * value_length` index into the flat buffer:
+    // `FixedSizeListArray::offset()` and `Float32Array::offset()` are both
+    // hardcoded to 0 in arrow-array 58.3.0 (`slice()` bakes any logical
+    // offset directly into a new, already-adjusted `values` buffer rather
+    // than tracking a separate offset field -- confirmed against the
+    // installed source), so no extra offset arithmetic is needed here.
+    let value_length = usize::try_from(vectors.value_length()).unwrap_or(0);
+    let flat: &arrow::array::Float32Array =
+        vectors.values().as_any().downcast_ref().ok_or_else(|| {
+            TxnError::Arrow(arrow::error::ArrowError::CastError(
+                "vector column's inner type must be Float32".to_string(),
+            ))
+        })?;
+    let flat_values = flat.values();
+
     let mut entries = Vec::with_capacity(vectors.len());
     for i in 0..vectors.len() {
         if vectors.is_null(i) {
             continue;
         }
-        let row = vectors.value(i);
-        let row: &arrow::array::Float32Array = row.as_any().downcast_ref().ok_or_else(|| {
-            TxnError::Arrow(arrow::error::ArrowError::CastError(
-                "vector column's inner type must be Float32".to_string(),
-            ))
-        })?;
+        let start = i * value_length;
+        let row = &flat_values[start..start + value_length];
         let row_id = row_id_base.checked_add(u64::try_from(i)?).ok_or_else(|| {
             TxnError::ManifestOverflow(format!("row_id_base {row_id_base} + {i}"))
         })?;
-        if row.values().iter().any(|component| !component.is_finite()) {
+        if row.iter().any(|component| !component.is_finite()) {
             return Err(TxnError::NonFiniteVectorComponent { row_id });
         }
         entries.push(DeltaEntry::Insert {
             row_id,
-            vector: row.values().to_vec(),
+            vector: row.to_vec(),
         });
     }
     Ok(entries)
@@ -1694,7 +1723,11 @@ mod tests {
     }
 
     fn temp_dir(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("strata-txn-test-{label}-{}", std::process::id()))
+        tempfile::Builder::new()
+            .prefix(&format!("strata-txn-test-{label}-"))
+            .tempdir()
+            .unwrap()
+            .keep()
     }
 
     #[test]
@@ -3608,6 +3641,123 @@ mod tests {
     }
 
     #[test]
+    fn build_delta_entries_produces_the_correct_vector_per_row() {
+        // Distinct, easily-distinguishable vectors per row -- a flat-buffer
+        // indexing bug (e.g. an off-by-one in row * value_length, or
+        // accidentally reading a neighboring row's slice) would surface as
+        // a row getting the wrong vector, which a row_id-only assertion
+        // (as the other build_delta_entries tests use) would never catch.
+        let ids = Arc::new(Int64Array::from(vec![10, 11, 12]));
+        let item_field = Arc::new(Field::new("item", DataType::Float32, false));
+        let values = Arc::new(arrow::array::Float32Array::from(vec![
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0,
+        ]));
+        let vectors = Arc::new(arrow::array::FixedSizeListArray::new(
+            item_field, 3, values, None,
+        ));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 3),
+                false,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![ids, vectors]).unwrap();
+
+        let deltas = build_delta_entries(&batch, 100).unwrap();
+        assert_eq!(deltas.len(), 3);
+        let as_insert = |d: &DeltaEntry| match d {
+            DeltaEntry::Insert { row_id, vector } => (*row_id, vector.clone()),
+            DeltaEntry::Tombstone { .. } => panic!("expected an Insert entry"),
+        };
+        assert_eq!(as_insert(&deltas[0]), (100, vec![1.0, 2.0, 3.0]));
+        assert_eq!(as_insert(&deltas[1]), (101, vec![4.0, 5.0, 6.0]));
+        assert_eq!(as_insert(&deltas[2]), (102, vec![7.0, 8.0, 9.0]));
+    }
+
+    #[test]
+    fn build_delta_entries_reads_the_correct_vector_from_a_sliced_batch() {
+        // Pins the assumption build_delta_entries's downcast-hoist rewrite
+        // rests on: FixedSizeListArray::offset()/Float32Array::offset() are
+        // both always 0 in the installed arrow-array version, because
+        // slicing bakes the offset into a new `values` buffer rather than
+        // tracking a separate offset field. If a future arrow upgrade ever
+        // changed that representation, a flat `i * value_length` index
+        // would silently read the wrong vector for every row of a sliced
+        // batch -- with every *other* test here still green, since none of
+        // them exercise a sliced batch. This one does.
+        let ids = Arc::new(Int64Array::from(vec![1, 2, 3, 4]));
+        let item_field = Arc::new(Field::new("item", DataType::Float32, false));
+        let values = Arc::new(arrow::array::Float32Array::from(vec![
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+        ]));
+        let vectors = Arc::new(arrow::array::FixedSizeListArray::new(
+            item_field, 3, values, None,
+        ));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 3),
+                false,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![ids, vectors]).unwrap();
+        // Rows 2..4 of the original batch: expected vectors [7,8,9] and
+        // [10,11,12], not the first two rows' [1,2,3]/[4,5,6].
+        let sliced = batch.slice(2, 2);
+
+        let deltas = build_delta_entries(&sliced, 0).unwrap();
+        assert_eq!(deltas.len(), 2);
+        let as_insert = |d: &DeltaEntry| match d {
+            DeltaEntry::Insert { row_id, vector } => (*row_id, vector.clone()),
+            DeltaEntry::Tombstone { .. } => panic!("expected an Insert entry"),
+        };
+        assert_eq!(as_insert(&deltas[0]), (0, vec![7.0, 8.0, 9.0]));
+        assert_eq!(as_insert(&deltas[1]), (1, vec![10.0, 11.0, 12.0]));
+    }
+
+    #[test]
+    fn build_delta_entries_errors_on_wrong_inner_type_even_with_zero_rows() {
+        // Behavior change from the downcast-hoist rewrite: the Float32
+        // downcast used to happen lazily inside the per-row loop, so a
+        // batch with zero surviving rows (empty, or every vector null)
+        // never triggered it, silently returning Ok(vec![]) even for a
+        // wrong-typed vector column. Hoisting the downcast to run once,
+        // unconditionally, before the loop now catches this upfront --
+        // matching this function's own doc comment ("a `vector` column
+        // present with the wrong type... is [an error]"), which the old
+        // lazy check didn't actually honor for this case.
+        let item_field = Arc::new(Field::new("item", DataType::Int32, false));
+        let values = Arc::new(arrow::array::Int32Array::from(vec![1, 2, 3]));
+        let null_buffer = arrow::buffer::NullBuffer::from(vec![false]);
+        let vectors = Arc::new(arrow::array::FixedSizeListArray::new(
+            item_field,
+            3,
+            values,
+            Some(null_buffer),
+        ));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, false)), 3),
+                true,
+            ),
+        ]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1])), vectors])
+                .unwrap();
+
+        let result = build_delta_entries(&batch, 0);
+        assert!(
+            result.is_err(),
+            "a wrong inner type must error even when every row is null: {result:?}"
+        );
+    }
+
+    #[test]
     fn build_delta_entries_errors_when_vector_column_is_not_a_fixed_size_list() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
@@ -4035,10 +4185,11 @@ mod tests {
     #[test]
     #[allow(clippy::cast_precision_loss)]
     fn commit_applies_only_its_own_new_deltas_not_the_full_history() {
-        let dir = std::env::temp_dir().join(format!(
-            "strata-replay-cost-regression-{}",
-            std::process::id()
-        ));
+        let dir = tempfile::Builder::new()
+            .prefix("strata-replay-cost-regression-")
+            .tempdir()
+            .unwrap()
+            .keep();
         Dataset::create(&dir).unwrap();
         let dataset = Dataset::open(&dir).unwrap();
 
@@ -4770,11 +4921,15 @@ mod loom_tests {
     #[test]
     fn two_threads_deleting_the_same_row_exactly_one_conflicts() {
         loom::model(|| {
-            let dir = std::env::temp_dir().join(format!(
-                "strata-loom-conflict-{}-{:?}",
-                std::process::id(),
-                loom::thread::current().id()
-            ));
+            let dir = tempfile::Builder::new()
+                .prefix(&format!(
+                    "strata-loom-conflict-{}-{:?}-",
+                    std::process::id(),
+                    loom::thread::current().id()
+                ))
+                .tempdir()
+                .unwrap()
+                .keep();
             let ds = crate::Dataset::create(&dir).unwrap();
             let schema = StdArc::new(arrow::datatypes::Schema::new(vec![
                 arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
@@ -4836,11 +4991,15 @@ mod loom_tests {
     #[test]
     fn two_threads_deleting_disjoint_rows_both_succeed() {
         loom::model(|| {
-            let dir = std::env::temp_dir().join(format!(
-                "strata-loom-disjoint-{}-{:?}",
-                std::process::id(),
-                loom::thread::current().id()
-            ));
+            let dir = tempfile::Builder::new()
+                .prefix(&format!(
+                    "strata-loom-disjoint-{}-{:?}-",
+                    std::process::id(),
+                    loom::thread::current().id()
+                ))
+                .tempdir()
+                .unwrap()
+                .keep();
             let ds = crate::Dataset::create(&dir).unwrap();
             let schema = StdArc::new(arrow::datatypes::Schema::new(vec![
                 arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
@@ -5073,16 +5232,15 @@ mod loom_tests {
         // interleaving, and every run does real filesystem I/O, so keeping
         // per-run work down is what makes the model tractable.
         loom::model(|| {
-            let dir = std::env::temp_dir().join(format!(
-                "strata-loom-residue-{}-{:?}",
-                std::process::id(),
-                loom::thread::current().id()
-            ));
-            // Also cleaned up-front: a previous model iteration that
-            // panicked would otherwise leave a dataset here and make the
-            // next iteration fail with `AlreadyExists`, masking the real
-            // assertion failure.
-            std::fs::remove_dir_all(&dir).ok();
+            let dir = tempfile::Builder::new()
+                .prefix(&format!(
+                    "strata-loom-residue-{}-{:?}-",
+                    std::process::id(),
+                    loom::thread::current().id()
+                ))
+                .tempdir()
+                .unwrap()
+                .keep();
             let ds = crate::Dataset::create(&dir).unwrap();
 
             let ds_failing = ds.clone();

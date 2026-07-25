@@ -194,12 +194,11 @@ mod tests {
     use crate::stats::Value;
 
     fn temp_dataset_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "strata-manifest-test-{label}-{}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+        tempfile::Builder::new()
+            .prefix(&format!("strata-manifest-test-{label}-"))
+            .tempdir()
+            .unwrap()
+            .keep()
     }
 
     #[test]

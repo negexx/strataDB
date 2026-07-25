@@ -156,8 +156,11 @@ mod tests {
         let encoded = encode_batch(&original_batch).unwrap();
 
         // Write to file and read back
-        let dir = std::env::temp_dir().join(format!("strata-encoding-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("strata-encoding-test-")
+            .tempdir()
+            .unwrap()
+            .keep();
         let path = dir.join("test.arrow");
 
         crate::datafile::write_batch(&path, &encoded).unwrap();

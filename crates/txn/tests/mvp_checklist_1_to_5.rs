@@ -13,7 +13,11 @@ use strata_txn::mvp_fixtures::{mvp_batch, mvp_schema};
 
 #[test]
 fn mvp_checklist_steps_1_through_5() {
-    let dir = std::env::temp_dir().join(format!("strata-mvp-1to5-{}", std::process::id()));
+    let dir = tempfile::Builder::new()
+        .prefix("strata-mvp-1to5-")
+        .tempdir()
+        .unwrap()
+        .keep();
 
     // 1. Create a new dataset.
     let ds = Dataset::create(&dir).unwrap();
