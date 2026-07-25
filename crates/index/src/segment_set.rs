@@ -555,4 +555,63 @@ mod tests {
         assert_eq!(set.established_dimension(), 3);
         assert_eq!(SegmentSet::empty().established_dimension(), 0);
     }
+
+    #[test]
+    fn duplicate_row_id_across_two_parts_is_deduped_keeping_the_nearer_occurrence() {
+        // Deliberately give both segments the SAME row-id range (0..10) so
+        // every row-id exists in both parts at once. S1 has no compaction
+        // yet, so this exact overlap cannot occur naturally today -- it is
+        // constructed here on purpose, because S2's compaction (a row
+        // transiently existing in both a source segment and its compacted
+        // output) is exactly this shape, and the merge logic must already
+        // be correct for it.
+        let near = build_sealed(10, 0, 0.0); // row-ids 0..10, clustered near the origin
+        let far = build_sealed(10, 0, 10_000.0); // SAME row-ids 0..10, clustered far away
+        let set = SegmentSet::from_segments(vec![near, far]);
+
+        // k=15 is deliberately larger than the 10 *unique* row-ids that
+        // exist: only 10 rows exist in total, so the merged result can
+        // never legitimately have more than 10 entries. A broken
+        // implementation that skips dedup would return up to 15 raw
+        // (row-id, distance) pairs -- the near occurrences of every row-id
+        // plus the 5 nearest far occurrences -- reintroducing row-ids
+        // already present from the near part. k=10 would truncate away
+        // every far entry regardless of dedup (since all 10 near entries
+        // are already nearer than any far one), which would make this test
+        // pass vacuously even with dedup removed; k=15 is what forces a
+        // duplicate to actually survive truncation if dedup is missing.
+        let hits = set.search(&[50.0, 50.0, 50.0], 15, 32, |_| true).unwrap();
+
+        assert_eq!(
+            hits.len(),
+            10,
+            "only 10 unique row-ids exist across both parts; a result longer \
+             than that means a duplicate survived dedup: {hits:?}"
+        );
+
+        // Every duplicated row-id must appear exactly once in the merged
+        // result -- not once per part.
+        let mut seen = std::collections::HashSet::new();
+        for m in &hits {
+            assert!(
+                seen.insert(m.row_id),
+                "row-id {} appeared more than once in the merged result: {hits:?}",
+                m.row_id
+            );
+        }
+
+        // And the surviving occurrence must be the NEAR one: a squared
+        // distance computed against the far segment's ~10_000-offset
+        // cluster would be on the order of 10_000^2 * 3, many orders of
+        // magnitude larger than anything the near cluster can produce for
+        // a query at [50, 50, 50].
+        for m in &hits {
+            assert!(
+                m.squared_distance < 1_000_000.0,
+                "row-id {} kept the far occurrence instead of the near one -- \
+                 dedup did not retain the nearest duplicate: {m:?}",
+                m.row_id
+            );
+        }
+    }
 }
