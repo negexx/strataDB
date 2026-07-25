@@ -34,6 +34,7 @@ imbl = "7"
 
 [dev-dependencies]
 loom = "0.7"
+proptest = { workspace = true }
 tempfile = { workspace = true }
 
 [features]
