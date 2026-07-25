@@ -147,20 +147,24 @@ impl Ord for Candidate {
     }
 }
 
-/// Per-thread reusable scratch space for `search_layer`, avoiding a
-/// fresh `HashSet`/two `BinaryHeap`s/two more `HashSet`s on every call.
-/// Safe as plain `RefCell` (not a `Mutex`/atomic): `search_layer` is
-/// never called reentrantly on the same thread -- every caller
-/// (`Graph::insert`'s two call sites, `Graph::k_nn_search`'s two call
-/// sites) calls it sequentially and lets each call fully return before
-/// starting the next, so a nested `borrow_mut()` can never happen. This
-/// also depends on every caller-supplied `filter` closure (threaded
-/// through from `HnswIndex::search`/`search_filtered`'s public,
-/// caller-controlled `impl Fn(u64) -> bool`) being a pure membership/
-/// visibility predicate that never itself calls back into this graph's
-/// search path -- every filter passed anywhere in this codebase today
-/// is, but this is an invariant on the caller, not something the type
-/// system enforces.
+/// Per-thread reusable scratch space, avoiding a fresh allocation on every
+/// call. Originally just `search_layer`'s own heap/hashset fields; now also
+/// holds `occupied_buf`/`heuristic_working`, borrowed directly by
+/// `Graph::insert`'s connection-selection and shrink steps (not only via
+/// `search_layer`). Safe as plain `RefCell` (not a `Mutex`/atomic): nothing
+/// that borrows `SEARCH_SCRATCH` is ever called reentrantly on the same
+/// thread -- every borrow (`search_layer`'s own use, `Graph::insert`'s two
+/// direct uses, `Graph::k_nn_search`'s two call sites into `search_layer`)
+/// runs to completion and releases before the next one starts, so a nested
+/// `borrow_mut()` can never happen. This also depends on every closure run
+/// while a borrow is live -- `search_layer`'s caller-supplied `filter`
+/// (threaded through from `HnswIndex::search`/`search_filtered`'s public,
+/// caller-controlled `impl Fn(u64) -> bool`), and `insert`'s own
+/// `pairwise_distance`-based closures passed to
+/// `select_neighbors_heuristic_into` -- never calling back into anything
+/// that itself borrows `SEARCH_SCRATCH`. Every closure passed anywhere in
+/// this codebase today satisfies this, but it's an invariant on the
+/// caller, not something the type system enforces.
 #[derive(Default)]
 struct SearchScratch {
     visited: std::collections::HashSet<u64>,
@@ -168,6 +172,24 @@ struct SearchScratch {
     result: BinaryHeap<Candidate>,
     previous_result_ids: std::collections::HashSet<u64>,
     current_result_ids: std::collections::HashSet<u64>,
+    // Reused across `SlotArray::occupied_into` and
+    // `select_neighbors_heuristic_into` calls on the construction-time
+    // insert path (`search_layer`'s per-popped-candidate neighbor lookup,
+    // and `Graph::insert`'s connection selection + shrink step) — these
+    // were previously the largest single source of the per-insert
+    // allocation churn (a fresh `Vec` per call, up to once per popped
+    // candidate during the ef-wide build traversal). Every use is a single
+    // `SEARCH_SCRATCH.with_borrow_mut` call that runs to completion before
+    // the next one starts (never nested), so sequential reuse across these
+    // otherwise-unrelated call sites is safe. `heuristic_working` is the
+    // one worth reusing (bounded by the candidate-list size, up to
+    // `ef_construction`); `select_neighbors_heuristic_into`'s small `out`
+    // buffer (bounded by `m`/shrink capacity) is left as a fresh local at
+    // each call site instead, since its allocation cost is negligible by
+    // comparison and reusing it too would mean copying it out of scratch
+    // before the same buffer gets reused for the shrink step's own call.
+    occupied_buf: Vec<u64>,
+    heuristic_working: Vec<(u64, f32)>,
 }
 
 thread_local! {
@@ -270,7 +292,14 @@ impl<D: Distance> Graph<D> {
                 if lc > node.level() {
                     continue;
                 }
-                for neighbor_id in node.layer(lc).occupied() {
+                node.layer(lc).occupied_into(&mut scratch.occupied_buf);
+                // `occupied_buf` and `visited`/`candidates`/`result` are
+                // disjoint fields of the same `&mut SearchScratch` — the
+                // borrow checker splits them, so iterating one while
+                // mutating the others compiles cleanly (verified: this is
+                // not the same restriction a method call on `&mut self`
+                // would hit).
+                for &neighbor_id in &scratch.occupied_buf {
                     if scratch.visited.contains(&neighbor_id) {
                         continue;
                     }
@@ -466,8 +495,17 @@ impl<D: Distance> Graph<D> {
                 entry = *nearest;
             }
             let capacity = if lc == 0 { mmax0 } else { mmax };
-            let chosen = select_neighbors_heuristic(&candidates, m, alpha, |a, b| {
-                self.pairwise_distance(a, b)
+            let chosen = SEARCH_SCRATCH.with_borrow_mut(|scratch| {
+                let mut chosen = Vec::new();
+                select_neighbors_heuristic_into(
+                    &candidates,
+                    m,
+                    alpha,
+                    |a, b| self.pairwise_distance(a, b),
+                    &mut scratch.heuristic_working,
+                    &mut chosen,
+                );
+                chosen
             });
 
             let Some(new_node) = self.nodes.get(row_id) else {
@@ -480,22 +518,37 @@ impl<D: Distance> Graph<D> {
                 {
                     neighbor_node.layer(lc).claim(row_id);
                     // Shrink the neighbor's list if it now exceeds capacity.
-                    let occupied = neighbor_node.layer(lc).occupied();
-                    if occupied.len() > capacity {
-                        let with_dists: Vec<(u64, f32)> = occupied
-                            .iter()
-                            .map(|&id| (id, self.pairwise_distance(neighbor_id, id)))
-                            .collect();
-                        let keep =
-                            select_neighbors_heuristic(&with_dists, capacity, alpha, |a, b| {
-                                self.pairwise_distance(a, b)
-                            });
-                        let to_remove: Vec<u64> = occupied
-                            .into_iter()
-                            .filter(|id| !keep.contains(id))
-                            .collect();
-                        neighbor_node.layer(lc).clear_matching(&to_remove);
-                    }
+                    // occupied_buf/heuristic_working are distinct scratch
+                    // fields accessed sequentially within this one borrow —
+                    // never simultaneously live borrows of the same field.
+                    SEARCH_SCRATCH.with_borrow_mut(|scratch| {
+                        neighbor_node
+                            .layer(lc)
+                            .occupied_into(&mut scratch.occupied_buf);
+                        if scratch.occupied_buf.len() > capacity {
+                            let with_dists: Vec<(u64, f32)> = scratch
+                                .occupied_buf
+                                .iter()
+                                .map(|&id| (id, self.pairwise_distance(neighbor_id, id)))
+                                .collect();
+                            let mut keep = Vec::new();
+                            select_neighbors_heuristic_into(
+                                &with_dists,
+                                capacity,
+                                alpha,
+                                |a, b| self.pairwise_distance(a, b),
+                                &mut scratch.heuristic_working,
+                                &mut keep,
+                            );
+                            let to_remove: Vec<u64> = scratch
+                                .occupied_buf
+                                .iter()
+                                .copied()
+                                .filter(|id| !keep.contains(id))
+                                .collect();
+                            neighbor_node.layer(lc).clear_matching(&to_remove);
+                        }
+                    });
                 }
             }
         }
@@ -689,18 +742,53 @@ fn select_neighbors_simple(candidates: &[(u64, f32)], m: usize) -> Vec<u64> {
 /// as `candidates`' own distances, between two candidate row-ids — needed
 /// for line 11's diversity check, which compares a candidate against
 /// *other candidates*, not just against the query.
+// `Graph::insert`'s two call sites (main selection + shrink) now call
+// `select_neighbors_heuristic_into` directly with reused scratch buffers;
+// this owned-return wrapper is kept as the simpler-to-call form for this
+// module's own unit tests below, which don't need scratch reuse.
+#[allow(dead_code)]
 fn select_neighbors_heuristic(
     candidates: &[(u64, f32)],
     m: usize,
     alpha: f64,
     pairwise_dist: impl Fn(u64, u64) -> f32,
 ) -> Vec<u64> {
-    let mut working: Vec<(u64, f32)> = candidates.to_vec();
+    let mut working = Vec::new();
+    let mut result = Vec::new();
+    select_neighbors_heuristic_into(
+        candidates,
+        m,
+        alpha,
+        pairwise_dist,
+        &mut working,
+        &mut result,
+    );
+    result
+}
+
+/// Same algorithm as [`select_neighbors_heuristic`], writing into
+/// caller-supplied scratch buffers instead of allocating fresh `Vec`s each
+/// call — `Graph::insert` calls this twice per layer (the main connection
+/// selection, then again inside the shrink step), so a caller that reuses
+/// `working`/`out` across both calls (and across layers/rows) avoids
+/// paying two allocations per call on the hot insert path. Both buffers
+/// are cleared first, so stale contents from a previous call never leak
+/// into the result.
+fn select_neighbors_heuristic_into(
+    candidates: &[(u64, f32)],
+    m: usize,
+    alpha: f64,
+    pairwise_dist: impl Fn(u64, u64) -> f32,
+    working: &mut Vec<(u64, f32)>,
+    out: &mut Vec<u64>,
+) {
+    working.clear();
+    working.extend_from_slice(candidates);
     working.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(CmpOrdering::Equal));
 
-    let mut result: Vec<u64> = Vec::new();
-    for (candidate_id, query_dist) in working {
-        if result.len() >= m {
+    out.clear();
+    for &(candidate_id, query_dist) in working.iter() {
+        if out.len() >= m {
             break;
         }
         // Vamana's RobustPrune reachability parameter (alpha >= 1,
@@ -712,14 +800,13 @@ fn select_neighbors_heuristic(
         // edges.
         #[allow(clippy::cast_possible_truncation)]
         let relaxed_threshold = (f64::from(query_dist) / alpha) as f32;
-        let dominated = result
+        let dominated = out
             .iter()
             .any(|&picked| pairwise_dist(candidate_id, picked) < relaxed_threshold);
         if !dominated {
-            result.push(candidate_id);
+            out.push(candidate_id);
         }
     }
-    result
 }
 
 #[cfg(all(test, not(loom)))]
@@ -985,6 +1072,49 @@ mod tests {
             vec![2, 3],
             "alpha=2.0 must retain candidate 3 (no longer dominated at the \
              relaxed threshold), unlike alpha=1.0's [2, 4]: {selected:?}"
+        );
+    }
+
+    #[test]
+    fn select_neighbors_heuristic_into_prunes_a_dominated_candidate() {
+        // Same fixture as select_neighbors_heuristic_prunes_a_candidate_dominated_by_an_already_picked_neighbor
+        // above, but asserted against a pinned literal rather than the
+        // owned wrapper — that wrapper is now itself implemented in terms
+        // of this function, so comparing against it would be tautological.
+        let candidates = vec![(2, 1.0), (3, 3.0), (4, 3.1)];
+        let pairwise = |a: u64, b: u64| -> f32 {
+            match (a, b) {
+                (3, 2) | (2, 3) => 2.0,
+                (4, 2) | (2, 4) => 5.0,
+                _ => 0.0,
+            }
+        };
+        let mut working = Vec::new();
+        let mut out = Vec::new();
+        select_neighbors_heuristic_into(&candidates, 2, 1.0, pairwise, &mut working, &mut out);
+        assert_eq!(out, vec![2, 4]);
+    }
+
+    #[test]
+    fn select_neighbors_heuristic_into_clears_stale_contents_from_reused_buffers() {
+        let candidates = vec![(2, 1.0), (3, 3.0), (4, 3.1)];
+        let pairwise = |a: u64, b: u64| -> f32 {
+            match (a, b) {
+                (3, 2) | (2, 3) => 2.0,
+                (4, 2) | (2, 4) => 5.0,
+                _ => 0.0,
+            }
+        };
+        // Buffers pre-loaded with stale data from an imagined prior call at
+        // a different layer, as they would be when reused via thread-local
+        // scratch.
+        let mut working = vec![(999, 0.0), (998, 0.0)];
+        let mut out = vec![999, 998, 997];
+        select_neighbors_heuristic_into(&candidates, 2, 1.0, pairwise, &mut working, &mut out);
+        assert_eq!(
+            out,
+            vec![2, 4],
+            "stale entries from a reused buffer must not leak into the result"
         );
     }
 
