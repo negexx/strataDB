@@ -165,7 +165,8 @@ mod tests {
 
     #[test]
     fn occupied_into_reports_every_claimed_value() {
-        let arr = SlotArray::new(4);
+        let backing: Vec<AtomicU64> = (0..4).map(|_| AtomicU64::new(EMPTY)).collect();
+        let arr = SlotArray::new(&backing);
         arr.claim(5);
         arr.claim(6);
         let mut out = Vec::new();
@@ -181,7 +182,8 @@ mod tests {
 
     #[test]
     fn occupied_into_clears_stale_contents_from_a_reused_buffer() {
-        let arr = SlotArray::new(4);
+        let backing: Vec<AtomicU64> = (0..4).map(|_| AtomicU64::new(EMPTY)).collect();
+        let arr = SlotArray::new(&backing);
         arr.claim(9);
         let mut out = vec![111, 222, 333]; // stale data from a prior call
         arr.occupied_into(&mut out);
@@ -190,7 +192,8 @@ mod tests {
 
     #[test]
     fn occupied_into_reuses_the_buffers_existing_capacity() {
-        let arr = SlotArray::new(4);
+        let backing: Vec<AtomicU64> = (0..4).map(|_| AtomicU64::new(EMPTY)).collect();
+        let arr = SlotArray::new(&backing);
         arr.claim(1);
         arr.claim(2);
         let mut out = Vec::with_capacity(16);
