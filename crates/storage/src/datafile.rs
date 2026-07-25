@@ -121,8 +121,11 @@ mod tests {
 
     #[test]
     fn write_then_read_round_trips() {
-        let dir = std::env::temp_dir().join(format!("strata-datafile-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("strata-datafile-test-")
+            .tempdir()
+            .unwrap()
+            .keep();
         let path = dir.join("test.arrow");
 
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
@@ -138,9 +141,11 @@ mod tests {
 
     #[test]
     fn read_batch_errors_on_an_ipc_file_with_zero_record_batches() {
-        let dir =
-            std::env::temp_dir().join(format!("strata-datafile-empty-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("strata-datafile-empty-")
+            .tempdir()
+            .unwrap()
+            .keep();
         let path = dir.join("empty.arrow");
 
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
@@ -158,9 +163,11 @@ mod tests {
 
     #[test]
     fn read_batch_errors_on_a_non_ipc_file() {
-        let dir =
-            std::env::temp_dir().join(format!("strata-datafile-garbage-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("strata-datafile-garbage-")
+            .tempdir()
+            .unwrap()
+            .keep();
         let path = dir.join("garbage.arrow");
         std::fs::write(&path, b"not an arrow ipc file").unwrap();
 

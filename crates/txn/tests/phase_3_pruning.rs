@@ -23,7 +23,11 @@ fn batch(ids: Vec<i64>) -> RecordBatch {
 
 #[test]
 fn explain_skips_files_whose_stats_cannot_match_and_scans_only_the_rest() {
-    let dir = std::env::temp_dir().join(format!("strata-phase3-explain-{}", std::process::id()));
+    let dir = tempfile::Builder::new()
+        .prefix("strata-phase3-explain-")
+        .tempdir()
+        .unwrap()
+        .keep();
     let ds = Dataset::create(&dir).unwrap();
 
     // Three commits, three disjoint id ranges -> three files.
@@ -85,7 +89,11 @@ fn explain_skips_files_whose_stats_cannot_match_and_scans_only_the_rest() {
 
 #[test]
 fn explain_and_scan_with_predicate_agree_on_a_range_predicate_not_just_equality() {
-    let dir = std::env::temp_dir().join(format!("strata-phase3-range-{}", std::process::id()));
+    let dir = tempfile::Builder::new()
+        .prefix("strata-phase3-range-")
+        .tempdir()
+        .unwrap()
+        .keep();
     let ds = Dataset::create(&dir).unwrap();
 
     let mut txn = ds.begin();
