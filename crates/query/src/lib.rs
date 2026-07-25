@@ -7,8 +7,10 @@ use arrow::error::ArrowError;
 
 pub mod group_by;
 pub mod predicate;
+pub mod predicate_key;
 pub use group_by::{AggFunc, group_by};
 pub use predicate::{Predicate, filter, mask, should_scan_file};
+pub use predicate_key::PredicateKey;
 
 /// Returns the rows of `batch` where `column` equals `value`. A thin
 /// convenience wrapper over [`filter`] with [`Predicate::Eq`] — kept for
