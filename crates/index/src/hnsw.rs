@@ -69,7 +69,7 @@ pub struct MaxLayers(pub usize);
 pub struct EfConstruction(pub usize);
 
 pub struct HnswIndex {
-    graph: Graph<L2>,
+    pub(crate) graph: Graph<L2>,
     m: usize,
     mmax0: usize,
     mmax: usize,
@@ -314,42 +314,7 @@ impl HnswIndex {
         live_ids: &[usize],
         is_visible: impl Fn(u64) -> bool,
     ) -> Result<Vec<VectorMatch>, IndexError> {
-        // live_ids membership and is_visible are composed into ONE
-        // predicate passed straight into k_nn_search -> search_layer,
-        // applied during traversal-time result-set construction — not a
-        // post-filter over an already-capped top-k. This matches
-        // hnsw_rs's original FilterT-based behavior exactly: a live_ids
-        // row deep in the graph is never missed just because it fell
-        // outside some pre-guessed widened candidate window, since the
-        // predicate is evaluated as part of the same search, not after it.
-        // A dense bitset rather than a `HashSet`. Row-ids are dense and
-        // monotonic (see `NodeTable`'s own contract), so membership is one
-        // indexed load plus a shift instead of a `SipHash` probe, and no
-        // hashing or rehash growth is paid while building it.
-        //
-        // Sizing note: the bitset is `max_row_id / 8` bytes — proportional to
-        // the largest live row-id, *not* to `live_ids.len()`. For a dense
-        // low-selectivity filter that is a large win over the ~24-bytes/entry
-        // `HashSet` (~12KB vs ~1MB at 100k live ids). For a *highly selective*
-        // predicate over a very large dataset it can be the other way round —
-        // a handful of matches with a max row-id near 1e8 still allocates
-        // ~12MB here where the `HashSet` would have been tiny. Both are dwarfed
-        // by the in-memory graph and by the whole-file re-read `row_ids_matching`
-        // already pays per query, so this is not the term that matters — but
-        // it is not unconditionally smaller.
-        //
-        // `live_ids` need not be sorted: the bitset is order-insensitive.
-        let max_id = live_ids.iter().copied().max().unwrap_or(0);
-        let mut live = vec![0_u64; max_id / 64 + 1];
-        for &id in live_ids {
-            live[id / 64] |= 1_u64 << (id % 64);
-        }
-        let filter = move |id: u64| {
-            // An id past the end of the bitset simply isn't live, which is
-            // also what makes the empty-`live_ids` case behave correctly.
-            let word = usize::try_from(id / 64).unwrap_or(usize::MAX);
-            word < live.len() && (live[word] >> (id % 64)) & 1 == 1 && is_visible(id)
-        };
+        let filter = build_live_filter(live_ids, is_visible);
         let raw = self.graph.k_nn_search(query, k, ef_search, filter)?;
         Ok(raw
             .into_iter()
@@ -358,6 +323,54 @@ impl HnswIndex {
                 squared_distance: dist * dist,
             })
             .collect())
+    }
+}
+
+/// Builds the combined live-ids/visibility predicate used by
+/// [`HnswIndex::search_filtered`] and by `segment_set::SegmentSet::search_filtered`
+/// (the sibling module), which calls `k_nn_search_generic` directly rather
+/// than through this type's methods — see that module's doc comments for
+/// why. Factored out here (rather than duplicated) so both call sites build
+/// the exact same predicate from the exact same code.
+///
+/// `live_ids` membership and `is_visible` are composed into ONE predicate
+/// passed straight into `k_nn_search` -> `search_layer`, applied during
+/// traversal-time result-set construction — not a post-filter over an
+/// already-capped top-k. This matches `hnsw_rs`'s original FilterT-based
+/// behavior exactly: a `live_ids` row deep in the graph is never missed just
+/// because it fell outside some pre-guessed widened candidate window, since
+/// the predicate is evaluated as part of the same search, not after it.
+/// A dense bitset rather than a `HashSet`. Row-ids are dense and monotonic
+/// (see `NodeTable`'s own contract), so membership is one indexed load plus
+/// a shift instead of a `SipHash` probe, and no hashing or rehash growth is
+/// paid while building it.
+///
+/// Sizing note: the bitset is `max_row_id / 8` bytes — proportional to the
+/// largest live row-id, *not* to `live_ids.len()`. For a dense
+/// low-selectivity filter that is a large win over the ~24-bytes/entry
+/// `HashSet` (~12KB vs ~1MB at 100k live ids). For a *highly selective*
+/// predicate over a very large dataset it can be the other way round — a
+/// handful of matches with a max row-id near 1e8 still allocates ~12MB here
+/// where the `HashSet` would have been tiny. Both are dwarfed by the
+/// in-memory graph and by the whole-file re-read `row_ids_matching` already
+/// pays per query, so this is not the term that matters — but it is not
+/// unconditionally smaller.
+///
+/// `live_ids` need not be sorted: the bitset is order-insensitive.
+pub(crate) fn build_live_filter(
+    live_ids: &[usize],
+    is_visible: impl Fn(u64) -> bool,
+) -> impl Fn(u64) -> bool {
+    let max_id = live_ids.iter().copied().max().unwrap_or(0);
+    let mut live = vec![0_u64; max_id / 64 + 1];
+    for &id in live_ids {
+        live[id / 64] |= 1_u64 << (id % 64);
+    }
+    move |id: u64| {
+        // An id past the end of the bitset simply isn't live, which is
+        // also what makes the empty-`live_ids` case behave correctly.
+        let word = usize::try_from(id / 64).unwrap_or(usize::MAX);
+        word < live.len() && (live[word] >> (id % 64)) & 1 == 1 && is_visible(id)
     }
 }
 

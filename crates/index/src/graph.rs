@@ -752,7 +752,7 @@ fn search_layer_generic<S: NodeSource, D: Distance>(
 ///
 /// Returns `IndexError::DimensionMismatch` if `query`'s length doesn't
 /// match `source`'s established dimension.
-fn k_nn_search_generic<S: NodeSource, D: Distance>(
+pub(crate) fn k_nn_search_generic<S: NodeSource, D: Distance>(
     source: &S,
     distance: &D,
     query: &[f32],
