@@ -1739,6 +1739,7 @@ mod tests {
             next_row_id: 3,
             tombstones: Vec::new(),
             next_attempt_id: 0, // <-- the exact legacy-deserialize shape
+            commit_time_high_water: 0,
         };
         // The delta log referenced above must exist too (replay_index reads
         // it on open), but can be empty -- this test's batch has no vector
@@ -1863,6 +1864,7 @@ mod tests {
             next_row_id: u64::MAX,
             tombstones: Vec::new(),
             next_attempt_id: 0,
+            commit_time_high_water: 0,
         };
         strata_storage::commit_manifest(&dir, &hostile).unwrap();
 
@@ -1889,6 +1891,7 @@ mod tests {
             next_row_id: 0,
             tombstones: Vec::new(),
             next_attempt_id: 0,
+            commit_time_high_water: 0,
         };
         strata_storage::commit_manifest(&dir, &hostile).unwrap();
         let ds = Dataset::open(&dir).unwrap();
@@ -2490,6 +2493,7 @@ mod tests {
             next_row_id: 0,
             tombstones: Vec::new(),
             next_attempt_id: 0,
+            commit_time_high_water: 0,
         };
         strata_storage::commit_manifest(&dir, &hostile).unwrap();
         // The delta log must exist (empty is fine — it replays to zero
