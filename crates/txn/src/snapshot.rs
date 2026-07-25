@@ -332,8 +332,6 @@ impl Snapshot {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use strata_index::{EfConstruction, MaxConnections, MaxElements, MaxLayers};
-
     use super::*;
 
     fn test_snapshot(watermark: u64, tombstoned: &[u64]) -> Snapshot {
@@ -349,15 +347,11 @@ mod tests {
             dir: PathBuf::from("unused-in-these-tests"),
             version: 1,
             manifest: Arc::new(Manifest::empty()),
-            index: strata_index::SegmentSet::from_live(Arc::new(
-                strata_index::HnswIndex::new(
-                    MaxConnections(16),
-                    MaxElements(100),
-                    MaxLayers(16),
-                    EfConstruction(200),
-                )
-                .unwrap(),
-            )),
+            // These tests exercise `is_visible` only — the watermark,
+            // in-flight and tombstone arithmetic — and never search, so an
+            // empty segment set is exactly right and avoids building an
+            // index nothing queries.
+            index: strata_index::SegmentSet::empty(),
             watermark,
             in_flight: in_flight.into(),
             tombstones: Arc::new(tombstoned.iter().copied().collect()),

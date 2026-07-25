@@ -18,25 +18,22 @@
 //! segment and its compacted output — does not require reopening this
 //! merge logic.
 //!
-//! [`IndexPart::Live`] is a **transient** variant, present only while
-//! `crates/txn` is being cut over to the segment write path; it is deleted
-//! in the same workstream. See
-//! `docs/superpowers/specs/2026-07-25-s1-w3-2-design-amendment.md` §1 for
-//! why every method below iterates length-independently and matches
-//! exhaustively rather than destructuring a fixed-arity slice.
+//! [`IndexPart`] is an enum with one variant today rather than a bare
+//! `Arc<SegmentReader>` alias: S2 compaction and Phase B branching are the
+//! variants it exists for, and every method below already matches
+//! exhaustively, so adding one is a compile error at each site rather than
+//! a runtime surprise. That forcing property is exactly what
+//! `docs/superpowers/specs/2026-07-25-s1-w3-2-design-amendment.md` §1
+//! required when `Live` was removed.
 
 use std::sync::Arc;
 
 use crate::graph::k_nn_search_generic;
-use crate::hnsw::{HnswIndex, IndexError, VectorMatch, build_live_filter};
+use crate::hnsw::{IndexError, VectorMatch, build_live_filter};
 use crate::segment_reader::SegmentReader;
 
 /// One part of a segment set.
 pub enum IndexPart {
-    /// The legacy shared, mutable in-memory graph. **Transient** — exists
-    /// only until `crates/txn`'s write path is fully cut over to segments,
-    /// and is deleted in this same workstream. No code may rely on it.
-    Live(Arc<HnswIndex>),
     /// One immutable on-disk segment, loaded once and shared by every
     /// snapshot whose manifest lists it.
     Sealed(Arc<SegmentReader>),
@@ -55,15 +52,6 @@ impl SegmentSet {
     pub fn empty() -> Self {
         Self {
             parts: Arc::from(Vec::new()),
-        }
-    }
-
-    /// Builds a segment set of exactly one live part, wrapping the legacy
-    /// shared mutable index. **Transient** — see [`IndexPart::Live`].
-    #[must_use]
-    pub fn from_live(index: Arc<HnswIndex>) -> Self {
-        Self {
-            parts: Arc::from(vec![IndexPart::Live(index)]),
         }
     }
 
@@ -90,7 +78,6 @@ impl SegmentSet {
         let mut parts: Vec<IndexPart> = Vec::with_capacity(self.parts.len() + 1);
         for part in self.parts.iter() {
             match part {
-                IndexPart::Live(index) => parts.push(IndexPart::Live(Arc::clone(index))),
                 IndexPart::Sealed(sealed) => parts.push(IndexPart::Sealed(Arc::clone(sealed))),
             }
         }
@@ -132,18 +119,6 @@ impl SegmentSet {
         let mut merged: Vec<(u64, f32)> = Vec::new();
         for part in self.parts.iter() {
             match part {
-                IndexPart::Live(index) => {
-                    // A live graph's local id IS its row-id, so no mapping.
-                    let raw = k_nn_search_generic(
-                        &index.graph,
-                        &crate::distance::L2,
-                        query,
-                        k,
-                        ef_search,
-                        filter,
-                    )?;
-                    merged.extend(raw);
-                }
                 IndexPart::Sealed(reader) => {
                     let raw = k_nn_search_generic(
                         reader.as_ref(),
@@ -230,44 +205,10 @@ impl SegmentSet {
         self.parts
             .iter()
             .map(|part| match part {
-                IndexPart::Live(index) => index.established_dimension(),
                 IndexPart::Sealed(reader) => reader.dimension(),
             })
             .find(|&dim| dim != 0)
             .unwrap_or(0)
-    }
-
-    /// Recovers the underlying live index. **Transient** — see
-    /// [`IndexPart::Live`]; deleted with that variant.
-    ///
-    /// # Panics
-    ///
-    /// Panics unless this set holds exactly one part, and that part is
-    /// `Live` — any other shape (zero parts, more than one part, or a
-    /// `Live` part mixed with `Sealed` ones) is a caller bug, and is
-    /// reported loudly rather than silently returning some `Live` part
-    /// found among others.
-    #[must_use]
-    pub fn live_arc(&self) -> Arc<HnswIndex> {
-        let mut live_count = 0usize;
-        let mut sole_live: Option<Arc<HnswIndex>> = None;
-        for part in self.parts.iter() {
-            match part {
-                IndexPart::Live(index) => {
-                    live_count += 1;
-                    sole_live = Some(Arc::clone(index));
-                }
-                IndexPart::Sealed(_) => {}
-            }
-        }
-        match (self.parts.len(), sole_live) {
-            (1, Some(index)) => index,
-            _ => panic!(
-                "live_arc called on a SegmentSet with {} part(s) ({live_count} Live), \
-                 expected exactly one Live part",
-                self.parts.len()
-            ),
-        }
     }
 }
 
@@ -275,128 +216,20 @@ impl SegmentSet {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::cast_precision_loss)]
 mod tests {
     use super::*;
+    use crate::hnsw::HnswIndex;
     use crate::{EfConstruction, MaxConnections, MaxElements, MaxLayers};
 
     // Quasi-random (non-collinear) offsets -- same rationale as
     // `hnsw.rs`'s own `insert_cluster` doc comment: collinear points let
     // the build-time diversity heuristic prune down to a near-complete
     // graph, which makes layer-0 search exact for *any* `ef_search`,
-    // masking a `k`/`ef_search` argument-order bug (see the doc comment
-    // on `build_index` below).
+    // masking a `k`/`ef_search` argument-order bug (see
+    // `search_over_one_sealed_part_matches_searching_its_source_graph_directly`'s
+    // comment, and `build_index`'s deleted doc comment in git history, for
+    // the specific rationale).
     const PHI: f64 = 0.618_033_988_749_895;
     const SQRT2: f64 = 0.414_213_562_373_095;
     const SQRT3: f64 = 0.732_050_807_568_877;
-
-    /// `MaxConnections(2)` (`mmax0 = 4`) with a generously large `n` keeps
-    /// layer 0 genuinely sparse (unlike an earlier version of this fixture,
-    /// `MaxConnections(16)`/`n = 20`, where `mmax0 = 32 > n - 1 = 19` made
-    /// every node reachable from any entry point in a single hop --
-    /// layer-0 search was then mathematically exact regardless of
-    /// `ef_search`, so the two equivalence tests below could not have
-    /// caught a `k`/`ef_search` argument swap in the code under test: for
-    /// an exact search, the final result is always the true top-
-    /// `min(k, ef_search, n)`, which is symmetric in `(k, ef_search)`. With
-    /// a genuinely approximate (sparse) graph, a small `ef_search` can miss
-    /// true nearest neighbors that a larger one would find, breaking that
-    /// symmetry -- see the two tests' own comments for the specific
-    /// `k`/`ef_search` values this was verified against.
-    #[allow(clippy::cast_possible_truncation, clippy::many_single_char_names)]
-    fn build_index(n: usize) -> Arc<HnswIndex> {
-        let index = HnswIndex::new(
-            MaxConnections(2),
-            MaxElements(n + 1),
-            MaxLayers(16),
-            EfConstruction(5),
-        )
-        .unwrap();
-        for i in 0..n as u64 {
-            let f = i as f64;
-            let x = ((f * PHI).fract() * 1000.0) as f32;
-            let y = ((f * SQRT2).fract() * 1000.0) as f32;
-            let z = ((f * SQRT3).fract() * 1000.0) as f32;
-            index.insert_owned(i, vec![x, y, z]).unwrap();
-        }
-        Arc::new(index)
-    }
-
-    #[test]
-    fn search_over_one_live_part_matches_hnsw_index_search_directly() {
-        let index = build_index(500);
-        let set = SegmentSet::from_live(Arc::clone(&index));
-        let query = [500.0, 500.0, 500.0];
-
-        // k=40, ef_search=5 verified (empirically, against this exact
-        // fixture) to make a `k`/`ef_search` argument swap in the code
-        // under test observable: calling `k_nn_search_generic` with these
-        // two arguments swapped returns a different row-id set than
-        // calling it in the correct order, because ef_search=5 caps the
-        // beam width low enough that this sparse graph's search is
-        // genuinely approximate. `direct`/`via_set` below are both called
-        // with the SAME (correct) argument order -- this doesn't test a
-        // swap directly, it only confirms the two wrappers still agree
-        // with each other using values that would have caught it if either
-        // one got the order wrong.
-        let direct = index.search(&query, 40, 5, |_| true).unwrap();
-        let via_set = set.search(&query, 40, 5, |_| true).unwrap();
-
-        assert_eq!(
-            via_set.len(),
-            direct.len(),
-            "SegmentSet::search must return the same number of matches as HnswIndex::search"
-        );
-        for (a, b) in via_set.iter().zip(direct.iter()) {
-            assert_eq!(a.row_id, b.row_id, "row-id order must match exactly");
-            assert!(
-                (a.squared_distance - b.squared_distance).abs() < f32::EPSILON,
-                "distances must match exactly: {} vs {}",
-                a.squared_distance,
-                b.squared_distance
-            );
-        }
-    }
-
-    #[test]
-    fn search_filtered_over_one_live_part_matches_hnsw_index_search_filtered_directly() {
-        let index = build_index(500);
-        let set = SegmentSet::from_live(Arc::clone(&index));
-        let query = [500.0, 500.0, 500.0];
-        let live_ids: Vec<usize> = (0..500).step_by(2).collect(); // only even row-ids
-
-        // Same k=40/ef_search=5 choice, re-verified with a `live_ids`
-        // filter engaged (see `search_over_one_live_part_...`'s comment) --
-        // filtering changes which candidates survive into the result set,
-        // so the swap-detecting property was checked again under filtering
-        // rather than assumed to carry over unchanged.
-        let direct = index
-            .search_filtered(&query, 40, 5, &live_ids, |_| true)
-            .unwrap();
-        let via_set = set
-            .search_filtered(&query, 40, 5, &live_ids, |_| true)
-            .unwrap();
-
-        assert_eq!(via_set.len(), direct.len());
-        for (a, b) in via_set.iter().zip(direct.iter()) {
-            assert_eq!(a.row_id, b.row_id);
-            assert!(
-                (a.squared_distance - b.squared_distance).abs() < f32::EPSILON,
-                "distances must match exactly: {} vs {}",
-                a.squared_distance,
-                b.squared_distance
-            );
-        }
-        assert!(
-            via_set.iter().all(|m| m.row_id % 2 == 0),
-            "only even row-ids were in live_ids: {via_set:?}"
-        );
-    }
-
-    #[test]
-    fn established_dimension_matches_the_underlying_index() {
-        let index = build_index(3);
-        let set = SegmentSet::from_live(Arc::clone(&index));
-        assert_eq!(set.established_dimension(), index.established_dimension());
-        assert_eq!(set.established_dimension(), 3);
-    }
 
     /// Builds one sealed segment over `n` quasi-random 3-d points whose
     /// global row-ids start at `row_id_base` — the exact shape
@@ -438,6 +271,72 @@ mod tests {
         let bytes = index.to_segment_bytes(&row_ids).unwrap();
         let reader = Arc::new(crate::SegmentReader::from_bytes(&bytes).unwrap());
         (reader, points)
+    }
+
+    #[test]
+    fn search_over_one_sealed_part_matches_searching_its_source_graph_directly() {
+        // The successor to W3.1's Live-part equivalence tests: one part,
+        // and SegmentSet::search must agree exactly with running the same
+        // generic traversal against the graph the segment was sealed from.
+        // Verified at k=40/ef_search=5 against a deliberately sparse
+        // fixture, where a k/ef_search argument swap would change the
+        // result set (see `build_index`'s deleted doc comment in git
+        // history for why an over-connected fixture cannot catch that).
+        let n = 500;
+        let index = HnswIndex::new(
+            MaxConnections(2),
+            MaxElements(n + 1),
+            MaxLayers(16),
+            EfConstruction(5),
+        )
+        .unwrap();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+        for local in 0..n as u64 {
+            let f = local as f64;
+            index
+                .insert_owned(
+                    local,
+                    vec![
+                        ((f * PHI).fract() * 1000.0) as f32,
+                        ((f * SQRT2).fract() * 1000.0) as f32,
+                        ((f * SQRT3).fract() * 1000.0) as f32,
+                    ],
+                )
+                .unwrap();
+        }
+        let row_ids: Vec<u64> = (0..n as u64).collect();
+        let bytes = index.to_segment_bytes(&row_ids).unwrap();
+        let set = SegmentSet::from_segments(vec![Arc::new(
+            crate::SegmentReader::from_bytes(&bytes).unwrap(),
+        )]);
+        let query = [500.0_f32, 500.0, 500.0];
+
+        let direct = crate::graph::k_nn_search_generic(
+            &index.graph,
+            &crate::distance::L2,
+            &query,
+            40,
+            5,
+            |_| true,
+        )
+        .unwrap();
+        let via_set = set.search(&query, 40, 5, |_| true).unwrap();
+
+        assert_eq!(via_set.len(), direct.len(), "{via_set:?} vs {direct:?}");
+        for (a, b) in via_set.iter().zip(&direct) {
+            // Row-ids are 0..n here, so they equal the local ordinals --
+            // which is the one case where the ordinal-vs-row-id mapping bug
+            // is invisible. `search_returns_global_row_ids_not_segment_local_ordinals`
+            // is the test that catches that; this one is about traversal
+            // equivalence.
+            assert_eq!(a.row_id, b.0, "row-id order must match exactly");
+            assert!(
+                (a.squared_distance - b.1 * b.1).abs() < f32::EPSILON,
+                "distances must match exactly: {} vs {}",
+                a.squared_distance,
+                b.1 * b.1
+            );
+        }
     }
 
     #[test]
@@ -647,58 +546,6 @@ mod tests {
                 m.row_id
             );
         }
-    }
-
-    #[test]
-    fn search_fans_out_across_a_live_part_and_a_sealed_part_and_finds_rows_in_both() {
-        // The one shape this task's transitional staging actually produces
-        // that no other test covers: a set holding BOTH a `Live` part (the
-        // legacy shared graph) and a `Sealed` part (an on-disk segment) at
-        // once -- exactly what `with_appended`'s `IndexPart::Live` arm
-        // exists to build. Two well-separated clusters, one per part, same
-        // technique as `search_fans_out_across_every_part_and_finds_rows_in_all_of_them`.
-        let live = build_index(30); // row-ids 0..30, clustered near [0, 1000]^3
-        let sealed = build_sealed(30, 500, 10_000.0); // row-ids 500..530, far away
-        let set = SegmentSet::from_live(Arc::clone(&live)).with_appended(sealed);
-        assert_eq!(set.len(), 2);
-
-        let near_hits = set.search(&[500.0, 500.0, 500.0], 3, 32, |_| true).unwrap();
-        assert_eq!(near_hits.len(), 3, "{near_hits:?}");
-        assert!(
-            near_hits.iter().all(|m| m.row_id < 30),
-            "a query near the live part must return the live part's rows: {near_hits:?}"
-        );
-
-        let far_hits = set
-            .search(&[10_050.0, 10_050.0, 10_050.0], 3, 32, |_| true)
-            .unwrap();
-        assert_eq!(far_hits.len(), 3, "{far_hits:?}");
-        assert!(
-            far_hits.iter().all(|m| (500..530).contains(&m.row_id)),
-            "a query near the sealed part must return the sealed part's rows -- this is \
-             the assertion a consult-one-part implementation fails: {far_hits:?}"
-        );
-    }
-
-    #[test]
-    fn live_arc_panics_on_any_shape_other_than_exactly_one_live_part() {
-        // `live_arc`'s old (pre-this-task) `sole_live()` ancestor panicked
-        // on any arity != 1. This task's fan-out rewrite must not silently
-        // narrow that to "panics only if there is no Live part at all" --
-        // a set with a Live part mixed with Sealed parts (this test's
-        // fixture) must still panic loudly, not silently return the one
-        // Live part it happens to find.
-        let live = build_index(3);
-        let sealed = build_sealed(3, 500, 10_000.0);
-        let set = SegmentSet::from_live(live).with_appended(sealed);
-        assert_eq!(set.len(), 2);
-
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| set.live_arc()));
-        assert!(
-            result.is_err(),
-            "live_arc must panic on a set with a Live part mixed with Sealed parts, \
-             not silently return the Live part"
-        );
     }
 
     #[test]
