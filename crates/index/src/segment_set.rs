@@ -108,6 +108,7 @@ impl SegmentSet {
         self.parts.len()
     }
 
+    /// Whether this set holds no parts at all.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.parts.is_empty()
@@ -115,12 +116,18 @@ impl SegmentSet {
 
     /// Queries every part and merges the results — see this module's doc
     /// comment for the merge contract.
-    fn fan_out(
+    ///
+    /// Generic over the filter type (rather than `&dyn Fn(u64) -> bool`) so
+    /// the compiler can monomorphize and inline the filter closure into
+    /// `search_layer_generic`'s two admission-gate call sites — a `dyn Fn`
+    /// would force a vtable call at both, defeating the whole point of
+    /// [`build_live_filter`]'s dense-bitset design (see its own doc comment).
+    fn fan_out<F: Fn(u64) -> bool>(
         &self,
         query: &[f32],
         k: usize,
         ef_search: usize,
-        filter: &dyn Fn(u64) -> bool,
+        filter: &F,
     ) -> Result<Vec<VectorMatch>, IndexError> {
         let mut merged: Vec<(u64, f32)> = Vec::new();
         for part in self.parts.iter() {
@@ -157,7 +164,7 @@ impl SegmentSet {
                 }
             }
         }
-        merged.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        merged.sort_by(|a, b| a.1.total_cmp(&b.1));
         // Nearest-first order means the retained occurrence of a duplicated
         // row-id is always its nearest one.
         let mut seen = std::collections::HashSet::with_capacity(merged.len());
@@ -235,16 +242,32 @@ impl SegmentSet {
     ///
     /// # Panics
     ///
-    /// Panics if this set does not hold exactly one `Live` part, which no
-    /// caller can produce once `crates/txn` is cut over.
+    /// Panics unless this set holds exactly one part, and that part is
+    /// `Live` — any other shape (zero parts, more than one part, or a
+    /// `Live` part mixed with `Sealed` ones) is a caller bug, and is
+    /// reported loudly rather than silently returning some `Live` part
+    /// found among others.
     #[must_use]
     pub fn live_arc(&self) -> Arc<HnswIndex> {
+        let mut live_count = 0usize;
+        let mut sole_live: Option<Arc<HnswIndex>> = None;
         for part in self.parts.iter() {
-            if let IndexPart::Live(index) = part {
-                return Arc::clone(index);
+            match part {
+                IndexPart::Live(index) => {
+                    live_count += 1;
+                    sole_live = Some(Arc::clone(index));
+                }
+                IndexPart::Sealed(_) => {}
             }
         }
-        unreachable!("live_arc called on a set with no Live part")
+        match (self.parts.len(), sole_live) {
+            (1, Some(index)) => index,
+            _ => panic!(
+                "live_arc called on a SegmentSet with {} part(s) ({live_count} Live), \
+                 expected exactly one Live part",
+                self.parts.len()
+            ),
+        }
     }
 }
 
@@ -381,6 +404,18 @@ mod tests {
     /// segment-local ordinals `0..n`, serialized, and loaded back.
     #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
     fn build_sealed(n: usize, row_id_base: u64, offset: f32) -> Arc<crate::SegmentReader> {
+        build_sealed_with_points(n, row_id_base, offset).0
+    }
+
+    /// As [`build_sealed`], but also returns the `(row_id, vector)` pairs it
+    /// built the segment from — needed by ground-truth tests that must
+    /// brute-force the exact same points the segment was built over.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    fn build_sealed_with_points(
+        n: usize,
+        row_id_base: u64,
+        offset: f32,
+    ) -> (Arc<crate::SegmentReader>, Vec<(u64, Vec<f32>)>) {
         let index = HnswIndex::new(
             MaxConnections(4),
             MaxElements(n + 1),
@@ -388,22 +423,21 @@ mod tests {
             EfConstruction(20),
         )
         .unwrap();
+        let mut points: Vec<(u64, Vec<f32>)> = Vec::with_capacity(n);
         for local in 0..n as u64 {
             let f = local as f64;
-            index
-                .insert_owned(
-                    local,
-                    vec![
-                        offset + ((f * PHI).fract() * 100.0) as f32,
-                        offset + ((f * SQRT2).fract() * 100.0) as f32,
-                        offset + ((f * SQRT3).fract() * 100.0) as f32,
-                    ],
-                )
-                .unwrap();
+            let vector = vec![
+                offset + ((f * PHI).fract() * 100.0) as f32,
+                offset + ((f * SQRT2).fract() * 100.0) as f32,
+                offset + ((f * SQRT3).fract() * 100.0) as f32,
+            ];
+            index.insert_owned(local, vector.clone()).unwrap();
+            points.push((row_id_base + local, vector));
         }
         let row_ids: Vec<u64> = (row_id_base..row_id_base + n as u64).collect();
         let bytes = index.to_segment_bytes(&row_ids).unwrap();
-        Arc::new(crate::SegmentReader::from_bytes(&bytes).unwrap())
+        let reader = Arc::new(crate::SegmentReader::from_bytes(&bytes).unwrap());
+        (reader, points)
     }
 
     #[test]
@@ -613,5 +647,119 @@ mod tests {
                 m.row_id
             );
         }
+    }
+
+    #[test]
+    fn search_fans_out_across_a_live_part_and_a_sealed_part_and_finds_rows_in_both() {
+        // The one shape this task's transitional staging actually produces
+        // that no other test covers: a set holding BOTH a `Live` part (the
+        // legacy shared graph) and a `Sealed` part (an on-disk segment) at
+        // once -- exactly what `with_appended`'s `IndexPart::Live` arm
+        // exists to build. Two well-separated clusters, one per part, same
+        // technique as `search_fans_out_across_every_part_and_finds_rows_in_all_of_them`.
+        let live = build_index(30); // row-ids 0..30, clustered near [0, 1000]^3
+        let sealed = build_sealed(30, 500, 10_000.0); // row-ids 500..530, far away
+        let set = SegmentSet::from_live(Arc::clone(&live)).with_appended(sealed);
+        assert_eq!(set.len(), 2);
+
+        let near_hits = set.search(&[500.0, 500.0, 500.0], 3, 32, |_| true).unwrap();
+        assert_eq!(near_hits.len(), 3, "{near_hits:?}");
+        assert!(
+            near_hits.iter().all(|m| m.row_id < 30),
+            "a query near the live part must return the live part's rows: {near_hits:?}"
+        );
+
+        let far_hits = set
+            .search(&[10_050.0, 10_050.0, 10_050.0], 3, 32, |_| true)
+            .unwrap();
+        assert_eq!(far_hits.len(), 3, "{far_hits:?}");
+        assert!(
+            far_hits.iter().all(|m| (500..530).contains(&m.row_id)),
+            "a query near the sealed part must return the sealed part's rows -- this is \
+             the assertion a consult-one-part implementation fails: {far_hits:?}"
+        );
+    }
+
+    #[test]
+    fn live_arc_panics_on_any_shape_other_than_exactly_one_live_part() {
+        // `live_arc`'s old (pre-this-task) `sole_live()` ancestor panicked
+        // on any arity != 1. This task's fan-out rewrite must not silently
+        // narrow that to "panics only if there is no Live part at all" --
+        // a set with a Live part mixed with Sealed parts (this test's
+        // fixture) must still panic loudly, not silently return the one
+        // Live part it happens to find.
+        let live = build_index(3);
+        let sealed = build_sealed(3, 500, 10_000.0);
+        let set = SegmentSet::from_live(live).with_appended(sealed);
+        assert_eq!(set.len(), 2);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| set.live_arc()));
+        assert!(
+            result.is_err(),
+            "live_arc must panic on a set with a Live part mixed with Sealed parts, \
+             not silently return the Live part"
+        );
+    }
+
+    #[test]
+    fn merged_top_k_matches_brute_force_ground_truth_over_the_full_point_set() {
+        // Every other test here checks structural properties of the merge
+        // (ordering, capping, row-id ranges) -- none of them would catch a
+        // merge that, say, drops a part before exploring it fully, or an
+        // off-by-one in per-part ef. This test instead compares against an
+        // exact brute-force top-k computed over the UNION of every part's
+        // points, using the crate's own `brute_force_search` (the same
+        // exact-result reference implementation the CLI's `--exact` flag
+        // and Phase 1's MVP checklist use).
+        let (seg_a, points_a) = build_sealed_with_points(40, 0, 0.0);
+        let (seg_b, points_b) = build_sealed_with_points(40, 1_000, 5_000.0);
+        let (seg_c, points_c) = build_sealed_with_points(40, 2_000, 20_000.0);
+        let set = SegmentSet::from_segments(vec![seg_a, seg_b, seg_c]);
+
+        let mut all_points: Vec<(u64, Vec<f32>)> = Vec::new();
+        all_points.extend(points_a);
+        all_points.extend(points_b);
+        all_points.extend(points_c);
+
+        // A FixedSizeListArray built in the SAME order as `all_points`, so
+        // `brute_force_search`'s `row_index` maps 1:1 onto
+        // `all_points[row_index].0`'s row-id.
+        let flat: Vec<f32> = all_points
+            .iter()
+            .flat_map(|(_, v)| v.iter().copied())
+            .collect();
+        let values = std::sync::Arc::new(arrow::array::Float32Array::from(flat));
+        let field = std::sync::Arc::new(arrow::datatypes::Field::new(
+            "item",
+            arrow::datatypes::DataType::Float32,
+            false,
+        ));
+        let vectors = arrow::array::FixedSizeListArray::new(field, 3, values, None);
+
+        let query = [50.0f32, 50.0, 50.0];
+        let k = 10;
+        // ef_search generous relative to each 40-point segment so per-part
+        // search is exact (or as close to it as this graph's connectivity
+        // allows) -- isolating the merge logic as the thing under test,
+        // not per-part ANN approximation error.
+        let ef_search = 128;
+
+        let truth = crate::brute_force_search(&vectors, &query, k).unwrap();
+        let truth_row_ids: std::collections::HashSet<u64> = truth
+            .iter()
+            .map(|neighbor| all_points[neighbor.row_index].0)
+            .collect();
+
+        let hits = set.search(&query, k, ef_search, |_| true).unwrap();
+        assert_eq!(hits.len(), k, "{hits:?}");
+        let hit_row_ids: std::collections::HashSet<u64> = hits.iter().map(|m| m.row_id).collect();
+
+        let recall = hit_row_ids.intersection(&truth_row_ids).count() as f64 / k as f64;
+        assert!(
+            recall >= 0.9,
+            "merged top-{k} must closely match exact brute-force ground truth over the \
+             full 120-point union; recall@{k} = {recall:.2}. got {hit_row_ids:?}, \
+             truth {truth_row_ids:?}"
+        );
     }
 }
