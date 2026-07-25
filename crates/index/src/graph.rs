@@ -128,7 +128,7 @@ pub struct Graph<D: Distance> {
 /// A `(row_id, distance)` pair ordered so a `BinaryHeap` behaves as a
 /// min-heap by distance (nearest first) when wrapped in `Reverse`, or as a
 /// max-heap (farthest first, for evicting the worst candidate from a
-/// capped result set) when used directly — see `search_layer`'s two heaps.
+/// capped result set) when used directly — see `search_layer_generic`'s two heaps.
 #[derive(Clone, Copy, PartialEq)]
 struct Candidate {
     row_id: u64,
@@ -208,6 +208,9 @@ impl<D: Distance> Graph<D> {
         }
     }
 
+    /// Thin wrapper delegating to `search_layer_generic` with `self` as the
+    /// `NodeSource`. See that function's doc comment for the actual
+    /// algorithm and its rationale.
     fn search_layer(
         &self,
         query: &[f32],
@@ -499,7 +502,7 @@ impl<D: Distance> Graph<D> {
     /// predicate (e.g. `HnswIndex::search_filtered`'s `live_ids`) can
     /// never be silently missed by routing through a node the coarse ef=1
     /// descent excluded from ITS results (excluding from results never
-    /// blocks traversal — see `search_layer`'s own doc comment — so this
+    /// blocks traversal — see `search_layer_generic`'s own doc comment — so this
     /// is safe: the ef=1 phase still finds a good entry point even
     /// through filtered-out nodes, it just never returns one as that
     /// phase's own single "nearest" pick unless it passes the filter).
@@ -582,9 +585,16 @@ impl<D: Distance> Graph<D> {
 /// `lc`. `filter` and the deleted-flag check both gate entry into the
 /// returned result set `W`, never `neighbourhood(c)` traversal — a node
 /// excluded by `filter` (or tombstoned) still serves as a live waypoint for
-/// reaching other nodes. Generic over `NodeSource` so the identical
-/// algorithm runs over `Graph<D>` today and a segment reader from W3.2 —
-/// see `docs/superpowers/specs/2026-07-24-s1-segment-format-w3-migration-design.md`
+/// reaching other nodes, exactly mirroring `hnsw_rs`'s own `FilterT`
+/// behavior (see the original `crates/index/src/hnsw.rs`'s
+/// `search_filtered` doc comment: "both are applied during `hnsw_rs`'s own
+/// traversal... not as a post-filter on an already-capped top-k"). This is
+/// what lets a caller's `live_ids` membership push all the way into
+/// traversal-time filtering, not just the deleted flag. See design doc §3.
+///
+/// Generic over `NodeSource` so the identical algorithm runs over
+/// `Graph<D>` today and a segment reader from W3.2 — see
+/// `docs/superpowers/specs/2026-07-24-s1-segment-format-w3-migration-design.md`
 /// §2. `filter`/`row_id` operate in row-id space; everything else (`entry`,
 /// the returned ids, traversal) is in `source`'s local-id space — for
 /// `Graph<D>` these coincide (`row_id` is the identity), so this is not yet
@@ -630,17 +640,29 @@ fn search_layer_generic<S: NodeSource, D: Distance>(
         scratch.visited.insert(entry);
 
         let entry_dist = distance_to(source, distance, query, entry);
+        // Min-heap of candidates still to explore (nearest first via `Reverse`).
         scratch.candidates.push(std::cmp::Reverse(Candidate {
             row_id: entry,
             dist: entry_dist,
         }));
-        if !source.is_deleted(entry) && filter(source.row_id(entry)) {
+        // Max-heap of the best `ef` results found so far (farthest first, for cheap eviction).
+        if source.vector(entry).is_some()
+            && !source.is_deleted(entry)
+            && filter(source.row_id(entry))
+        {
             scratch.result.push(Candidate {
                 row_id: entry,
                 dist: entry_dist,
             });
         }
 
+        // Saturation-based early termination ("Patience in Proximity",
+        // Teofili & Lin, ECIR 2025) -- gated by `saturate`: firing during
+        // Graph::insert's own construction-time search_layer calls
+        // permanently bakes truncated-candidate-set edges into the graph
+        // for a one-time build-speed win, a worse trade than the intended
+        // recurring per-query one -- see design doc
+        // docs/superpowers/specs/2026-07-19-saturation-during-insert-design.md.
         #[allow(clippy::items_after_statements)]
         const SATURATION_THRESHOLD_PERCENT: u32 = 95;
         #[allow(
@@ -656,15 +678,21 @@ fn search_layer_generic<S: NodeSource, D: Distance>(
                 && c.dist > furthest.dist
                 && scratch.result.len() >= ef
             {
-                break;
+                break; // Algorithm 2 line 7-8: all of W is settled.
             }
             let Some(node_level) = source.level(c.row_id) else {
                 continue;
             };
+            // A node's layer-lc slot array only exists for lc <= node.level().
             if lc > node_level {
                 continue;
             }
             source.neighbors_into(c.row_id, lc, &mut scratch.occupied_buf);
+            // `occupied_buf` and `visited`/`candidates`/`result` are
+            // disjoint fields of the same `&mut SearchScratch` — the
+            // borrow checker splits them, so iterating one while mutating
+            // the others compiles cleanly (verified: this is not the same
+            // restriction a method call on `&mut self` would hit).
             for &neighbor_id in &scratch.occupied_buf {
                 if scratch.visited.contains(&neighbor_id) {
                     continue;
@@ -680,13 +708,16 @@ fn search_layer_generic<S: NodeSource, D: Distance>(
                         row_id: neighbor_id,
                         dist: neighbor_dist,
                     }));
-                    if !source.is_deleted(neighbor_id) && filter(source.row_id(neighbor_id)) {
+                    if source.vector(neighbor_id).is_some()
+                        && !source.is_deleted(neighbor_id)
+                        && filter(source.row_id(neighbor_id))
+                    {
                         scratch.result.push(Candidate {
                             row_id: neighbor_id,
                             dist: neighbor_dist,
                         });
                         if scratch.result.len() > ef {
-                            scratch.result.pop();
+                            scratch.result.pop(); // evict the current furthest
                         }
                     }
                 }
@@ -730,7 +761,7 @@ fn search_layer_generic<S: NodeSource, D: Distance>(
     })
 }
 
-impl<D: Distance> crate::node_source::NodeSource for Graph<D> {
+impl<D: Distance> NodeSource for Graph<D> {
     fn entry_point(&self) -> Option<(u64, usize)> {
         self.entry_point.get()
     }
