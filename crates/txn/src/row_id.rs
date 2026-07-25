@@ -282,6 +282,7 @@ impl Drop for RowIdClaim {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn bases(bound: &VisibilityBound) -> Vec<u64> {
         bound.in_flight.iter().map(|range| range.base).collect()
@@ -379,5 +380,23 @@ mod tests {
         };
         assert!(saturating.contains(u64::MAX));
         assert!(!saturating.contains(0));
+    }
+
+    proptest! {
+        #[test]
+        fn contains_matches_naive_range_check(base: u64, len: u64, row_id: u64) {
+            let range = RowIdRange { base, len };
+            let actual = range.contains(row_id);
+            // Deliberately naive reference: computed with u128 so the
+            // reference itself can never overflow, independent of whatever
+            // technique the real implementation uses to avoid overflow.
+            let naive = {
+                let base = u128::from(base);
+                let len = u128::from(len);
+                let row_id = u128::from(row_id);
+                row_id >= base && row_id < base + len
+            };
+            prop_assert_eq!(actual, naive);
+        }
     }
 }
