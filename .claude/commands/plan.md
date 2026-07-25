@@ -42,7 +42,7 @@ Produce a plan, not code. The plan should be the kind of thing a competent teamm
 - Read before planning. Don't propose changes to files you haven't read.
 - Match existing patterns. If a similar feature already exists, copy its shape.
 - No yak shaving — only touch what the task requires.
-- For anything touching `crates/txn/` (transaction/conflict layer) or `crates/index/` (vector index delta log), call out review needed — these are the flagship subsystem and mistakes here are the most expensive to undo.
+- For anything touching `crates/txn/` (transaction/conflict layer) or `crates/index/` (vector index segments), call out review needed — these are the flagship subsystem and mistakes here are the most expensive to undo.
 - End with a one-line "ready to execute?" and stop. Don't start coding.
 
 ## When to escalate the model
@@ -51,7 +51,7 @@ This command runs on Opus 5 by default — planning and architecture is exactly 
 
 If the plan additionally involves:
 - Architectural decisions (isolation level, conflict granularity, on-disk format changes)
-- The transaction/conflict layer or vector index delta log
+- The transaction/conflict layer or vector index segment format
 - Ambiguity the user hasn't resolved
 
 …flag that explicitly in the "Risks / Open questions" section so the user knows this plan needed the deepest reasoning tier, not just the default one.
