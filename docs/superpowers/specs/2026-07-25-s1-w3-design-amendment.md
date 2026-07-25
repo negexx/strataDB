@@ -130,10 +130,14 @@ Add both to `crates/index/Cargo.toml` only, and justify them in the W3.2 commit 
   message) but the ADR was not re-run. The qualitative conclusion ("no recall cliff") is very unlikely to
   flip at ef=100, but **W3.3's recall-parity test tolerance must be calibrated against a fresh
   measurement, not against the ADR's stale table.**
-- **`search_filtered`'s live-id bitset is rebuilt on every call** (`hnsw.rs:342-346`), not built once and
+- ~~**`search_filtered`'s live-id bitset is rebuilt on every call** (`hnsw.rs:342-346`), not built once and
   shared as §4/W3.3 assumes. Fanning out to K segments naively would rebuild it K times per query.
   W3.3 needs either a new entry point taking a pre-built bitset/filter, or the construction hoisted into
-  `SegmentSet::search` — call this out explicitly in the W3.3 task, it's not free.
+  `SegmentSet::search` — call this out explicitly in the W3.3 task, it's not free.~~ **RESOLVED by W3.1**
+  (see [`2026-07-25-s1-w3-2-design-amendment.md`](2026-07-25-s1-w3-2-design-amendment.md) §8): the hoist
+  landed as `pub(crate) fn build_live_filter` in `hnsw.rs`, called once by `SegmentSet::search_filtered`
+  before the underlying search. W3.3's fan-out can reuse the same filter across every part with zero
+  rebuilds. Do not carry this forward as outstanding work.
 - **`Manifest` gained `commit_time_high_water: i64`** (W2, after the base doc's §3 sketch was written).
   No conflict with `SegmentEntry`/`Manifest.segments`; the sketch's "existing fields unchanged" is just
   stale, not wrong.

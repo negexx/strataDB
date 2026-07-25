@@ -1,11 +1,21 @@
 # Phase S1 — Segment Format & W3 Migration — Design
 
-> **Amended 2026-07-25:** see
+> **Amended 2026-07-25 (pre-W3.1):** see
 > [`2026-07-25-s1-w3-design-amendment.md`](2026-07-25-s1-w3-design-amendment.md) before implementing.
 > §2's `neighbor_buf`/latency-improvement claim, the `NodeSource` deleted-flag gap, §7's
 > "delete `delta_log.rs`" instruction, and the segment writer's crate ownership are all corrected there
-> against the code as it stands after merging `main`'s graph-construction-cost perf work. The text below
-> is left as originally approved; the amendment takes precedence where the two disagree.
+> against the code as it stands after merging `main`'s graph-construction-cost perf work.
+>
+> **Amended again 2026-07-25 (post-W3.1, pre-W3.2):** see
+> [`2026-07-25-s1-w3-2-design-amendment.md`](2026-07-25-s1-w3-2-design-amendment.md) before implementing
+> W3.2. Resolves a direct contradiction between this doc's §4 (delete-`Live` enum shape) and the W3.1
+> plan (additive-`Sealed` shape) in favor of delete-`Live`; supplies the missing answer for where
+> `Transaction.graph` comes from once there is no `Live` part (the design doc was silent — `live_arc()`
+> postdates it); and corrects the segment-builder instructions (build via `HnswIndex`, not a
+> crate-inaccessible `Graph<L2>`; key by segment-local ordinals; skip vector-less commits).
+>
+> The text below is left as originally approved; both amendments take precedence where they disagree
+> with it, and the second amendment takes precedence over the first for anything concerning W3.2.
 
 **Date:** 2026-07-24
 **Trigger:** [`phase-s1-segmented-index-spec.md`](../../../.claude/docs/design/phase-s1-segmented-index-spec.md) §7
