@@ -2894,6 +2894,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn vector_search_with_timestamp_and_category_compound_predicate() {
         use strata_query::Predicate;
         use strata_storage::Value;
@@ -2910,48 +2911,83 @@ mod tests {
             ),
         ]));
 
-        // Two commits, two clusters: near (category "a"), far (category
-        // "b"). Both share this test's helper cluster generator so recall
-        // is non-flaky (matching the precedent's own justification).
+        // Three commits, three clusters at increasing distance from the
+        // query point (the origin): near (id 0..10, category "a", commit 1
+        // - EARLIEST timestamp), far (id 10..20, category "a", commit 2),
+        // mid (id 20..30, category "b", commit 3 - LATEST timestamp).
+        //
+        // Predicate: timestamp >= ts_after_commit_2 AND category = "a".
+        // - category="a" ALONE matches near+far (0..20); nearest to the
+        //   origin is the near cluster (distance 0) - so category alone
+        //   returns the WRONG answer (near is commit 1, excluded by the
+        //   timestamp leaf).
+        // - timestamp>=ts_after_commit_2 ALONE matches far+mid (10..30);
+        //   nearest to the origin is the mid cluster (distance 500) - so
+        //   timestamp alone ALSO returns the WRONG answer (mid is category
+        //   "b", excluded by the category leaf).
+        // - Only the AND correctly identifies the far cluster (10..20):
+        //   it's the only cluster satisfying both conjuncts, and neither
+        //   leaf alone could identify it.
         let near_cluster = cluster_vectors(10, [0.0, 0.0, 0.0], 0.01);
         let far_cluster = cluster_vectors(10, [1000.0, 0.0, 0.0], 0.01);
-
-        let flat_near: Vec<f32> = near_cluster.iter().flatten().copied().collect();
+        let mid_cluster = cluster_vectors(10, [500.0, 0.0, 0.0], 0.01);
         let item_field = Arc::new(Field::new("item", DataType::Float32, false));
-        let vec_arr_near = Arc::new(arrow::array::FixedSizeListArray::new(
-            item_field.clone(),
-            3,
-            Arc::new(arrow::array::Float32Array::from(flat_near)),
-            None,
-        ));
+
         let mut txn = ds.begin();
         txn.insert(
             RecordBatch::try_new(
                 schema.clone(),
                 vec![
                     Arc::new(arrow::array::StringArray::from(vec!["a"; 10])),
-                    vec_arr_near,
+                    Arc::new(arrow::array::FixedSizeListArray::new(
+                        item_field.clone(),
+                        3,
+                        Arc::new(arrow::array::Float32Array::from(
+                            near_cluster.iter().flatten().copied().collect::<Vec<f32>>(),
+                        )),
+                        None,
+                    )),
                 ],
             )
             .unwrap(),
         );
         txn.commit().unwrap();
-        let ts_after_first_commit = ds.snapshot().manifest.commit_time_high_water;
 
-        let flat_far: Vec<f32> = far_cluster.iter().flatten().copied().collect();
-        let vec_arr_far = Arc::new(arrow::array::FixedSizeListArray::new(
-            item_field,
-            3,
-            Arc::new(arrow::array::Float32Array::from(flat_far)),
-            None,
-        ));
+        let mut txn = ds.begin();
+        txn.insert(
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(arrow::array::StringArray::from(vec!["a"; 10])),
+                    Arc::new(arrow::array::FixedSizeListArray::new(
+                        item_field.clone(),
+                        3,
+                        Arc::new(arrow::array::Float32Array::from(
+                            far_cluster.iter().flatten().copied().collect::<Vec<f32>>(),
+                        )),
+                        None,
+                    )),
+                ],
+            )
+            .unwrap(),
+        );
+        txn.commit().unwrap();
+        let ts_after_commit_2 = ds.snapshot().manifest.commit_time_high_water;
+
         let mut txn = ds.begin();
         txn.insert(
             RecordBatch::try_new(
                 schema,
                 vec![
                     Arc::new(arrow::array::StringArray::from(vec!["b"; 10])),
-                    vec_arr_far,
+                    Arc::new(arrow::array::FixedSizeListArray::new(
+                        item_field,
+                        3,
+                        Arc::new(arrow::array::Float32Array::from(
+                            mid_cluster.iter().flatten().copied().collect::<Vec<f32>>(),
+                        )),
+                        None,
+                    )),
                 ],
             )
             .unwrap(),
@@ -2960,51 +2996,129 @@ mod tests {
 
         let snapshot = ds.snapshot();
 
-        // category="a" alone would match the near cluster (10 pts).
-        // timestamp >= (after the first commit) alone would match only the
-        // second commit's rows (the far cluster, category "b"). The AND
-        // must match NEITHER in full - it needs category="a" (near
-        // cluster) AND a timestamp from the first commit, which the first
-        // commit's own rows satisfy trivially (>= its own timestamp).
+        // Control 1: category="a" alone must return the near cluster (the
+        // WRONG answer per the predicate's intent - proves category alone
+        // is insufficient).
+        let category_only = Predicate::Eq("category".to_string(), Value::Utf8("a".to_string()));
+        let category_only_results = snapshot
+            .vector_search(&[0.0, 0.0, 0.0], 5, Some(&category_only))
+            .unwrap();
+        assert_eq!(
+            category_only_results.len(),
+            5,
+            "unexpected: {category_only_results:?}"
+        );
+        assert!(
+            category_only_results.iter().all(|r| r.row_id < 10),
+            "category=a alone must return the near cluster (row-ids 0..10) - proving it alone \
+             is the wrong answer: {category_only_results:?}"
+        );
+
+        // Control 2: timestamp>=ts_after_commit_2 alone must return the mid
+        // cluster (also the WRONG answer - proves timestamp alone is
+        // insufficient too).
+        let timestamp_only = Predicate::GtEq(
+            TIMESTAMP_COLUMN.to_string(),
+            Value::Int64(ts_after_commit_2),
+        );
+        let timestamp_only_results = snapshot
+            .vector_search(&[0.0, 0.0, 0.0], 5, Some(&timestamp_only))
+            .unwrap();
+        assert_eq!(
+            timestamp_only_results.len(),
+            5,
+            "unexpected: {timestamp_only_results:?}"
+        );
+        assert!(
+            timestamp_only_results
+                .iter()
+                .all(|r| (20..30).contains(&r.row_id)),
+            "timestamp>=ts_after_commit_2 alone must return the mid cluster (row-ids 20..30) - \
+             proving it alone is ALSO the wrong answer: {timestamp_only_results:?}"
+        );
+
+        // The AND: only the far cluster satisfies both conjuncts, and
+        // neither control above could identify it alone.
         let predicate = Predicate::And(
-            Box::new(Predicate::GtEq(
-                TIMESTAMP_COLUMN.to_string(),
-                Value::Int64(0),
-            )),
-            Box::new(Predicate::Eq(
-                "category".to_string(),
-                Value::Utf8("a".to_string()),
-            )),
+            Box::new(timestamp_only.clone()),
+            Box::new(category_only.clone()),
         );
         let results = snapshot
             .vector_search(&[0.0, 0.0, 0.0], 5, Some(&predicate))
             .unwrap();
         assert_eq!(results.len(), 5, "unexpected results: {results:?}");
         assert!(
-            results.iter().all(|r| r.row_id < 10),
-            "timestamp>=0 AND category=a must return only the near cluster (row-ids 0..10): {results:?}"
+            results.iter().all(|r| (10..20).contains(&r.row_id)),
+            "timestamp>=ts_after_commit_2 AND category=a must return the far cluster \
+             (row-ids 10..20) - the only cluster satisfying both, which neither leaf alone \
+             (near, for category; mid, for timestamp) could identify: {results:?}"
         );
 
-        // The sharper case: timestamp strictly after the first commit AND
-        // category="a" must match NOTHING - the only category="a" rows are
-        // from the first commit, whose timestamp is not >= a value taken
-        // after it.
-        let predicate_none = Predicate::And(
-            Box::new(Predicate::GtEq(
-                TIMESTAMP_COLUMN.to_string(),
-                Value::Int64(ts_after_first_commit + 1),
-            )),
-            Box::new(Predicate::Eq(
-                "category".to_string(),
-                Value::Utf8("a".to_string()),
-            )),
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn last_issued_timestamp_is_seeded_from_the_persisted_high_water_mark_on_reopen() {
+        use strata_query::Predicate;
+        use strata_storage::Value;
+
+        let dir = temp_dir("timestamp-restart-floor-seeding");
+        let ds = Dataset::create(&dir).unwrap();
+        let mut txn = ds.begin();
+        txn.insert(
+            RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![1]))]).unwrap(),
         );
-        let empty_results = snapshot
-            .vector_search(&[0.0, 0.0, 0.0], 5, Some(&predicate_none))
+        txn.commit().unwrap();
+        drop(ds);
+
+        // Directly overwrite the on-disk manifest with a commit_time_high_water
+        // far in the future - simulating what a real prior session's clock
+        // would eventually produce, without waiting for it. If Dataset::open
+        // does NOT seed last_issued_timestamp from this persisted value (e.g.
+        // seeds from 0, or from a fresh unclamped wall-clock read), the next
+        // commit's real timestamp will land far BELOW this floor, and the
+        // assertions below catch it.
+        let mut manifest = strata_storage::read_current(&dir).unwrap().unwrap();
+        let far_future = manifest.commit_time_high_water + 1_000_000_000_000; // ~11.6 days ahead, in microseconds
+        manifest.commit_time_high_water = far_future;
+        strata_storage::commit_manifest(&dir, &manifest).unwrap();
+
+        let reopened = Dataset::open(&dir).unwrap();
+        assert_eq!(
+            reopened.snapshot().manifest.commit_time_high_water,
+            far_future,
+            "sanity check: the persisted value itself must survive the reopen unchanged"
+        );
+
+        let mut txn = reopened.begin();
+        txn.insert(
+            RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![2]))]).unwrap(),
+        );
+        txn.commit().unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(TIMESTAMP_COLUMN, DataType::Int64, false),
+        ]));
+        let batch = reopened
+            .snapshot()
+            .scan_with_predicate(&schema, &Predicate::Eq("id".to_string(), Value::Int64(2)))
             .unwrap();
+        let new_row_ts = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap()
+            .value(0);
         assert!(
-            empty_results.is_empty(),
-            "no row can satisfy a timestamp strictly after its own commit: {empty_results:?}"
+            new_row_ts >= far_future,
+            "the new commit's own timestamp must be >= the persisted restart floor - \
+             last_issued_timestamp must be seeded from commit_time_high_water on open, not \
+             from 0 or an unclamped fresh wall-clock read: new_row_ts={new_row_ts}, far_future={far_future}"
+        );
+        assert!(
+            reopened.snapshot().manifest.commit_time_high_water >= far_future,
+            "commit_time_high_water itself must never regress below the persisted floor"
         );
 
         std::fs::remove_dir_all(&dir).ok();
