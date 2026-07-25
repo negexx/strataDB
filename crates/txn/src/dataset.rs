@@ -957,6 +957,14 @@ impl Transaction {
         // `manifest.segments.push` below and before `commit_manifest`: a
         // rejected commit must leave no trace, same as a conflict
         // rejection above.
+        //
+        // Precondition this mutual exclusion actually relies on: it holds
+        // for every committer sharing *one* `Dataset` instance (one
+        // process's one open handle on this directory), not across two
+        // separate `Dataset::open` handles on the same directory — that
+        // cross-handle case is a pre-existing whole-layer assumption
+        // shared with conflict detection and manifest versioning
+        // generally (spec §1), not something specific to this check.
         if let Some(published) = &new_segment {
             let established = latest_snapshot.index.established_dimension();
             let segment_dimension = usize::try_from(published.entry.dimension)?;
@@ -1487,14 +1495,20 @@ const MAX_REASONABLE_ROW_ID_CAPACITY: u64 = 1_000_000_000;
 /// escape `data/`, [`TxnError::Io`] if a listed segment can't be read,
 /// [`TxnError::CorruptSegment`] if a segment's on-disk length, format
 /// version, vector count, dimension, or row-id range disagrees with what
-/// the manifest records for it (a truncated/overwritten file, or — as a
-/// second line of defense — a manifest whose `SegmentEntry` was corrupted
-/// or, per this task's Finding 1, briefly permitted to disagree with a
-/// dimension another segment already established), or [`TxnError::Index`]
-/// if a segment fails its own header/body validation.
+/// the manifest records for it (a truncated/overwritten file, or a
+/// manifest whose `SegmentEntry` was corrupted), if a segment's dimension
+/// disagrees with a dimension an earlier segment in the *same* manifest
+/// already established (the actual second line of defense against Finding
+/// 1's dimension race: the per-entry checks above only ever compare a
+/// segment against its own on-disk bytes, so a manifest listing two
+/// mutually self-consistent segments at different dimensions — exactly
+/// the corruption the original race could produce — would pass every one
+/// of them; only this cross-segment check catches it), or
+/// [`TxnError::Index`] if a segment fails its own header/body validation.
 fn load_segments(dir: &Path, manifest: &Manifest) -> Result<strata_index::SegmentSet> {
     let data_dir = data_subdir(dir);
     let mut parts = Vec::with_capacity(manifest.segments.len());
+    let mut established_dimension: Option<u32> = None;
     for entry in &manifest.segments {
         let path = safe_join(&data_dir, &entry.name)?;
         let bytes = std::fs::read(&path)?;
@@ -1513,11 +1527,13 @@ fn load_segments(dir: &Path, manifest: &Manifest) -> Result<strata_index::Segmen
         let reader = strata_index::SegmentReader::from_bytes(&bytes)?;
         // Cross-check every other field the manifest records about this
         // segment, not just its byte length — same rationale as the
-        // `byte_len` check above, and a second line of defense against
-        // Finding 1's dimension race specifically: a `SegmentEntry` whose
-        // `dimension` ever disagreed with what its own bytes actually
-        // encode is caught here at open-time, independent of whatever
-        // in-lock check ran (or didn't) at commit-time.
+        // `byte_len` check above. Each field here is compared only against
+        // this segment's *own* on-disk bytes, catching a `SegmentEntry`
+        // that disagrees with what its own segment file actually encodes.
+        // This does NOT catch two mutually self-consistent segments at
+        // different dimensions — see the cross-segment check after this
+        // segment's own checks, below, for the actual second line of
+        // defense against Finding 1's dimension race.
         if reader.format_version() != entry.format_version {
             return Err(TxnError::CorruptSegment(format!(
                 "segment {} has format_version {} on disk but the manifest records {}",
@@ -1549,6 +1565,28 @@ fn load_segments(dir: &Path, manifest: &Manifest) -> Result<strata_index::Segmen
                  manifest records [{}, {}]",
                 entry.name, entry.row_id_min, entry.row_id_max
             )));
+        }
+        // The actual second line of defense against Finding 1's dimension
+        // race: every check above only ever compares this segment against
+        // its own bytes, so a manifest listing two mutually
+        // self-consistent segments at different dimensions — exactly the
+        // corruption the original race could produce — would pass all of
+        // them. Tracking the first segment's dimension here and rejecting
+        // any later disagreement converts that from a permanently
+        // unsearchable dataset (every future `vector_search` hitting
+        // `DimensionMismatch` on whichever segment doesn't match the
+        // query) into a typed error at `Dataset::open`, before the
+        // dataset is ever handed back to a caller.
+        match established_dimension {
+            Some(expected) if entry.dimension != expected => {
+                return Err(TxnError::CorruptSegment(format!(
+                    "segment {} has dimension {} but an earlier segment in this \
+                     manifest already established dimension {expected}",
+                    entry.name, entry.dimension
+                )));
+            }
+            Some(_) => {}
+            None => established_dimension = Some(entry.dimension),
         }
         parts.push(Arc::new(reader));
     }
@@ -5459,11 +5497,19 @@ mod loom_tests {
     /// their slot — `rt::thread::new_thread` asserts against the total ever
     /// created. The cap is not raisable either; it sizes fixed-length arrays
     /// inside loom (`FirstSeen([u16; MAX_THREADS])`), so a larger
-    /// `model::Builder::max_threads` indexes out of bounds. All three
-    /// commit-running models sit at 4 of 5 (root + 3). One more
-    /// `spawn_committer` in any of them trips an assert inside loom, so a
-    /// commit that only needs the stack — not the concurrency — still costs
-    /// a hard-capped slot.
+    /// `model::Builder::max_threads` indexes out of bounds. The cap is
+    /// per `#[test]` (each `loom::model` closure gets its own count, not a
+    /// crate-wide total), but every commit-running model here still has to
+    /// budget against it independently: the two `two_threads_deleting_*`
+    /// models sit at 4 of 5 (root + setup + 2 racing threads);
+    /// `a_failed_commits_graph_residue_is_never_searchable_under_concurrent_commits`
+    /// sits at the cap itself, 5 of 5 (root + seed + failing + succeeding +
+    /// final);
+    /// `concurrent_first_vector_commits_at_different_dimensions_are_not_both_accepted`
+    /// sits at 3 of 5 (root + the two racing committers). One more
+    /// `spawn_committer` in any model already at the cap trips an assert
+    /// inside loom, so a commit that only needs the stack — not the
+    /// concurrency — still costs a hard-capped slot.
     ///
     /// loom documents this value as bytes while `generator` consumes it as
     /// words, so the real stack is 8 MiB today. Left uncompensated on
@@ -5755,11 +5801,17 @@ mod loom_tests {
         });
     }
 
-    /// One row, one 3-d vector, in the shape `build_delta_entries` expects.
-    /// Defined locally rather than reusing `dataset::tests`' `vector_batch`
-    /// so this module stays compilable under `--cfg loom` regardless of
-    /// whether `cfg(test)` is also set for that build.
-    fn loom_vector_batch(id: i64, vector: [f32; 3]) -> arrow::array::RecordBatch {
+    /// One row, one vector of `vector.len()` dimensions, in the shape
+    /// `build_vector_inserts` expects. Dimension is inferred from the
+    /// slice rather than fixed, so this same helper serves both the
+    /// 3-dimensional residue model below and the dimension-race model,
+    /// which needs two different dimensions in the same run. Defined
+    /// locally rather than reusing `dataset::tests`' `vector_batch` (fixed
+    /// at 3 dimensions and not `pub(crate)`) so this module stays
+    /// compilable under `--cfg loom` regardless of whether `cfg(test)` is
+    /// also set for that build.
+    fn loom_vector_batch(id: i64, vector: &[f32]) -> arrow::array::RecordBatch {
+        let dim = i32::try_from(vector.len()).unwrap();
         let item = || {
             StdArc::new(arrow::datatypes::Field::new(
                 "item",
@@ -5771,7 +5823,7 @@ mod loom_tests {
             arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
             arrow::datatypes::Field::new(
                 "vector",
-                arrow::datatypes::DataType::FixedSizeList(item(), 3),
+                arrow::datatypes::DataType::FixedSizeList(item(), dim),
                 false,
             ),
         ]));
@@ -5779,7 +5831,7 @@ mod loom_tests {
         let values = StdArc::new(arrow::array::Float32Array::from(vector.to_vec()));
         let vectors = StdArc::new(arrow::array::FixedSizeListArray::new(
             item(),
-            3,
+            dim,
             values,
             None,
         ));
@@ -5878,7 +5930,7 @@ mod loom_tests {
             let ds_seed = ds.clone();
             spawn_committer(move || {
                 let mut seed = ds_seed.begin();
-                seed.insert(loom_vector_batch(0, [0.0, 0.0, 0.0]));
+                seed.insert(loom_vector_batch(0, &[0.0, 0.0, 0.0]));
                 seed.commit()
             })
             .join()
@@ -5890,7 +5942,7 @@ mod loom_tests {
 
             let failing = spawn_committer(move || {
                 let mut txn = ds_failing.begin();
-                txn.insert(loom_vector_batch(1, [900.0, 900.0, 900.0]));
+                txn.insert(loom_vector_batch(1, &[900.0, 900.0, 900.0]));
                 txn.inject_manifest_commit_failure();
                 txn.commit()
             });
@@ -5972,6 +6024,138 @@ mod loom_tests {
                 snapshot.index.len(),
                 1,
                 "the snapshot's segment set must stay in lockstep with the manifest"
+            );
+
+            std::fs::remove_dir_all(&dir).ok();
+        });
+    }
+
+    #[test]
+    fn concurrent_first_vector_commits_at_different_dimensions_are_not_both_accepted() {
+        // The interleaving counterpart to
+        // `dataset::tests::concurrent_first_vector_commits_at_different_dimensions_are_not_both_accepted`.
+        // That deterministic test pauses the 5-d transaction on the
+        // existing `pause_after_row_id_claim` checkpoint, which fires
+        // *before* `commit_lock.lock()` — so it fixes one specific
+        // schedule (T1 runs to completion while T2 sits paused right
+        // outside the lock) rather than proving the property across every
+        // interleaving. It cannot tell "the in-lock re-check reads
+        // `established_dimension()` from a snapshot loaded *inside*
+        // `commit_lock`" apart from "the dimension merely happens to
+        // already be established by the time the lock is acquired" — a
+        // future refactor that hoisted `let latest_snapshot =
+        // self.current.load_full();` to above `commit_lock.lock()` would
+        // still pass that test while silently reopening the exact race
+        // `Transaction::commit`'s in-lock dimension check exists to close.
+        // Only loom's exhaustive interleaving exploration can rule that
+        // out, which is the whole reason this project chose Rust + loom
+        // over a hand-rolled concurrency proof (see
+        // `.claude/rules/concurrency-txn-layer.md`).
+        //
+        // Unlike the deterministic sibling, this model installs no
+        // checkpoint and imposes no ordering: both committers begin from
+        // the same fresh, dimension-0 dataset and race straight into
+        // `commit()`, so loom explores every order in which they reach
+        // and release `commit_lock`. Under every one of those orders,
+        // exactly one commit must publish (establishing the dataset's
+        // dimension) and the other must be rejected by the in-lock check
+        // — never both succeeding (which would durably brick
+        // `vector_search`, per Finding 1) and never both failing (which
+        // would mean no dimension was ever established at all).
+        //
+        // Budget: this model spawns 2 committers (+ root) = 3 of loom's
+        // 5-created-threads-per-execution cap — see [`spawn_committer`]'s
+        // doc comment for the full per-model accounting. loom never frees
+        // a terminated thread's slot, so any future model added to this
+        // file needs to budget against that same hard cap independently,
+        // not against whatever headroom this or any other existing model
+        // happens to leave.
+        loom::model(|| {
+            let dir = tempfile::Builder::new()
+                .prefix(&format!(
+                    "strata-loom-dimension-race-{}-{:?}-",
+                    std::process::id(),
+                    loom::thread::current().id()
+                ))
+                .tempdir()
+                .unwrap()
+                .keep();
+            let ds = crate::Dataset::create(&dir).unwrap();
+            assert_eq!(
+                ds.snapshot().index.established_dimension(),
+                0,
+                "precondition: a fresh dataset has no established dimension"
+            );
+
+            let ds_3d = ds.clone();
+            let ds_5d = ds.clone();
+
+            // No checkpoint, no artificial ordering: both transactions
+            // begin from the same dimension-0 snapshot and commit
+            // concurrently, letting loom explore every interleaving of
+            // both reaching `commit_lock`.
+            let three_d = spawn_committer(move || {
+                let mut txn = ds_3d.begin();
+                txn.insert(loom_vector_batch(0, &[1.0, 0.0, 0.0]));
+                txn.commit()
+            });
+            let five_d = spawn_committer(move || {
+                let mut txn = ds_5d.begin();
+                txn.insert(loom_vector_batch(1, &[9.0, 9.0, 9.0, 9.0, 9.0]));
+                txn.commit()
+            });
+
+            let result_3d = three_d.join().unwrap();
+            let result_5d = five_d.join().unwrap();
+
+            let successes = [&result_3d, &result_5d]
+                .iter()
+                .filter(|r| r.is_ok())
+                .count();
+            assert_eq!(
+                successes, 1,
+                "exactly one of two concurrent first-vector commits at different \
+                 dimensions may ever succeed, under every interleaving: \
+                 3d={result_3d:?}, 5d={result_5d:?}"
+            );
+
+            let is_dimension_mismatch = |result: &crate::Result<()>| {
+                matches!(
+                    result,
+                    Err(crate::TxnError::Index(
+                        strata_index::IndexError::DimensionMismatch { .. }
+                    ))
+                )
+            };
+            assert!(
+                is_dimension_mismatch(&result_3d) || is_dimension_mismatch(&result_5d),
+                "the losing commit must fail with a dimension-mismatch error specifically, \
+                 not silently or with some other error shape: 3d={result_3d:?}, \
+                 5d={result_5d:?}"
+            );
+
+            // No corrupted mixed-dimension state can result regardless of
+            // which side won: exactly one segment, and the established
+            // dimension matches whichever commit actually published.
+            let snapshot = ds.snapshot();
+            assert_eq!(
+                snapshot.manifest.segments.len(),
+                1,
+                "exactly one segment may ever be published, regardless of which \
+                 dimension won the race: {:?}",
+                snapshot.manifest.segments
+            );
+            assert_eq!(
+                snapshot.index.len(),
+                1,
+                "the snapshot's segment set must stay in lockstep with the manifest"
+            );
+            let winner_dimension = if result_3d.is_ok() { 3 } else { 5 };
+            assert_eq!(
+                snapshot.index.established_dimension(),
+                winner_dimension,
+                "established_dimension() must match whichever commit actually won, \
+                 never a mix of the two: 3d={result_3d:?}, 5d={result_5d:?}"
             );
 
             std::fs::remove_dir_all(&dir).ok();
