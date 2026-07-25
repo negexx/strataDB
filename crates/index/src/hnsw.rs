@@ -38,6 +38,8 @@ pub enum IndexError {
     MaxConnectionTooLarge(usize),
     #[error("query has {query_len} dimensions, but the index expects {expected}")]
     DimensionMismatch { query_len: usize, expected: usize },
+    #[error("row_id {row_id} is beyond the index's addressable capacity of {capacity} rows")]
+    RowIdOutOfRange { row_id: u64, capacity: u64 },
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("delta log entry serialization error: {0}")]
@@ -152,6 +154,24 @@ impl HnswIndex {
     /// `check_or_establish_dimension` call) so a corrupted delta-log entry
     /// with a wrong-length vector can never reach the distance function.
     pub fn insert(&self, row_id: u64, vector: &[f32]) -> Result<(), IndexError> {
+        self.insert_owned(row_id, vector.to_vec())
+    }
+
+    /// Same as [`Self::insert`], but takes ownership of `vector` and moves
+    /// it straight into the graph instead of cloning a borrowed slice.
+    /// `crates/txn`'s commit-apply loop and recovery replay both already
+    /// own a freshly-deserialized/freshly-built `Vec<f32>` at their call
+    /// site — routing through `insert`'s `&[f32]` there would force a
+    /// wasted clone of the full 512-dim embedding on every insert, on top
+    /// of the one copy already paid getting the vector out of Arrow (or
+    /// out of the delta log) in the first place. `Graph::insert` moves
+    /// `vector` into `Node::new` from there, not a further copy — so this
+    /// takes the vector from two copies down to one, not three to two.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::insert`].
+    pub fn insert_owned(&self, row_id: u64, vector: Vec<f32>) -> Result<(), IndexError> {
         // A deterministic-but-varying draw per insert, avoiding a new RNG
         // dependency: derived from a monotonically-advancing counter run
         // through a fixed hash, mapped into (0, 1). This is NOT
@@ -177,7 +197,7 @@ impl HnswIndex {
 
         self.graph.insert(
             row_id,
-            vector.to_vec(),
+            vector,
             self.m,
             self.mmax0,
             self.mmax,
@@ -186,6 +206,51 @@ impl HnswIndex {
             1.0,
             unif,
         )
+    }
+
+    /// Soft-deletes `row_id`: it is excluded from every subsequent
+    /// [`Self::search`]/[`Self::search_filtered`] result by the graph's own
+    /// deleted-flag check, independent of any caller-supplied visibility
+    /// predicate. Its node physically remains as a traversal waypoint, so
+    /// other rows stay reachable through it, until Phase 8 compaction. A
+    /// no-op if `row_id` was never inserted, and irreversible — nothing
+    /// clears the flag.
+    ///
+    /// **Sole intended use: undoing an insert that never became durable.**
+    /// `crates/txn`'s commit path calls this to drop a transaction's
+    /// vectors back out of the shared graph when that transaction failed
+    /// before its manifest commit (see that crate's `GraphResidueGuard`).
+    /// That is sound precisely because such a row-id was never committed in
+    /// *any* version, so no snapshot should ever observe it, and because
+    /// row-ids are never reused
+    /// (`.claude/docs/design/phase-0-transaction-and-format-spec.md` §8) —
+    /// a soft-deleted id can never legitimately reappear.
+    ///
+    /// **Do not use this to implement a user-level DELETE.** That is
+    /// `crates/txn`'s versioned `Snapshot::tombstones` set, which is
+    /// per-version and replayed from the manifest. This flag is global and
+    /// unversioned: applying it to a committed row would hide that row from
+    /// *already-open* snapshots taken before the delete, breaking the
+    /// snapshot isolation those readers are promised.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use strata_index::{EfConstruction, HnswIndex, MaxConnections, MaxElements, MaxLayers};
+    ///
+    /// let index = HnswIndex::new(
+    ///     MaxConnections(16), MaxElements(100), MaxLayers(16), EfConstruction(200),
+    /// )?;
+    /// index.insert(0, &[0.0, 0.0, 0.0])?;
+    /// index.insert(1, &[10.0, 10.0, 10.0])?;
+    ///
+    /// index.remove(0);
+    /// let results = index.search(&[0.0, 0.0, 0.0], 1, 50, |_| true)?;
+    /// assert_eq!(results[0].row_id, 1, "the removed row is never returned");
+    /// # Ok::<(), strata_index::IndexError>(())
+    /// ```
+    pub fn remove(&self, row_id: u64) {
+        self.graph.delete(row_id);
     }
 
     /// The vector dimension established by the first-ever [`Self::insert`]
@@ -257,8 +322,34 @@ impl HnswIndex {
         // row deep in the graph is never missed just because it fell
         // outside some pre-guessed widened candidate window, since the
         // predicate is evaluated as part of the same search, not after it.
-        let live: std::collections::HashSet<u64> = live_ids.iter().map(|&id| id as u64).collect();
-        let filter = move |id: u64| live.contains(&id) && is_visible(id);
+        // A dense bitset rather than a `HashSet`. Row-ids are dense and
+        // monotonic (see `NodeTable`'s own contract), so membership is one
+        // indexed load plus a shift instead of a `SipHash` probe, and no
+        // hashing or rehash growth is paid while building it.
+        //
+        // Sizing note: the bitset is `max_row_id / 8` bytes — proportional to
+        // the largest live row-id, *not* to `live_ids.len()`. For a dense
+        // low-selectivity filter that is a large win over the ~24-bytes/entry
+        // `HashSet` (~12KB vs ~1MB at 100k live ids). For a *highly selective*
+        // predicate over a very large dataset it can be the other way round —
+        // a handful of matches with a max row-id near 1e8 still allocates
+        // ~12MB here where the `HashSet` would have been tiny. Both are dwarfed
+        // by the in-memory graph and by the whole-file re-read `row_ids_matching`
+        // already pays per query, so this is not the term that matters — but
+        // it is not unconditionally smaller.
+        //
+        // `live_ids` need not be sorted: the bitset is order-insensitive.
+        let max_id = live_ids.iter().copied().max().unwrap_or(0);
+        let mut live = vec![0_u64; max_id / 64 + 1];
+        for &id in live_ids {
+            live[id / 64] |= 1_u64 << (id % 64);
+        }
+        let filter = move |id: u64| {
+            // An id past the end of the bitset simply isn't live, which is
+            // also what makes the empty-`live_ids` case behave correctly.
+            let word = usize::try_from(id / 64).unwrap_or(usize::MAX);
+            word < live.len() && (live[word] >> (id % 64)) & 1 == 1 && is_visible(id)
+        };
         let raw = self.graph.k_nn_search(query, k, ef_search, filter)?;
         Ok(raw
             .into_iter()
@@ -372,6 +463,50 @@ mod tests {
                 && results[1].squared_distance <= results[2].squared_distance,
             "results must be ranked by increasing distance: {results:?}"
         );
+    }
+
+    #[test]
+    fn insert_owned_makes_a_vector_findable_by_search() {
+        let index = HnswIndex::new(
+            MaxConnections(TEST_MAX_NB_CONNECTION),
+            MaxElements(100),
+            MaxLayers(TEST_MAX_LAYER),
+            EfConstruction(TEST_EF_CONSTRUCTION),
+        )
+        .unwrap();
+        index.insert_owned(0, vec![0.0, 0.0, 0.0]).unwrap();
+        index.insert_owned(1, vec![1000.0, 0.0, 0.0]).unwrap();
+
+        let results = index
+            .search(&[0.0, 0.0, 0.0], 1, TEST_EF_SEARCH, |_| true)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].row_id, 0);
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(results[0].squared_distance, 0.0);
+        }
+    }
+
+    #[test]
+    fn insert_owned_errors_on_dimension_mismatch_with_previously_inserted_vectors() {
+        let index = HnswIndex::new(
+            MaxConnections(16),
+            MaxElements(100),
+            MaxLayers(16),
+            EfConstruction(200),
+        )
+        .unwrap();
+        index.insert_owned(0, vec![0.0, 0.0, 0.0]).unwrap();
+
+        let result = index.insert_owned(1, vec![0.0, 0.0]);
+        assert!(matches!(
+            result,
+            Err(IndexError::DimensionMismatch {
+                query_len: 2,
+                expected: 3
+            })
+        ));
     }
 
     #[test]

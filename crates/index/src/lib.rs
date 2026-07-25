@@ -31,6 +31,7 @@ pub mod distance;
 pub mod graph;
 pub mod hnsw;
 mod node;
+mod node_layout;
 mod node_table;
 mod slot_array;
 

@@ -34,6 +34,7 @@ imbl = "7"
 
 [dev-dependencies]
 loom = "0.7"
+tempfile = { workspace = true }
 
 [features]
 chaos-injection = ["strata-storage/chaos-injection"]

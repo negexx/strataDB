@@ -15,10 +15,11 @@ use strata_txn::mvp_fixtures::{mvp_batch, mvp_schema};
 #[test]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::cast_precision_loss)]
 fn a_snapshot_never_gains_or_loses_rows_after_it_was_taken() {
-    let dir = std::env::temp_dir().join(format!(
-        "strata-concurrent-snapshot-isolation-{}",
-        std::process::id()
-    ));
+    let dir = tempfile::Builder::new()
+        .prefix("strata-concurrent-snapshot-isolation-")
+        .tempdir()
+        .unwrap()
+        .keep();
     Dataset::create(&dir).unwrap();
     let writer_dataset = Dataset::open(&dir).unwrap();
 
@@ -113,10 +114,11 @@ fn an_old_snapshot_still_sees_a_row_tombstoned_by_a_later_commit() {
     // This is the direct regression test for the isolation bug this whole
     // design exists to fix: a reader's snapshot must NOT lose a row just
     // because a LATER commit tombstoned it.
-    let dir = std::env::temp_dir().join(format!(
-        "strata-old-snapshot-sees-tombstoned-row-{}",
-        std::process::id()
-    ));
+    let dir = tempfile::Builder::new()
+        .prefix("strata-old-snapshot-sees-tombstoned-row-")
+        .tempdir()
+        .unwrap()
+        .keep();
     Dataset::create(&dir).unwrap();
     let dataset = Dataset::open(&dir).unwrap();
 
@@ -214,7 +216,7 @@ fn an_old_snapshots_vector_search_never_leaks_a_later_commits_rows() {
     // the real `Dataset`/`Transaction`/`commit` path (not `HnswIndex`
     // directly), and therefore through `Snapshot::vector_search`'s
     // no-predicate branch's PRODUCTION HNSW parameters
-    // (`HNSW_MAX_NB_CONNECTION=16`, `HNSW_EF_CONSTRUCTION=200`,
+    // (`HNSW_MAX_NB_CONNECTION=16`, `HNSW_EF_CONSTRUCTION`,
     // `EF_SEARCH_DEFAULT=32` in `crates/txn/src/dataset.rs` /
     // `crates/txn/src/snapshot.rs`) — weaker than the elevated test-only
     // parameters `crates/index/src/hnsw.rs`'s own unit tests use.
@@ -236,10 +238,11 @@ fn an_old_snapshots_vector_search_never_leaks_a_later_commits_rows() {
     const CLUSTER_SIZE: usize = 20;
     const K: usize = 5;
 
-    let dir = std::env::temp_dir().join(format!(
-        "strata-old-snapshot-vector-search-isolation-{}",
-        std::process::id()
-    ));
+    let dir = tempfile::Builder::new()
+        .prefix("strata-old-snapshot-vector-search-isolation-")
+        .tempdir()
+        .unwrap()
+        .keep();
     Dataset::create(&dir).unwrap();
     let dataset = Dataset::open(&dir).unwrap();
 

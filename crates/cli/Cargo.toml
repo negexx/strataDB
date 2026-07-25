@@ -17,3 +17,6 @@ strata-storage = { path = "../storage" }
 strata-txn = { path = "../txn" }
 strata-index = { path = "../index" }
 strata-query = { path = "../query" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
