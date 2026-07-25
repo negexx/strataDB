@@ -12,6 +12,7 @@ use std::collections::BinaryHeap;
 
 use crate::distance::Distance;
 use crate::node::{Node, assign_level};
+use crate::node_source::NodeSource;
 use crate::node_table::NodeTable;
 
 /// Sentinel for "the graph has no nodes yet" — see `EntryPoint::new`.
@@ -207,25 +208,6 @@ impl<D: Distance> Graph<D> {
         }
     }
 
-    /// Algorithm 2, `SEARCH-LAYER`. Returns up to `ef` `(row_id, distance)`
-    /// pairs, nearest-first, found by greedy traversal from `entry` at
-    /// layer `lc`. `filter` and the deleted-flag check both gate entry
-    /// into the returned result set `W`, never `neighbourhood(c)`
-    /// traversal — a node excluded by `filter` (or tombstoned) still
-    /// serves as a live waypoint for reaching other nodes, exactly
-    /// mirroring `hnsw_rs`'s own `FilterT` behavior (see the original
-    /// `crates/index/src/hnsw.rs`'s `search_filtered` doc comment: "both
-    /// are applied during `hnsw_rs`'s own traversal... not as a post-filter
-    /// on an already-capped top-k"). This is what lets a caller's
-    /// `live_ids` membership push all the way into traversal-time
-    /// filtering, not just the deleted flag. See design doc §3.
-    // The thread-local-scratch closure (Task 3 of the HNSW search-perf
-    // plan) pushed this past clippy's default 100-line threshold; the
-    // extra length is entirely the pre-existing Task 2 algorithm body now
-    // wrapped in `with_borrow_mut`, not new complexity -- splitting it
-    // into sub-functions would mean threading `scratch`'s fields through
-    // several new signatures for no behavioral benefit.
-    #[allow(clippy::too_many_lines)]
     fn search_layer(
         &self,
         query: &[f32],
@@ -235,139 +217,7 @@ impl<D: Distance> Graph<D> {
         filter: &impl Fn(u64) -> bool,
         saturate: bool,
     ) -> Vec<(u64, f32)> {
-        SEARCH_SCRATCH.with_borrow_mut(|scratch| {
-            scratch.visited.clear();
-            scratch.candidates.clear();
-            scratch.result.clear();
-            scratch.previous_result_ids.clear();
-            scratch.current_result_ids.clear();
-
-            scratch.visited.insert(entry);
-
-            let entry_dist = self.distance_to(query, entry);
-            // Min-heap of candidates still to explore (nearest first via `Reverse`).
-            scratch.candidates.push(std::cmp::Reverse(Candidate {
-                row_id: entry,
-                dist: entry_dist,
-            }));
-            // Max-heap of the best `ef` results found so far (farthest first, for cheap eviction).
-            if let Some(node) = self.nodes.get(entry)
-                && !node.is_deleted()
-                && filter(entry)
-            {
-                scratch.result.push(Candidate {
-                    row_id: entry,
-                    dist: entry_dist,
-                });
-            }
-
-            // Saturation-based early termination ("Patience in Proximity",
-            // Teofili & Lin, ECIR 2025) -- gated by `saturate`: firing
-            // during Graph::insert's own construction-time search_layer
-            // calls permanently bakes truncated-candidate-set edges into
-            // the graph for a one-time build-speed win, a worse trade
-            // than the intended recurring per-query one -- see design doc
-            // docs/superpowers/specs/2026-07-19-saturation-during-insert-design.md.
-            #[allow(clippy::items_after_statements)]
-            const SATURATION_THRESHOLD_PERCENT: u32 = 95;
-            #[allow(
-                clippy::cast_possible_truncation,
-                clippy::cast_sign_loss,
-                clippy::cast_precision_loss
-            )]
-            let patience: u32 = ((ef as f64) * 0.3).ceil().max(7.0) as u32;
-            let mut saturated_streak: u32 = 0;
-
-            while let Some(std::cmp::Reverse(c)) = scratch.candidates.pop() {
-                if let Some(furthest) = scratch.result.peek()
-                    && c.dist > furthest.dist
-                    && scratch.result.len() >= ef
-                {
-                    break; // Algorithm 2 line 7-8: all of W is settled.
-                }
-                let Some(node) = self.nodes.get(c.row_id) else {
-                    continue;
-                };
-                // A node's layer-lc slot array only exists for lc <= node.level().
-                if lc > node.level() {
-                    continue;
-                }
-                node.layer(lc).occupied_into(&mut scratch.occupied_buf);
-                // `occupied_buf` and `visited`/`candidates`/`result` are
-                // disjoint fields of the same `&mut SearchScratch` — the
-                // borrow checker splits them, so iterating one while
-                // mutating the others compiles cleanly (verified: this is
-                // not the same restriction a method call on `&mut self`
-                // would hit).
-                for &neighbor_id in &scratch.occupied_buf {
-                    if scratch.visited.contains(&neighbor_id) {
-                        continue;
-                    }
-                    scratch.visited.insert(neighbor_id);
-                    let neighbor_dist = self.distance_to(query, neighbor_id);
-                    let should_add = match scratch.result.peek() {
-                        Some(furthest) => {
-                            neighbor_dist < furthest.dist || scratch.result.len() < ef
-                        }
-                        None => true,
-                    };
-                    if should_add {
-                        scratch.candidates.push(std::cmp::Reverse(Candidate {
-                            row_id: neighbor_id,
-                            dist: neighbor_dist,
-                        }));
-                        if let Some(neighbor_node) = self.nodes.get(neighbor_id)
-                            && !neighbor_node.is_deleted()
-                            && filter(neighbor_id)
-                        {
-                            scratch.result.push(Candidate {
-                                row_id: neighbor_id,
-                                dist: neighbor_dist,
-                            });
-                            if scratch.result.len() > ef {
-                                scratch.result.pop(); // evict the current furthest
-                            }
-                        }
-                    }
-                }
-
-                if saturate {
-                    scratch.current_result_ids.clear();
-                    scratch
-                        .current_result_ids
-                        .extend(scratch.result.iter().map(|c| c.row_id));
-                    if !scratch.previous_result_ids.is_empty() && ef > 0 {
-                        let overlap = scratch
-                            .previous_result_ids
-                            .intersection(&scratch.current_result_ids)
-                            .count();
-                        #[allow(
-                            clippy::cast_precision_loss,
-                            clippy::cast_possible_truncation,
-                            clippy::cast_sign_loss
-                        )]
-                        let overlap_percent = ((overlap as f64 / ef as f64) * 100.0) as u32;
-                        if overlap_percent >= SATURATION_THRESHOLD_PERCENT {
-                            saturated_streak += 1;
-                            if saturated_streak >= patience {
-                                break;
-                            }
-                        } else {
-                            saturated_streak = 0;
-                        }
-                    }
-                    std::mem::swap(
-                        &mut scratch.previous_result_ids,
-                        &mut scratch.current_result_ids,
-                    );
-                }
-            }
-
-            let mut out: Vec<(u64, f32)> =
-                scratch.result.iter().map(|c| (c.row_id, c.dist)).collect();
-            out.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(CmpOrdering::Equal));
-            out
-        })
+        search_layer_generic(self, &self.distance, query, entry, ef, lc, filter, saturate)
     }
 
     fn distance_to(&self, query: &[f32], row_id: u64) -> f32 {
@@ -725,6 +575,159 @@ impl<D: Distance> Graph<D> {
         }
         Ok(())
     }
+}
+
+/// Algorithm 2, `SEARCH-LAYER`. Returns up to `ef` `(local id, distance)`
+/// pairs, nearest-first, found by greedy traversal from `entry` at layer
+/// `lc`. `filter` and the deleted-flag check both gate entry into the
+/// returned result set `W`, never `neighbourhood(c)` traversal — a node
+/// excluded by `filter` (or tombstoned) still serves as a live waypoint for
+/// reaching other nodes. Generic over `NodeSource` so the identical
+/// algorithm runs over `Graph<D>` today and a segment reader from W3.2 —
+/// see `docs/superpowers/specs/2026-07-24-s1-segment-format-w3-migration-design.md`
+/// §2. `filter`/`row_id` operate in row-id space; everything else (`entry`,
+/// the returned ids, traversal) is in `source`'s local-id space — for
+/// `Graph<D>` these coincide (`row_id` is the identity), so this is not yet
+/// externally visible, but callers over a future segment must remember the
+/// two domains can differ.
+// As a method, `search_layer` kept this under the 7-argument default via
+// clippy's implicit `&self` exemption; as a free function taking `source`
+// and `distance` explicitly (so the same body can run over a future
+// segment reader, not just `Graph<D>`), those two become real parameters
+// and push the count to 8. Splitting them into a struct would just be
+// indirection around the same eight logically-independent inputs — same
+// rationale as `Graph::insert`'s own `#[allow(clippy::too_many_arguments)]`
+// above.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn search_layer_generic<S: NodeSource, D: Distance>(
+    source: &S,
+    distance: &D,
+    query: &[f32],
+    entry: u64,
+    ef: usize,
+    lc: usize,
+    filter: &impl Fn(u64) -> bool,
+    saturate: bool,
+) -> Vec<(u64, f32)> {
+    fn distance_to<S: NodeSource, D: Distance>(
+        source: &S,
+        distance: &D,
+        query: &[f32],
+        local: u64,
+    ) -> f32 {
+        source
+            .vector(local)
+            .map_or(f32::INFINITY, |v| distance.eval(query, v))
+    }
+
+    SEARCH_SCRATCH.with_borrow_mut(|scratch| {
+        scratch.visited.clear();
+        scratch.candidates.clear();
+        scratch.result.clear();
+        scratch.previous_result_ids.clear();
+        scratch.current_result_ids.clear();
+
+        scratch.visited.insert(entry);
+
+        let entry_dist = distance_to(source, distance, query, entry);
+        scratch.candidates.push(std::cmp::Reverse(Candidate {
+            row_id: entry,
+            dist: entry_dist,
+        }));
+        if !source.is_deleted(entry) && filter(source.row_id(entry)) {
+            scratch.result.push(Candidate {
+                row_id: entry,
+                dist: entry_dist,
+            });
+        }
+
+        #[allow(clippy::items_after_statements)]
+        const SATURATION_THRESHOLD_PERCENT: u32 = 95;
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
+        let patience: u32 = ((ef as f64) * 0.3).ceil().max(7.0) as u32;
+        let mut saturated_streak: u32 = 0;
+
+        while let Some(std::cmp::Reverse(c)) = scratch.candidates.pop() {
+            if let Some(furthest) = scratch.result.peek()
+                && c.dist > furthest.dist
+                && scratch.result.len() >= ef
+            {
+                break;
+            }
+            let Some(node_level) = source.level(c.row_id) else {
+                continue;
+            };
+            if lc > node_level {
+                continue;
+            }
+            source.neighbors_into(c.row_id, lc, &mut scratch.occupied_buf);
+            for &neighbor_id in &scratch.occupied_buf {
+                if scratch.visited.contains(&neighbor_id) {
+                    continue;
+                }
+                scratch.visited.insert(neighbor_id);
+                let neighbor_dist = distance_to(source, distance, query, neighbor_id);
+                let should_add = match scratch.result.peek() {
+                    Some(furthest) => neighbor_dist < furthest.dist || scratch.result.len() < ef,
+                    None => true,
+                };
+                if should_add {
+                    scratch.candidates.push(std::cmp::Reverse(Candidate {
+                        row_id: neighbor_id,
+                        dist: neighbor_dist,
+                    }));
+                    if !source.is_deleted(neighbor_id) && filter(source.row_id(neighbor_id)) {
+                        scratch.result.push(Candidate {
+                            row_id: neighbor_id,
+                            dist: neighbor_dist,
+                        });
+                        if scratch.result.len() > ef {
+                            scratch.result.pop();
+                        }
+                    }
+                }
+            }
+
+            if saturate {
+                scratch.current_result_ids.clear();
+                scratch
+                    .current_result_ids
+                    .extend(scratch.result.iter().map(|c| c.row_id));
+                if !scratch.previous_result_ids.is_empty() && ef > 0 {
+                    let overlap = scratch
+                        .previous_result_ids
+                        .intersection(&scratch.current_result_ids)
+                        .count();
+                    #[allow(
+                        clippy::cast_precision_loss,
+                        clippy::cast_possible_truncation,
+                        clippy::cast_sign_loss
+                    )]
+                    let overlap_percent = ((overlap as f64 / ef as f64) * 100.0) as u32;
+                    if overlap_percent >= SATURATION_THRESHOLD_PERCENT {
+                        saturated_streak += 1;
+                        if saturated_streak >= patience {
+                            break;
+                        }
+                    } else {
+                        saturated_streak = 0;
+                    }
+                }
+                std::mem::swap(
+                    &mut scratch.previous_result_ids,
+                    &mut scratch.current_result_ids,
+                );
+            }
+        }
+
+        let mut out: Vec<(u64, f32)> = scratch.result.iter().map(|c| (c.row_id, c.dist)).collect();
+        out.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(CmpOrdering::Equal));
+        out
+    })
 }
 
 impl<D: Distance> crate::node_source::NodeSource for Graph<D> {
