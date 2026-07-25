@@ -5977,6 +5977,13 @@ mod tests {
 /// exhaustive interleaving exploration. This is the same relationship a
 /// hand-rolled `Mutex`-guarded swap would have to a loom test: the pattern
 /// is verified, not the third-party crate's own internals.
+///
+/// **Model 3 is deliberately absent.** Base design §5 defines it as the
+/// regression gate for deleting `RowIdAllocator.active` / `in_flight` /
+/// collapsing `Snapshot::is_visible` to the tombstone check — explicitly
+/// "its own PR after W3.3 is green", not folded into this workstream. It
+/// belongs in that PR, where it must pass both before and after the
+/// deletion.
 #[cfg(loom)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod loom_tests {
@@ -6024,10 +6031,14 @@ mod loom_tests {
     /// sits at the cap itself, 5 of 5 (root + seed + failing + succeeding +
     /// final);
     /// `concurrent_first_vector_commits_at_different_dimensions_are_not_both_accepted`
-    /// sits at 3 of 5 (root + the two racing committers). One more
-    /// `spawn_committer` in any model already at the cap trips an assert
-    /// inside loom, so a commit that only needs the stack — not the
-    /// concurrency — still costs a hard-capped slot.
+    /// sits at 3 of 5 (root + the two racing committers);
+    /// `a_failed_commits_segment_is_never_visible_to_a_concurrent_reader` and
+    /// `a_commits_row_and_its_segment_become_visible_as_one_atomic_step` each
+    /// sit at 3 of 5 (root + a committer + a reader racing it directly,
+    /// rather than another committer). One more `spawn_committer` in any
+    /// model already at the cap trips an assert inside loom, so a commit
+    /// that only needs the stack — not the concurrency — still costs a
+    /// hard-capped slot.
     ///
     /// loom documents this value as bytes while `generator` consumes it as
     /// words, so the real stack is 8 MiB today. Left uncompensated on
@@ -6675,6 +6686,210 @@ mod loom_tests {
                 "established_dimension() must match whichever commit actually won, \
                  never a mix of the two: 3d={result_3d:?}, 5d={result_5d:?}"
             );
+
+            std::fs::remove_dir_all(&dir).ok();
+        });
+    }
+
+    #[test]
+    fn a_failed_commits_segment_is_never_visible_to_a_concurrent_reader() {
+        // Base design §5, loom Model 1 -- "failed commit is invisible."
+        //
+        // Thread A commits with `inject_manifest_commit_failure`: it claims
+        // row-ids, builds and fsyncs its segment, then returns Err before
+        // the manifest swap. Thread B takes a snapshot and searches
+        // concurrently. Under EVERY interleaving, B must observe neither
+        // A's row-id nor A's segment file.
+        //
+        // The interleavings loom explores that matter here are B's
+        // `current.load()` landing (i) before A takes `commit_lock`,
+        // (ii) between A's segment fsync and A's Err, and (iii) after A's
+        // Err. The property is the same in all three -- which is exactly
+        // the point: after W3.2a it holds structurally (a snapshot's
+        // segment set is its manifest's list, and A's segment never enters
+        // a manifest), not because a compensating action won a race.
+        //
+        // This is the genuinely new interleaving space relative to
+        // `a_failed_commits_graph_residue_is_never_searchable_under_concurrent_commits`
+        // above: that model races two *committers* against each other and
+        // only reads afterward (sequentially, once both have joined). This
+        // one races a *reader* directly against the failing committer's own
+        // execution, so loom explores schedules where the reader's
+        // `snapshot()` lands mid-commit -- something the committer-vs-
+        // committer model never exercises.
+        //
+        // Deliberately minimal per §5's flagged risk: one row, dim 3, and
+        // only A carries a vector. Budget: root + failing + reader = 3 of
+        // loom's 5-created-threads-per-execution cap.
+        loom::model(|| {
+            let dir = tempfile::Builder::new()
+                .prefix(&format!(
+                    "strata-loom-failed-segment-{}-{:?}-",
+                    std::process::id(),
+                    loom::thread::current().id()
+                ))
+                .tempdir()
+                .unwrap()
+                .keep();
+            let ds = crate::Dataset::create(&dir).unwrap();
+            let version_before = ds.snapshot().version;
+
+            let ds_failing = ds.clone();
+            let failing = spawn_committer(move || {
+                let mut txn = ds_failing.begin();
+                txn.insert(loom_vector_batch(1, &[900.0, 900.0, 900.0]));
+                txn.inject_manifest_commit_failure();
+                txn.commit()
+            });
+
+            let ds_reader = ds.clone();
+            let reader = spawn_committer(move || {
+                let snapshot = ds_reader.snapshot();
+                let hits = snapshot
+                    .vector_search(&[900.0, 900.0, 900.0], 1, None)
+                    .unwrap();
+                let segment_names: Vec<String> = snapshot
+                    .manifest
+                    .segments
+                    .iter()
+                    .map(|s| s.name.clone())
+                    .collect();
+                (snapshot.version, snapshot.index.len(), hits, segment_names)
+            });
+
+            assert!(
+                failing.join().unwrap().is_err(),
+                "the injected manifest-commit failure must make this commit fail"
+            );
+            let (observed_version, observed_parts, hits, segment_names) = reader.join().unwrap();
+
+            assert_eq!(
+                observed_version, version_before,
+                "no snapshot may exist at a version the failed commit never produced"
+            );
+            assert!(
+                segment_names.is_empty(),
+                "a reader must never see a manifest naming the failed commit's \
+                 segment file: {segment_names:?}"
+            );
+            assert_eq!(
+                observed_parts, 0,
+                "the observed snapshot's segment set must match its manifest's \
+                 (empty) segment list"
+            );
+            assert!(
+                hits.is_empty(),
+                "the failed commit's vector was the only one ever inserted, and \
+                 must never be searchable under any interleaving: {hits:?}"
+            );
+
+            // The root thread's own post-join view, which is the quiescent
+            // half of the property.
+            assert_eq!(
+                ds.snapshot().version,
+                version_before,
+                "a failed commit must not advance the visible version"
+            );
+            assert!(ds.snapshot().manifest.segments.is_empty());
+
+            std::fs::remove_dir_all(&dir).ok();
+        });
+    }
+
+    #[test]
+    fn a_commits_row_and_its_segment_become_visible_as_one_atomic_step() {
+        // Base design §5, loom Model 2 -- "row + segment publish
+        // atomically."
+        //
+        // A commits successfully; B snapshots and then both scans and
+        // vector-searches THAT SAME snapshot. B must observe either the
+        // complete pre-commit state or the complete post-commit state --
+        // never A's row present under the old manifest version, and never
+        // the version bumped with A's segment absent.
+        //
+        // This is close to trivially true once both live in one `Manifest`
+        // published by a single atomic swap, but it is the entire
+        // justification for deleting the old guard/registry machinery, so
+        // §5 requires it be proven rather than assumed. Like the model
+        // above, this races a reader directly against a committer's own
+        // execution rather than against another committer -- the
+        // interleaving space neither
+        // `a_failed_commits_graph_residue_is_never_searchable_under_concurrent_commits`
+        // nor
+        // `concurrent_first_vector_commits_at_different_dimensions_are_not_both_accepted`
+        // covers.
+        //
+        // B reads one snapshot and derives every assertion from it: taking
+        // two snapshots would let a commit land in between and make the
+        // test assert nothing.
+        //
+        // Budget: root + writer + reader = 3 of loom's
+        // 5-created-threads-per-execution cap.
+        loom::model(|| {
+            let dir = tempfile::Builder::new()
+                .prefix(&format!(
+                    "strata-loom-atomic-publish-{}-{:?}-",
+                    std::process::id(),
+                    loom::thread::current().id()
+                ))
+                .tempdir()
+                .unwrap()
+                .keep();
+            let ds = crate::Dataset::create(&dir).unwrap();
+
+            let ds_writer = ds.clone();
+            let writer = spawn_committer(move || {
+                let mut txn = ds_writer.begin();
+                txn.insert(loom_vector_batch(1, &[900.0, 900.0, 900.0]));
+                txn.commit()
+            });
+
+            let ds_reader = ds.clone();
+            let reader = spawn_committer(move || {
+                let snapshot = ds_reader.snapshot();
+                let hits = snapshot
+                    .vector_search(&[900.0, 900.0, 900.0], 1, None)
+                    .unwrap();
+                (
+                    snapshot.version,
+                    snapshot.manifest.data_files.len(),
+                    snapshot.manifest.segments.len(),
+                    snapshot.index.len(),
+                    hits.len(),
+                )
+            });
+
+            writer.join().unwrap().unwrap();
+            let (version, data_files, segments, parts, hit_count) = reader.join().unwrap();
+
+            // The in-memory segment set and the manifest's segment list are
+            // the two halves that must never disagree, in any observed
+            // state.
+            assert_eq!(
+                parts, segments,
+                "a snapshot's segment set must always equal its manifest's segment \
+                 list -- observed {parts} parts against {segments} entries at \
+                 version {version}"
+            );
+
+            match version {
+                0 => {
+                    assert_eq!(data_files, 0, "the pre-commit state has no data file");
+                    assert_eq!(segments, 0, "...and no segment");
+                    assert_eq!(hit_count, 0, "...and nothing to find");
+                }
+                1 => {
+                    assert_eq!(data_files, 1, "the post-commit state has A's data file");
+                    assert_eq!(segments, 1, "...and A's segment");
+                    assert_eq!(
+                        hit_count, 1,
+                        "...and A's row is findable in it -- a version bump with \
+                         the segment absent, or present but unsearchable, is the \
+                         partial state this model rules out"
+                    );
+                }
+                other => panic!("no interleaving may produce version {other}"),
+            }
 
             std::fs::remove_dir_all(&dir).ok();
         });
