@@ -1204,12 +1204,25 @@ impl Transaction {
     }
 }
 
-// HNSW parameter defaults — small, correctness-only values for now.
-// Task 7's benchmark is what tunes the real production defaults; see
-// .claude/rules/vector-index.md ("tuned via benchmarks, not guessed").
+// HNSW parameter defaults — tuned via benchmarks, not guessed, per
+// .claude/rules/vector-index.md.
 const HNSW_MAX_NB_CONNECTION: usize = 16;
 const HNSW_MAX_LAYER: usize = 16;
-const HNSW_EF_CONSTRUCTION: usize = 200;
+// ef_construction is the build-cost dial: the insert-time saturation
+// early-exit is disabled, so every build traversal runs the full beam and
+// cost is near-linear in this value. Lowered 200 -> 100 based on
+// bench/benches/ef_construction_sweep_bench.rs (run it to reproduce; the
+// numbers below are its default 100k-row / 200-query configuration, the
+// same scale as vector_search_bench):
+//   - recall@10: 0.9855 (ef=200) -> 0.9820 (ef=100), a 0.35pp drop, still
+//     well clear of this project's recall@10 >= 0.9 ship floor.
+//   - build time: 225.15s (ef=200) -> 101.26s (ef=100), a 2.2x speedup.
+//   - cross-checked two other ways: production-path recall via
+//     vector_search_bench (100k rows, real Dataset) gives the same
+//     direction and magnitude (0.9850 -> 0.9800); end-to-end ingest+commit
+//     and recovery wall time via lifecycle_bench (25k rows, real commit
+//     path) both drop ~1.8x (37.30s -> 21.17s, 36.12s -> 19.41s).
+const HNSW_EF_CONSTRUCTION: usize = 100;
 
 fn new_hnsw_index(capacity: usize) -> Result<HnswIndex> {
     Ok(HnswIndex::new(
