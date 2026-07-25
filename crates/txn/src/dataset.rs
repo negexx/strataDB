@@ -38,17 +38,17 @@ use crate::snapshot::Snapshot;
 
 /// The hidden internal row-id column every committed batch carries
 /// alongside its logical columns. Callers can retrieve it through the
-/// public `scan`/`scan_with_predicate` API, but only under one precondition:
-/// the caller's schema must list every physical column in the same order
-/// data was inserted in, with `ROW_ID_COLUMN` appended last (see the CLI's
-/// `handle_search`, which does exactly this). A schema that omits, reorders,
-/// or partially includes columns will not retrieve row-ids correctly — as
-/// of the `cast_batch_to_schema` column-count check, a mismatched column
-/// count now returns a typed `TxnError::SchemaMismatch` instead of silently
-/// producing wrong data, but column *order* is still the caller's
-/// responsibility. `row_ids_matching` (below) sidesteps this precondition
-/// entirely by reading each file's raw physical batch directly rather than
-/// going through the public schema-based API. See
+/// public `scan`/`scan_with_predicate` API by listing `ROW_ID_COLUMN`
+/// (and/or `TIMESTAMP_COLUMN`) anywhere in their requested schema (see the
+/// CLI's `handle_search`, which does exactly this) — `cast_batch_to_schema`
+/// matches hidden columns by *name*, not position, so any combination of
+/// `_row_id`/`_timestamp` can be requested, in any position, independently
+/// of the other. Only the *visible* (user) columns must still be listed in
+/// the same order the data was inserted in; a mismatched visible-column
+/// count returns a typed `TxnError::SchemaMismatch` instead of silently
+/// producing wrong data. `row_ids_matching` (below) sidesteps this
+/// precondition entirely by reading each file's raw physical batch directly
+/// rather than going through the public schema-based API. See
 /// `.claude/docs/design/phase-0-transaction-and-format-spec.md` §8.
 pub const ROW_ID_COLUMN: &str = "_row_id";
 
@@ -1474,54 +1474,90 @@ pub(crate) fn safe_join(data_dir: &Path, name: &str) -> Result<PathBuf> {
     Ok(data_dir.join(candidate))
 }
 
-/// Casts every column of `batch` to the corresponding field type in
-/// `schema`, leaving already-matching columns untouched (a cheap `Arc`
-/// clone, not a copy). See [`crate::snapshot::Snapshot::scan`]'s doc comment
-/// for why this is necessary rather than a defensive nicety.
-///
-/// Every committed file physically carries a trailing hidden
-/// [`ROW_ID_COLUMN`] (see `append_row_id_column`). It only counts toward
-/// the batch's *logical* width when the caller's `schema` explicitly
-/// requests it (as the CLI's `search` subcommand does) — otherwise the
-/// positional zip below deliberately drops it. Any other width
-/// disagreement is an error: without the up-front check, `Iterator::zip`
-/// would silently truncate to the shorter side — dropping real columns, or
-/// worse, pairing the hidden row-id column with a caller field and casting
-/// row-ids into the caller's data.
+/// Hidden columns every committed batch may carry alongside its logical
+/// (user) columns — `_row_id` always, `_timestamp` always (since W2).
+/// `cast_batch_to_schema` matches these by *name*, not position; every
+/// other (visible) column is still matched positionally against `schema`'s
+/// fields, so the caller's `schema` must still list its visible fields in
+/// the same order the data was inserted in.
+const HIDDEN_COLUMNS: [&str; 2] = [ROW_ID_COLUMN, TIMESTAMP_COLUMN];
+
+/// Casts `batch`'s physical columns to `schema`'s logical field types,
+/// reattaching any hidden column (`_row_id`, `_timestamp`) `schema`
+/// explicitly requests. See
+/// `docs/superpowers/specs/2026-07-25-s1-w2-timestamp-column-design.md` §5
+/// for why matching a *second* hidden column by position was unsound (it
+/// either misfired a spurious `SchemaMismatch`, or — in the mixed-request
+/// case — silently paired the wrong physical column against the wrong
+/// logical field).
 ///
 /// # Errors
 ///
-/// Returns [`TxnError::SchemaMismatch`] if `schema`'s field count doesn't
-/// match `batch`'s logical column count, or an Arrow error if a column
-/// can't be cast to its corresponding field's type.
+/// Returns [`TxnError::SchemaMismatch`] if the number of *visible* columns
+/// `schema` requests doesn't match the number of visible physical columns
+/// in `batch`, an [`TxnError::Arrow`] if `schema` requests a hidden column
+/// not present in `batch`, or an [`TxnError::Arrow`]/[`TxnError`] wrapping
+/// a cast failure if a column's physical type can't convert to its
+/// requested logical type.
 pub(crate) fn cast_batch_to_schema(batch: &RecordBatch, schema: &SchemaRef) -> Result<RecordBatch> {
-    let physical = batch.num_columns();
-    let hidden_row_id = batch.schema_ref().index_of(ROW_ID_COLUMN).is_ok()
-        && schema.index_of(ROW_ID_COLUMN).is_err();
-    let logical = if hidden_row_id {
-        physical.saturating_sub(1)
-    } else {
-        physical
-    };
-    if logical != schema.fields().len() {
+    let physical_schema = batch.schema_ref();
+
+    let mut hidden_physical: std::collections::HashMap<&str, ArrayRef> =
+        std::collections::HashMap::new();
+    let mut visible_physical: Vec<ArrayRef> = Vec::new();
+    for (field, column) in physical_schema.fields().iter().zip(batch.columns()) {
+        if HIDDEN_COLUMNS.contains(&field.name().as_str()) {
+            hidden_physical.insert(field.name().as_str(), Arc::clone(column));
+        } else {
+            visible_physical.push(Arc::clone(column));
+        }
+    }
+
+    let visible_requested = schema
+        .fields()
+        .iter()
+        .filter(|f| !HIDDEN_COLUMNS.contains(&f.name().as_str()))
+        .count();
+    if visible_requested != visible_physical.len() {
         return Err(TxnError::SchemaMismatch {
-            expected: schema.fields().len(),
-            actual: logical,
+            expected: visible_requested,
+            actual: visible_physical.len(),
         });
     }
-    let columns: std::result::Result<Vec<ArrayRef>, arrow::error::ArrowError> = batch
-        .columns()
-        .iter()
-        .zip(schema.fields())
-        .map(|(column, field)| {
-            if column.data_type() == field.data_type() {
-                Ok(Arc::clone(column))
-            } else {
-                cast(column.as_ref(), field.data_type())
+
+    let mut visible_iter = visible_physical.into_iter();
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
+    for field in schema.fields() {
+        let column = if HIDDEN_COLUMNS.contains(&field.name().as_str()) {
+            hidden_physical
+                .get(field.name().as_str())
+                .cloned()
+                .ok_or_else(|| {
+                    TxnError::Arrow(arrow::error::ArrowError::SchemaError(format!(
+                        "requested hidden column '{}' not present in this batch",
+                        field.name()
+                    )))
+                })?
+        } else {
+            // `visible_requested == visible_physical.len()` was already
+            // checked above, so this iterator has exactly as many elements
+            // as there are non-hidden fields in `schema` — it cannot run
+            // dry before this loop does.
+            match visible_iter.next() {
+                Some(column) => column,
+                None => unreachable!(
+                    "visible column count was checked equal to visible field count above"
+                ),
             }
-        })
-        .collect();
-    Ok(RecordBatch::try_new(Arc::clone(schema), columns?)?)
+        };
+        let casted = if column.data_type() == field.data_type() {
+            column
+        } else {
+            cast(column.as_ref(), field.data_type())?
+        };
+        columns.push(casted);
+    }
+    Ok(RecordBatch::try_new(Arc::clone(schema), columns)?)
 }
 
 /// Appends a `_row_id: UInt64` column to `batch`, assigning
@@ -2375,6 +2411,121 @@ mod tests {
             "_row_id must not appear in scan() output when the caller's schema doesn't ask for it"
         );
         assert!(scanned.schema_ref().index_of(ROW_ID_COLUMN).is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cast_batch_to_schema_reattaches_neither_hidden_column_by_default() {
+        let dir = temp_dir("cast-hidden-neither");
+        let ds = Dataset::create(&dir).unwrap();
+        let mut txn = ds.begin();
+        txn.insert(
+            RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![1, 2]))])
+                .unwrap(),
+        );
+        txn.commit().unwrap();
+
+        let batch = ds.snapshot().scan(&test_schema()).unwrap();
+        assert_eq!(
+            batch.num_columns(),
+            1,
+            "requesting no hidden columns must return just 'id'"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cast_batch_to_schema_reattaches_row_id_only() {
+        let dir = temp_dir("cast-hidden-row-id-only");
+        let ds = Dataset::create(&dir).unwrap();
+        let mut txn = ds.begin();
+        txn.insert(
+            RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![1, 2]))])
+                .unwrap(),
+        );
+        txn.commit().unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(ROW_ID_COLUMN, DataType::UInt64, false),
+        ]));
+        let batch = ds.snapshot().scan(&schema).unwrap();
+        assert_eq!(batch.num_columns(), 2);
+        let row_ids = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(row_ids.values(), &[0, 1]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cast_batch_to_schema_reattaches_timestamp_only() {
+        let dir = temp_dir("cast-hidden-timestamp-only");
+        let ds = Dataset::create(&dir).unwrap();
+        let mut txn = ds.begin();
+        txn.insert(
+            RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![1, 2]))])
+                .unwrap(),
+        );
+        txn.commit().unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(TIMESTAMP_COLUMN, DataType::Int64, false),
+        ]));
+        let batch = ds.snapshot().scan(&schema).unwrap();
+        assert_eq!(batch.num_columns(), 2);
+        let timestamps = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        assert!(timestamps.value(0) > 0);
+        assert_eq!(
+            timestamps.value(0),
+            timestamps.value(1),
+            "this is the exact case that risked a silent miscast under the old positional logic - \
+             both rows must show the SAME real timestamp, not a row-id value reinterpreted as Int64"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cast_batch_to_schema_reattaches_both_hidden_columns() {
+        let dir = temp_dir("cast-hidden-both");
+        let ds = Dataset::create(&dir).unwrap();
+        let mut txn = ds.begin();
+        txn.insert(
+            RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![1, 2]))])
+                .unwrap(),
+        );
+        txn.commit().unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(ROW_ID_COLUMN, DataType::UInt64, false),
+            Field::new(TIMESTAMP_COLUMN, DataType::Int64, false),
+        ]));
+        let batch = ds.snapshot().scan(&schema).unwrap();
+        assert_eq!(batch.num_columns(), 3);
+        let row_ids = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(row_ids.values(), &[0, 1]);
+        let timestamps = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        assert_eq!(timestamps.value(0), timestamps.value(1));
 
         std::fs::remove_dir_all(&dir).ok();
     }
