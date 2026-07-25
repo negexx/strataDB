@@ -41,6 +41,8 @@ pub enum TxnError {
     UnreasonableCapacity(u64, u64),
     #[error("manifest references an unsafe file path: {0:?}")]
     UnsafeManifestPath(String),
+    #[error("segment listed in the manifest is unusable: {0}")]
+    CorruptSegment(String),
     #[error("schema mismatch casting a data file: expected {expected} columns, found {actual}")]
     SchemaMismatch { expected: usize, actual: usize },
     #[error("conflict: {contested_row_ids:?} were modified by another transaction")]

@@ -22,13 +22,10 @@ use arc_swap::ArcSwap;
 use arrow::array::{Array, ArrayRef, RecordBatch, UInt64Array};
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use strata_index::{
-    DeltaEntry, EfConstruction, HnswIndex, MaxConnections, MaxElements, MaxLayers, read_delta_log,
-    write_delta_log,
-};
+use strata_index::{EfConstruction, HnswIndex, MaxConnections, MaxElements, MaxLayers};
 use strata_storage::{
-    ColumnStats, DataFileEntry, Manifest, Value, commit_manifest, compute_stats, read_current,
-    write_batch,
+    ColumnStats, DataFileEntry, Manifest, SegmentEntry, Value, commit_manifest, compute_stats,
+    read_current, write_batch, write_bytes,
 };
 
 use crate::commit_log::{CommitLog, ConflictCheck};
@@ -123,7 +120,7 @@ pub struct Dataset {
 
 /// The single source of truth for "where does this dataset's data live,
 /// relative to its root directory" — used by `Dataset::data_dir`,
-/// `Transaction::commit`, and `replay_index`, which each need it from a
+/// `Transaction::commit`, and `load_segments`, which each need it from a
 /// different type/context (a `&Dataset`, a `Transaction`, and a bare
 /// `&Path` respectively) and previously each hardcoded `dir.join("data")`
 /// independently.
@@ -279,7 +276,6 @@ impl Dataset {
         let manifest = Manifest::empty();
         commit_manifest(&dir, &manifest)?;
         let last_issued_timestamp = Arc::new(AtomicI64::new(manifest.commit_time_high_water));
-        let graph = new_hnsw_index(0)?;
         let row_ids = Arc::new(RowIdAllocator::new(manifest.next_row_id));
         let write_attempt_counter = Arc::new(AtomicU64::new(manifest.next_attempt_id));
         let snapshot = Snapshot {
@@ -289,7 +285,10 @@ impl Dataset {
             // A freshly created dataset has no transaction in flight.
             in_flight: Vec::new().into(),
             manifest: Arc::new(manifest),
-            index: strata_index::SegmentSet::from_live(Arc::new(graph)),
+            // A brand-new dataset has committed no vectors, so it has no
+            // segments — not an empty graph. `vector_search` on it returns
+            // an empty result, which is what it always did.
+            index: strata_index::SegmentSet::empty(),
             tombstones: Arc::new(imbl::HashSet::new()),
         };
         Ok(Self {
@@ -309,6 +308,10 @@ impl Dataset {
     /// `strata_storage::manifest`), so a process killed mid-commit leaves
     /// this returning the *previous* version, never a torn one — the Phase 1
     /// MVP checklist's kill-9 test exercises exactly this.
+    ///
+    /// Index recovery is loading `manifest.segments` — `O(bytes)` of
+    /// validation per segment, with zero distance evaluations and zero
+    /// graph construction — not replaying an insert log.
     ///
     /// # Examples
     ///
@@ -334,7 +337,22 @@ impl Dataset {
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self> {
         let dir = dir.into();
         let manifest = read_current(&dir)?.ok_or_else(|| TxnError::NotFound(dir.clone()))?;
-        let (graph, tombstones) = replay_index(&dir, &manifest)?;
+        // The capacity guard used to live inside `replay_index`, which sized
+        // an `HnswIndex` from `next_row_id`. Nothing sizes an allocation
+        // from it any more, but the ceiling is still a panic-safety bound on
+        // what row-ids may reach `NodeTable` — see
+        // `MAX_REASONABLE_ROW_ID_CAPACITY`.
+        if manifest.next_row_id > MAX_REASONABLE_ROW_ID_CAPACITY {
+            return Err(TxnError::UnreasonableCapacity(
+                manifest.next_row_id,
+                MAX_REASONABLE_ROW_ID_CAPACITY,
+            ));
+        }
+        let index = load_segments(&dir, &manifest)?;
+        // The manifest's tombstone list is now the only source: index-level
+        // tombstone entries went away with the delta log, and never had a
+        // producer on the commit path anyway.
+        let tombstones: imbl::HashSet<u64> = manifest.tombstones.iter().copied().collect();
         let row_ids = Arc::new(RowIdAllocator::new(manifest.next_row_id));
         // The real fix for the cross-session filename-collision bug: seed
         // from the persisted `manifest.next_attempt_id`, not 0. Without
@@ -366,13 +384,13 @@ impl Dataset {
             // Nothing is in flight in a process that has just opened this
             // dataset. A *prior* session's abandoned claims need no entry
             // either: `manifest.next_row_id` may cover them, but their data
-            // files never entered a manifest and their delta logs are not
-            // replayed, so nothing exists at those ids to be found. That is
-            // why this hazard was only ever transient, never survivable
-            // across a restart.
+            // files never entered a manifest, and their segments were never
+            // listed in a manifest, so nothing exists at those ids to be
+            // found. That is why this hazard was only ever transient, never
+            // survivable across a restart.
             in_flight: Vec::new().into(),
             manifest: Arc::new(manifest),
-            index: strata_index::SegmentSet::from_live(Arc::new(graph)),
+            index,
             tombstones: Arc::new(tombstones),
         };
         Ok(Self {
@@ -419,7 +437,6 @@ impl Dataset {
         Transaction {
             dir: self.dir.clone(),
             base_version: snapshot.version,
-            graph: snapshot.index.live_arc(),
             pending: Vec::new(),
             pending_tombstones: Vec::new(),
             write_set: Vec::new(),
@@ -434,7 +451,7 @@ impl Dataset {
             #[cfg(test)]
             pause_after_row_id_claim: None,
             #[cfg(test)]
-            pause_after_graph_apply: None,
+            pause_before_manifest_commit: None,
         }
     }
 
@@ -462,7 +479,6 @@ pub struct Transaction {
     /// cloning the whole `Manifest` at `begin()` time (as earlier Phase 6
     /// commits did) was pure waste: every field but `version` went unused.
     base_version: u64,
-    graph: Arc<HnswIndex>,
     pending: Vec<RecordBatch>,
     /// Row-ids queued for tombstoning by [`Transaction::delete`]/
     /// [`Transaction::update`], applied at commit time (see
@@ -494,10 +510,11 @@ pub struct Transaction {
     /// claimed but nothing shared has been touched yet. See [`Checkpoint`].
     #[cfg(test)]
     pause_after_row_id_claim: Option<Checkpoint>,
-    /// Test-only: stops this commit at the instant its vectors are in the
-    /// shared graph but the commit is not yet durable. See [`Checkpoint`].
+    /// Test-only: stops this commit inside `commit_lock`, after its
+    /// conflict check has passed and its segment is already fsynced, but
+    /// before `commit_manifest` makes any of it durable. See [`Checkpoint`].
     #[cfg(test)]
-    pause_after_graph_apply: Option<Checkpoint>,
+    pause_before_manifest_commit: Option<Checkpoint>,
 }
 
 /// Test-only rendezvous that stops a [`Transaction::commit`] at an exact
@@ -586,80 +603,43 @@ pub(crate) fn checkpoint_pair() -> (Checkpoint, CheckpointControl) {
     )
 }
 
-/// Undoes this commit's in-memory graph inserts if the commit never reaches
-/// its durability point.
+/// **Inert as of S1 W3.2a. Deleted in W3.2b.**
 ///
-/// [`Transaction::commit`] applies each `Insert` delta's vector to the
-/// shared `Arc<HnswIndex>` *before* `commit_manifest` makes the commit
-/// durable — a Phase 5 optimization (apply only this commit's own new
-/// deltas instead of replaying all history) layered on top of the spec's
-/// disk-based model, which has no such in-memory step. Without this guard,
-/// any failure between the first `graph.insert` and a successful
-/// `commit_manifest` leaves that transaction's vectors in the shared graph
-/// with no manifest entry backing them. Their row-ids were already claimed
-/// by `write_phase`, so the *next* successful commit persists a
-/// `manifest.next_row_id` past them and publishes a `watermark` covering
-/// them — at which point [`crate::Snapshot::is_visible`] starts passing and
-/// `vector_search` returns them as dangling hits: rows `scan` can never
-/// see, because their data files never entered the manifest. Row-id gaps
-/// from a failed attempt are explicitly safe (spec §8); a *searchable* gap
-/// is not, and is exactly what the "no silently stale vector search
-/// results" claim rules out.
+/// Until W3.2a, [`Transaction::commit`] applied each insert's vector to a
+/// shared `Arc<HnswIndex>` *before* `commit_manifest` made the commit
+/// durable, so any failure in between left that transaction's vectors in
+/// the shared graph with no manifest entry backing them — and a later
+/// commit's watermark would eventually make them visible to
+/// [`crate::Snapshot::vector_search`] as dangling hits: rows `scan` could
+/// never corroborate. This guard soft-deleted them on the way out (on an
+/// early `?` return *or* a panic).
 ///
-/// On drop this soft-deletes every row-id it recorded, unless
-/// [`Self::disarm`] was called — which happens only once `commit_manifest`
-/// has succeeded and those rows are genuinely committed. Being a `Drop`
-/// impl rather than an `if let Err(..)` arm, it fires on **both** an early
-/// `?` return and a panic unwinding out of the apply loop.
+/// **That hazard no longer exists, by construction rather than by
+/// compensation.** A commit's vectors now only ever exist in a fresh,
+/// per-commit `HnswIndex` that is dropped with the failed `write_phase`,
+/// plus an orphaned `.seg` file that no manifest references — exactly like
+/// an orphaned row data file, and exactly as invisible. There is no shared
+/// graph left to leave residue in.
 ///
-/// It must be declared *after* `commit`'s `commit_lock` guard, so
-/// reverse-declaration drop order runs this compensation before the lock is
-/// released, rather than leaving residue live for the next committer to
-/// build on.
-///
-/// **What this closes, and what covers the rest.** This guard is what
-/// guarantees no *permanent* residue: once the failing committer returns,
-/// nothing it inserted is reachable by any later search. It is deliberately
-/// not what keeps a residue row-id invisible *while* the failing commit is
-/// still running — between its `graph.insert` and this guard firing, the
-/// row is physically in the shared graph, and readers take no
-/// `commit_lock`. That narrower window is [`crate::row_id`]'s job: the
-/// row-ids were claimed before the lock and stay registered as in-flight
-/// until this transaction reaches its durability point, so every snapshot
-/// published in the meantime excludes them. The two compose — the
-/// exclusion set hides the residue while the commit is in flight, and this
-/// guard removes it before the claim is released, so there is no instant at
-/// which the row is both un-excluded and still in the graph.
-///
-/// The same in-flight exclusion also covers the *success* path, which this
-/// guard never touched: before it existed, a reader could see a row between
-/// another transaction's `graph.insert` and its `commit_manifest` even when
-/// that commit went on to succeed — a plain violation of spec §2's "not
-/// visible to any other transaction until commit succeeds."
+/// The type survives this workstream's first step deliberately, per the
+/// base design doc §4's "migrate the guarantee, then remove the mechanism"
+/// sub-sequencing: the failed-commit tests land against a state where the
+/// old mechanism is still present and provably doing nothing, which proves
+/// the guarantee moved rather than trusting that it did. W3.2b (its own
+/// plan) then deletes the type, its two call sites, and this comment.
 struct GraphResidueGuard {
-    /// Its own `Arc` clone rather than a borrow of `Transaction::graph`, so
-    /// `commit` can still move that field into the new `Snapshot`.
-    graph: Arc<HnswIndex>,
-    applied: Vec<u64>,
+    /// Whether this commit is still short of its durability point. Read by
+    /// `Drop` below; set false by [`Self::disarm`] once `commit_manifest`
+    /// has succeeded.
     armed: bool,
 }
 
 impl GraphResidueGuard {
-    fn new(graph: Arc<HnswIndex>) -> Self {
-        Self {
-            graph,
-            applied: Vec::new(),
-            armed: true,
-        }
+    fn new() -> Self {
+        Self { armed: true }
     }
 
-    /// Records a row-id whose vector has just entered the shared graph.
-    fn record(&mut self, row_id: u64) {
-        self.applied.push(row_id);
-    }
-
-    /// Marks this commit as past its durability point: the recorded row-ids
-    /// are genuinely committed now and must survive this guard's drop.
+    /// Marks this commit as past its durability point.
     fn disarm(&mut self) {
         self.armed = false;
     }
@@ -667,13 +647,22 @@ impl GraphResidueGuard {
 
 impl Drop for GraphResidueGuard {
     fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        for &row_id in &self.applied {
-            self.graph.remove(row_id);
+        if self.armed {
+            // Deliberately empty, not an omission — see this type's doc
+            // comment. A commit that never reached its durability point has
+            // nothing to compensate: its vectors were never published
+            // anywhere a reader can reach.
         }
     }
+}
+
+/// A commit's index segment, in the two forms `commit` needs: the manifest
+/// entry that makes it durable, and an already-validated reader over the
+/// same bytes that were just fsynced, so the new snapshot's `SegmentSet`
+/// needs no read-back.
+struct PublishedSegment {
+    entry: SegmentEntry,
+    reader: Arc<strata_index::SegmentReader>,
 }
 
 impl Transaction {
@@ -722,15 +711,15 @@ impl Transaction {
     }
 
     /// Test-only: makes this transaction's [`Self::commit`] fail at its
-    /// durability step, *after* its deltas have already been applied to the
-    /// shared graph. Models a recoverable I/O failure (e.g. ENOSPC writing
-    /// the manifest) — the one failure shape that leaves the process alive
-    /// and therefore exposes the dangling-search-hit hazard
-    /// [`GraphResidueGuard`] closes. The `chaos-injection` harness cannot
-    /// stand in for this: its `chaos_checkpoint` calls
-    /// `std::process::abort()`, and the restart that forces *heals* the
-    /// hazard, since `replay_index` rebuilds only from manifest-listed
-    /// delta logs.
+    /// durability step, *after* its segment (if any) has already been built
+    /// and fsynced in `write_phase` and its conflict check has passed
+    /// in-lock. Models a recoverable I/O failure (e.g. ENOSPC writing the
+    /// manifest) — the one failure shape that leaves the process alive and
+    /// therefore exposes the dangling-search-hit hazard [`GraphResidueGuard`]
+    /// used to compensate for. The `chaos-injection` harness cannot stand in
+    /// for this: its `chaos_checkpoint` calls `std::process::abort()`, and
+    /// the restart that forces *heals* the hazard, since a restart's
+    /// `Dataset::open` loads only manifest-listed segments.
     #[cfg(any(test, loom))]
     pub(crate) fn inject_manifest_commit_failure(&mut self) {
         self.inject_manifest_commit_failure = true;
@@ -745,13 +734,14 @@ impl Transaction {
         self.pause_after_row_id_claim = Some(checkpoint);
     }
 
-    /// Test-only: stops [`Self::commit`] once its vectors are in the shared
-    /// graph but `commit_manifest` has not yet made them durable — the
-    /// instant at which an uncommitted row is physically reachable by a
-    /// reader that takes no lock.
+    /// Test-only: stops [`Self::commit`] inside `commit_lock`, after the
+    /// conflict check and after this commit's `.seg` file is durable, but
+    /// before `commit_manifest`. The instant at which a concurrent reader
+    /// could observe a partially-applied commit, if one were possible —
+    /// after W3.2a it is not, because nothing shared has been touched yet.
     #[cfg(test)]
-    pub(crate) fn pause_after_graph_apply(&mut self, checkpoint: Checkpoint) {
-        self.pause_after_graph_apply = Some(checkpoint);
+    pub(crate) fn pause_before_manifest_commit(&mut self, checkpoint: Checkpoint) {
+        self.pause_before_manifest_commit = Some(checkpoint);
     }
 
     /// Tombstones `row_id` and inserts `batch` as its replacement, within
@@ -767,21 +757,29 @@ impl Transaction {
     }
 
     /// Commits per spec §3's write/durability steps (3-5), with Phase 6's
-    /// real conflict check (§3.1/§3.2) in front of them. Data files are
-    /// written outside any lock (they are unique to this transaction);
-    /// then, inside `Dataset.commit_lock`, the *latest* committed snapshot
-    /// is re-read (not this transaction's stale `begin()`-time view),
+    /// real conflict check (§3.1/§3.2) in front of them. Data files and this
+    /// commit's index segment are both built and fsynced outside any lock in
+    /// `write_phase` (they are unique to this transaction); then, inside
+    /// `Dataset.commit_lock`, the *latest* committed snapshot is re-read (not
+    /// this transaction's stale `begin()`-time view), and
     /// `CommitLog::conflicts_with` checks every version that landed in
-    /// between against this transaction's write-set, and only if clean are
-    /// this commit's own new delta entries applied to the shared,
-    /// ever-growing `HnswIndex` graph (no full historical replay — see
-    /// `docs/superpowers/specs/2026-07-17-phase-5-mvcc-snapshot-isolation-design.md`).
-    /// A conflicting transaction leaves the graph completely untouched.
-    /// The new manifest and tombstone set are layered on top of the latest
+    /// between against this transaction's write-set.
+    ///
+    /// A conflicting transaction leaves the manifest — and therefore every
+    /// reader's index view — completely untouched. The new manifest,
+    /// segment list and tombstone set are layered on top of the latest
     /// snapshot's state, so a clean commit composes with whatever else
-    /// committed after this transaction began. Only after
-    /// `commit_manifest` succeeds is the new `Snapshot` swapped in. Any
-    /// `Dataset` handle sharing this same `ArcSwap` (including the one
+    /// committed after this transaction began. Only after `commit_manifest`
+    /// succeeds is the new `Snapshot` swapped in.
+    ///
+    /// **This commit's index segment is built, serialized and fsynced in
+    /// `write_phase`, outside `commit_lock`** — the real HNSW construction
+    /// cost is not in the critical section, and the in-lock step performs
+    /// no index mutation of any kind. An interrupted or unfsynced segment
+    /// write leaves an orphaned `.seg` file that no manifest references,
+    /// exactly like an orphaned row data file.
+    ///
+    /// Any `Dataset` handle sharing this same `ArcSwap` (including the one
     /// this transaction was created from) observes the new state on its
     /// next [`Dataset::snapshot`] call; nothing is mutated in place.
     ///
@@ -817,72 +815,48 @@ impl Transaction {
     /// row in this transaction's write-set, or (conservatively, with this
     /// transaction's entire write-set as the contested rows) if the
     /// bounded in-memory commit log has already evicted history needed to
-    /// prove cleanliness. A conflicting transaction applies none of its
-    /// deltas to the shared graph and leaves the manifest unadvanced.
+    /// prove cleanliness.
     ///
     /// Returns [`TxnError::NonFiniteVectorComponent`] if any pending batch's
     /// vector column contains a `NaN`/`Infinity` component — checked, and
-    /// rejected, before any file for that batch is written to disk. Also
-    /// returns an error if any pending batch fails to dictionary-encode, if
-    /// applying this commit's new deltas to the graph fails (e.g. a
-    /// dimension mismatch), or if the manifest commit's atomic rename fails.
+    /// rejected, before any file for that batch is written to disk. Returns
+    /// [`TxnError::Index`] wrapping a `DimensionMismatch` if this commit's
+    /// vectors disagree with each other or with the dimension already
+    /// established by committed segments — checked before the segment is
+    /// built, so a half-built segment can never be fsynced. Also returns an
+    /// error if any pending batch fails to dictionary-encode, if the segment
+    /// can't be serialized or written, or if the manifest commit's atomic
+    /// rename fails.
     ///
     /// **Every one of these leaves the dataset with nothing this transaction
-    /// wrote reachable by any later reader.** The manifest stays unadvanced,
-    /// so the new data/delta-log files are orphaned on disk and invisible to
-    /// [`crate::Snapshot::scan`], which reads only manifest-listed files.
-    /// That much has always held. What it does *not* cover on its own is the
-    /// shared in-memory graph: delta-application runs before the manifest
-    /// commit, so a failure after it would otherwise leave this
-    /// transaction's vectors physically in the graph, and a later commit's
-    /// watermark would eventually make them visible to
-    /// [`crate::Snapshot::vector_search`] — a hit `scan` could never
-    /// corroborate. [`GraphResidueGuard`] soft-deletes them on the way out
-    /// (on an early return *or* a panic), which is what makes "invisible"
-    /// true for the search path too, not just for `scan`. See that type for
-    /// the one narrower, pre-existing window this does not close.
+    /// wrote reachable by any later reader**, and needs no compensating
+    /// action to make that true. The manifest stays unadvanced, so this
+    /// commit's data files and its `.seg` file are orphaned on disk and
+    /// invisible to both [`crate::Snapshot::scan`] (which reads only
+    /// manifest-listed data files) and [`crate::Snapshot::vector_search`]
+    /// (which searches only manifest-listed segments). There is no shared
+    /// mutable graph for a failed commit to leave residue in — see
+    /// [`GraphResidueGuard`], which is inert as of W3.2a for exactly this
+    /// reason.
     ///
-    /// Three in-memory traces do outlive a failed commit, none of them
-    /// reachable as data: the row-ids it claimed (never recycled — a row-id
-    /// gap is explicitly safe, a *searchable* gap is not, spec §8); the
-    /// soft-deleted nodes themselves, which stay physically present as
-    /// traversal waypoints until Phase 8 compaction, so repeated failures
-    /// accumulate memory until restart; and, if this was the first-ever
-    /// vector commit, the graph's established dimension, which
-    /// `check_or_establish_dimension` sets permanently and no removal
-    /// resets. That last one means a retry at a *different* dimension stays
-    /// rejected for the rest of the session and then succeeds after a
-    /// restart (`replay_index` rebuilds from manifest-listed logs only) — a
-    /// typed error, never a wrong answer.
-    ///
-    /// **Formerly a known limitation, now closed:** earlier, a commit whose
-    /// pending batches had inconsistent vector dimensions across batches
-    /// could partially mutate the shared graph before failing — `Insert`
-    /// deltas are applied to the graph in pending-batch order, so a later
-    /// batch's dimension mismatch was only caught after an earlier batch's
-    /// deltas had already landed in the live, shared `HnswIndex`.
-    /// [`validate_vector_dimensions`] now runs before any delta is applied,
-    /// rejecting the entire commit — with zero graph mutation — the moment
-    /// any two pending batches (or a pending batch and the graph's
-    /// already-established dimension) disagree. The residual cases that
-    /// pre-validation alone cannot cover — a failure *after* the first delta
-    /// has landed, whether from a concurrent first-insert establishing a
-    /// different dimension between the pre-lock check and the in-lock apply,
-    /// an I/O failure in the manifest commit, or a panic mid-loop — are
-    /// covered by [`GraphResidueGuard`] instead.
+    /// Two in-memory traces do outlive a failed commit, neither reachable
+    /// as data: the row-ids it claimed (never recycled — a row-id gap is
+    /// explicitly safe, a *searchable* gap is not, spec §8), and the
+    /// orphaned `.seg` file itself, which stays on disk until a future
+    /// garbage-collection pass. Unlike before W3.2a, a failed first-ever
+    /// vector commit no longer poisons the session's established dimension:
+    /// that is read from the manifest's segments, which the failed commit
+    /// never joined.
     pub fn commit(self) -> Result<()> {
         let ts = issue_timestamp(&self.last_issued_timestamp)?;
         let data_dir = data_subdir(&self.dir);
 
-        let (new_data_files, inserts, mut claim) = self.write_phase(&data_dir, ts)?;
-        // Sourced from the current snapshot's segment set rather than from
-        // a live graph handle -- see `validate_vector_dimensions`' doc.
-        let established_dimension = self.current.load().index.established_dimension();
-        validate_vector_dimensions(&inserts, established_dimension)?;
+        let (new_data_files, new_segment, mut claim) = self.write_phase(&data_dir, ts)?;
 
-        // Test-only rendezvous: row-ids claimed, data files written, but
-        // `commit_lock` not yet acquired and the shared graph not yet
-        // touched. Absent entirely from production builds.
+        // Test-only rendezvous: row-ids claimed, data files written, this
+        // commit's segment (if any) already fsynced, but `commit_lock` not
+        // yet acquired and nothing shared touched. Absent entirely from
+        // production builds.
         #[cfg(test)]
         if let Some(checkpoint) = &self.pause_after_row_id_claim {
             checkpoint.arrive();
@@ -906,9 +880,9 @@ impl Transaction {
         let latest_snapshot = self.current.load_full();
         let latest_version = latest_snapshot.version;
 
-        // Conflict detection MUST run before any mutation of the shared
-        // graph: a transaction that turns out to conflict must leave the
-        // graph completely untouched.
+        // Conflict detection MUST run before the manifest is touched at all:
+        // a transaction that turns out to conflict must leave the manifest,
+        // and therefore every reader's index view, completely untouched.
         match commit_log.conflicts_with(self.base_version, latest_version, &self.write_set) {
             ConflictCheck::Clean => {}
             ConflictCheck::Conflict(contested_row_ids) => {
@@ -927,46 +901,21 @@ impl Transaction {
             .checked_add(1)
             .ok_or_else(|| TxnError::ManifestOverflow(format!("version {latest_version} + 1")))?;
 
-        // Apply only this commit's new deltas to the shared graph — the
-        // fix for the O(historical)-per-commit regression. Extending the
-        // same Arc'd instance every commit matches what every
-        // existing/future Snapshot's Arc<HnswIndex> already points at; what
-        // makes that safe is that a node is only ever *added* here, and
-        // `is_visible`'s watermark decides whether readers may see it. The
-        // graph does have a removal API (`HnswIndex::remove`, a soft-delete
-        // — the backend is `crates/index`'s own lock-free graph, not
-        // `hnsw_rs`), but its only use on this path is
-        // `GraphResidueGuard`'s undo of a commit that never became durable.
-        // Tombstones layer on top of the *latest*
-        // snapshot's set (not this transaction's stale begin()-time view),
-        // so a clean commit composes with everything that landed in
-        // between.
+        // Tombstones layer on top of the *latest* snapshot's set (not this
+        // transaction's stale begin()-time view), so a clean commit
+        // composes with everything that landed in between.
         let mut tombstones = latest_snapshot.tombstones.as_ref().clone();
-        // Declared after `commit_log` above, so reverse-declaration drop
-        // order compensates the shared graph *before* the commit lock is
-        // released on any early return or panic below. Tombstone deltas
-        // need no compensation: they only touch the `tombstones` local,
-        // which is discarded unless the new `Snapshot` is published.
+        // **No index mutation happens here, or anywhere else inside this
+        // lock.** This commit's segment was built and fsynced in
+        // `write_phase`, outside the lock; publishing it is the
+        // `manifest.segments.push` below, which is part of the same atomic
+        // manifest swap that publishes the row data. That is the entire
+        // point of the S1 W3.2 migration.
         //
-        // It must equally be declared *after* `claim`, for the same reason
-        // in the other direction: reverse-declaration drop order then
-        // scrubs the graph before the claim is released, so a residue
-        // row-id is never simultaneously un-excluded and still in the
-        // graph. Rebinding `claim` below this line would silently reopen
-        // the very window this whole mechanism closes, with every test
-        // still green — see [`GraphResidueGuard`]'s doc.
-        let mut residue_guard = GraphResidueGuard::new(Arc::clone(&self.graph));
-        for insert in inserts {
-            self.graph.insert_owned(insert.row_id, insert.vector)?;
-            residue_guard.record(insert.row_id);
-        }
-        // Test-only rendezvous: this commit's vectors are physically in the
-        // shared graph, but `commit_manifest` below has not yet made them
-        // durable. Absent entirely from production builds.
-        #[cfg(test)]
-        if let Some(checkpoint) = &self.pause_after_graph_apply {
-            checkpoint.arrive();
-        }
+        // Declared here, in the position the old graph-compensation guard
+        // occupied, so W3.2b's deletion diff is a straight removal — see
+        // [`GraphResidueGuard`], which is now inert.
+        let mut residue_guard = GraphResidueGuard::new();
 
         // The new manifest is likewise built from the latest snapshot's
         // manifest: this transaction's new data files are *appended* to
@@ -976,6 +925,13 @@ impl Transaction {
         let mut manifest = latest_snapshot.manifest.as_ref().clone();
         manifest.version = new_version;
         manifest.data_files.extend(new_data_files);
+        // The index side of the same atomic publish. Appended, never
+        // substituted: a concurrent, non-conflicting transaction's segment
+        // that landed after this one began is already in
+        // `latest_snapshot.manifest.segments` and must survive.
+        if let Some(published) = &new_segment {
+            manifest.segments.push(published.entry.clone());
+        }
         // The bound and the exclusion set this commit's snapshot will carry,
         // read as one unit under the allocator lock so they cannot disagree
         // — the disagreement being precisely the bug this closes. Every
@@ -1032,10 +988,19 @@ impl Transaction {
             tombstones.insert(*row_id);
         }
 
+        // Test-only rendezvous: this commit's `.seg` file and data files are
+        // durable and its conflict check has passed, but `commit_manifest`
+        // below has not yet made any of it visible. Absent entirely from
+        // production builds.
+        #[cfg(test)]
+        if let Some(checkpoint) = &self.pause_before_manifest_commit {
+            checkpoint.arrive();
+        }
+
         // Test-only fault injection modelling a recoverable I/O failure
         // (e.g. ENOSPC) of the durability step below, occurring *after* this
-        // commit's deltas have already been applied to the shared graph.
-        // Absent entirely from production builds.
+        // commit's segment has already been fsynced and its conflict check
+        // has passed. Absent entirely from production builds.
         #[cfg(any(test, loom))]
         if self.inject_manifest_commit_failure {
             return Err(TxnError::Io(std::io::Error::other(
@@ -1045,11 +1010,11 @@ impl Transaction {
 
         commit_manifest(&self.dir, &manifest)?;
 
-        // Past the durability point: this commit's graph inserts are now
-        // genuinely committed and must survive the guard's drop. Disarmed
-        // here rather than after the snapshot swap because *this* is the
-        // instant the rows become committed — nothing after it may undo
-        // them, even if a later step were to fail.
+        // Past the durability point: this commit is now genuinely committed
+        // and must survive the guard's drop. Disarmed here rather than
+        // after the snapshot swap because *this* is the instant the commit
+        // becomes durable — nothing after it may undo it, even if a later
+        // step were to fail.
         residue_guard.disarm();
 
         // Same instant, same reason: these row-ids are committed, so they
@@ -1070,11 +1035,22 @@ impl Transaction {
         // visible to future Dataset::snapshot() calls — the in-memory swap
         // must never run ahead of the on-disk durability point.
         let watermark = manifest.next_row_id.saturating_sub(1);
+        // The new snapshot's segment set is the previous snapshot's parts
+        // plus a reader over the very bytes just fsynced — no read-back.
+        let index = match new_segment {
+            Some(published) => latest_snapshot.index.with_appended(published.reader),
+            None => latest_snapshot.index.clone(),
+        };
+        debug_assert_eq!(
+            index.len(),
+            manifest.segments.len(),
+            "a snapshot's segment set must be exactly its manifest's segment list"
+        );
         let snapshot = Snapshot {
             dir: self.dir,
             version: new_version,
             manifest: Arc::new(manifest),
-            index: strata_index::SegmentSet::from_live(self.graph),
+            index,
             watermark,
             in_flight: visibility.in_flight,
             tombstones: Arc::new(tombstones),
@@ -1085,11 +1061,11 @@ impl Transaction {
     }
 
     /// Spec §3 step 3's durable write, run *before* `commit_lock` is
-    /// acquired. Claims this transaction's row-ids, writes its data and
-    /// delta-log files, and fsyncs them — none of which needs conflict
-    /// information to proceed, and none of which can collide with a
-    /// concurrent transaction's own writes, because every path it touches
-    /// is unique to this attempt.
+    /// acquired. Claims this transaction's row-ids, writes its data files,
+    /// builds and fsyncs this commit's index segment, and fsyncs the data
+    /// directory — none of which needs conflict information to proceed, and
+    /// none of which can collide with a concurrent transaction's own
+    /// writes, because every path it touches is unique to this attempt.
     ///
     /// The filename prefix comes from `write_attempt_counter`, **not**
     /// `base_version + 1`: two truly concurrent transactions can share the
@@ -1099,22 +1075,35 @@ impl Transaction {
     /// regardless of version, which is what makes doing any of this outside
     /// the lock safe at all.
     ///
-    /// Returns the new `DataFileEntry`s, this commit's delta entries, and
-    /// the row-id claim to hold until the commit reaches its durability
-    /// point (`None` for a delete-only transaction, which inserts no rows,
-    /// claims no row-ids, and has nothing to hide from concurrent readers).
+    /// Building the segment out here is the whole point of the S1 W3.2
+    /// migration: the real HNSW construction cost leaves the critical
+    /// section entirely, and an interrupted or unfsynced segment write is
+    /// just an orphaned file nothing points to — exactly like today's
+    /// orphaned row data files.
+    ///
+    /// Returns the new `DataFileEntry`s, this commit's published segment
+    /// (`None` for a commit that carries no vectors — see
+    /// [`Self::build_and_write_segment`]), and the row-id claim to hold
+    /// until the commit reaches its durability point (`None` for a
+    /// delete-only transaction, which inserts no rows, claims no row-ids,
+    /// and has nothing to hide from concurrent readers).
     ///
     /// # Errors
     ///
     /// Same conditions as [`Transaction::commit`]'s own doc comment:
-    /// dictionary-encoding failure, a non-finite vector component, an I/O
-    /// failure writing or fsyncing a file, or [`TxnError::ManifestOverflow`]
-    /// if the row-id range would run past `u64::MAX`.
+    /// dictionary-encoding failure, a non-finite vector component, a
+    /// vector-dimension disagreement, an I/O failure writing or fsyncing a
+    /// file, or [`TxnError::ManifestOverflow`] if the row-id range would run
+    /// past `u64::MAX`.
     fn write_phase(
         &self,
         data_dir: &Path,
         ts: i64,
-    ) -> Result<(Vec<DataFileEntry>, Vec<VectorInsert>, Option<RowIdClaim>)> {
+    ) -> Result<(
+        Vec<DataFileEntry>,
+        Option<PublishedSegment>,
+        Option<RowIdClaim>,
+    )> {
         // Skipped entirely when there's nothing to insert: a delete-only
         // transaction writes no new files, so there's no new directory
         // entry to create or fsync and no attempt_id needs reserving.
@@ -1122,7 +1111,7 @@ impl Transaction {
         // per `Dataset` lifetime; recreating it on every single commit
         // regardless of whether it had anything to write was redundant.
         if self.pending.is_empty() {
-            return Ok((Vec::new(), Vec::new(), None));
+            return Ok((Vec::new(), None, None));
         }
         for batch in &self.pending {
             for name in HIDDEN_COLUMNS {
@@ -1168,7 +1157,7 @@ impl Transaction {
         })?;
         let claim = self.row_ids.claim(total_rows)?;
         let mut new_data_files = Vec::new();
-        let deltas = Self::write_pending_batches(
+        let inserts = Self::write_pending_batches(
             &self.pending,
             data_dir,
             attempt_id,
@@ -1176,16 +1165,132 @@ impl Transaction {
             ts,
             &mut new_data_files,
         )?;
-        // Fsyncing each data file's *content* (already done inside
-        // write_batch) is not sufficient — the new directory entries
-        // themselves must also be fsynced, or a real power-loss crash
-        // can leave a file's bytes durable while the file itself is
-        // absent. Must happen before the graph update/manifest commit.
+
+        // Pre-validate before building anything: `insert_owned`'s only
+        // fallible path is dimension validation, so a ragged commit must be
+        // rejected before a half-built segment can be produced. Sourced
+        // from the current snapshot's segment set, not a live graph handle.
+        let established_dimension = self.current.load().index.established_dimension();
+        validate_vector_dimensions(&inserts, established_dimension)?;
+
+        let segment = Self::build_and_write_segment(data_dir, attempt_id, inserts)?;
+
+        // Fsyncing each file's *content* (already done inside `write_batch`
+        // and `write_bytes`) is not sufficient — the new directory entries
+        // themselves must also be fsynced, or a real power-loss crash can
+        // leave a file's bytes durable while the file itself is absent.
+        // Must happen before the manifest commit.
         strata_storage::sync_dir(data_dir)?;
-        Ok((new_data_files, deltas, Some(claim)))
+        Ok((new_data_files, segment, Some(claim)))
     }
 
-    /// Writes every pending batch's data file and delta-log file to
+    /// Builds this commit's index segment from `inserts`, writes and fsyncs
+    /// it as `{attempt_id:020}.seg`, and returns everything `commit` needs
+    /// to publish it — or `None` if this commit carries no vectors.
+    ///
+    /// **A vector-less commit writes no segment and pushes no
+    /// `SegmentEntry`** (post-W3.1 amendment §3c). That is simpler than
+    /// writing an empty segment, which would need its own `node_count == 0`
+    /// support in `SegmentReader`; `manifest.segments.len() == N` therefore
+    /// holds after N *vector-carrying* commits, not after N commits.
+    ///
+    /// The working index is keyed by **segment-local ordinals `0..N`**, not
+    /// by global row-ids (amendment §3b). Two reasons, both concrete:
+    /// `NodeTable` demand-allocates a fixed-size chunk per 65536-row-id
+    /// span regardless of how few ids land in it, so a 10-row commit at
+    /// row-id 5,000,000 would allocate a whole chunk for ten slots; and
+    /// keying `0..N` makes the segment's `row_ids` section a direct
+    /// positional dump that is ascending by construction, with no remap
+    /// pass.
+    ///
+    /// # Errors
+    ///
+    /// [`TxnError::Index`] if the working index rejects an insert or the
+    /// serializer rejects the built graph, [`TxnError::Io`] if the `.seg`
+    /// file can't be written or fsynced, or [`TxnError::TryFromInt`] if a
+    /// count doesn't fit its manifest field.
+    fn build_and_write_segment(
+        data_dir: &Path,
+        attempt_id: u64,
+        inserts: Vec<VectorInsert>,
+    ) -> Result<Option<PublishedSegment>> {
+        if inserts.is_empty() {
+            return Ok(None);
+        }
+        let node_count = inserts.len();
+        let index = new_hnsw_index(node_count)?;
+        let mut row_ids = Vec::with_capacity(node_count);
+        for (local, insert) in inserts.into_iter().enumerate() {
+            row_ids.push(insert.row_id);
+            index.insert_owned(u64::try_from(local)?, insert.vector)?;
+        }
+        let bytes = index.to_segment_bytes(&row_ids)?;
+
+        let name = format!("{attempt_id:020}.seg");
+        let path = data_dir.join(&name);
+        write_bytes(&path, &bytes)?;
+
+        // Built from the same buffer that was just fsynced — no read-back
+        // on the commit path (base design doc §4).
+        let reader = strata_index::SegmentReader::from_bytes(&bytes)?;
+
+        // Debug-only structural cross-check that what landed on disk parses
+        // back to the same segment. Excluded under `loom`: loom re-runs the
+        // model closure once per interleaving, and an extra whole-file read
+        // per commit would multiply an already-expensive model's I/O.
+        #[cfg(all(debug_assertions, not(loom)))]
+        {
+            match std::fs::read(&path)
+                .map_err(TxnError::from)
+                .and_then(|on_disk| {
+                    strata_index::SegmentReader::from_bytes(&on_disk).map_err(TxnError::from)
+                }) {
+                Ok(reread) => {
+                    debug_assert_eq!(
+                        reread.node_count(),
+                        reader.node_count(),
+                        "the fsynced segment must parse back to the same node count"
+                    );
+                    debug_assert_eq!(
+                        reread.row_id_range(),
+                        reader.row_id_range(),
+                        "the fsynced segment must parse back to the same row-id range"
+                    );
+                    debug_assert_eq!(
+                        reread.byte_len(),
+                        reader.byte_len(),
+                        "the fsynced segment must be exactly as long as the buffer written"
+                    );
+                }
+                Err(e) => debug_assert!(false, "the just-fsynced segment failed to re-read: {e}"),
+            }
+        }
+
+        // Non-empty (checked above) and strictly ascending (enforced by the
+        // serializer, which would have errored otherwise).
+        let (Some(&row_id_min), Some(&row_id_max)) = (row_ids.first(), row_ids.last()) else {
+            unreachable!("row_ids is non-empty: `inserts` was checked non-empty above")
+        };
+
+        let entry = SegmentEntry {
+            name,
+            format_version: strata_index::SEGMENT_FORMAT_VERSION,
+            vector_count: u64::try_from(node_count)?,
+            dimension: u32::try_from(index.established_dimension())?,
+            row_id_min,
+            row_id_max,
+            byte_len: u64::try_from(bytes.len())?,
+            // W3 ships this empty; W4 populates it. An absent or empty zone
+            // map must always mean "must scan", never "may prune".
+            zone_map: std::collections::HashMap::new(),
+        };
+        Ok(Some(PublishedSegment {
+            entry,
+            reader: Arc::new(reader),
+        }))
+    }
+
+    /// Writes every pending batch's data file to
     /// `data_dir`, assigning row-ids out of `claim` and appending
     /// each batch's `DataFileEntry` to `data_files` in place. Returns every
     /// [`VectorInsert`] produced across all pending batches, in order — the
@@ -1211,7 +1316,7 @@ impl Transaction {
     ///
     /// Returns an error under the same conditions as [`Transaction::commit`]'s
     /// own doc comment (dictionary-encoding failure, non-finite vector
-    /// component, or an I/O failure writing a data/delta-log file). Row-id
+    /// component, or an I/O failure writing a data file). Row-id
     /// overflow is no longer possible here — the whole range was bounds-checked
     /// when it was claimed.
     fn write_pending_batches(
@@ -1251,23 +1356,9 @@ impl Transaction {
             let file_name = format!("{attempt_id:020}-{i}.arrow");
             write_batch(&data_dir.join(&file_name), &encoded)?;
 
-            // Still written for now: Task 6 of the S1 W3.2a plan is what
-            // removes the delta-log path, so this task stays a pure
-            // relocation that every existing test proves unchanged.
-            let delta_file_name = format!("{attempt_id:020}-{i}.deltalog");
-            let deltas: Vec<DeltaEntry> = inserts
-                .iter()
-                .map(|insert| DeltaEntry::Insert {
-                    row_id: insert.row_id,
-                    vector: insert.vector.clone(),
-                })
-                .collect();
-            write_delta_log(&data_dir.join(&delta_file_name), &deltas)?;
-
             data_files.push(DataFileEntry {
                 name: file_name,
                 stats,
-                delta_log: delta_file_name,
             });
             all_inserts.extend(inserts);
             // Cannot overflow: `write_phase` sized the claim as the checked
@@ -1338,48 +1429,49 @@ fn new_hnsw_index(capacity: usize) -> Result<HnswIndex> {
 /// One billion rows is far beyond any realistic embedded dataset today;
 /// revisit if a real workload needs more — and change both constants
 /// together, since the two crates' values must stay equal.
+///
+/// Enforced in [`Dataset::open`] directly (it used to live in
+/// `replay_index`, which no longer exists).
 const MAX_REASONABLE_ROW_ID_CAPACITY: u64 = 1_000_000_000;
 
-/// Rebuilds a fresh `HnswIndex` plus its tombstone set by replaying every
-/// delta-log entry across every committed data file in `manifest`, in
-/// order. Used only by [`Dataset::open`] (crash recovery / process start) —
-/// `Transaction::commit` no longer calls this; it applies only its own new
-/// delta entries directly to the already-shared graph instead (see
-/// `docs/superpowers/specs/2026-07-17-phase-5-mvcc-snapshot-isolation-design.md`).
+/// Loads every segment `manifest` lists into a [`strata_index::SegmentSet`],
+/// in manifest order. This is what replaced delta-log replay: a segment is
+/// the durable built graph, so recovery is `O(bytes)` validation with zero
+/// distance evaluations and zero graph construction, rather than replaying
+/// every historical insert through `HnswIndex::insert_owned`.
+///
+/// Used only by [`Dataset::open`]. A freshly created dataset has no
+/// segments and starts from [`strata_index::SegmentSet::empty`].
 ///
 /// # Errors
 ///
-/// Returns an error if any delta-log file listed in `manifest` fails to
-/// read or parse, if `manifest.next_row_id` exceeds
-/// [`MAX_REASONABLE_ROW_ID_CAPACITY`], or (via [`TxnError::Index`]) if a
-/// replayed `DeltaEntry::Insert`'s vector length doesn't match the
-/// dimensionality established by the first vector ever inserted into the
-/// index.
-fn replay_index(dir: &Path, manifest: &Manifest) -> Result<(HnswIndex, imbl::HashSet<u64>)> {
-    if manifest.next_row_id > MAX_REASONABLE_ROW_ID_CAPACITY {
-        return Err(TxnError::UnreasonableCapacity(
-            manifest.next_row_id,
-            MAX_REASONABLE_ROW_ID_CAPACITY,
-        ));
-    }
-    let capacity = usize::try_from(manifest.next_row_id).unwrap_or(usize::MAX);
-    let index = new_hnsw_index(capacity)?;
-    let mut tombstones: imbl::HashSet<u64> = imbl::HashSet::new();
+/// Returns [`TxnError::UnsafeManifestPath`] if a segment name tries to
+/// escape `data/`, [`TxnError::Io`] if a listed segment can't be read,
+/// [`TxnError::CorruptSegment`] if a segment's on-disk length disagrees
+/// with the length the manifest records for it (a truncated or overwritten
+/// file), or [`TxnError::Index`] if a segment fails its own header/body
+/// validation.
+fn load_segments(dir: &Path, manifest: &Manifest) -> Result<strata_index::SegmentSet> {
     let data_dir = data_subdir(dir);
-    for entry in &manifest.data_files {
-        for delta in read_delta_log(&safe_join(&data_dir, &entry.delta_log)?)? {
-            match delta {
-                DeltaEntry::Insert { row_id, vector } => index.insert_owned(row_id, vector)?,
-                DeltaEntry::Tombstone { row_id } => {
-                    tombstones.insert(row_id);
-                }
-            }
+    let mut parts = Vec::with_capacity(manifest.segments.len());
+    for entry in &manifest.segments {
+        let path = safe_join(&data_dir, &entry.name)?;
+        let bytes = std::fs::read(&path)?;
+        // Checked before parsing so a truncated file is reported as the
+        // truncation it is, rather than as whichever internal check its
+        // remaining bytes happen to trip first. `SegmentEntry.byte_len`
+        // exists for exactly this (base design doc §3).
+        if u64::try_from(bytes.len())? != entry.byte_len {
+            return Err(TxnError::CorruptSegment(format!(
+                "segment {} is {} bytes on disk but the manifest records {}",
+                entry.name,
+                bytes.len(),
+                entry.byte_len
+            )));
         }
+        parts.push(Arc::new(strata_index::SegmentReader::from_bytes(&bytes)?));
     }
-    for row_id in &manifest.tombstones {
-        tombstones.insert(*row_id);
-    }
-    Ok((index, tombstones))
+    Ok(strata_index::SegmentSet::from_segments(parts))
 }
 
 /// One row's vector, ready to be inserted into a segment's working index.
@@ -1519,9 +1611,10 @@ fn validate_vector_dimensions(inserts: &[VectorInsert], established: usize) -> R
 /// `name` containing `..` or an absolute path (which `Path::join` would
 /// otherwise resolve/replace unchecked) must never let a corrupted/hostile
 /// manifest read a file outside the dataset's own `data/` directory.
-/// `DataFileEntry.name`/`.delta_log` are documented as "relative to the
-/// dataset's data/ directory" (`crates/storage/src/manifest.rs`) — this is
-/// what actually enforces that contract instead of merely documenting it.
+/// `DataFileEntry.name` and `SegmentEntry.name`
+/// (`crates/storage/src/manifest.rs`) are both documented as "relative to
+/// the dataset's data/ directory" — this is what actually enforces that
+/// contract instead of merely documenting it, for both.
 pub(crate) fn safe_join(data_dir: &Path, name: &str) -> Result<PathBuf> {
     let candidate = Path::new(name);
     let all_normal = candidate
@@ -2224,7 +2317,6 @@ mod tests {
             data_files: vec![DataFileEntry {
                 name: format!("{:020}-0.arrow", 1u64),
                 stats: std::collections::HashMap::new(),
-                delta_log: format!("{:020}-0.deltalog", 1u64),
             }],
             next_row_id: 3,
             tombstones: Vec::new(),
@@ -2232,14 +2324,6 @@ mod tests {
             commit_time_high_water: 0,
             segments: Vec::new(),
         };
-        // The delta log referenced above must exist too (replay_index reads
-        // it on open), but can be empty -- this test's batch has no vector
-        // column, so no Insert deltas were ever produced for it.
-        strata_index::write_delta_log(
-            &versions_dir_data.join(format!("{:020}-0.deltalog", 1u64)),
-            &[],
-        )
-        .unwrap();
         strata_storage::commit_manifest(&dir, &legacy_manifest).unwrap();
 
         // Open (must migrate the attempt-id counter away from 0) and commit
@@ -3275,7 +3359,7 @@ mod tests {
     }
 
     #[test]
-    fn reopening_a_dataset_rebuilds_the_vector_index_from_the_delta_log() {
+    fn reopening_a_dataset_loads_the_vector_index_from_the_manifests_segments() {
         let dir = temp_dir("delta-log-replay");
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
@@ -3303,10 +3387,10 @@ mod tests {
         txn.commit().unwrap();
         drop(ds);
 
-        // Force a real replay from disk, not an in-memory shortcut — this is
+        // Force a real load from disk, not an in-memory shortcut -- this is
         // the crash-recovery-equivalent test for the index (a fresh Dataset
-        // struct, same process, but the index cache is definitely rebuilt from
-        // the delta-log file, not carried over).
+        // struct, same process, but the segment set is definitely rebuilt
+        // from the .seg file the manifest lists, not carried over).
         let reopened = Dataset::open(&dir).unwrap();
         let results = reopened
             .snapshot()
@@ -3317,6 +3401,16 @@ mod tests {
         assert_eq!(
             results[0].row_id, 0,
             "row 0's vector [0,0,0] is the true nearest match"
+        );
+        assert_eq!(
+            reopened.snapshot().manifest.segments.len(),
+            1,
+            "one vector-carrying commit must have produced exactly one segment"
+        );
+        assert_eq!(
+            reopened.snapshot().index.len(),
+            1,
+            "the loaded segment set must match the manifest's segment list"
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -3418,7 +3512,6 @@ mod tests {
             data_files: vec![DataFileEntry {
                 name: "../../etc/passwd".to_string(),
                 stats: std::collections::HashMap::new(),
-                delta_log: "d.deltalog".to_string(),
             }],
             next_row_id: 0,
             tombstones: Vec::new(),
@@ -3427,10 +3520,6 @@ mod tests {
             segments: Vec::new(),
         };
         strata_storage::commit_manifest(&dir, &hostile).unwrap();
-        // The delta log must exist (empty is fine — it replays to zero
-        // entries) or Dataset::open's replay_index fails on a plain
-        // missing-file I/O error before scan ever sees the hostile name.
-        std::fs::write(dir.join("data").join("d.deltalog"), "").unwrap();
         let ds = Dataset::open(&dir).unwrap();
 
         let result = ds.snapshot().scan(&test_schema());
@@ -3558,6 +3647,59 @@ mod tests {
             ds.data_files().is_empty(),
             "an empty commit adds no data files"
         );
+        assert!(
+            ds.snapshot().manifest.segments.is_empty(),
+            "an empty commit adds no segments either"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_commit_whose_batch_has_no_vector_column_writes_no_segment_file() {
+        // Amendment §3c: a commit that carries rows but no vectors at all
+        // (no `"vector"` column on any pending batch) must publish zero
+        // segments -- not an empty one. Distinct from the zero-pending-batch
+        // case above: this commit writes a real data file, so `write_phase`
+        // runs the full path down to `build_and_write_segment`, which must
+        // still return `None` because `build_vector_inserts` produced no
+        // entries.
+        let dir = temp_dir("no-vector-column-no-segment");
+        let ds = Dataset::create(&dir).unwrap();
+
+        let batch = RecordBatch::try_new(
+            test_schema(),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let mut txn = ds.begin();
+        txn.insert(batch);
+        txn.commit().unwrap();
+
+        assert_eq!(
+            ds.data_files().len(),
+            1,
+            "the commit's row data must still be written"
+        );
+        assert!(
+            ds.snapshot().manifest.segments.is_empty(),
+            "a commit with no vector column must publish no SegmentEntry: {:?}",
+            ds.snapshot().manifest.segments
+        );
+        assert_eq!(
+            ds.snapshot().index.len(),
+            0,
+            "the snapshot's segment set must stay empty too"
+        );
+        let seg_files: Vec<_> = std::fs::read_dir(ds.data_dir())
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "seg"))
+            .collect();
+        assert!(
+            seg_files.is_empty(),
+            "no .seg file must have been written to data_dir: {seg_files:?}"
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3885,68 +4027,6 @@ mod tests {
         ];
         assert!(validate_vector_dimensions(&consistent, 3).is_ok());
         assert!(validate_vector_dimensions(&consistent, 0).is_ok());
-    }
-
-    #[test]
-    fn replay_index_applies_tombstone_entries_from_the_delta_log() {
-        // Well-separated clusters, not a 2-point fixture - hnsw_rs's
-        // unseeded layer-assignment RNG has repeatedly made tiny (2-3
-        // point) fixtures flaky elsewhere in this file and in
-        // crates/index/src/hnsw.rs's own tests (see cluster_vectors'/
-        // insert_cluster's doc comments); the same precaution applies here.
-        let dir = temp_dir("tombstone-replay");
-        let ds = Dataset::create(&dir).unwrap();
-
-        let near_cluster = cluster_vectors(15, [0.0, 0.0, 0.0], 0.01);
-        let far_cluster = cluster_vectors(15, [1000.0, 0.0, 0.0], 0.01);
-        let mut ids = vec![1i64; 15];
-        ids.extend(vec![2i64; 15]);
-        let mut vectors = near_cluster;
-        vectors.extend(far_cluster);
-        let batch = vector_batch(ids, vectors);
-        let mut txn = ds.begin();
-        txn.insert(batch);
-        txn.commit().unwrap();
-
-        // Hand-append a Tombstone entry for row 0 (the exact-match nearest
-        // neighbor in the near cluster) to the just-written delta-log file,
-        // simulating what a future real DELETE path (Phase 5/6) will
-        // produce - build_delta_entries itself never emits Tombstone
-        // entries today.
-        let data_dir = ds.data_dir();
-        let delta_log_path = data_dir.join(&ds.data_files()[0].delta_log);
-        let mut entries = strata_index::read_delta_log(&delta_log_path).unwrap();
-        entries.push(DeltaEntry::Tombstone { row_id: 0 });
-        strata_index::write_delta_log(&delta_log_path, &entries).unwrap();
-
-        drop(ds);
-        let reopened = Dataset::open(&dir).unwrap();
-        // k=3, matching this file's other vector_search tests against the
-        // same cluster shape (e.g. vector_search_with_predicate_only_returns_matching_rows) -
-        // production HNSW defaults (EF_SEARCH_DEFAULT=32, not the much
-        // wider tuned constants crates/index/src/hnsw.rs's own unit tests
-        // use) don't reliably surface a larger k against this fixture.
-        let results = reopened
-            .snapshot()
-            .vector_search(&[0.0, 0.0, 0.0], 3, None)
-            .unwrap();
-
-        assert_eq!(
-            results.len(),
-            3,
-            "the near cluster has 14 live rows left after the tombstone, all vastly \
-             closer than the far cluster, so the top 3 must still be fully populated: {results:?}"
-        );
-        assert!(
-            results.iter().all(|r| r.row_id != 0),
-            "the hand-tombstoned row must be excluded after replay: {results:?}"
-        );
-        assert!(
-            results.iter().all(|r| r.row_id < 15),
-            "every returned row must still be a genuine near-cluster neighbor, \
-             not a fallback to the far cluster: {results:?}"
-        );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -4320,7 +4400,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_rejects_inconsistent_batch_dimensions_before_touching_the_shared_graph() {
+    fn commit_rejects_inconsistent_batch_dimensions_without_publishing_any_segment() {
         // Regression test for the hazard the Phase 5 final whole-branch
         // review flagged: Transaction::commit applies Insert deltas to the
         // shared, ever-growing Arc<HnswIndex> in pending-batch order, so a
@@ -4340,6 +4420,7 @@ mod tests {
         let snapshot_before = ds.snapshot();
         let version_before = snapshot_before.version;
         let established_before = snapshot_before.index.established_dimension();
+        let segments_before = snapshot_before.manifest.segments.len();
         assert_eq!(
             established_before, 3,
             "the seed commit must have established dimension 3"
@@ -4411,39 +4492,40 @@ mod tests {
              regression this test exists to catch"
         );
 
-        // The assertion that actually discriminates fixed-from-buggy:
-        // row-id 1 (the mismatched transaction's first, individually-valid
-        // 3-d batch) must never have been physically inserted into the
-        // shared HnswIndex graph. Pre-fix, its `HnswIndex::insert` call
-        // succeeds (its dimension matches the graph's already-established
-        // one) before the second batch's 5-d insert fails -- silently
-        // mutating the graph even though the whole commit is rejected.
-        // `Snapshot::vector_search` can't observe this: it filters by
-        // `is_visible` (row_id <= watermark), and row-id 1's watermark is
-        // never advanced by this rejected commit either way, so it would
-        // hide the leaked row regardless of whether the fix exists. This
-        // instead calls `SegmentSet::search` directly on
-        // `snapshot_after.index` (wrapping the same shared `Arc<HnswIndex>`
-        // the failed commit mutated in place -- `pub(crate) index` is
-        // reachable from this same-crate test) with an always-true
-        // visibility predicate, bypassing the watermark filter entirely to
-        // see exactly what's physically in the graph.
+        // The assertion that actually discriminates fixed-from-buggy. Before
+        // W3.2a this checked that row-id 1 (the mismatched transaction's
+        // first, individually-valid 3-d batch) had not been inserted into a
+        // *shared* graph. There is no shared graph now, so the equivalent
+        // property is that the rejected commit published no segment at all:
+        // the manifest's segment list is unchanged, and so is the snapshot's
+        // in-memory view of it. A half-built segment reaching the manifest
+        // would show up here as a segment count of 2.
+        assert_eq!(
+            snapshot_after.manifest.segments.len(),
+            segments_before,
+            "a rejected commit must publish no segment: {:?}",
+            snapshot_after.manifest.segments
+        );
+        assert_eq!(
+            snapshot_after.index.len(),
+            segments_before,
+            "the snapshot's segment set must stay in lockstep with the manifest"
+        );
         let leaked = snapshot_after
             .index
             .search(&[1.0, 0.0, 0.0], 2, 200, |_| true)
             .unwrap();
         assert!(
             leaked.iter().all(|m| m.row_id != 1),
-            "row-id 1 must never have been inserted into the shared graph -- a rejected \
-             commit must apply zero of its deltas, not just the ones that come after the \
-             first failure: {leaked:?}"
+            "row-id 1 must not be searchable -- a rejected commit must apply zero \
+             of its vectors, not just the ones after the first failure: {leaked:?}"
         );
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn losing_transactions_graph_insert_never_lands_when_it_conflicts() {
+    fn losing_transactions_vectors_never_become_searchable_when_it_conflicts() {
         // Deterministic, not loom: both transactions begin from the same
         // snapshot, then commit sequentially (not concurrently) so which
         // one wins is fixed by test order, not explored interleavings —
@@ -4585,14 +4667,14 @@ mod tests {
         );
 
         // Positive controls, so the assertion above can't pass vacuously.
-        // The failed transaction really did reach the graph (it established
-        // the dimension, which no removal resets), and search itself really
-        // is working on this snapshot — so "not found" above means
-        // *excluded*, not "nothing was ever inserted" or "search is broken".
+        // Search itself really is working on this snapshot — so "not found"
+        // above means *excluded*, not "search is broken".
         assert_eq!(
             snapshot.index.established_dimension(),
             3,
-            "the failed commit's vector must genuinely have reached the graph"
+            "the seed commit established dimension 3; the failed commit contributes \
+             nothing to it, which is itself the W3.2a improvement -- a failed \
+             first-ever vector commit no longer poisons the session's dimension"
         );
         let seed_hit = snapshot.vector_search(&[0.0, 0.0, 0.0], 1, None).unwrap();
         assert_eq!(
@@ -4654,7 +4736,7 @@ mod tests {
         seed.commit().unwrap();
 
         let (claim_point, claimed) = checkpoint_pair();
-        let (apply_point, applied) = checkpoint_pair();
+        let (publish_point, ready_to_publish) = checkpoint_pair();
 
         // The slow transaction: inserts at distinctive, never-reused
         // coordinates so a hit for it is unambiguous.
@@ -4664,7 +4746,7 @@ mod tests {
             cluster_vectors(1, [900.0, 900.0, 900.0], 0.0),
         ));
         slow.pause_after_row_id_claim(claim_point);
-        slow.pause_after_graph_apply(apply_point);
+        slow.pause_before_manifest_commit(publish_point);
         let slow_thread = std::thread::spawn(move || slow.commit());
 
         // Step 1: the slow transaction has claimed row-id 1 and written its
@@ -4684,10 +4766,16 @@ mod tests {
         ));
         other.commit().unwrap();
 
-        // Step 3: release the slow transaction as far as the shared graph,
-        // and stop it before `commit_manifest`. The window is now open.
+        // Step 3: release the slow transaction into `commit_lock` and stop
+        // it just before `commit_manifest`. Its `.seg` file is durable but
+        // no manifest references it, so -- unlike before W3.2a, when its
+        // vector was physically in the shared graph at this instant -- there
+        // is nothing for a reader to observe even in principle. The
+        // assertion below is now a structural guarantee rather than a
+        // race the in-flight registry has to win; it is kept because it is
+        // the end-to-end proof that the guarantee actually moved.
         claimed.release();
-        applied.wait();
+        ready_to_publish.wait();
 
         // Step 4: a reader thread races the apply loop. It takes no
         // `commit_lock`, so it runs freely while the slow commit is parked
@@ -4746,7 +4834,7 @@ mod tests {
         // Step 5: let the slow transaction finish. Its row is committed now,
         // so it must become visible — the fix must hide in-flight rows, not
         // committed ones.
-        applied.release();
+        ready_to_publish.release();
         slow_thread.join().unwrap().unwrap();
 
         let after = ds
@@ -4815,7 +4903,7 @@ mod tests {
         );
 
         // Same PID-reuse collision risk as
-        // `losing_transactions_graph_insert_never_lands_when_it_conflicts` —
+        // `losing_transactions_vectors_never_become_searchable_when_it_conflicts` —
         // see that test's cleanup comment for why this matters.
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -4862,7 +4950,7 @@ mod tests {
         );
 
         // Same PID-reuse collision risk as
-        // `losing_transactions_graph_insert_never_lands_when_it_conflicts` —
+        // `losing_transactions_vectors_never_become_searchable_when_it_conflicts` —
         // see that test's cleanup comment for why this matters.
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -5044,7 +5132,7 @@ mod loom_tests {
 
             // Both transactions begin (and capture their shared, fixed base
             // snapshot version) before either thread starts, mirroring the
-            // deterministic `losing_transactions_graph_insert_never_lands_when_it_conflicts`
+            // deterministic `losing_transactions_vectors_never_become_searchable_when_it_conflicts`
             // test above. This guarantees the two transactions are actually
             // concurrent (design doc §7's intent) instead of allowing loom
             // to explore a schedule where thread A's begin()-through-commit()
