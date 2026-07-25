@@ -37,8 +37,12 @@ pub fn write_delta_log(path: &Path, entries: &[DeltaEntry]) -> Result<(), IndexE
     // BufWriter coalesces them into 64 KiB writes.
     let mut writer = std::io::BufWriter::with_capacity(64 * 1024, file);
     for entry in entries {
-        let line = serde_json::to_string(entry)?;
-        writeln!(writer, "{line}")?;
+        // Writes directly into the buffered writer instead of building a
+        // per-entry String via to_string() first -- byte-identical output
+        // (same serializer, same bytes), one fewer heap allocation per
+        // entry.
+        serde_json::to_writer(&mut writer, entry)?;
+        writer.write_all(b"\n")?;
     }
     // Ordering is load-bearing: `into_inner` flushes the userspace buffer
     // into the OS *before* the fsync — `sync_all()` only flushes OS-level
