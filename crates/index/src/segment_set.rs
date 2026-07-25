@@ -122,6 +122,19 @@ impl SegmentSet {
         };
         index.established_dimension()
     }
+
+    /// Recovers the underlying live index, for callers that still need a bare
+    /// `Arc<HnswIndex>` — today, `Dataset::begin()` seeds a new `Transaction`'s
+    /// own `graph: Arc<HnswIndex>` field from the current snapshot's index this
+    /// way. Will need to change once a `SegmentSet` can hold more than one live
+    /// part or any `Sealed` part (not yet possible — see this file's module doc).
+    #[must_use]
+    pub fn live_arc(&self) -> Arc<HnswIndex> {
+        let [IndexPart::Live(index)] = self.parts.as_ref() else {
+            unreachable!("SegmentSet has exactly one Live part until W3.2")
+        };
+        Arc::clone(index)
+    }
 }
 
 #[cfg(all(test, not(loom)))]

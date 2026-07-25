@@ -9,7 +9,6 @@ use std::sync::Arc;
 use arrow::array::{Array, RecordBatch, UInt64Array};
 use arrow::compute::concat_batches;
 use arrow::datatypes::SchemaRef;
-use strata_index::HnswIndex;
 use strata_query::{Predicate, filter, mask, should_scan_file};
 use strata_storage::{DataFileEntry, Manifest, read_batch, read_batch_columns};
 
@@ -21,7 +20,7 @@ pub struct Snapshot {
     pub(crate) dir: PathBuf,
     pub(crate) version: u64,
     pub(crate) manifest: Arc<Manifest>,
-    pub(crate) graph: Arc<HnswIndex>,
+    pub(crate) index: strata_index::SegmentSet,
     pub(crate) watermark: u64,
     /// Row-id ranges claimed by transactions that had not yet committed
     /// when this snapshot was published — subtracted from `watermark`'s
@@ -255,7 +254,7 @@ impl Snapshot {
     ) -> Result<Vec<strata_index::VectorMatch>> {
         let Some(predicate) = predicate else {
             return Ok(self
-                .graph
+                .index
                 .search(query, k, EF_SEARCH_DEFAULT, |id| self.is_visible(id))?);
         };
 
@@ -270,7 +269,7 @@ impl Snapshot {
         let live_ids = self.row_ids_matching(predicate)?;
         let ef = widen_ef(EF_SEARCH_DEFAULT, self, predicate);
         Ok(self
-            .graph
+            .index
             .search_filtered(query, k, ef, &live_ids, |id| self.is_visible(id))?)
     }
 
@@ -349,15 +348,15 @@ mod tests {
             dir: PathBuf::from("unused-in-these-tests"),
             version: 1,
             manifest: Arc::new(Manifest::empty()),
-            graph: Arc::new(
-                HnswIndex::new(
+            index: strata_index::SegmentSet::from_live(Arc::new(
+                strata_index::HnswIndex::new(
                     MaxConnections(16),
                     MaxElements(100),
                     MaxLayers(16),
                     EfConstruction(200),
                 )
                 .unwrap(),
-            ),
+            )),
             watermark,
             in_flight: in_flight.into(),
             tombstones: Arc::new(tombstoned.iter().copied().collect()),

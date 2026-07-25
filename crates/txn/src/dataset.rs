@@ -289,7 +289,7 @@ impl Dataset {
             // A freshly created dataset has no transaction in flight.
             in_flight: Vec::new().into(),
             manifest: Arc::new(manifest),
-            graph: Arc::new(graph),
+            index: strata_index::SegmentSet::from_live(Arc::new(graph)),
             tombstones: Arc::new(imbl::HashSet::new()),
         };
         Ok(Self {
@@ -372,7 +372,7 @@ impl Dataset {
             // across a restart.
             in_flight: Vec::new().into(),
             manifest: Arc::new(manifest),
-            graph: Arc::new(graph),
+            index: strata_index::SegmentSet::from_live(Arc::new(graph)),
             tombstones: Arc::new(tombstones),
         };
         Ok(Self {
@@ -419,7 +419,7 @@ impl Dataset {
         Transaction {
             dir: self.dir.clone(),
             base_version: snapshot.version,
-            graph: Arc::clone(&snapshot.graph),
+            graph: snapshot.index.live_arc(),
             pending: Vec::new(),
             pending_tombstones: Vec::new(),
             write_set: Vec::new(),
@@ -1078,7 +1078,7 @@ impl Transaction {
             dir: self.dir,
             version: new_version,
             manifest: Arc::new(manifest),
-            graph: self.graph,
+            index: strata_index::SegmentSet::from_live(self.graph),
             watermark,
             in_flight: visibility.in_flight,
             tombstones: Arc::new(tombstones),
@@ -4255,7 +4255,7 @@ mod tests {
 
         let snapshot_before = ds.snapshot();
         let version_before = snapshot_before.version;
-        let established_before = snapshot_before.graph.established_dimension();
+        let established_before = snapshot_before.index.established_dimension();
         assert_eq!(
             established_before, 3,
             "the seed commit must have established dimension 3"
@@ -4321,7 +4321,7 @@ mod tests {
             "a rejected commit must not advance the visible version at all"
         );
         assert_eq!(
-            snapshot_after.graph.established_dimension(),
+            snapshot_after.index.established_dimension(),
             established_before,
             "sanity check only -- see the row-id-1-leak assertion below for the actual \
              regression this test exists to catch"
@@ -4338,14 +4338,14 @@ mod tests {
         // `is_visible` (row_id <= watermark), and row-id 1's watermark is
         // never advanced by this rejected commit either way, so it would
         // hide the leaked row regardless of whether the fix exists. This
-        // instead calls `HnswIndex::search` directly on
-        // `snapshot_after.graph` (the same shared `Arc<HnswIndex>` the
-        // failed commit mutated in place -- `pub(crate) graph` is
+        // instead calls `SegmentSet::search` directly on
+        // `snapshot_after.index` (wrapping the same shared `Arc<HnswIndex>`
+        // the failed commit mutated in place -- `pub(crate) index` is
         // reachable from this same-crate test) with an always-true
         // visibility predicate, bypassing the watermark filter entirely to
         // see exactly what's physically in the graph.
         let leaked = snapshot_after
-            .graph
+            .index
             .search(&[1.0, 0.0, 0.0], 2, 200, |_| true)
             .unwrap();
         assert!(
@@ -4506,7 +4506,7 @@ mod tests {
         // is working on this snapshot — so "not found" above means
         // *excluded*, not "nothing was ever inserted" or "search is broken".
         assert_eq!(
-            snapshot.graph.established_dimension(),
+            snapshot.index.established_dimension(),
             3,
             "the failed commit's vector must genuinely have reached the graph"
         );
