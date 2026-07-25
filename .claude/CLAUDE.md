@@ -17,7 +17,7 @@ The flagship claim: "correct under concurrent multi-agent writes, with no silent
 - **Linter:** `clippy` (workspace lints in root `Cargo.toml`: `clippy::all` + `clippy::pedantic` at warn, `unwrap_used`/`expect_used` at warn)
 - **Formatter:** `rustfmt` (`rustfmt.toml` — stable-only options; `imports_granularity`/`group_imports` are nightly-only and deliberately not used)
 - **Columnar library:** `arrow` (arrow-rs)
-- **HNSW library:** `hnsw_rs` (pure Rust — chosen over `usearch`'s Rust bindings specifically to avoid re-introducing a C++ core via FFI, which would undercut the reason for switching to Rust; see `docs/decisions/0005-rust-over-cpp-reversal.md`). Like every HNSW library audited (C++ or Rust), it doesn't expose graph internals for a native delta log — Strata's transaction shim maintains that log itself.
+- **HNSW library:** none — `crates/index` is a from-scratch, fully lock-free HNSW implementation, replacing an earlier `hnsw_rs` dependency (`docs/superpowers/specs/2026-07-18-lockfree-hnsw-rewrite-design.md`; the decision to fully replace rather than wrap/fork is justified narrowly by the lock-freedom requirement alone in `docs/superpowers/specs/2026-07-18-hnsw-rs-wrap-vs-replace-decision.md`). The only remaining external dependency is `anndists` (with the `simdeez_f` feature enabled), used solely for SIMD-accelerated distance kernels. No HNSW library audited (C++ or Rust) exposed graph internals for a native delta log — Strata's transaction shim maintains that log itself regardless.
 - **Python bindings:** PyO3 (modern `#[pymodule] mod { #[pymodule_export] ... }` form, not the older function-based API) + `maturin` for building wheels
 - **Concurrency correctness:** `loom` (exhaustive interleaving testing of locks/atomics/CAS loops — this is the whole reason Rust was the original recommendation) for `crates/txn`/`crates/index`. Phase 7's correctness harness (`tests/sim`, `crates/chaos-worker`) does NOT use `madsim`/`turmoil` as originally planned here — both were found to be async/tokio-shaped and a poor fit for this codebase's entirely synchronous production code (see `docs/superpowers/specs/2026-07-22-phase-7-correctness-harness-design.md` §2). Phase 7 instead follows Jepsen's methodology: real process spawn, real `std::process::abort()` at instrumented checkpoints, seed-reproducible scenarios. The instrumented checkpoints live behind an off-by-default `chaos-injection` Cargo feature that's functionally inert (no aborts) unless `STRATA_CHAOS_ABORT_AT` is set, and a package-scoped build (e.g. `cargo build --release -p strata-cli`) is fully clean of it — but `cargo build --workspace` (this file's own documented default) unifies `chaos-injection` into the shared `strata-storage` artifact, including the one the `strata` CLI binary links, because `crates/chaos-worker` requests it as a normal workspace dependency. Don't leave `STRATA_CHAOS_ABORT_AT` set in your shell when running a `--workspace`-built `strata` binary — that's the one combination that would actually trigger an unwanted abort.
 
@@ -81,16 +81,16 @@ Pick the tier that matches the task's complexity, not the biggest model availabl
 |------|-------|
 | Trivial — search, read, copy, simple lookups | Haiku 4.5 |
 | Implementation — basic to medium complexity (DEFAULT) | Sonnet 5 |
-| In-depth planning, architecture, highly complex implementation | Fable 5 — fall back to Opus 4.8 if Fable 5 isn't available |
-| Review — every completed task, before it's marked done | Opus 4.8 (mandatory, not an escalation) |
+| In-depth planning, architecture, highly complex implementation | Fable 5 — fall back to Opus 5 if Fable 5 isn't available |
+| Review — every completed task, before it's marked done | Opus 5 (mandatory, not an escalation) |
 
-**Escalate** Sonnet 5 → Fable 5 (→ Opus 4.8 if Fable 5 is unavailable) when: the task is architectural, security-critical, the approach is genuinely unclear, or a wrong call here is expensive to undo. Given this project's flagship subsystem (Phase 6 concurrency engine) is exactly that kind of work by design, escalate liberally when touching `crates/txn/`.
+**Escalate** Sonnet 5 → Fable 5 (→ Opus 5 if Fable 5 is unavailable) when: the task is architectural, security-critical, the approach is genuinely unclear, or a wrong call here is expensive to undo. Given this project's flagship subsystem (Phase 6 concurrency engine) is exactly that kind of work by design, escalate liberally when touching `crates/txn/`.
 
 **Downgrade** back to Sonnet 5 once the approach is settled and the remaining work is mechanical.
 
-**Review is not optional.** Every task — regardless of which model implemented it — goes through an Opus 4.8 review (the `reviewer` subagent) before it's marked done.
+**Review is not optional.** Every task — regardless of which model implemented it — goes through an Opus 5 review (the `reviewer` subagent) before it's marked done.
 
-Never drive a main session on Haiku 4.5. Never skip the Opus 4.8 review step to save time.
+Never drive a main session on Haiku 4.5. Never skip the Opus 5 review step to save time.
 
 ## What "done" means
 
@@ -100,7 +100,7 @@ Before claiming work is complete:
 2. `cargo test --workspace` passes
 3. `cargo clippy --workspace --all-targets -- -D warnings` is clean
 4. New behavior has a test (TDD for non-trivial logic) — for anything touching `crates/txn/` or `crates/index/`, that includes a `loom` interleaving test, not just a happy-path unit test
-5. Reviewed by the `reviewer` subagent (Opus 4.8) — no task is marked done without this, regardless of which model implemented it
+5. Reviewed by the `reviewer` subagent (Opus 5) — no task is marked done without this, regardless of which model implemented it
 
 ## Skills — when to invoke
 

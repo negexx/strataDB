@@ -71,10 +71,12 @@ mod tests {
     use super::*;
 
     fn temp_path(label: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "strata-delta-log-test-{label}-{}.jsonl",
-            std::process::id()
-        ))
+        tempfile::Builder::new()
+            .prefix(&format!("strata-delta-log-test-{label}-"))
+            .tempdir()
+            .unwrap()
+            .keep()
+            .join("delta.jsonl")
     }
 
     #[test]
@@ -96,7 +98,7 @@ mod tests {
         let read_back = read_delta_log(&path).unwrap();
 
         assert_eq!(read_back, entries);
-        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     #[test]
@@ -104,5 +106,6 @@ mod tests {
         let path = temp_path("missing");
         let result = read_delta_log(&path);
         assert!(result.is_err());
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 }

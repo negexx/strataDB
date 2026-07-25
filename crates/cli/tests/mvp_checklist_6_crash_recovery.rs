@@ -28,7 +28,11 @@ fn field(text: &str, key: &str) -> Option<u64> {
 
 #[test]
 fn crash_mid_write_recovers_last_committed_version() {
-    let dir = std::env::temp_dir().join(format!("strata-crash-test-{}", std::process::id()));
+    let dir = tempfile::Builder::new()
+        .prefix("strata-crash-test-")
+        .tempdir()
+        .unwrap()
+        .keep();
     let strata_bin = env!("CARGO_BIN_EXE_strata");
     let dir_str = dir.to_str().expect("temp dir path must be valid UTF-8");
 

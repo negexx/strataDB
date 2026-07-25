@@ -386,9 +386,36 @@ impl<D: Distance> Graph<D> {
     ) -> Result<(), crate::hnsw::IndexError> {
         self.check_or_establish_dimension(vector.len())?;
 
-        let level = assign_level(m_l, unif);
+        // Clamped to the same ceiling `pack` enforces (see `pack`'s doc
+        // comment): `assign_level`'s contract permits draws that produce
+        // an enormous level (up to `usize::MAX` for `unif == 0.0`, or a
+        // pathological `m_l` from `MaxConnections(1)`), which would
+        // overflow `compute_node_layout`'s per-layer arithmetic in
+        // `Node::new` — a deterministic panic. Clamping degrades that to a
+        // valid max-level node instead, consistent with `pack`'s own
+        // "clamp, never trust blindly" treatment of out-of-range levels.
+        // `cast_possible_truncation`: `LEVEL_MASK` is 255, which fits in
+        // `usize` on every supported target.
+        #[allow(clippy::cast_possible_truncation)]
+        let level = assign_level(m_l, unif).min(LEVEL_MASK as usize);
         let node = Node::new(row_id, vector, level, mmax0, mmax);
-        self.nodes.insert(row_id, node);
+        // A `row_id` past the node table's addressable range is rejected here
+        // rather than panicking on an out-of-bounds directory index. Zero
+        // graph *structure* is mutated — no node stored, entry point and
+        // edges untouched — since everything below this line is still
+        // unrun. (The one exception is `check_or_establish_dimension` above:
+        // if this were the graph's first-ever insert, it will already have
+        // locked in the vector dimension. That is an index-global property,
+        // not per-node state, and the pre-existing code established it and
+        // then panicked, so this is not a regression.) The `crates/txn`
+        // commit path already refuses such row-ids upstream; this makes the
+        // `pub` index self-defending for any other caller.
+        self.nodes
+            .insert(row_id, node)
+            .map_err(|e| crate::hnsw::IndexError::RowIdOutOfRange {
+                row_id,
+                capacity: e.capacity,
+            })?;
 
         let Some((mut entry, mut entry_level)) = self.entry_point.get() else {
             // First node in the graph: it IS the entry point, no
@@ -603,13 +630,10 @@ impl<D: Distance> Graph<D> {
     /// to serve as a live traversal waypoint for other queries (Stage 1's
     /// tombstone-flag-only scope — see design doc §1/§3). A no-op if
     /// `row_id` was never inserted.
-    // Not yet called from `HnswIndex` — the pre-rewrite `HnswIndex` never
-    // had a `delete` method (soft-delete lives at `crates/txn`'s
-    // conflict-resolution layer today), and Task 14's API-preservation
-    // constraint forbids adding new public surface here. This is Stage 1's
-    // tombstone primitive for a future `crates/txn` consumer; exercised
-    // today only by this module's own tests below.
-    #[allow(dead_code)]
+    // Reachable in production through `HnswIndex::remove`, which
+    // `crates/txn`'s commit path calls to undo an in-memory insert whose
+    // transaction failed before durably committing (see that crate's
+    // `GraphResidueGuard`).
     pub(crate) fn delete(&self, row_id: u64) {
         if let Some(node) = self.nodes.get(row_id) {
             node.mark_deleted();
@@ -1380,6 +1404,87 @@ mod tests {
                 1,
                 "row {row_id} must be findable after concurrent insertion"
             );
+        }
+    }
+
+    #[test]
+    fn concurrent_inserts_after_dimension_established_are_findable_and_vector_readable() {
+        use std::sync::Arc;
+
+        const THREADS: u64 = 16;
+        // THREADS + 1 is a small compile-time constant (17), nowhere near
+        // usize::MAX on any real target.
+        #[allow(clippy::cast_possible_truncation)]
+        let graph = Arc::new(Graph::new(crate::distance::L2, (THREADS + 1) as usize));
+        let m_l = 1.0 / (16f64).ln();
+
+        // Establish dimension 3 single-threaded first, so every concurrent
+        // insert below hits `check_or_establish_dimension`'s
+        // already-established fast path deterministically, rather than
+        // racing to establish it -- this test targets ordering *after*
+        // establishment, distinct from the pre-existing stress test above
+        // (which lets the first insert to land establish the dimension).
+        graph
+            .insert(
+                0,
+                vec![0.0, 0.0, 0.0],
+                16,
+                32,
+                16,
+                100,
+                m_l,
+                1.0,
+                test_unif(0),
+            )
+            .unwrap();
+
+        let handles: Vec<_> = (1..=THREADS)
+            .map(|row_id| {
+                let graph = Arc::clone(&graph);
+                std::thread::spawn(move || {
+                    graph
+                        .insert(
+                            row_id,
+                            vec![row_id as f32, 0.0, 0.0],
+                            16,
+                            32,
+                            16,
+                            100,
+                            m_l,
+                            1.0,
+                            test_unif(row_id),
+                        )
+                        .unwrap();
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        for row_id in 0..=THREADS {
+            // Vector read-back: every node's single-block storage must
+            // report its own vector correctly, keyed off the header's `dim`
+            // field that Task 3 introduced (see `node.rs`'s `vector()`) --
+            // not just be findable via search.
+            let node = graph.nodes.get(row_id).unwrap_or_else(|| {
+                panic!("row {row_id} must exist in the node table after concurrent insertion")
+            });
+            assert_eq!(
+                node.vector(),
+                &[row_id as f32, 0.0, 0.0],
+                "row {row_id}'s vector must read back correctly from single-block storage"
+            );
+
+            let results = graph
+                .k_nn_search(&[row_id as f32, 0.0, 0.0], 1, 200, |_| true)
+                .unwrap();
+            assert_eq!(
+                results.len(),
+                1,
+                "row {row_id} must be findable after concurrent insertion into single-block storage"
+            );
+            assert_eq!(results[0].0, row_id);
         }
     }
 
