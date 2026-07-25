@@ -6,6 +6,7 @@
 pub mod commit_log;
 pub mod dataset;
 pub mod error;
+pub(crate) mod live_set_cache;
 pub mod mvp_fixtures;
 pub(crate) mod row_id;
 pub mod snapshot;

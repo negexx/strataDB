@@ -32,6 +32,7 @@ use strata_storage::{
 
 use crate::commit_log::{CommitLog, ConflictCheck};
 use crate::error::{Result, TxnError};
+use crate::live_set_cache::LiveSetCache;
 use crate::row_id::{RowIdAllocator, RowIdClaim};
 use crate::snapshot::Snapshot;
 
@@ -243,6 +244,7 @@ impl Dataset {
             manifest: Arc::new(manifest),
             graph: Arc::new(graph),
             tombstones: Arc::new(imbl::HashSet::new()),
+            live_set_cache: LiveSetCache::new(crate::snapshot::LIVE_SET_CACHE_BYTE_BUDGET),
         };
         Ok(Self {
             dir,
@@ -324,6 +326,7 @@ impl Dataset {
             manifest: Arc::new(manifest),
             graph: Arc::new(graph),
             tombstones: Arc::new(tombstones),
+            live_set_cache: LiveSetCache::new(crate::snapshot::LIVE_SET_CACHE_BYTE_BUDGET),
         };
         Ok(Self {
             dir,
@@ -1064,6 +1067,10 @@ impl Transaction {
             watermark,
             in_flight: visibility.in_flight,
             tombstones: Arc::new(tombstones),
+            // A fresh, empty cache per commit — see `crate::live_set_cache`'s
+            // module doc: the previous snapshot's cache is dropped with it,
+            // not carried forward, which is what keeps this bounded.
+            live_set_cache: LiveSetCache::new(crate::snapshot::LIVE_SET_CACHE_BYTE_BUDGET),
         };
         self.current.store(Arc::new(snapshot));
 
@@ -2444,6 +2451,76 @@ mod tests {
         assert!(
             results.iter().all(|r| r.row_id >= 15),
             "predicate must narrow results to only the far (id=2) cluster: {results:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn vector_search_with_two_different_predicates_against_one_snapshot_stays_correct_for_both() {
+        // Regression coverage for the per-snapshot live-set cache
+        // (`crate::live_set_cache`): querying the SAME snapshot with two
+        // DIFFERENT predicates, one after the other, must never have the
+        // second query's live set contaminated by the first's cached one —
+        // exactly the failure mode a mis-keyed cache produces (a wrong but
+        // *silent* answer, not an error).
+        use strata_query::Predicate;
+        use strata_storage::Value;
+
+        let dir = temp_dir("vector-search-two-predicates-one-snapshot");
+        let ds = Dataset::create(&dir).unwrap();
+
+        let near_cluster = cluster_vectors(15, [0.0, 0.0, 0.0], 0.01);
+        let far_cluster = cluster_vectors(15, [1000.0, 0.0, 0.0], 0.01);
+        let mut ids = vec![1i64; 15];
+        ids.extend(vec![2i64; 15]);
+        let mut vectors = near_cluster;
+        vectors.extend(far_cluster);
+        let batch = vector_batch(ids, vectors);
+        let mut txn = ds.begin();
+        txn.insert(batch);
+        txn.commit().unwrap();
+
+        let snapshot = ds.snapshot();
+        let predicate_near = Predicate::Eq("id".to_string(), Value::Int64(1));
+        let predicate_far = Predicate::Eq("id".to_string(), Value::Int64(2));
+
+        // Query the far predicate FIRST, then the near one, so a cache keyed
+        // wrong (or not keyed at all) would hand the near query the far
+        // predicate's stale cached live set.
+        let far_results = snapshot
+            .vector_search(&[1000.0, 0.0, 0.0], 3, Some(&predicate_far))
+            .unwrap();
+        assert_eq!(far_results.len(), 3, "unexpected results: {far_results:?}");
+        assert!(
+            far_results.iter().all(|r| r.row_id >= 15),
+            "id=2 predicate must only return the far cluster: {far_results:?}"
+        );
+
+        let near_results = snapshot
+            .vector_search(&[0.0, 0.0, 0.0], 3, Some(&predicate_near))
+            .unwrap();
+        assert_eq!(
+            near_results.len(),
+            3,
+            "unexpected results: {near_results:?}"
+        );
+        assert!(
+            near_results.iter().all(|r| r.row_id < 15),
+            "id=1 predicate must only return the near cluster, not the \
+             other predicate's cached result: {near_results:?}"
+        );
+
+        // Re-querying the far predicate a second time must still be
+        // correct too (proves the cache didn't get overwritten by the
+        // intervening near-predicate query).
+        let far_again = snapshot
+            .vector_search(&[1000.0, 0.0, 0.0], 3, Some(&predicate_far))
+            .unwrap();
+        assert!(
+            far_again.iter().all(|r| r.row_id >= 15),
+            "re-querying id=2 after querying id=1 must still return the far \
+             cluster: {far_again:?}"
         );
 
         std::fs::remove_dir_all(&dir).ok();
