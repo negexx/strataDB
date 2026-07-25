@@ -2811,6 +2811,206 @@ mod tests {
     }
 
     #[test]
+    fn timestamps_and_the_high_water_mark_survive_reopen() {
+        let dir = temp_dir("timestamp-survives-reopen");
+        let ds = Dataset::create(&dir).unwrap();
+
+        let mut txn = ds.begin();
+        txn.insert(
+            RecordBatch::try_new(
+                test_schema(),
+                vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+            )
+            .unwrap(),
+        );
+        txn.commit().unwrap();
+
+        let high_water_before_close = ds.snapshot().manifest.commit_time_high_water;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(TIMESTAMP_COLUMN, DataType::Int64, false),
+        ]));
+        let timestamps_before_close: Vec<i64> = {
+            let batch = ds.snapshot().scan(&schema).unwrap();
+            let col = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .unwrap();
+            (0..batch.num_rows()).map(|i| col.value(i)).collect()
+        };
+        drop(ds);
+
+        // Reopen — this is the actual file-read path (dictionary-encoded,
+        // per design doc §9), not an in-memory batch, so this is the test
+        // that would catch a dictionary-encoding round-trip bug the
+        // in-memory-only tests above cannot.
+        let reopened = Dataset::open(&dir).unwrap();
+        let timestamps_after_reopen: Vec<i64> = {
+            let batch = reopened.snapshot().scan(&schema).unwrap();
+            let col = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .unwrap();
+            (0..batch.num_rows()).map(|i| col.value(i)).collect()
+        };
+        assert_eq!(
+            timestamps_before_close, timestamps_after_reopen,
+            "per-row timestamps must round-trip through the actual (dictionary-encoded) file format"
+        );
+
+        // A predicate against the reopened, dictionary-encoded column must
+        // still work - the comparison kernel unwraps dictionaries
+        // transparently, but this proves it end to end rather than trusting
+        // that in isolation.
+        let predicate = strata_query::Predicate::GtEq(
+            TIMESTAMP_COLUMN.to_string(),
+            strata_storage::Value::Int64(timestamps_after_reopen[0]),
+        );
+        let filtered = reopened
+            .snapshot()
+            .scan_with_predicate(&schema, &predicate)
+            .unwrap();
+        assert_eq!(
+            filtered.num_rows(),
+            3,
+            "all 3 rows share the same timestamp, so all must match"
+        );
+
+        // The issuance floor must also survive: commit again post-reopen and
+        // confirm the high-water mark never regressed across the restart.
+        let mut txn = reopened.begin();
+        txn.insert(
+            RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![4]))]).unwrap(),
+        );
+        txn.commit().unwrap();
+        assert!(
+            reopened.snapshot().manifest.commit_time_high_water >= high_water_before_close,
+            "commit_time_high_water must not regress across a restart"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn vector_search_with_timestamp_and_category_compound_predicate() {
+        use strata_query::Predicate;
+        use strata_storage::Value;
+
+        let dir = temp_dir("timestamp-compound-vector-search");
+        let ds = Dataset::create(&dir).unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("category", DataType::Utf8, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 3),
+                false,
+            ),
+        ]));
+
+        // Two commits, two clusters: near (category "a"), far (category
+        // "b"). Both share this test's helper cluster generator so recall
+        // is non-flaky (matching the precedent's own justification).
+        let near_cluster = cluster_vectors(10, [0.0, 0.0, 0.0], 0.01);
+        let far_cluster = cluster_vectors(10, [1000.0, 0.0, 0.0], 0.01);
+
+        let flat_near: Vec<f32> = near_cluster.iter().flatten().copied().collect();
+        let item_field = Arc::new(Field::new("item", DataType::Float32, false));
+        let vec_arr_near = Arc::new(arrow::array::FixedSizeListArray::new(
+            item_field.clone(),
+            3,
+            Arc::new(arrow::array::Float32Array::from(flat_near)),
+            None,
+        ));
+        let mut txn = ds.begin();
+        txn.insert(
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(arrow::array::StringArray::from(vec!["a"; 10])),
+                    vec_arr_near,
+                ],
+            )
+            .unwrap(),
+        );
+        txn.commit().unwrap();
+        let ts_after_first_commit = ds.snapshot().manifest.commit_time_high_water;
+
+        let flat_far: Vec<f32> = far_cluster.iter().flatten().copied().collect();
+        let vec_arr_far = Arc::new(arrow::array::FixedSizeListArray::new(
+            item_field,
+            3,
+            Arc::new(arrow::array::Float32Array::from(flat_far)),
+            None,
+        ));
+        let mut txn = ds.begin();
+        txn.insert(
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(arrow::array::StringArray::from(vec!["b"; 10])),
+                    vec_arr_far,
+                ],
+            )
+            .unwrap(),
+        );
+        txn.commit().unwrap();
+
+        let snapshot = ds.snapshot();
+
+        // category="a" alone would match the near cluster (10 pts).
+        // timestamp >= (after the first commit) alone would match only the
+        // second commit's rows (the far cluster, category "b"). The AND
+        // must match NEITHER in full - it needs category="a" (near
+        // cluster) AND a timestamp from the first commit, which the first
+        // commit's own rows satisfy trivially (>= its own timestamp).
+        let predicate = Predicate::And(
+            Box::new(Predicate::GtEq(
+                TIMESTAMP_COLUMN.to_string(),
+                Value::Int64(0),
+            )),
+            Box::new(Predicate::Eq(
+                "category".to_string(),
+                Value::Utf8("a".to_string()),
+            )),
+        );
+        let results = snapshot
+            .vector_search(&[0.0, 0.0, 0.0], 5, Some(&predicate))
+            .unwrap();
+        assert_eq!(results.len(), 5, "unexpected results: {results:?}");
+        assert!(
+            results.iter().all(|r| r.row_id < 10),
+            "timestamp>=0 AND category=a must return only the near cluster (row-ids 0..10): {results:?}"
+        );
+
+        // The sharper case: timestamp strictly after the first commit AND
+        // category="a" must match NOTHING - the only category="a" rows are
+        // from the first commit, whose timestamp is not >= a value taken
+        // after it.
+        let predicate_none = Predicate::And(
+            Box::new(Predicate::GtEq(
+                TIMESTAMP_COLUMN.to_string(),
+                Value::Int64(ts_after_first_commit + 1),
+            )),
+            Box::new(Predicate::Eq(
+                "category".to_string(),
+                Value::Utf8("a".to_string()),
+            )),
+        );
+        let empty_results = snapshot
+            .vector_search(&[0.0, 0.0, 0.0], 5, Some(&predicate_none))
+            .unwrap();
+        assert!(
+            empty_results.is_empty(),
+            "no row can satisfy a timestamp strictly after its own commit: {empty_results:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn reopening_a_dataset_rebuilds_the_vector_index_from_the_delta_log() {
         let dir = temp_dir("delta-log-replay");
         let schema = Arc::new(Schema::new(vec![
