@@ -10,6 +10,18 @@
 //! Addressed in `u64` "local ids" universally: for a live graph the local id
 //! IS the row-id (`row_id` is the identity function); a future segment's
 //! local id is a `u32` ordinal, zero-extended.
+//!
+//! **Reentrancy precondition:** implementations of this trait must never
+//! borrow `crate::graph`'s thread-local `SEARCH_SCRATCH` from within any of
+//! their methods. `search_layer_generic` (in `crate::graph`) calls every
+//! `NodeSource` method from inside its own active
+//! `SEARCH_SCRATCH.with_borrow_mut` closure, so a `NodeSource` method that
+//! itself tried to borrow `SEARCH_SCRATCH` — directly, or transitively
+//! through some other function that does — would hit a nested
+//! `RefCell::borrow_mut` and panic. `Graph<D>`'s own implementation below
+//! satisfies this today (it touches no scratch state); a future
+//! `NodeSource` implementation (e.g. a segment reader, from W3.2) must
+//! preserve it too.
 
 /// Traversal-time element access, implemented once per graph representation
 /// (today: `Graph<D>`; from W3.2: a segment reader).

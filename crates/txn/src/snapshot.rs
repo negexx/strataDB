@@ -1,7 +1,8 @@
 //! A point-in-time, immutable view of a [`Dataset`](crate::Dataset) — see
 //! `docs/superpowers/specs/2026-07-17-phase-5-mvcc-snapshot-isolation-design.md`.
-//! Every field is either `Copy` or `Arc`-wrapped, so cloning a `Snapshot` is
-//! cheap and never touches the data it points to.
+//! Every field is `Copy`, `Arc`-wrapped, or (for `index: SegmentSet`) itself
+//! just an `Arc<[_]>` internally, so cloning a `Snapshot` is cheap and never
+//! touches the data it points to.
 
 use std::path::PathBuf;
 use std::sync::Arc;

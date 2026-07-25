@@ -273,8 +273,8 @@ fn an_old_snapshots_vector_search_never_leaks_a_later_commits_rows() {
 
     // Second commit: a 20-point cluster centered 100,000 units away, with
     // DIFFERENT row-ids (20..39). These vectors are inserted directly into
-    // the SAME shared `HnswIndex` graph object `old_snapshot.graph` (an
-    // `Arc`) points at.
+    // the SAME shared `HnswIndex` graph object `old_snapshot.index` (an
+    // `Arc` inside its `SegmentSet`) points at.
     let far_center = [100_000.0, 0.0, 0.0];
     let far_cluster = cluster_vectors(CLUSTER_SIZE, far_center, 0.01);
     let far_rows: Vec<(i64, &str, [f32; 3])> = (0..CLUSTER_SIZE)

@@ -154,15 +154,14 @@ impl Ord for Candidate {
 /// `Graph::insert`'s connection-selection and shrink steps (not only via
 /// `search_layer`). Safe as plain `RefCell` (not a `Mutex`/atomic): nothing
 /// that borrows `SEARCH_SCRATCH` is ever called reentrantly on the same
-/// thread -- every borrow (`search_layer`'s own use, `Graph::insert`'s two
-/// direct uses, `k_nn_search_generic`'s two call sites into
+/// thread -- every borrow (`search_layer_generic`'s own use, `Graph::insert`'s
+/// two direct uses, `k_nn_search_generic`'s two call sites into
 /// `search_layer_generic`) runs to completion and releases before the next
-/// one starts, so a nested
-/// `borrow_mut()` can never happen. This also depends on every closure run
-/// while a borrow is live -- `search_layer`'s caller-supplied `filter`
-/// (threaded through from `HnswIndex::search`/`search_filtered`'s public,
-/// caller-controlled `impl Fn(u64) -> bool`), and `insert`'s own
-/// `pairwise_distance`-based closures passed to
+/// one starts, so a nested `borrow_mut()` can never happen. This also
+/// depends on every closure run while a borrow is live -- `search_layer_generic`'s
+/// caller-supplied `filter` (threaded through from `HnswIndex::search`/
+/// `search_filtered`'s public, caller-controlled `impl Fn(u64) -> bool`),
+/// and `insert`'s own `pairwise_distance`-based closures passed to
 /// `select_neighbors_heuristic_into` -- never calling back into anything
 /// that itself borrows `SEARCH_SCRATCH`. Every closure passed anywhere in
 /// this codebase today satisfies this, but it's an invariant on the
