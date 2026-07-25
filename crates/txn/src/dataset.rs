@@ -1313,6 +1313,8 @@ fn new_hnsw_index(capacity: usize) -> Result<HnswIndex> {
 // scale by `crates/index`'s own
 // `insert_batch_parallel_recall_matches_sequential_insert_within_tolerance`.
 // Judged an acceptable trade for the ~2.5x ingest speedup measured above.
+// `vector_search_bench` itself takes no thread-count knob, so reproducing
+// either number means editing this private const to 1 or 8 and rerunning it.
 const PARALLEL_INSERT_THREADS: usize = 8;
 
 /// Sane ceiling for a manifest's `next_row_id`, enforced at open before any

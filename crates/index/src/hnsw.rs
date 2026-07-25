@@ -121,8 +121,9 @@ const MIN_ROWS_PER_CHUNK: usize = 64;
 /// Test-only sentinel row-id that deterministically panics
 /// [`HnswIndex::insert_owned_chunk`] -- see that method's own comment on the
 /// injection point. `u64::MAX` rather than some arbitrary large constant:
-/// `crates/txn`'s row-id allocator enforces `next_row_id <=
-/// MAX_ROW_ID_CAPACITY` (strictly less than `u64::MAX`), so no real
+/// this crate's own `slot_array`'s `EMPTY` sentinel already reserves
+/// `u64::MAX` as never a real row-id (see its own doc), and `crates/txn`'s
+/// row-id allocator independently caps every real row-id at 1e9, so no real
 /// production row-id can ever collide with this value.
 #[cfg(test)]
 const PANIC_TEST_ROW_ID: u64 = u64::MAX;
@@ -544,7 +545,7 @@ impl HnswIndex {
     /// thread (the sequential-degenerate path: `rows.len() < 2`,
     /// `threads <= 1`, or `MIN_ROWS_PER_CHUNK` folding everything into one
     /// chunk) -- but still under the same `catch_unwind` protection as the
-    /// multi-worker fan-out below. Without this, a panic from
+    /// multi-worker fan-out in [`Self::insert_batch_parallel`]. Without this, a panic from
     /// `insert_owned` here would unwind straight out of
     /// `insert_batch_parallel`, dropping `applied` -- and every row already
     /// recorded into it -- along with it, exactly the hazard the fan-out's
