@@ -448,6 +448,8 @@ impl Dataset {
             last_issued_timestamp: Arc::clone(&self.last_issued_timestamp),
             #[cfg(any(test, loom))]
             inject_manifest_commit_failure: false,
+            #[cfg(any(test, loom))]
+            inject_panic_before_manifest_commit: false,
             #[cfg(test)]
             pause_after_row_id_claim: None,
             #[cfg(test)]
@@ -506,6 +508,20 @@ pub struct Transaction {
     /// flag armed for one transaction be consumed by another.
     #[cfg(any(test, loom))]
     inject_manifest_commit_failure: bool,
+    /// Test-only fault injection: makes [`Transaction::commit`] panic at
+    /// the instant between this commit's segment being fsynced and its
+    /// manifest being swapped in — the one window where a crash could, in
+    /// principle, leave a durable segment referenced by nothing. Distinct
+    /// from [`Self::inject_manifest_commit_failure`], which returns a typed
+    /// error at the same point: a panic unwinds through every guard and
+    /// `Drop` on the way out, which is the failure shape that would expose
+    /// a compensating action that only ran on the `?` path.
+    ///
+    /// Scoped to one `Transaction` rather than a thread-local for the same
+    /// reason as the sibling injector: `loom` multiplexes its model
+    /// threads.
+    #[cfg(any(test, loom))]
+    inject_panic_before_manifest_commit: bool,
     /// Test-only: stops this commit at the instant its row-ids have been
     /// claimed but nothing shared has been touched yet. See [`Checkpoint`].
     #[cfg(test)]
@@ -725,6 +741,12 @@ impl Transaction {
         self.inject_manifest_commit_failure = true;
     }
 
+    /// Test-only: see [`Self::inject_panic_before_manifest_commit`].
+    #[cfg(any(test, loom))]
+    pub(crate) fn inject_panic_before_manifest_commit(&mut self) {
+        self.inject_panic_before_manifest_commit = true;
+    }
+
     /// Test-only: stops [`Self::commit`] once this transaction's row-ids
     /// have been claimed and its data files written, but *before* it
     /// acquires `commit_lock` — so a concurrent committer can run to
@@ -853,6 +875,15 @@ impl Transaction {
     /// vector commit no longer poisons the session's established dimension:
     /// that is read from the manifest's segments, which the failed commit
     /// never joined.
+    ///
+    /// # Panics
+    ///
+    /// Only in test/loom builds, and only if this transaction's caller
+    /// explicitly armed [`Self::inject_panic_before_manifest_commit`]: this
+    /// then panics at the instant this commit's segment is fsynced but its
+    /// manifest is not, modelling a crash there. Absent entirely from
+    /// production builds and never triggered otherwise.
+    #[allow(clippy::too_many_lines)]
     pub fn commit(self) -> Result<()> {
         let ts = issue_timestamp(&self.last_issued_timestamp)?;
         let data_dir = data_subdir(&self.dir);
@@ -1053,6 +1084,15 @@ impl Transaction {
                 "injected manifest-commit failure (test fault injection)",
             )));
         }
+
+        // Test-only fault injection modelling a panic at the instant this
+        // commit's segment is durable but its manifest is not. Absent
+        // entirely from production builds.
+        #[cfg(any(test, loom))]
+        assert!(
+            !self.inject_panic_before_manifest_commit,
+            "injected panic between segment fsync and manifest swap (test fault injection)"
+        );
 
         commit_manifest(&self.dir, &manifest)?;
 
@@ -1963,6 +2003,105 @@ mod tests {
             .tempdir()
             .unwrap()
             .keep()
+    }
+
+    /// Every `.seg` file physically present in `ds`'s data directory that
+    /// the current manifest does **not** list. A failed commit must leave
+    /// exactly one — orphaned, not absent.
+    fn orphaned_segment_files(ds: &Dataset) -> Vec<String> {
+        let referenced: std::collections::HashSet<String> = ds
+            .snapshot()
+            .manifest
+            .segments
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        let mut orphans: Vec<String> = std::fs::read_dir(ds.data_dir())
+            .into_iter()
+            .flatten()
+            .filter_map(std::result::Result::ok)
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| {
+                std::path::Path::new(name)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("seg"))
+                    && !referenced.contains(name)
+            })
+            .collect();
+        orphans.sort();
+        orphans
+    }
+
+    /// Asserts base design §5's six-point list for a dataset whose most
+    /// recent commit failed, then reopens and asserts (a)-(d) again.
+    /// `attempted_query` is the failed commit's own vector, whose
+    /// distinctive coordinates make a hit for it unambiguous.
+    fn assert_failed_commit_left_no_trace(
+        dir: &std::path::Path,
+        ds: &Dataset,
+        version_before: u64,
+        segments_before: usize,
+        attempted_query: &[f32],
+    ) {
+        // (b) the visible version never advanced.
+        let snapshot = ds.snapshot();
+        assert_eq!(
+            snapshot.version, version_before,
+            "a failed commit must not advance the visible version"
+        );
+
+        // (d) no manifest entry names the orphaned segment, and the
+        // snapshot's in-memory segment set agrees with the manifest.
+        assert_eq!(
+            snapshot.manifest.segments.len(),
+            segments_before,
+            "a failed commit must publish no SegmentEntry: {:?}",
+            snapshot.manifest.segments
+        );
+        assert_eq!(
+            snapshot.index.len(),
+            segments_before,
+            "the snapshot's segment set must stay in lockstep with the manifest"
+        );
+
+        // (f) the orphan really was written -- without this the whole test
+        // would pass against an implementation that never wrote a segment.
+        let orphans = orphaned_segment_files(ds);
+        assert_eq!(
+            orphans.len(),
+            1,
+            "exactly one orphaned .seg file must exist on disk: {orphans:?}"
+        );
+
+        // (c) the attempted row is not searchable. Asserted by distance
+        // rather than by row-id so it cannot pass vacuously on an empty
+        // result set caused by a broken search.
+        let hits = snapshot.vector_search(attempted_query, 1, None).unwrap();
+        assert!(
+            hits.is_empty() || hits[0].squared_distance > 1000.0,
+            "the failed commit's vector must never be searchable: {hits:?}"
+        );
+
+        // (e) reopening reproduces all of the above. This is the assertion
+        // that catches an in-memory-only cleanup that never made it to disk.
+        let reopened = Dataset::open(dir).unwrap();
+        let reopened_snapshot = reopened.snapshot();
+        assert_eq!(reopened_snapshot.version, version_before);
+        assert_eq!(reopened_snapshot.manifest.segments.len(), segments_before);
+        assert_eq!(reopened_snapshot.index.len(), segments_before);
+        assert_eq!(
+            orphaned_segment_files(&reopened).len(),
+            1,
+            "the orphan must survive a reopen -- it is garbage, not corruption"
+        );
+        let reopened_hits = reopened_snapshot
+            .vector_search(attempted_query, 1, None)
+            .unwrap();
+        assert!(
+            reopened_hits.is_empty() || reopened_hits[0].squared_distance > 1000.0,
+            "the failed commit's vector must still not be searchable after a \
+             reopen: {reopened_hits:?}"
+        );
     }
 
     #[test]
@@ -4049,6 +4188,12 @@ mod tests {
         // runs the full path down to `build_and_write_segment`, which must
         // still return `None` because `build_vector_inserts` produced no
         // entries.
+        //
+        // Task 9 extends this with the delete-only-commit case below: a
+        // transaction that only tombstones rows likewise inserts nothing and
+        // must build no segment either, made explicit so it can't regress
+        // into "we write an empty segment and nobody noticed" (amendment
+        // §3c).
         let dir = temp_dir("no-vector-column-no-segment");
         let ds = Dataset::create(&dir).unwrap();
 
@@ -4084,6 +4229,22 @@ mod tests {
         assert!(
             seg_files.is_empty(),
             "no .seg file must have been written to data_dir: {seg_files:?}"
+        );
+
+        // And a delete-only commit likewise: nothing to insert, so no
+        // segment is built at all.
+        let mut deleting = ds.begin();
+        deleting.delete(0);
+        deleting.commit().unwrap();
+        assert!(
+            ds.snapshot().manifest.segments.is_empty(),
+            "a delete-only commit must publish no SegmentEntry either: {:?}",
+            ds.snapshot().manifest.segments
+        );
+        assert!(
+            orphaned_segment_files(&ds).is_empty(),
+            "no .seg file may be written at all for a delete-only commit -- \
+             not even an unreferenced one"
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -5510,6 +5671,267 @@ mod tests {
         // Same PID-reuse collision risk as
         // `losing_transactions_vectors_never_become_searchable_when_it_conflicts` —
         // see that test's cleanup comment for why this matters.
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_commit_failing_at_the_manifest_step_leaves_an_orphaned_segment_and_nothing_else() {
+        // Flavor 1 of base design §5's failed-commit test: a recoverable
+        // I/O failure (e.g. ENOSPC) at `commit_manifest`, injected at
+        // exactly that step -- after this commit's .seg file is already
+        // fsynced. Distinct from
+        // `a_failed_commits_vector_is_never_searchable_after_a_later_commit_advances_the_watermark`
+        // above, which uses the same injector to regression-test one
+        // specific hazard (a dangling search hit surfacing only after a
+        // *later* commit advances the watermark); this test asserts the
+        // full six-point list -- including that the orphan `.seg` file
+        // exists on disk and that a reopen reproduces everything -- against
+        // the very next observation, with no later commit involved.
+        let dir = temp_dir("failed-commit-io-orphan");
+        let ds = Dataset::create(&dir).unwrap();
+
+        let mut seed = ds.begin();
+        seed.insert(vector_batch(
+            vec![1i64],
+            cluster_vectors(1, [0.0, 0.0, 0.0], 0.0),
+        ));
+        seed.commit().unwrap();
+        let version_before = ds.snapshot().version;
+        let segments_before = ds.snapshot().manifest.segments.len();
+        assert_eq!(segments_before, 1, "the seed commit produced one segment");
+
+        let mut failing = ds.begin();
+        failing.insert(vector_batch(
+            vec![2i64],
+            cluster_vectors(1, [900.0, 900.0, 900.0], 0.0),
+        ));
+        failing.inject_manifest_commit_failure();
+        // (a)
+        let result = failing.commit();
+        assert!(
+            result.is_err(),
+            "the injected manifest-commit failure must make this commit fail, \
+             else this test proves nothing: {result:?}"
+        );
+
+        assert_failed_commit_left_no_trace(
+            &dir,
+            &ds,
+            version_before,
+            segments_before,
+            &[900.0, 900.0, 900.0],
+        );
+
+        // A subsequent commit must still succeed -- a failed commit leaves
+        // no state that blocks the next one.
+        let mut next = ds.begin();
+        next.insert(vector_batch(
+            vec![3i64],
+            cluster_vectors(1, [500.0, 500.0, 500.0], 0.0),
+        ));
+        next.commit().unwrap();
+        assert_eq!(ds.snapshot().manifest.segments.len(), segments_before + 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_conflicting_commit_leaves_an_orphaned_segment_and_nothing_else() {
+        // Flavor 2: a typed Conflict. The losing transaction wrote and
+        // fsynced its segment in `write_phase`, before the lock, so the
+        // orphan exists -- and must never be referenced. Distinct from
+        // `losing_transactions_vectors_never_become_searchable_when_it_conflicts`
+        // above, which only asserts (a) and (c); this test asserts the full
+        // six-point list, including the orphaned `.seg` file's on-disk
+        // existence and survival across a reopen.
+        let dir = temp_dir("failed-commit-conflict-orphan");
+        let ds = Dataset::create(&dir).unwrap();
+
+        let mut setup = ds.begin();
+        setup.insert(vector_batch(
+            vec![1i64],
+            cluster_vectors(1, [0.0, 0.0, 0.0], 0.0),
+        ));
+        setup.commit().unwrap();
+
+        // Both begin from the same snapshot, then commit sequentially, so
+        // which one loses is fixed by test order rather than by an explored
+        // interleaving -- there is no concurrency to model here, only a
+        // specific sequence to regression-test. Both use `update`, since a
+        // delete-only transaction inserts nothing and would build no
+        // segment at all.
+        let mut winner = ds.begin();
+        winner.update(
+            0,
+            vector_batch(vec![2i64], cluster_vectors(1, [500.0, 500.0, 500.0], 0.0)),
+        );
+        let mut loser = ds.begin();
+        loser.update(
+            0,
+            vector_batch(vec![3i64], cluster_vectors(1, [900.0, 900.0, 900.0], 0.0)),
+        );
+
+        winner.commit().unwrap();
+        let version_before = ds.snapshot().version;
+        let segments_before = ds.snapshot().manifest.segments.len();
+
+        // (a)
+        let result = loser.commit();
+        assert!(
+            matches!(result, Err(TxnError::Conflict { .. })),
+            "expected the second update to conflict on row 0, got {result:?}"
+        );
+
+        assert_failed_commit_left_no_trace(
+            &dir,
+            &ds,
+            version_before,
+            segments_before,
+            &[900.0, 900.0, 900.0],
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_panic_between_segment_fsync_and_manifest_swap_leaves_an_orphaned_segment_and_nothing_else()
+    {
+        // Flavor 3: a panic, not an early `?` return. This is the shape
+        // that would expose a compensating action wired only into the error
+        // path -- and, historically, the shape `GraphResidueGuard`'s `Drop`
+        // existed to survive. After W3.2a nothing needs to survive it,
+        // because nothing shared was ever touched; this test is what proves
+        // that rather than assuming it.
+        let dir = temp_dir("failed-commit-panic-orphan");
+        let ds = Dataset::create(&dir).unwrap();
+
+        let mut seed = ds.begin();
+        seed.insert(vector_batch(
+            vec![1i64],
+            cluster_vectors(1, [0.0, 0.0, 0.0], 0.0),
+        ));
+        seed.commit().unwrap();
+        let version_before = ds.snapshot().version;
+        let segments_before = ds.snapshot().manifest.segments.len();
+
+        // The default panic hook would print a backtrace for a panic this
+        // test deliberately causes, which is noise in an otherwise clean
+        // run. Suppressed only around the `catch_unwind`, then restored.
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        // (a) -- `Transaction` is not `UnwindSafe` (it holds `Arc`s and an
+        // `ArcSwap` handle), and it does not need to be: the panic happens
+        // before any shared state is mutated, and the only thing that could
+        // observe a torn value -- the manifest -- is never written on this
+        // path. `AssertUnwindSafe` records that reasoning explicitly.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut panicking = ds.begin();
+            panicking.insert(vector_batch(
+                vec![2i64],
+                cluster_vectors(1, [900.0, 900.0, 900.0], 0.0),
+            ));
+            panicking.inject_panic_before_manifest_commit();
+            panicking.commit()
+        }));
+        std::panic::set_hook(previous_hook);
+        assert!(
+            outcome.is_err(),
+            "the injected panic must actually unwind out of commit, else this \
+             test proves nothing"
+        );
+
+        assert_failed_commit_left_no_trace(
+            &dir,
+            &ds,
+            version_before,
+            segments_before,
+            &[900.0, 900.0, 900.0],
+        );
+
+        // A subsequent commit must still succeed -- the panic must not have
+        // left `commit_lock` poisoned in a way that blocks progress. (It
+        // does poison it; `commit` recovers a poisoned lock via
+        // `PoisonError::into_inner`, and this is what proves that path is
+        // still exercised and still correct after the guard went inert.)
+        let mut next = ds.begin();
+        next.insert(vector_batch(
+            vec![3i64],
+            cluster_vectors(1, [500.0, 500.0, 500.0], 0.0),
+        ));
+        next.commit().unwrap();
+        assert_eq!(ds.snapshot().manifest.segments.len(), segments_before + 1);
+        let after = ds
+            .snapshot()
+            .vector_search(&[500.0, 500.0, 500.0], 1, None)
+            .unwrap();
+        assert!(
+            after.first().is_some_and(|m| m.squared_distance < 0.001),
+            "the post-panic commit's vector must be searchable: {after:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn n_vector_carrying_commits_produce_exactly_n_segments_and_all_stay_searchable() {
+        // The design doc §4 proof criterion, with amendment §3c's
+        // correction applied -- and, because search fans out over every
+        // part (this plan's Scope decision), also the end-to-end proof that
+        // a row committed in segment 0 is still findable after segment 4
+        // lands. Without fan-out this second half fails. Distinct from
+        // `reopening_a_dataset_with_multiple_segments_finds_each_segments_own_cluster`,
+        // which only checks the *final* segment count and post-reopen
+        // fan-out across 3 segments; this test additionally asserts the
+        // per-commit invariant (`segments.len() == i + 1`) after each of 5
+        // commits, which is the design doc's literal proof criterion, not
+        // just a consequence observed at the end.
+        let dir = temp_dir("n-commits-n-segments");
+        let ds = Dataset::create(&dir).unwrap();
+
+        let centers = [
+            [0.0_f32, 0.0, 0.0],
+            [1000.0, 0.0, 0.0],
+            [0.0, 1000.0, 0.0],
+            [0.0, 0.0, 1000.0],
+            [1000.0, 1000.0, 1000.0],
+        ];
+        for (i, center) in centers.iter().enumerate() {
+            let mut txn = ds.begin();
+            txn.insert(vector_batch(
+                vec![i64::try_from(i).unwrap()],
+                cluster_vectors(1, *center, 0.0),
+            ));
+            txn.commit().unwrap();
+            assert_eq!(
+                ds.snapshot().manifest.segments.len(),
+                i + 1,
+                "one segment per vector-carrying commit"
+            );
+            assert_eq!(ds.snapshot().index.len(), i + 1);
+        }
+
+        for (i, center) in centers.iter().enumerate() {
+            let hits = ds.snapshot().vector_search(center, 1, None).unwrap();
+            assert_eq!(
+                hits.first().map(|m| m.row_id),
+                Some(u64::try_from(i).unwrap()),
+                "the row committed in segment {i} must still be the nearest match \
+                 for its own vector after every later segment landed: {hits:?}"
+            );
+        }
+
+        // And after a reopen, which loads all five from the manifest.
+        let reopened = Dataset::open(&dir).unwrap();
+        assert_eq!(reopened.snapshot().index.len(), 5);
+        for (i, center) in centers.iter().enumerate() {
+            let hits = reopened.snapshot().vector_search(center, 1, None).unwrap();
+            assert_eq!(
+                hits.first().map(|m| m.row_id),
+                Some(u64::try_from(i).unwrap()),
+                "segment {i}'s row must survive a reopen: {hits:?}"
+            );
+        }
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }
