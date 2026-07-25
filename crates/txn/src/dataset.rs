@@ -3821,6 +3821,101 @@ mod tests {
     }
 
     #[test]
+    fn open_errors_with_corrupt_segment_when_two_segments_in_one_manifest_disagree_on_dimension() {
+        // `load_segments`'s running `established_dimension` (see the doc
+        // comment just above it) is the *second* line of defense against
+        // Finding 1's dimension race: the in-lock check in `commit` makes
+        // this branch unreachable through the normal write path, so
+        // nothing in the existing suite ever exercises it. A future
+        // refactor could silently break or delete it with every other test
+        // staying green. Same hand-crafted-manifest technique as the
+        // sibling test just above (`..._on_an_unsafe_segment_entry`): no
+        // real commit path can ever produce two self-consistent segments
+        // at different dimensions in the same manifest, so the only way to
+        // exercise this branch is to fabricate one directly.
+        let dir_a = temp_dir("cross-segment-dimension-a");
+        let ds_a = Dataset::create(&dir_a).unwrap();
+        let mut txn = ds_a.begin();
+        txn.insert(vector_batch(
+            vec![1, 2],
+            vec![[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]],
+        ));
+        txn.commit().unwrap();
+
+        // A second, wholly separate dataset, committed to independently,
+        // whose vectors are 5-dimensional rather than A's 3 — producing a
+        // real, valid, self-consistent 5-d `.seg` file and `SegmentEntry`.
+        let dir_b = temp_dir("cross-segment-dimension-b");
+        let ds_b = Dataset::create(&dir_b).unwrap();
+        let schema_b = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 5),
+                false,
+            ),
+        ]));
+        let item_field = Arc::new(Field::new("item", DataType::Float32, false));
+        let flat: Vec<f32> = vec![
+            0.0, 0.0, 0.0, 0.0, 0.0, // row 1
+            1.0, 1.0, 1.0, 1.0, 1.0, // row 2
+        ];
+        let vec_arr = Arc::new(arrow::array::FixedSizeListArray::new(
+            item_field,
+            5,
+            Arc::new(arrow::array::Float32Array::from(flat)),
+            None,
+        ));
+        let batch_b = RecordBatch::try_new(
+            schema_b,
+            vec![Arc::new(Int64Array::from(vec![1i64, 2])), vec_arr],
+        )
+        .unwrap();
+        let mut txn_b = ds_b.begin();
+        txn_b.insert(batch_b);
+        txn_b.commit().unwrap();
+
+        let manifest_b = ds_b.snapshot().manifest.as_ref().clone();
+        assert_eq!(
+            manifest_b.segments.len(),
+            1,
+            "sanity: B's commit must have produced exactly one segment"
+        );
+        let mut foreign_entry = manifest_b.segments[0].clone();
+        assert_eq!(foreign_entry.dimension, 5);
+
+        // Copy B's real segment bytes into A's data/ dir under a name that
+        // doesn't collide with anything A itself ever generates (A's own
+        // segment names come from its own `write_attempt_counter`, which
+        // starts at 0), then point a hand-crafted `SegmentEntry` at it —
+        // dimension/byte_len/etc left exactly as B produced them, since the
+        // actual on-disk bytes must match what's declared.
+        let foreign_name = "foreign-5d.seg".to_string();
+        std::fs::copy(
+            data_subdir(&dir_b).join(&foreign_entry.name),
+            data_subdir(&dir_a).join(&foreign_name),
+        )
+        .unwrap();
+        foreign_entry.name = foreign_name;
+
+        let mut manifest_a = ds_a.snapshot().manifest.as_ref().clone();
+        manifest_a.version += 1;
+        manifest_a.segments.push(foreign_entry);
+        strata_storage::commit_manifest(&dir_a, &manifest_a).unwrap();
+
+        match Dataset::open(&dir_a) {
+            Err(TxnError::CorruptSegment(_)) => {}
+            Err(other) => panic!("expected CorruptSegment, got a different error: {other}"),
+            Ok(_) => panic!(
+                "open must not succeed against a manifest whose segments disagree on dimension"
+            ),
+        }
+
+        std::fs::remove_dir_all(&dir_a).ok();
+        std::fs::remove_dir_all(&dir_b).ok();
+    }
+
+    #[test]
     fn scan_errors_on_column_count_mismatch_between_physical_file_and_caller_schema() {
         let dir = temp_dir("schema-mismatch");
         let write_schema = test_schema(); // single "id" column
