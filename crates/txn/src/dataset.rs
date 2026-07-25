@@ -11,7 +11,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicI64, AtomicU64};
 
 #[cfg(loom)]
 use loom::sync::Mutex;
@@ -105,6 +105,10 @@ pub struct Dataset {
     /// complex active-transaction-lifetime tracking this was weighed
     /// against. See [`Dataset::insufficient_history_conflict_count`].
     insufficient_history_conflicts: Arc<AtomicU64>,
+    /// Lock-free issuance floor for `_timestamp` values — see
+    /// `issue_timestamp`. Seeded from `Manifest.commit_time_high_water` on
+    /// both `create` and `open`, so this floor survives a restart.
+    last_issued_timestamp: Arc<AtomicI64>,
 }
 
 /// The single source of truth for "where does this dataset's data live,
@@ -115,6 +119,40 @@ pub struct Dataset {
 /// independently.
 pub(crate) fn data_subdir(dir: &Path) -> PathBuf {
     dir.join("data")
+}
+
+/// Captures the current wall-clock time (microseconds since the Unix
+/// epoch) and issues it through `last_issued`, guaranteeing the returned
+/// value is never less than any value this `Dataset` has issued before —
+/// including across a wall-clock regression (an NTP step, a manual clock
+/// change), not just under concurrency. See
+/// `docs/superpowers/specs/2026-07-25-s1-w2-timestamp-column-design.md` §3.
+///
+/// No `Mutex` is needed here, unlike `RowIdAllocator`: there is no paired
+/// state that must advance atomically together, just one independent
+/// integer high-water mark — a single `fetch_max` is sufficient.
+///
+/// # Errors
+///
+/// Returns [`TxnError::ClockError`] if the system clock reports a time
+/// before the Unix epoch (`SystemTime::now() < UNIX_EPOCH`), or
+/// [`TxnError::TryFromInt`] if the current time in microseconds since the
+/// epoch overflows `i64` (not reachable before the year 292471, but
+/// checked rather than assumed).
+///
+/// Not yet called outside this module's own tests — `Transaction::commit`
+/// wiring it in to stamp each committed row's `_timestamp` column is a
+/// later task in this workstream, hence the otherwise-unused warning.
+#[allow(dead_code)]
+fn issue_timestamp(last_issued: &AtomicI64) -> Result<i64> {
+    let now_us = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| TxnError::ClockError(e.to_string()))?
+            .as_micros(),
+    )?;
+    let prev = last_issued.fetch_max(now_us, std::sync::atomic::Ordering::SeqCst);
+    Ok(prev.max(now_us))
 }
 
 /// Determines the correct starting value for `write_attempt_counter` on
@@ -231,6 +269,7 @@ impl Dataset {
         std::fs::create_dir_all(dir.join("data"))?;
         let manifest = Manifest::empty();
         commit_manifest(&dir, &manifest)?;
+        let last_issued_timestamp = Arc::new(AtomicI64::new(manifest.commit_time_high_water));
         let graph = new_hnsw_index(0)?;
         let row_ids = Arc::new(RowIdAllocator::new(manifest.next_row_id));
         let write_attempt_counter = Arc::new(AtomicU64::new(manifest.next_attempt_id));
@@ -251,6 +290,7 @@ impl Dataset {
             write_attempt_counter,
             commit_lock: Arc::new(Mutex::new(CommitLog::new(commit_log_capacity))),
             insufficient_history_conflicts: Arc::new(AtomicU64::new(0)),
+            last_issued_timestamp,
         })
     }
 
@@ -309,6 +349,7 @@ impl Dataset {
         // its own doc comment.
         let write_attempt_counter =
             Arc::new(AtomicU64::new(seed_write_attempt_counter(&manifest)?));
+        let last_issued_timestamp = Arc::new(AtomicI64::new(manifest.commit_time_high_water));
         let snapshot = Snapshot {
             dir: dir.clone(),
             version: manifest.version,
@@ -332,6 +373,7 @@ impl Dataset {
             write_attempt_counter,
             commit_lock: Arc::new(Mutex::new(CommitLog::new(COMMIT_LOG_CAPACITY))),
             insufficient_history_conflicts: Arc::new(AtomicU64::new(0)),
+            last_issued_timestamp,
         })
     }
 
@@ -377,6 +419,7 @@ impl Dataset {
             write_attempt_counter: Arc::clone(&self.write_attempt_counter),
             commit_lock: Arc::clone(&self.commit_lock),
             insufficient_history_conflicts: Arc::clone(&self.insufficient_history_conflicts),
+            last_issued_timestamp: Arc::clone(&self.last_issued_timestamp),
             #[cfg(any(test, loom))]
             inject_manifest_commit_failure: false,
             #[cfg(test)]
@@ -425,6 +468,11 @@ pub struct Transaction {
     write_attempt_counter: Arc<AtomicU64>,
     commit_lock: Arc<Mutex<CommitLog>>,
     insufficient_history_conflicts: Arc<AtomicU64>,
+    /// Not yet read outside `begin`'s construction of this field —
+    /// `Transaction::commit` consuming it via `issue_timestamp` is a later
+    /// task in this workstream, hence the otherwise-unused warning.
+    #[allow(dead_code)]
+    last_issued_timestamp: Arc<AtomicI64>,
     /// Test-only fault injection: makes [`Transaction::commit`]'s durability
     /// step fail, modelling a recoverable I/O error (e.g. ENOSPC) *after*
     /// this commit's deltas have already reached the shared graph. See
@@ -1551,6 +1599,35 @@ mod tests {
 
     fn temp_dir(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!("strata-txn-test-{label}-{}", std::process::id()))
+    }
+
+    #[test]
+    fn issue_timestamp_never_decreases_even_if_the_clock_would() {
+        let last_issued = std::sync::atomic::AtomicI64::new(0);
+
+        let first = issue_timestamp(&last_issued).unwrap();
+        assert!(
+            first > 0,
+            "a real clock read must be positive microseconds-since-epoch"
+        );
+
+        // Simulate a wall-clock regression (an NTP step backward) by seeding
+        // the atomic far ahead of any real clock reading it could compete
+        // against - `fetch_max` must keep the issued value at or above this,
+        // never let a subsequent "now()" that's smaller win.
+        last_issued.store(first + 1_000_000_000, std::sync::atomic::Ordering::SeqCst);
+        let second = issue_timestamp(&last_issued).unwrap();
+        assert_eq!(
+            second,
+            first + 1_000_000_000,
+            "issuance must never go backward, even against a clock read that would be smaller"
+        );
+
+        let third = issue_timestamp(&last_issued).unwrap();
+        assert!(
+            third >= second,
+            "a normal (non-regressing) subsequent issuance must still be non-decreasing"
+        );
     }
 
     fn test_schema() -> Arc<Schema> {

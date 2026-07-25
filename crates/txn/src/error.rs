@@ -45,6 +45,8 @@ pub enum TxnError {
     SchemaMismatch { expected: usize, actual: usize },
     #[error("conflict: {contested_row_ids:?} were modified by another transaction")]
     Conflict { contested_row_ids: Vec<u64> },
+    #[error("system clock error: {0}")]
+    ClockError(String),
 }
 
 pub type Result<T> = std::result::Result<T, TxnError>;
