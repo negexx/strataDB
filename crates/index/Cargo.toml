@@ -38,10 +38,7 @@ bytemuck = "1"
 # dependencies. `crc32fast` is NOT a substitute -- it implements CRC-32
 # (IEEE), a different polynomial than the format specifies.
 crc32c = "0.6"
-serde.workspace = true
-serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 loom = "0.7"
-tempfile = { workspace = true }

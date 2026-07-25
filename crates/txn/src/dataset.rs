@@ -337,10 +337,10 @@ impl Dataset {
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self> {
         let dir = dir.into();
         let manifest = read_current(&dir)?.ok_or_else(|| TxnError::NotFound(dir.clone()))?;
-        // The capacity guard used to live inside `replay_index`, which sized
-        // an `HnswIndex` from `next_row_id`. Nothing sizes an allocation
-        // from it any more, but the ceiling is still a panic-safety bound on
-        // what row-ids may reach `NodeTable` — see
+        // The capacity guard used to live inside the old delta-replay open
+        // path, which sized an `HnswIndex` from `next_row_id`. Nothing sizes
+        // an allocation from it any more, but the ceiling is still a
+        // panic-safety bound on what row-ids may reach `NodeTable` — see
         // `MAX_REASONABLE_ROW_ID_CAPACITY`.
         if manifest.next_row_id > MAX_REASONABLE_ROW_ID_CAPACITY {
             return Err(TxnError::UnreasonableCapacity(
@@ -357,7 +357,7 @@ impl Dataset {
         // The real fix for the cross-session filename-collision bug: seed
         // from the persisted `manifest.next_attempt_id`, not 0. Without
         // this, a reopened dataset would regenerate the same
-        // `{attempt_id:020}-{i}.arrow`/`.deltalog` filenames a prior
+        // `{attempt_id:020}-{i}.arrow` filenames a prior
         // session already committed, and `write_batch`'s `File::create`
         // would silently truncate and destroy that prior session's
         // already-durable data. See `Manifest.next_attempt_id`'s doc
@@ -1476,8 +1476,8 @@ fn new_hnsw_index(capacity: usize) -> Result<HnswIndex> {
 /// revisit if a real workload needs more — and change both constants
 /// together, since the two crates' values must stay equal.
 ///
-/// Enforced in [`Dataset::open`] directly (it used to live in
-/// `replay_index`, which no longer exists).
+/// Enforced in [`Dataset::open`] directly (it used to live in the old
+/// delta-replay open path, which no longer exists).
 const MAX_REASONABLE_ROW_ID_CAPACITY: u64 = 1_000_000_000;
 
 /// Loads every segment `manifest` lists into a [`strata_index::SegmentSet`],
@@ -1595,10 +1595,10 @@ fn load_segments(dir: &Path, manifest: &Manifest) -> Result<strata_index::Segmen
 
 /// One row's vector, ready to be inserted into a segment's working index.
 /// The in-memory carrier between `write_pending_batches` and the segment
-/// build — the role `strata_index::DeltaEntry` used to play before the
-/// delta log was removed. There is no `Tombstone` counterpart: deletion is
-/// the manifest's versioned `tombstones` list, never an index-level entry
-/// (base design doc §5).
+/// build — the role the index crate's old append-only mutation-log entry
+/// type used to play before that log was removed. There is no `Tombstone`
+/// counterpart: deletion is the manifest's versioned `tombstones` list,
+/// never an index-level entry (base design doc §5).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct VectorInsert {
     pub(crate) row_id: u64,
@@ -2539,12 +2539,13 @@ mod tests {
     // NOTE (Batch 1, Task 2): the plan also specified a sibling test,
     // `commit_errors_instead_of_overflowing_when_next_row_id_would_wrap`,
     // crafting a hostile manifest with `next_row_id: u64::MAX - 1`. Task 2
-    // deferred it because `Dataset::open` -> `replay_index` panicked
-    // ("capacity overflow") on such a manifest before `commit` ever ran.
-    // Resolved by Batch 1, Task 4: `Dataset::open` now rejects any manifest
-    // whose `next_row_id` exceeds `MAX_REASONABLE_ROW_ID_CAPACITY` with a
-    // typed `TxnError::UnreasonableCapacity`, checked directly (the check
-    // used to live inside `replay_index`, which no longer exists — see
+    // deferred it because `Dataset::open`'s old delta-replay open path
+    // panicked ("capacity overflow") on such a manifest before `commit`
+    // ever ran. Resolved by Batch 1, Task 4: `Dataset::open` now rejects
+    // any manifest whose `next_row_id` exceeds
+    // `MAX_REASONABLE_ROW_ID_CAPACITY` with a typed
+    // `TxnError::UnreasonableCapacity`, checked directly (the check used to
+    // live inside that removed open path — see
     // `MAX_REASONABLE_ROW_ID_CAPACITY`'s own doc comment) — covered by
     // `open_errors_instead_of_attempting_a_huge_allocation_on_an_unreasonable_next_row_id`
     // below. The capacity ceiling makes a near-`u64::MAX` `next_row_id`
@@ -3663,10 +3664,10 @@ mod tests {
     fn committing_a_batch_with_a_non_finite_vector_component_is_rejected_cleanly() {
         // Regression test for the Phase 4 final-review finding: a
         // non-finite (NaN/Infinity) vector component used to durably
-        // commit — serde_json silently encodes it as JSON `null` — and
-        // then permanently brick the dataset, since every future
-        // replay_index (including Dataset::open) would fail to parse that
-        // `null` back into an f32. Must now be rejected upfront, before any
+        // commit — the old delta log's JSON encoding silently turned it
+        // into `null` — and then permanently brick the dataset, since every
+        // future open-time replay would fail to parse that `null` back into
+        // an f32. Must now be rejected upfront, before any
         // file for the offending batch is written to disk, leaving no
         // trace: no manifest advance, no orphaned-but-referenced files.
         let dir = temp_dir("non-finite-vector-rejected");

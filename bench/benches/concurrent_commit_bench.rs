@@ -66,10 +66,11 @@ fn setup_dataset(row_count: i64) -> TempDataset {
 
 /// Schema for the vector-workload benchmarks: an `id` column plus a
 /// `"vector"` `FixedSizeList<Float32, VECTOR_DIM>` column — the presence of
-/// a `"vector"` column is what makes `build_delta_entries` (inside
-/// `Transaction::commit`) actually produce `DeltaEntry::Insert` entries,
-/// which is what makes `HnswIndex::insert` run at all. The plain-`Int64`
-/// benchmarks above never exercise this path.
+/// a `"vector"` column is what makes each commit actually extract vectors
+/// (inside `Transaction::commit`'s write phase) and therefore build,
+/// serialize and fsync a real `.seg` segment. The plain-`Int64`
+/// benchmarks above never exercise this path: a commit with no vectors
+/// writes no segment at all.
 fn vector_schema() -> Arc<Schema> {
     let item_field = Arc::new(Field::new("item", DataType::Float32, false));
     Arc::new(Schema::new(vec![
@@ -158,7 +159,8 @@ fn bench_concurrent_non_conflicting_inserts(c: &mut Criterion) {
 
 /// Vector-workload counterpart to `bench_concurrent_non_conflicting_inserts`.
 /// The two `Int64`-only benchmarks above never populate a `"vector"` column,
-/// so `HnswIndex::insert` never runs inside `commit_lock` during them — the
+/// so no segment is built during them, which is what isolates the
+/// conflict-check cost from the index-build cost: the
 /// "concurrent beats sequential" result they measure comes entirely from
 /// data-file fsync (which runs outside the lock) parallelizing across
 /// threads. This benchmark is what actually exercises the flagship
