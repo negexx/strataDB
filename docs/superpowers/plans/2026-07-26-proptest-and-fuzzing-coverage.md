@@ -297,12 +297,23 @@ Scoped to a single `Int64` column (not every `Value` variant × every column typ
 
 Add to `crates/query/src/predicate.rs`'s `#[cfg(test)] mod tests` (add `use proptest::prelude::*;` at the top of that module if not already present; the module already imports `RecordBatch`, `Int64Array`, etc. for its existing tests — reuse those imports):
 
+**Design note, applied proactively before this task's own execution** (based on the same lesson Tasks 2 and 3 each independently rediscovered and had to fix mid-execution): `Predicate::Eq`'s naive arm is `v == threshold` — with `threshold` drawn fully independently from `values`, this has the same near-zero-power problem as `RowIdRange::contains`'s `row_id == base + len` and `conflicts_with`'s `since_version == committed_version`. Rather than let this task rediscover the same issue a third time, `threshold` is generated as a mix of fully random `i64` and one of `values`' actual entries up front. Still verify this empirically in Step 2 below, exactly as the prior two tasks did — a reasoned prediction is not a substitute for actually running it.
+
 ```rust
     proptest! {
         #[test]
         fn mask_matches_a_naive_per_row_reference(
-            values in prop::collection::vec(any::<i64>(), 0..30),
-            threshold: i64,
+            (values, threshold) in prop::collection::vec(any::<i64>(), 0..30)
+                .prop_flat_map(|values| {
+                    // threshold is NOT independently random -- see this
+                    // task's own "Design note" above. Predicate::Eq's
+                    // naive arm needs threshold to actually equal one of
+                    // values' entries some of the time, or that variant's
+                    // true branch is never meaningfully exercised.
+                    let mut candidates = values.clone();
+                    candidates.push(0); // always non-empty, even if values is empty
+                    (Just(values), prop_oneof![any::<i64>(), prop::sample::select(candidates)])
+                }),
             variant in 0..5u8,
         ) {
             let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
@@ -342,11 +353,13 @@ Add to `crates/query/src/predicate.rs`'s `#[cfg(test)] mod tests` (add `use prop
 
 - [ ] **Step 2: Run it to verify the harness can fail**
 
-Temporarily flip `variant => 1`'s naive arm from `v < threshold` to `v <= threshold` (wrong operator), run, confirm failure with a shrunk counterexample, then revert.
+**Correction, found during execution:** flipping `variant => 0`'s naive arm from `v == threshold` to `v != threshold` is a full boolean negation, not an equality-boundary bug — it fails on almost any non-empty input regardless of whether `threshold` ever actually equals an entry, so "it failed" doesn't prove the `prop_flat_map` correlation strategy matters, only that *some* bug is detectable (verified directly: this flip fails readily even with the correlation stripped back to bare `any::<i64>()`). Use this check instead: temporarily inject a realistic off-by-one into `compare()`'s actual `Eq` match arm in `crates/query/src/predicate.rs` (production code, not the test's naive reference) — one that's wrong only on the branch where a real match occurs. Run, confirm failure with a shrunk counterexample where `threshold` actually equals one of `values`' entries; then temporarily strip the correlation (`threshold`'s strategy back to bare `any::<i64>()`) with the same bug still injected, and confirm it now goes UNDETECTED across a few fresh runs — this is what actually proves the correlation is load-bearing, not just that some bug is catchable. Revert both temporary changes (the production off-by-one and the correlation strip) back to the shipped state.
+
+Separately, do the simpler sanity check for `variant => 1`'s naive arm (`v < threshold` flipped to `v <= threshold`), which doesn't depend on the correlation (any random threshold exercises `Lt` meaningfully) and should fail readily on its own.
 
 Run: `cargo test -p strata-query --lib -- mask_matches_a_naive_per_row_reference`
-Expected (with the temporary flip): FAIL.
-Then revert the temporary change.
+Expected (with each temporary change): FAIL, with a real proptest-shrunk counterexample; the correlation-dependent check should also demonstrate the reverse (undetected without correlation).
+Then revert every temporary change, and delete `crates/query/proptest-regressions/predicate.txt` if a failing run created it.
 
 - [ ] **Step 3: Run it for real**
 
