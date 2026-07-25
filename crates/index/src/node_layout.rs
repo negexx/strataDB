@@ -1,0 +1,342 @@
+//! Raw single-block layout for a graph node: header, vector, and every
+//! layer's edge slots packed into one allocation. See
+//! `docs/superpowers/specs/2026-07-23-single-allocation-hnsw-node-layout-design.md`.
+
+use std::alloc::Layout;
+
+#[cfg(loom)]
+use loom::sync::atomic::{AtomicU8, AtomicU64};
+#[cfg(not(loom))]
+use std::sync::atomic::{AtomicU8, AtomicU64};
+
+use crate::slot_array::EMPTY;
+
+#[repr(C)]
+pub(crate) struct NodeHeader {
+    pub(crate) row_id: u64,
+    /// The vector's element count, stored here (mirroring `mmax0`/`mmax`)
+    /// so `Node::vector`/`Node::layer` can recompute this block's layout
+    /// without threading `dim` as a parameter through every accessor.
+    pub(crate) dim: u32,
+    pub(crate) level: u8,
+    pub(crate) mmax0: u16,
+    pub(crate) mmax: u16,
+    pub(crate) deleted: AtomicU8,
+}
+
+pub(crate) struct NodeLayoutOffsets {
+    pub(crate) vector_offset: usize,
+    /// `layer_offsets[lc]` is the byte offset of layer `lc`'s first slot.
+    pub(crate) layer_offsets: Vec<usize>,
+}
+
+/// The single source of truth for a layer's physical slot count: layer 0
+/// gets `mmax0 + 1` slots, every other layer gets `mmax + 1` (the `+ 1`
+/// is one slot of transient headroom — see `Node::layer_capacity`'s doc
+/// comment in node.rs for why it exists at all). `compute_node_layout`,
+/// `layer_byte_offset`, and `Node::layer_capacity` must all size layers
+/// through this one function: if any of them diverged, `Node::layer`'s
+/// `slice::from_raw_parts` could read past the region actually reserved
+/// for the last layer — undefined behavior, not just a wrong answer.
+/// Drift-guarded by `byte_offset_helpers_match_compute_node_layout`.
+pub(crate) fn layer_slot_count(mmax0: usize, mmax: usize, lc: usize) -> usize {
+    if lc == 0 { mmax0 + 1 } else { mmax + 1 }
+}
+
+// The `expect`s here guard only `Layout` arithmetic overflowing `isize`,
+// which is unreachable for any real node (dim and slot counts are bounded
+// far below `isize::MAX / 8` by upstream validation) — a `Result` return
+// would force every caller to handle an impossible error.
+#[allow(clippy::expect_used)]
+pub(crate) fn compute_node_layout(
+    dim: usize,
+    level: usize,
+    mmax0: usize,
+    mmax: usize,
+) -> (Layout, NodeLayoutOffsets) {
+    let mut layout = Layout::new::<NodeHeader>();
+    let mut layer_offsets = Vec::with_capacity(level + 1);
+
+    let (extended, vector_offset) = layout
+        .extend(Layout::array::<f32>(dim).expect("dim*4 bytes must not overflow isize"))
+        .expect("header+vector layout must not overflow isize");
+    layout = extended;
+
+    for lc in 0..=level {
+        let capacity = layer_slot_count(mmax0, mmax, lc);
+        let (extended, layer_offset) = layout
+            .extend(
+                Layout::array::<AtomicU64>(capacity)
+                    .expect("slot array bytes must not overflow isize"),
+            )
+            .expect("layer layout must not overflow isize");
+        layout = extended;
+        layer_offsets.push(layer_offset);
+    }
+
+    (
+        layout.pad_to_align(),
+        NodeLayoutOffsets {
+            vector_offset,
+            layer_offsets,
+        },
+    )
+}
+
+/// Non-allocating equivalent of `compute_node_layout(..).1.vector_offset`,
+/// for `Node::vector`'s hot path (called once per candidate distance
+/// evaluation in `search_layer`). `dim` is unused today — a field's offset
+/// depends only on what precedes it — but is kept for symmetry with
+/// `layer_byte_offset` and in case `NodeHeader` ever grows a
+/// dim-dependent prefix. Guarded against drift from `compute_node_layout`
+/// by `byte_offset_helpers_match_compute_node_layout` below.
+// `expect_used`: same impossible-overflow guard as `compute_node_layout`.
+#[allow(clippy::expect_used)]
+pub(crate) fn vector_byte_offset(dim: usize) -> usize {
+    let (_, vector_offset) = Layout::new::<NodeHeader>()
+        .extend(Layout::array::<f32>(dim).expect("dim*4 bytes must not overflow isize"))
+        .expect("header+vector layout must not overflow isize");
+    vector_offset
+}
+
+/// Non-allocating equivalent of
+/// `compute_node_layout(..).1.layer_offsets[lc]`, for `Node::layer`'s hot
+/// path. Walks the same `Layout::extend` sequence as `compute_node_layout`
+/// but stops at layer `lc` without building a `Vec`. Panics if
+/// `lc > level`, matching `Node::layer`'s bounds contract. Guarded against
+/// drift by `byte_offset_helpers_match_compute_node_layout` below.
+// `expect_used`: same impossible-overflow guard as `compute_node_layout`.
+#[allow(clippy::expect_used)]
+pub(crate) fn layer_byte_offset(
+    dim: usize,
+    level: usize,
+    mmax0: usize,
+    mmax: usize,
+    lc: usize,
+) -> usize {
+    assert!(
+        lc <= level,
+        "layer {lc} requested but node's level is {level}"
+    );
+    let (mut layout, _) = Layout::new::<NodeHeader>()
+        .extend(Layout::array::<f32>(dim).expect("dim*4 bytes must not overflow isize"))
+        .expect("header+vector layout must not overflow isize");
+    for current in 0..=lc {
+        let capacity = layer_slot_count(mmax0, mmax, current);
+        let (extended, layer_offset) = layout
+            .extend(
+                Layout::array::<AtomicU64>(capacity)
+                    .expect("slot array bytes must not overflow isize"),
+            )
+            .expect("layer layout must not overflow isize");
+        if current == lc {
+            return layer_offset;
+        }
+        layout = extended;
+    }
+    unreachable!("loop always returns at current == lc")
+}
+
+/// Allocates and fully initializes a single raw block for a node: header,
+/// vector, and every layer's slots preset to `EMPTY`. The returned
+/// pointer is never freed or moved for the caller's process lifetime,
+/// matching this crate's existing node/chunk-storage invariant -- there
+/// is deliberately no matching `dealloc`/`Drop` anywhere in this crate.
+///
+/// # Safety
+/// The caller must ensure the returned pointer is eventually published
+/// (made reachable to other threads) via a `Release`-or-stronger store,
+/// since this function performs no synchronization itself. Today's
+/// production chain is `Node::new` -> `NodeTable::insert`, whose
+/// `AtomicPtr::store` provides that publication; `NodeTable::insert_ptr`
+/// is the intended future consumer (Task 10's arena work) but is not yet
+/// called from any production path.
+// `expect_used`: the `try_from`s are caller-contract guards on parameters
+// upstream code already bounds (`level` is clamped to `LEVEL_MASK` in
+// graph.rs; `mmax0`/`mmax` are small tuning constants) — violating them is
+// a caller bug worth a loud panic, not a recoverable error.
+// `cast_ptr_alignment`: every `u8`-pointer cast below is provably aligned —
+// `alloc` returns a pointer aligned to `layout.align()` (>= 8, since the
+// header contains a `u64`), and every offset comes from `Layout::extend`,
+// which aligns each region to its own type's alignment; the SAFETY comment
+// at each cast site restates the specific guarantee.
+#[allow(clippy::expect_used, clippy::cast_ptr_alignment)]
+pub(crate) unsafe fn alloc_node(
+    row_id: u64,
+    vector: &[f32],
+    level: usize,
+    mmax0: usize,
+    mmax: usize,
+) -> *mut u8 {
+    let (layout, offsets) = compute_node_layout(vector.len(), level, mmax0, mmax);
+    // SAFETY: `layout` has non-zero size (NodeHeader alone is non-zero-sized).
+    let ptr = unsafe { std::alloc::alloc(layout) };
+    if ptr.is_null() {
+        // Not `assert!`: formatting a panic message would itself allocate,
+        // during the very OOM condition being reported --
+        // `handle_alloc_error` is built to run while allocation is failing.
+        std::alloc::handle_alloc_error(layout);
+    }
+
+    // SAFETY: `ptr` was just allocated with exactly `layout`, which
+    // reserves space for one `NodeHeader` at offset 0 with correct
+    // alignment (`Layout::new::<NodeHeader>()` is `compute_node_layout`'s
+    // first component) -- writing one `NodeHeader` here does not exceed
+    // the allocation and does not read the uninitialized memory it
+    // overwrites.
+    unsafe {
+        std::ptr::write(
+            ptr.cast::<NodeHeader>(),
+            NodeHeader {
+                row_id,
+                dim: u32::try_from(vector.len()).expect("dim must fit in u32"),
+                level: u8::try_from(level).expect("level must fit in u8 (see graph.rs LEVEL_MASK)"),
+                mmax0: u16::try_from(mmax0).expect("mmax0 must fit in u16"),
+                mmax: u16::try_from(mmax).expect("mmax must fit in u16"),
+                deleted: AtomicU8::new(0),
+            },
+        );
+    }
+
+    // SAFETY: `offsets.vector_offset` plus `vector.len() * 4` bytes was
+    // reserved by `compute_node_layout`'s `Layout::array::<f32>(dim)`
+    // extension using this exact `vector.len()`, and the target region
+    // does not overlap `vector`'s own backing memory (freshly allocated).
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            vector.as_ptr(),
+            ptr.add(offsets.vector_offset).cast::<f32>(),
+            vector.len(),
+        );
+    }
+
+    // NOT alloc_zeroed: EMPTY is u64::MAX, not 0 -- every slot must be
+    // explicitly written, or a zeroed slot would be silently misread as
+    // an edge to row-id 0.
+    for (lc, &layer_offset) in offsets.layer_offsets.iter().enumerate() {
+        let slot_count = layer_slot_count(mmax0, mmax, lc);
+        for i in 0..slot_count {
+            // SAFETY: each slot's address (`layer_offset + i *
+            // size_of::<AtomicU64>()`) is within the region
+            // `compute_node_layout` reserved for this layer via
+            // `Layout::array::<AtomicU64>(capacity)` -- the same
+            // `layer_slot_count(mmax0, mmax, lc)` slots being written
+            // here -- and no other write targets this address.
+            unsafe {
+                let slot_ptr = ptr.add(layer_offset).cast::<AtomicU64>().add(i);
+                std::ptr::write(slot_ptr, AtomicU64::new(EMPTY));
+            }
+        }
+    }
+
+    ptr
+}
+
+#[cfg(all(test, not(loom)))]
+// `cast_ptr_alignment`: the test reads back through the same
+// provably-aligned offsets `compute_node_layout` produced (see the allow
+// on `alloc_node` above).
+#[allow(clippy::cast_ptr_alignment)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compute_node_layout_places_header_then_vector_then_layers_in_order() {
+        let (layout, offsets) = compute_node_layout(3, 1, 32, 16);
+        // Header must come first (offset 0 by construction of Layout::new::<NodeHeader>()).
+        assert!(offsets.vector_offset >= std::mem::size_of::<NodeHeader>());
+        // Vector (3 x f32 = 12 bytes) must end at or before layer 0's offset.
+        assert!(offsets.layer_offsets[0] >= offsets.vector_offset + 3 * 4);
+        // Layer 1 must start after layer 0's 33 slots (mmax0+1 = 33) x 8 bytes.
+        assert_eq!(offsets.layer_offsets.len(), 2);
+        assert!(offsets.layer_offsets[1] >= offsets.layer_offsets[0] + 33 * 8);
+        // The whole layout must be 8-byte aligned (AtomicU64's requirement) at minimum.
+        assert_eq!(layout.align() % 8, 0);
+    }
+
+    #[test]
+    fn byte_offset_helpers_match_compute_node_layout() {
+        for &(dim, level, mmax0, mmax) in &[
+            (1usize, 0usize, 16usize, 16usize),
+            (3, 1, 32, 16),
+            (512, 7, 32, 16),
+            (768, 0, 256, 256),
+        ] {
+            let (layout, offsets) = compute_node_layout(dim, level, mmax0, mmax);
+            assert_eq!(
+                vector_byte_offset(dim),
+                offsets.vector_offset,
+                "vector offset drifted for (dim={dim}, level={level}, mmax0={mmax0}, mmax={mmax})"
+            );
+            // A real node built with the same parameters: `Node::layer`'s
+            // `slice::from_raw_parts` capacity must exactly match the
+            // inter-offset spacing `compute_node_layout` reserved — if
+            // `Node::layer_capacity` ever sized a layer larger than its
+            // reservation, the last layer's slice would read past the
+            // allocation itself (UB), so this drift is guarded here
+            // alongside the offset checks.
+            let node = crate::node::Node::new(0, vec![0.0; dim], level, mmax0, mmax);
+            for lc in 0..=level {
+                assert_eq!(
+                    layer_byte_offset(dim, level, mmax0, mmax, lc),
+                    offsets.layer_offsets[lc],
+                    "layer {lc} offset drifted for (dim={dim}, level={level}, mmax0={mmax0}, mmax={mmax})"
+                );
+                let reserved_bytes = if lc < level {
+                    offsets.layer_offsets[lc + 1] - offsets.layer_offsets[lc]
+                } else {
+                    layout.size() - offsets.layer_offsets[lc]
+                };
+                assert_eq!(
+                    node.layer(lc).capacity() * std::mem::size_of::<AtomicU64>(),
+                    reserved_bytes,
+                    "Node::layer_capacity drifted from compute_node_layout's reservation \
+                     for (dim={dim}, level={level}, mmax0={mmax0}, mmax={mmax}, lc={lc})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "layer 2 requested but node's level is 1")]
+    fn layer_byte_offset_panics_when_lc_exceeds_level() {
+        layer_byte_offset(3, 1, 32, 16, 2);
+    }
+
+    #[test]
+    fn alloc_node_initializes_header_vector_and_every_slot_to_empty() {
+        let vector = vec![1.0f32, 2.0, 3.0];
+        // SAFETY: test-only call, immediately read back and never shared
+        // across threads before the read.
+        let ptr = unsafe { alloc_node(7, &vector, 1, 32, 16) };
+        // SAFETY: `ptr` was just returned by `alloc_node` above and is
+        // fully initialized per its own contract.
+        unsafe {
+            let header = &*ptr.cast::<NodeHeader>();
+            assert_eq!(header.row_id, 7);
+            assert_eq!(header.dim, 3);
+            assert_eq!(header.level, 1);
+            assert_eq!(header.mmax0, 32);
+            assert_eq!(header.mmax, 16);
+            assert_eq!(header.deleted.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+            let (_, offsets) = compute_node_layout(3, 1, 32, 16);
+            let vector_ptr = ptr.add(offsets.vector_offset).cast::<f32>();
+            assert_eq!(std::slice::from_raw_parts(vector_ptr, 3), &[1.0, 2.0, 3.0]);
+
+            for (lc, &layer_offset) in offsets.layer_offsets.iter().enumerate() {
+                let slot_count = layer_slot_count(32, 16, lc);
+                for i in 0..slot_count {
+                    let slot_ptr = ptr.add(layer_offset).cast::<AtomicU64>().add(i);
+                    assert_eq!(
+                        (*slot_ptr).load(std::sync::atomic::Ordering::SeqCst),
+                        EMPTY,
+                        "layer {lc} slot {i} must start EMPTY"
+                    );
+                }
+            }
+        }
+        // Deliberately leaked -- matches this crate's existing "nodes are
+        // never freed" invariant; see the module doc comment on Drop.
+    }
+}

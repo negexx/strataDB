@@ -21,7 +21,7 @@ const COMMITS_PER_THREAD: i64 = 50;
 /// workspace's benchmarks rather than picking a new arbitrary value.
 const VECTOR_DIM: usize = 512;
 /// Smaller than `COMMITS_PER_THREAD`: each vector insert does a real
-/// `ef_construction=200` HNSW candidate search, meaningfully more expensive
+/// `ef_construction`-driven HNSW candidate search, meaningfully more expensive
 /// per commit than an `Int64`-only row — at `COMMITS_PER_THREAD`'s scale
 /// this benchmark's total runtime would be impractical. Still large enough
 /// (`NUM_THREADS * VECTOR_COMMITS_PER_THREAD` = 80 total inserts) to grow a
@@ -84,7 +84,7 @@ fn vector_schema() -> Arc<Schema> {
 
 /// Builds a single-row batch with a deterministic, finite, non-degenerate
 /// vector derived from `id` — deterministic so the benchmark needs no `rand`
-/// dependency, varied per row so `ef_construction=200`'s candidate search
+/// dependency, varied per row so `ef_construction`'s candidate search
 /// during `HnswIndex::insert` does real work rather than deduping identical
 /// points.
 #[allow(clippy::cast_precision_loss)]

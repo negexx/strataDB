@@ -75,6 +75,40 @@ pub fn read_batch(path: &Path) -> Result<RecordBatch> {
     Ok(batch)
 }
 
+/// Reads the first `RecordBatch` from an Arrow IPC file, decoding **only**
+/// the named columns.
+///
+/// Arrow IPC lays each column's buffers out separately, so a projected read
+/// never touches the bodies of the columns it wasn't asked for. For a table
+/// carrying a wide embedding column that is the difference between decoding
+/// the entire dataset and decoding a couple of scalar columns — at 100k rows
+/// of 512-dim `f32`, ~204MB versus ~1.6MB.
+///
+/// [`read_batch`] reads everything and stays the right default; this is for
+/// callers that provably need a subset, such as resolving the row-ids
+/// matching a predicate without materialising the vectors alongside them.
+///
+/// The footer is read twice — once to resolve names to indices, once to apply
+/// the projection — but the footer is metadata only, so the first open
+/// decodes no record-batch body.
+///
+/// # Errors
+///
+/// As [`read_batch`], plus an error if any name in `columns` is not a field
+/// of this file's schema.
+pub fn read_batch_columns(path: &Path, columns: &[&str]) -> Result<RecordBatch> {
+    let schema = FileReader::try_new(File::open(path)?, None)?.schema();
+    let projection = columns
+        .iter()
+        .map(|name| schema.index_of(name))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut reader = FileReader::try_new(File::open(path)?, Some(projection))?;
+    let batch = reader
+        .next()
+        .ok_or_else(|| StorageError::EmptyDataFile(path.to_path_buf()))??;
+    Ok(batch)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -87,8 +121,11 @@ mod tests {
 
     #[test]
     fn write_then_read_round_trips() {
-        let dir = std::env::temp_dir().join(format!("strata-datafile-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("strata-datafile-test-")
+            .tempdir()
+            .unwrap()
+            .keep();
         let path = dir.join("test.arrow");
 
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
@@ -104,9 +141,11 @@ mod tests {
 
     #[test]
     fn read_batch_errors_on_an_ipc_file_with_zero_record_batches() {
-        let dir =
-            std::env::temp_dir().join(format!("strata-datafile-empty-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("strata-datafile-empty-")
+            .tempdir()
+            .unwrap()
+            .keep();
         let path = dir.join("empty.arrow");
 
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
@@ -124,9 +163,11 @@ mod tests {
 
     #[test]
     fn read_batch_errors_on_a_non_ipc_file() {
-        let dir =
-            std::env::temp_dir().join(format!("strata-datafile-garbage-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("strata-datafile-garbage-")
+            .tempdir()
+            .unwrap()
+            .keep();
         let path = dir.join("garbage.arrow");
         std::fs::write(&path, b"not an arrow ipc file").unwrap();
 

@@ -10,11 +10,12 @@ use arrow::array::{Array, RecordBatch, UInt64Array};
 use arrow::compute::concat_batches;
 use arrow::datatypes::SchemaRef;
 use strata_index::HnswIndex;
-use strata_query::{Predicate, filter, should_scan_file};
-use strata_storage::{DataFileEntry, Manifest, read_batch};
+use strata_query::{Predicate, filter, mask, should_scan_file};
+use strata_storage::{DataFileEntry, Manifest, read_batch, read_batch_columns};
 
 use crate::dataset::{ROW_ID_COLUMN, cast_batch_to_schema, data_subdir, safe_join};
 use crate::error::{Result, TxnError};
+use crate::row_id::RowIdRange;
 
 pub struct Snapshot {
     pub(crate) dir: PathBuf,
@@ -22,6 +23,11 @@ pub struct Snapshot {
     pub(crate) manifest: Arc<Manifest>,
     pub(crate) graph: Arc<HnswIndex>,
     pub(crate) watermark: u64,
+    /// Row-id ranges claimed by transactions that had not yet committed
+    /// when this snapshot was published — subtracted from `watermark`'s
+    /// coverage by [`Snapshot::is_visible`]. See [`crate::row_id`] for why a
+    /// scalar watermark alone cannot express "committed".
+    pub(crate) in_flight: Arc<[RowIdRange]>,
     pub(crate) tombstones: Arc<imbl::HashSet<u64>>,
 }
 
@@ -66,8 +72,25 @@ impl Snapshot {
     /// was built (immediately after the commit that produced it), not from
     /// a stored version per tombstone entry. See the design doc's
     /// "Tombstone mechanism" section.
+    ///
+    /// "Committed" is `watermark` *minus* `in_flight`, not `watermark`
+    /// alone. The watermark comes from the global row-id counter, which
+    /// advances when a transaction *claims* its ids — before the commit
+    /// lock, and so before it commits — so on its own it also covers
+    /// row-ids belonging to transactions still in flight. Those are exactly
+    /// the ones spec §2 says must stay invisible "until commit succeeds",
+    /// and `in_flight` is what subtracts them. See [`crate::row_id`].
+    ///
+    /// This runs once per candidate during HNSW graph traversal, so the
+    /// order of the three checks is the order of their cost: an integer
+    /// compare, then a scan of a set that is empty unless another
+    /// transaction was mid-commit when this snapshot was published (and
+    /// holds one entry per such transaction when it is not), then the hash
+    /// lookup.
     pub(crate) fn is_visible(&self, row_id: u64) -> bool {
-        row_id <= self.watermark && !self.tombstones.contains(&row_id)
+        row_id <= self.watermark
+            && !self.in_flight.iter().any(|range| range.contains(row_id))
+            && !self.tombstones.contains(&row_id)
     }
 
     /// Data file entries (name + per-column stats) belonging to this
@@ -84,9 +107,14 @@ impl Snapshot {
     /// via [`safe_join`], and applies `process` to each raw batch. Shared
     /// by [`Snapshot::scan`], [`Snapshot::scan_with_predicate`], and
     /// [`Snapshot::row_ids_matching`].
+    /// `columns`, when `Some`, restricts the Arrow IPC read to those columns
+    /// so the rest are never decoded. Callers that need whole rows pass
+    /// `None`; callers that only need a couple of scalar columns out of a
+    /// table carrying wide embeddings should not.
     fn read_surviving_files<T>(
         &self,
         predicate: Option<&Predicate>,
+        columns: Option<&[&str]>,
         mut process: impl FnMut(RecordBatch) -> Result<T>,
     ) -> Result<Vec<T>> {
         let data_dir = data_subdir(&self.dir);
@@ -95,7 +123,11 @@ impl Snapshot {
             .iter()
             .filter(|entry| predicate.is_none_or(|p| should_scan_file(&entry.stats, p)))
             .map(|entry| {
-                let batch = read_batch(&safe_join(&data_dir, &entry.name)?)?;
+                let path = safe_join(&data_dir, &entry.name)?;
+                let batch = match columns {
+                    Some(cols) => read_batch_columns(&path, cols)?,
+                    None => read_batch(&path)?,
+                };
                 process(batch)
             })
             .collect()
@@ -115,7 +147,7 @@ impl Snapshot {
     /// the cast batches can't be concatenated against `schema`.
     pub fn scan(&self, schema: &SchemaRef) -> Result<RecordBatch> {
         let batches =
-            self.read_surviving_files(None, |batch| cast_batch_to_schema(&batch, schema))?;
+            self.read_surviving_files(None, None, |batch| cast_batch_to_schema(&batch, schema))?;
         Ok(concat_batches(schema, &batches)?)
     }
 
@@ -155,7 +187,7 @@ impl Snapshot {
         schema: &SchemaRef,
         predicate: &Predicate,
     ) -> Result<RecordBatch> {
-        let batches = self.read_surviving_files(Some(predicate), |batch| {
+        let batches = self.read_surviving_files(Some(predicate), None, |batch| {
             let cast = cast_batch_to_schema(&batch, schema)?;
             Ok(filter(&cast, predicate)?)
         })?;
@@ -226,8 +258,15 @@ impl Snapshot {
                 .search(query, k, EF_SEARCH_DEFAULT, |id| self.is_visible(id))?);
         };
 
-        let mut live_ids = self.row_ids_matching(predicate)?;
-        live_ids.sort_unstable();
+        // Not sorted: `search_filtered` builds an order-insensitive bitset
+        // from these, so sorting them was pure work with no consumer.
+        //
+        // Measured phase split on a 100k-row, 512-dim dataset with a 1-in-10
+        // predicate: `row_ids_matching` 133-157ms, `widen_ef` 9us,
+        // `search_filtered` 1.3-1.8ms. This path is ~99% the cost of
+        // resolving `live_ids`, and that cost is dominated by re-reading the
+        // whole data file per query — see `row_ids_matching`'s own comment.
+        let live_ids = self.row_ids_matching(predicate)?;
         let ef = widen_ef(EF_SEARCH_DEFAULT, self, predicate);
         Ok(self
             .graph
@@ -238,24 +277,54 @@ impl Snapshot {
     /// surviving (per `should_scan_file`) file's raw on-disk batch
     /// directly — not through the public `scan_with_predicate`.
     fn row_ids_matching(&self, predicate: &Predicate) -> Result<Vec<usize>> {
-        let per_file_ids = self.read_surviving_files(Some(predicate), |batch| {
-            let matched = filter(&batch, predicate)?;
-            let row_id_idx = matched.schema_ref().index_of(ROW_ID_COLUMN)?;
-            let row_ids = matched
-                .column(row_id_idx)
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .ok_or_else(|| {
-                    TxnError::Arrow(arrow::error::ArrowError::CastError(format!(
-                        "{ROW_ID_COLUMN} column must be UInt64"
-                    )))
-                })?;
-            #[allow(clippy::cast_possible_truncation)]
-            let ids: Vec<usize> = (0..row_ids.len())
-                .map(|i| row_ids.value(i) as usize)
-                .collect();
-            Ok(ids)
-        })?;
+        // Decode only the predicate's own column and the row-id column, so
+        // the embedding column is never turned into an Arrow array.
+        //
+        // Be clear about what this does *not* buy: Arrow IPC stores a record
+        // batch as one contiguous message body, and `FileReader` reads that
+        // whole body off disk before decoding anything. Projection therefore
+        // skips array *construction*, not the read. Measured, this was worth
+        // only ~2ms of a ~109ms call — the remaining ~105ms is re-reading
+        // ~205MB (100k rows x 512-dim f32) from the page cache on *every*
+        // query, at ~1.5GB/s.
+        //
+        // Eliminating that needs one of: a per-snapshot cache of the
+        // resolved row-ids (snapshots are immutable, so this is sound but is
+        // a memory/latency tradeoff worth deciding deliberately), or a
+        // genuinely column-chunked file format so a single column can be
+        // read without its neighbours — the format change `datafile.rs`'s
+        // module doc already defers. Neither is a drive-by change.
+        let projection: Vec<&str> = if predicate.column() == ROW_ID_COLUMN {
+            vec![ROW_ID_COLUMN]
+        } else {
+            vec![predicate.column(), ROW_ID_COLUMN]
+        };
+        let per_file_ids =
+            self.read_surviving_files(Some(predicate), Some(&projection), |batch| {
+                // Apply the selection mask to the row-id column *only*. Using
+                // `filter` here instead would materialise a whole filtered
+                // `RecordBatch` — every column, including the embedding column —
+                // and then read one `u64` from it. At 512 dimensions that is
+                // ~2KB copied and discarded per matched row; on a 100k-row
+                // dataset with a 1-in-10 predicate it was ~20MB per query, and
+                // it dominated filtered `vector_search` end to end.
+                let selection = mask(&batch, predicate)?;
+                let row_id_idx = batch.schema_ref().index_of(ROW_ID_COLUMN)?;
+                let matched = arrow::compute::filter(batch.column(row_id_idx), &selection)?;
+                let row_ids = matched
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or_else(|| {
+                        TxnError::Arrow(arrow::error::ArrowError::CastError(format!(
+                            "{ROW_ID_COLUMN} column must be UInt64"
+                        )))
+                    })?;
+                // Bulk-read the values buffer rather than calling `value(i)` per
+                // row, which re-bounds-checks each access.
+                #[allow(clippy::cast_possible_truncation)]
+                let ids: Vec<usize> = row_ids.values().iter().map(|&id| id as usize).collect();
+                Ok(ids)
+            })?;
         Ok(per_file_ids.into_iter().flatten().collect())
     }
 }
@@ -268,6 +337,14 @@ mod tests {
     use super::*;
 
     fn test_snapshot(watermark: u64, tombstoned: &[u64]) -> Snapshot {
+        test_snapshot_with_in_flight(watermark, tombstoned, &[])
+    }
+
+    fn test_snapshot_with_in_flight(
+        watermark: u64,
+        tombstoned: &[u64],
+        in_flight: &[RowIdRange],
+    ) -> Snapshot {
         Snapshot {
             dir: PathBuf::from("unused-in-these-tests"),
             version: 1,
@@ -282,6 +359,7 @@ mod tests {
                 .unwrap(),
             ),
             watermark,
+            in_flight: in_flight.into(),
             tombstones: Arc::new(tombstoned.iter().copied().collect()),
         }
     }
@@ -304,5 +382,40 @@ mod tests {
         let snapshot = test_snapshot(10, &[5]);
         assert!(!snapshot.is_visible(5));
         assert!(snapshot.is_visible(6));
+    }
+
+    #[test]
+    fn in_flight_row_at_or_below_watermark_is_not_visible() {
+        // The watermark comes from the global row-id counter, so it covers
+        // ids claimed by transactions that have not committed. `in_flight`
+        // is what keeps spec §2's "not visible until commit succeeds" true
+        // for them.
+        let snapshot = test_snapshot_with_in_flight(10, &[], &[RowIdRange { base: 4, len: 3 }]);
+        assert!(snapshot.is_visible(3), "below the claimed range");
+        assert!(!snapshot.is_visible(4), "first id of the claimed range");
+        assert!(!snapshot.is_visible(6), "last id of the claimed range");
+        assert!(
+            snapshot.is_visible(7),
+            "the range is half-open — 7 is past its end"
+        );
+    }
+
+    #[test]
+    fn several_concurrent_claims_are_all_excluded() {
+        let snapshot = test_snapshot_with_in_flight(
+            10,
+            &[8],
+            &[
+                RowIdRange { base: 2, len: 1 },
+                RowIdRange { base: 5, len: 2 },
+            ],
+        );
+        assert!(snapshot.is_visible(0));
+        assert!(!snapshot.is_visible(2));
+        assert!(snapshot.is_visible(4), "between two claimed ranges");
+        assert!(!snapshot.is_visible(5));
+        assert!(!snapshot.is_visible(6));
+        assert!(snapshot.is_visible(7));
+        assert!(!snapshot.is_visible(8), "tombstones still apply");
     }
 }
