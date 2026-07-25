@@ -18,6 +18,11 @@ use loom::sync::Mutex;
 #[cfg(not(loom))]
 use std::sync::Mutex;
 
+// `arc_swap::ArcSwap` backs `SnapshotCell` in production (see that type's
+// doc comment below) but is unused under `--cfg loom`, where `SnapshotCell`
+// is a `Mutex`-backed shim instead — gated the same way `Mutex` above is,
+// to avoid an unused-import warning in the loom build.
+#[cfg(not(loom))]
 use arc_swap::ArcSwap;
 use arrow::array::{Array, ArrayRef, RecordBatch, UInt64Array};
 use arrow::compute::cast;
@@ -76,10 +81,98 @@ pub const TIMESTAMP_COLUMN: &str = "_timestamp";
 /// all.
 const COMMIT_LOG_CAPACITY: usize = 2048;
 
+/// Storage backing `Dataset.current` / `Transaction.current` — the shared
+/// cell holding whichever `Snapshot` is currently visible to new readers.
+///
+/// In production this is `arc_swap::ArcSwap`, chosen for its lock-free
+/// load/store. `arc_swap` (1.9.2, per `Cargo.lock`) has no documented `loom`
+/// integration or feature flag — confirmed against docs.rs/arc-swap/1.9.2,
+/// crates.io's listed features, and the crate's own upstream `Cargo.toml`
+/// (features: `weak`, `internal-test-strategies`, `experimental-strategies`,
+/// `experimental-thread-local` — no mention of loom). `loom`'s DPOR
+/// scheduler only branches at accesses to primitives it instruments; a
+/// reader calling `Dataset::snapshot()` (-> `ArcSwap::load_full`) and a
+/// committer calling `Transaction::commit`'s final `ArcSwap::store` are, as
+/// far as loom can see, two threads doing nothing at all to shared state —
+/// so DPOR collapses them to a single equivalence class instead of
+/// exploring the relative orderings that actually matter. That is the
+/// mechanism behind this crate's loom models needing this shim at all: see
+/// `loom_tests::a_failed_commits_segment_is_never_visible_to_a_concurrent_reader`
+/// and `loom_tests::a_commits_row_and_its_segment_become_visible_as_one_atomic_step`.
+///
+/// Under `--cfg loom`, `SnapshotCell` becomes a `Mutex`-backed equivalent
+/// exposing the same `load`/`load_full`/`store` surface `Dataset` and
+/// `Transaction` actually call (checked against every call site before
+/// choosing this shape — there are exactly three: `snapshot()`'s
+/// `load_full`, `write_phase`'s `load`, and `commit`'s `load_full` +
+/// `store`). This follows `row_id.rs`'s existing
+/// `#[cfg(loom)]`/`#[cfg(not(loom))]` dual-primitive pattern precedent, not
+/// a new abstraction: a small `#[cfg]`-gated type standing in for a
+/// production primitive loom cannot see into.
+///
+/// The non-loom definition is a bare type alias, so `Arc<SnapshotCell>` is
+/// byte-identical to `Arc<ArcSwap<Snapshot>>` and every call
+/// (`SnapshotCell::new`, `.load()`, `.load_full()`, `.store()`) resolves
+/// straight to `ArcSwap`'s own method of the same name — this shim changes
+/// nothing about the production build's type, behavior, or performance.
+#[cfg(not(loom))]
+type SnapshotCell = ArcSwap<Snapshot>;
+
+/// `loom`-instrumented stand-in for [`SnapshotCell`] under `--cfg loom` —
+/// see that type's doc comment for why this exists at all. A `Mutex` rather
+/// than an atomic-pointer swap because loom has no lock-free "swap an `Arc`"
+/// primitive analogous to `ArcSwap`; the only property this shim needs to
+/// provide is that a reader's load and a writer's store are both
+/// loom-instrumented, dependent accesses on the same object, and a `Mutex`
+/// around the shared `Arc<Snapshot>` gives exactly that. It is not
+/// attempting to model `ArcSwap`'s lock-freedom, only its externally
+/// observable load/store behavior.
+#[cfg(loom)]
+struct SnapshotCell(Mutex<Arc<Snapshot>>);
+
+#[cfg(loom)]
+impl SnapshotCell {
+    /// Mirrors `ArcSwap::new`.
+    fn new(snapshot: Arc<Snapshot>) -> Self {
+        Self(Mutex::new(snapshot))
+    }
+
+    /// Mirrors `ArcSwap::load_full` — clones the currently-stored `Arc`.
+    fn load_full(&self) -> Arc<Snapshot> {
+        Arc::clone(&self.lock())
+    }
+
+    /// Mirrors `ArcSwap::load`. Real `ArcSwap::load` returns a lightweight
+    /// `Guard` rather than cloning the `Arc`; under a `Mutex` there is no
+    /// equivalent, so this clones like `load_full` does. Not on any
+    /// interleaving-sensitive path this shim exists to test — `write_phase`
+    /// uses it for a pre-lock, best-effort dimension check that gets
+    /// re-validated inside `commit_lock` regardless (see `commit`'s doc
+    /// comment on the authoritative in-lock re-check).
+    fn load(&self) -> Arc<Snapshot> {
+        self.load_full()
+    }
+
+    /// Mirrors `ArcSwap::store`.
+    fn store(&self, snapshot: Arc<Snapshot>) {
+        *self.lock() = snapshot;
+    }
+
+    /// A poisoned lock is recovered rather than propagated, for the same
+    /// reason `RowIdAllocator::lock` and `Dataset.commit_lock` are: the
+    /// guarded state is only ever replaced by a whole-value assignment, so a
+    /// panicking holder cannot leave it half-updated.
+    fn lock(&self) -> loom::sync::MutexGuard<'_, Arc<Snapshot>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 #[derive(Clone)]
 pub struct Dataset {
     dir: PathBuf,
-    current: Arc<ArcSwap<Snapshot>>,
+    current: Arc<SnapshotCell>,
     /// Hands out row-id ranges *and* tracks which of them belong to
     /// transactions still in flight, so a published watermark can exclude
     /// them. Replaces the bare `AtomicU64` counter this used to be: the
@@ -293,7 +386,7 @@ impl Dataset {
         };
         Ok(Self {
             dir,
-            current: Arc::new(ArcSwap::new(Arc::new(snapshot))),
+            current: Arc::new(SnapshotCell::new(Arc::new(snapshot))),
             row_ids,
             write_attempt_counter,
             commit_lock: Arc::new(Mutex::new(CommitLog::new(commit_log_capacity))),
@@ -395,7 +488,7 @@ impl Dataset {
         };
         Ok(Self {
             dir,
-            current: Arc::new(ArcSwap::new(Arc::new(snapshot))),
+            current: Arc::new(SnapshotCell::new(Arc::new(snapshot))),
             row_ids,
             write_attempt_counter,
             commit_lock: Arc::new(Mutex::new(CommitLog::new(COMMIT_LOG_CAPACITY))),
@@ -490,7 +583,7 @@ pub struct Transaction {
     /// transitively `update`) — consulted by `commit`'s conflict check
     /// against every transaction that committed after this one began.
     write_set: Vec<u64>,
-    current: Arc<ArcSwap<Snapshot>>,
+    current: Arc<SnapshotCell>,
     row_ids: Arc<RowIdAllocator>,
     write_attempt_counter: Arc<AtomicU64>,
     commit_lock: Arc<Mutex<CommitLog>>,
@@ -801,8 +894,8 @@ impl Transaction {
     /// write leaves an orphaned `.seg` file that no manifest references,
     /// exactly like an orphaned row data file.
     ///
-    /// Any `Dataset` handle sharing this same `ArcSwap` (including the one
-    /// this transaction was created from) observes the new state on its
+    /// Any `Dataset` handle sharing this same `SnapshotCell` (including the
+    /// one this transaction was created from) observes the new state on its
     /// next [`Dataset::snapshot`] call; nothing is mutated in place.
     ///
     /// # Examples
@@ -5957,27 +6050,50 @@ mod tests {
 /// `strata-index` (and every other dependency) compiled normally, which
 /// sidesteps the conflict without touching `crates/index`.
 ///
-/// **Research note (Task 7):** `arc-swap` (resolved to 1.9.2 in Cargo.lock)
-/// has no documented `loom` integration or feature flag — confirmed against
-/// docs.rs/arc-swap/1.9.2, crates.io's listed features (only an optional
-/// `serde` feature), and the crate's own upstream `Cargo.toml` (features:
-/// `weak`, `internal-test-strategies`, `experimental-strategies`,
-/// `experimental-thread-local` — no mention of loom anywhere). `loom` can
-/// only explore interleavings of its own instrumented primitives, so it
-/// cannot see inside `arc-swap`'s real internal atomics without `arc-swap`
-/// itself being loom-aware — the same reason `crates/index`'s earlier loom
-/// test (`hnsw.rs`'s `establish_or_check_dimension`) needed a
+/// **Research note (Task 7), updated by the Task 10 fix below:** `arc-swap`
+/// (resolved to 1.9.2 in `Cargo.lock`) has no documented `loom` integration
+/// or feature flag — confirmed against docs.rs/arc-swap/1.9.2, crates.io's
+/// listed features (only an optional `serde` feature), and the crate's own
+/// upstream `Cargo.toml` (features: `weak`, `internal-test-strategies`,
+/// `experimental-strategies`, `experimental-thread-local` — no mention of
+/// loom anywhere). `loom` can only explore interleavings of its own
+/// instrumented primitives, so it cannot see inside `arc-swap`'s real
+/// internal atomics without `arc-swap` itself being loom-aware — the same
+/// reason `crates/index`'s earlier loom test (`hnsw.rs`'s
+/// `establish_or_check_dimension`) needed a
 /// `#[cfg(loom)]`/`#[cfg(not(loom))]` shim swapping in loom's atomic types.
-/// This test therefore does **not** instrument the real `Dataset`/`ArcSwap`
-/// type directly; it models the *shape* of the `Dataset::snapshot()` /
-/// `Transaction::commit()` race — one writer storing a new value, one or
-/// more readers loading concurrently — directly on loom's own
-/// `sync::atomic::AtomicUsize`, proving the swap-then-load pattern itself is
-/// race-free (no torn reads, no panics, no deadlocks) under loom's
-/// exhaustive interleaving exploration. This is the same relationship a
-/// hand-rolled `Mutex`-guarded swap would have to a loom test: the pattern
-/// is verified, not the third-party crate's own internals.
 ///
+/// `one_writer_store_races_safely_with_many_readers_load` below still does
+/// **not** instrument the real `Dataset`/`SnapshotCell` type; it models the
+/// *shape* of the `Dataset::snapshot()` / `Transaction::commit()` race
+/// directly on loom's own `sync::atomic::AtomicUsize` as a fast, minimal
+/// baseline sanity check of the swap-then-load pattern in the abstract.
+/// It is kept for exactly that reason — it explores the pattern's general
+/// safety in isolation from `commit`'s filesystem I/O and its own frame-cost
+/// budget.
+///
+/// The two Dataset-level models below —
+/// `a_failed_commits_segment_is_never_visible_to_a_concurrent_reader` and
+/// `a_commits_row_and_its_segment_become_visible_as_one_atomic_step` —
+/// exist to close the gap that note originally left open: they race a real
+/// reader thread (`Dataset::snapshot()`) against a real committer thread
+/// (`Transaction::commit()`) on an *actual* `Dataset`, and for loom to see
+/// that race at all, `Dataset.current` / `Transaction.current`'s storage
+/// (`SnapshotCell` — see its own doc comment above `struct Dataset`) is a
+/// `loom::sync::Mutex`-backed shim under `--cfg loom`, following exactly
+/// the `#[cfg(loom)]`/`#[cfg(not(loom))]` dual-primitive precedent
+/// `row_id.rs` already established, and reverting to the real
+/// `arc_swap::ArcSwap` outside it. Without this shim these two models'
+/// reader thread performs zero loom-instrumented operations, which is
+/// invisible to DPOR: loom's partial-order reduction collapses a thread
+/// with no dependent accesses to a single equivalence class, so the
+/// documented interleaving windows (the reader's read landing before the
+/// committer takes `commit_lock`, between the segment fsync and a failure,
+/// or after) were never actually being explored, only replayed once as a
+/// single trivial schedule — which is exactly what these two models'
+/// suspiciously fast original runtimes (sub-second) were a symptom of.
+///
+
 /// **Model 3 is deliberately absent.** Base design §5 defines it as the
 /// regression gate for deleting `RowIdAllocator.active` / `in_flight` /
 /// collapsing `Snapshot::is_visible` to the tombstone check — explicitly
@@ -6032,13 +6148,15 @@ mod loom_tests {
     /// final);
     /// `concurrent_first_vector_commits_at_different_dimensions_are_not_both_accepted`
     /// sits at 3 of 5 (root + the two racing committers);
-    /// `a_failed_commits_segment_is_never_visible_to_a_concurrent_reader` and
-    /// `a_commits_row_and_its_segment_become_visible_as_one_atomic_step` each
-    /// sit at 3 of 5 (root + a committer + a reader racing it directly,
-    /// rather than another committer). One more `spawn_committer` in any
-    /// model already at the cap trips an assert inside loom, so a commit
-    /// that only needs the stack — not the concurrency — still costs a
-    /// hard-capped slot.
+    /// `a_failed_commits_segment_is_never_visible_to_a_concurrent_reader` sits
+    /// at 4 of 5 (root + seed + failing + a reader racing it directly, rather
+    /// than another committer — the seed was added by Task 10 to make its
+    /// search assertion non-vacuous, see that test's own doc comment);
+    /// `a_commits_row_and_its_segment_become_visible_as_one_atomic_step` sits
+    /// at 3 of 5 (root + a committer + a reader racing it directly). One more
+    /// `spawn_committer` in any model already at the cap trips an assert
+    /// inside loom, so a commit that only needs the stack — not the
+    /// concurrency — still costs a hard-capped slot.
     ///
     /// loom documents this value as bytes while `generator` consumes it as
     /// words, so the real stack is 8 MiB today. Left uncompensated on
@@ -6695,19 +6813,60 @@ mod loom_tests {
     fn a_failed_commits_segment_is_never_visible_to_a_concurrent_reader() {
         // Base design §5, loom Model 1 -- "failed commit is invisible."
         //
-        // Thread A commits with `inject_manifest_commit_failure`: it claims
-        // row-ids, builds and fsyncs its segment, then returns Err before
-        // the manifest swap. Thread B takes a snapshot and searches
-        // concurrently. Under EVERY interleaving, B must observe neither
-        // A's row-id nor A's segment file.
+        // **Fixed by Task 10.** Review found that, before `SnapshotCell`
+        // (see its doc comment above `struct Dataset`, and the module doc
+        // comment above `mod loom_tests`), the reader thread below performed
+        // zero loom-instrumented operations: `Dataset::snapshot()` was a
+        // bare `arc_swap::ArcSwap::load_full` call, invisible to DPOR. With
+        // only one committer thread and nothing loom-instrumented on the
+        // reader side to create a race, loom collapsed this model to a
+        // single trivial schedule instead of exploring the windows this
+        // test's name promises -- which is exactly why its original runtime
+        // was suspiciously sub-second. `Dataset.current` now routes through
+        // `SnapshotCell`, a `loom::sync::Mutex` shim under `--cfg loom`, so
+        // B's `Dataset::snapshot()` and A's own `self.current.load()` /
+        // `load_full()` calls are all dependent accesses DPOR can actually
+        // branch on. `EXECUTIONS_EXPLORED` below is the honest check that it
+        // now does.
         //
-        // The interleavings loom explores that matter here are B's
-        // `current.load()` landing (i) before A takes `commit_lock`,
-        // (ii) between A's segment fsync and A's Err, and (iii) after A's
-        // Err. The property is the same in all three -- which is exactly
-        // the point: after W3.2a it holds structurally (a snapshot's
-        // segment set is its manifest's list, and A's segment never enters
-        // a manifest), not because a compensating action won a race.
+        // Thread A (`failing`) commits with `inject_manifest_commit_failure`:
+        // it claims row-ids, builds and fsyncs its segment, then returns Err
+        // before the manifest swap -- it never reaches `SnapshotCell::store`.
+        // Thread B (`reader`) takes a snapshot and searches concurrently.
+        // Under every interleaving loom now genuinely explores of B's
+        // `SnapshotCell::load_full()` landing (i) before A takes
+        // `commit_lock`, (ii) between A's segment fsync and A's Err, or
+        // (iii) after A's Err/return, B must observe neither A's row-id nor
+        // A's segment file.
+        //
+        // **Seed commit, added by Task 10.** Review also found the original
+        // `hits.is_empty()` assertion vacuous: with no vector-carrying
+        // commit landing before the racing pair, B's snapshot has zero
+        // segments under every interleaving and `vector_search` returns
+        // `Ok(vec![])` unconditionally, regardless of whether the code under
+        // test is correct. The seed below (one durable, far-away vector,
+        // run to completion first) gives the assertions something to
+        // discriminate -- "only the seed's vector is ever findable" versus
+        // "search finds nothing because there is nothing to search" --
+        // exactly mirroring the seed
+        // `a_failed_commits_graph_residue_is_never_searchable_under_concurrent_commits`
+        // above already uses for the same reason.
+        //
+        // **What this model proves, and what it can't.** The property here
+        // is *invariance*: B's observed (version, segment count, segment
+        // names, hits) is the same value under every interleaving loom
+        // explores, because A's failure path never reaches
+        // `SnapshotCell::store` at all -- there is no intermediate state to
+        // observe, by construction. That is the whole point (unlike Model 2
+        // below, whose two valid outcomes differ), but it also means the
+        // result itself can't demonstrate multiple schedules were explored.
+        // `EXECUTIONS_EXPLORED` is a plain (non-loom) counter, declared
+        // outside the modelled closure so it survives across every
+        // interleaving `loom::model` runs -- loom only resets state created
+        // *inside* the closure, not a `static` sitting outside it -- and
+        // asserting it ends up `> 1` afterward is a direct, honest signal
+        // that DPOR did not again collapse this model to the single trivial
+        // schedule the pre-fix version was actually running.
         //
         // This is the genuinely new interleaving space relative to
         // `a_failed_commits_graph_residue_is_never_searchable_under_concurrent_commits`
@@ -6718,10 +6877,15 @@ mod loom_tests {
         // `snapshot()` lands mid-commit -- something the committer-vs-
         // committer model never exercises.
         //
-        // Deliberately minimal per §5's flagged risk: one row, dim 3, and
-        // only A carries a vector. Budget: root + failing + reader = 3 of
-        // loom's 5-created-threads-per-execution cap.
+        // Deliberately minimal per §5's flagged risk: one seed row plus one
+        // row from the failing commit, dim 3. Budget: root + seed + failing
+        // + reader = 4 of loom's 5-created-threads-per-execution cap.
+        static EXECUTIONS_EXPLORED: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+
         loom::model(|| {
+            EXECUTIONS_EXPLORED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
             let dir = tempfile::Builder::new()
                 .prefix(&format!(
                     "strata-loom-failed-segment-{}-{:?}-",
@@ -6732,6 +6896,23 @@ mod loom_tests {
                 .unwrap()
                 .keep();
             let ds = crate::Dataset::create(&dir).unwrap();
+
+            // Seed: one durable, vector-carrying commit, run to completion
+            // *before* the racing pair below -- see this test's doc comment
+            // for why the assertions are vacuous without it. Spawned (and
+            // joined immediately, so the schedule below is unaffected) for
+            // the stack, not the concurrency -- the root thread's 32 KiB
+            // cannot hold a `commit` (see `COMMIT_STACK_SIZE`).
+            let ds_seed = ds.clone();
+            spawn_committer(move || {
+                let mut seed = ds_seed.begin();
+                seed.insert(loom_vector_batch(0, &[0.0, 0.0, 0.0]));
+                seed.commit()
+            })
+            .join()
+            .unwrap()
+            .unwrap();
+
             let version_before = ds.snapshot().version;
 
             let ds_failing = ds.clone();
@@ -6767,20 +6948,27 @@ mod loom_tests {
                 observed_version, version_before,
                 "no snapshot may exist at a version the failed commit never produced"
             );
-            assert!(
-                segment_names.is_empty(),
-                "a reader must never see a manifest naming the failed commit's \
-                 segment file: {segment_names:?}"
+            assert_eq!(
+                segment_names,
+                vec![ds.snapshot().manifest.segments[0].name.clone()],
+                "a reader must observe exactly the seed's segment, and never the \
+                 failed commit's, under any interleaving: {segment_names:?}"
             );
             assert_eq!(
-                observed_parts, 0,
+                observed_parts, 1,
                 "the observed snapshot's segment set must match its manifest's \
-                 (empty) segment list"
+                 seed-only segment list"
+            );
+            assert_eq!(
+                hits.len(),
+                1,
+                "the seed's vector is the only one ever reachable, under any \
+                 interleaving: {hits:?}"
             );
             assert!(
-                hits.is_empty(),
-                "the failed commit's vector was the only one ever inserted, and \
-                 must never be searchable under any interleaving: {hits:?}"
+                hits[0].squared_distance > 1000.0,
+                "the only searchable vector must be the far-away seed, never the \
+                 failed commit's near-zero-distance one: {hits:?}"
             );
 
             // The root thread's own post-join view, which is the quiescent
@@ -6790,16 +6978,43 @@ mod loom_tests {
                 version_before,
                 "a failed commit must not advance the visible version"
             );
-            assert!(ds.snapshot().manifest.segments.is_empty());
+            assert_eq!(
+                ds.snapshot().manifest.segments.len(),
+                1,
+                "only the seed's segment may ever be listed"
+            );
 
             std::fs::remove_dir_all(&dir).ok();
         });
+
+        let executions = EXECUTIONS_EXPLORED.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            executions > 1,
+            "loom explored only {executions} execution(s) of this model -- with \
+             `SnapshotCell` genuinely instrumented, the reader's read and the \
+             failing committer's own current-cell accesses should force DPOR \
+             to branch over more than the single trivial schedule this count \
+             would otherwise indicate (see the module doc comment above `mod \
+             loom_tests`)"
+        );
     }
 
     #[test]
     fn a_commits_row_and_its_segment_become_visible_as_one_atomic_step() {
         // Base design §5, loom Model 2 -- "row + segment publish
         // atomically."
+        //
+        // **Fixed by Task 10.** Same underlying gap as Model 1 above: before
+        // `SnapshotCell` (see the module doc comment above `mod loom_tests`
+        // and `struct SnapshotCell`'s own doc comment), B's
+        // `Dataset::snapshot()` was a bare `arc_swap::ArcSwap::load_full`
+        // call, invisible to loom's DPOR scheduler. That means the
+        // `version == 0` branch below -- B's read landing *before* A's
+        // `SnapshotCell::store` -- was never actually reachable under
+        // exploration; only `version == 1` (B scheduled strictly after A
+        // completed) ever ran, silently, and the model's sub-second runtime
+        // was the tell. `DISTINCT_VERSIONS_OBSERVED` below is the honest
+        // check that both branches are now genuinely hit.
         //
         // A commits successfully; B snapshots and then both scans and
         // vector-searches THAT SAME snapshot. B must observe either the
@@ -6823,8 +7038,22 @@ mod loom_tests {
         // two snapshots would let a commit land in between and make the
         // test assert nothing.
         //
+        // `DISTINCT_VERSIONS_OBSERVED` is a plain (non-loom) bitmask,
+        // declared outside the modelled closure so it accumulates across
+        // every interleaving `loom::model` explores -- loom only resets
+        // state created *inside* the closure, not a `static` sitting outside
+        // it. Bit 0 is set the first time some interleaving lands B on the
+        // `version == 0` branch, bit 1 the first time one lands on
+        // `version == 1`; asserting both bits are set after `loom::model`
+        // returns is a direct, honest proof that DPOR is genuinely
+        // exercising B's read on both sides of A's atomic publish, not just
+        // replaying whichever side happens to run first.
+        //
         // Budget: root + writer + reader = 3 of loom's
         // 5-created-threads-per-execution cap.
+        static DISTINCT_VERSIONS_OBSERVED: std::sync::atomic::AtomicU8 =
+            std::sync::atomic::AtomicU8::new(0);
+
         loom::model(|| {
             let dir = tempfile::Builder::new()
                 .prefix(&format!(
@@ -6874,11 +7103,13 @@ mod loom_tests {
 
             match version {
                 0 => {
+                    DISTINCT_VERSIONS_OBSERVED.fetch_or(0b01, std::sync::atomic::Ordering::Relaxed);
                     assert_eq!(data_files, 0, "the pre-commit state has no data file");
                     assert_eq!(segments, 0, "...and no segment");
                     assert_eq!(hit_count, 0, "...and nothing to find");
                 }
                 1 => {
+                    DISTINCT_VERSIONS_OBSERVED.fetch_or(0b10, std::sync::atomic::Ordering::Relaxed);
                     assert_eq!(data_files, 1, "the post-commit state has A's data file");
                     assert_eq!(segments, 1, "...and A's segment");
                     assert_eq!(
@@ -6893,5 +7124,16 @@ mod loom_tests {
 
             std::fs::remove_dir_all(&dir).ok();
         });
+
+        let observed = DISTINCT_VERSIONS_OBSERVED.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            observed, 0b11,
+            "loom must observe the reader landing on both sides of the \
+             committer's atomic publish -- version bitmask {observed:#04b}, \
+             expected 0b11 (both version 0 and version 1 reachable). Seeing \
+             only one side means DPOR collapsed this model to a single \
+             trivial schedule again (see the module doc comment above `mod \
+             loom_tests`)"
+        );
     }
 }
