@@ -36,6 +36,35 @@ pub struct DataFileEntry {
     pub delta_log: String,
 }
 
+/// One immutable index segment listed in the manifest — see
+/// `docs/superpowers/specs/2026-07-24-s1-segment-format-w3-migration-design.md`
+/// §3. Always an empty `Vec` on `Manifest` until S1 W3.2 starts writing
+/// segments; `#[serde(default)]` on the field below and on `zone_map` here
+/// both make "field absent" (a manifest written before this existed) and
+/// "field present but empty" indistinguishable, which is required: an
+/// absent/empty `zone_map` must always mean "must scan," never "may prune"
+/// (binding invariant, see the design doc §3).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SegmentEntry {
+    /// Relative to the dataset's `data/` directory, e.g. `"{attempt_id:020}.seg"`.
+    pub name: String,
+    /// Per-segment, not per-dataset — segments are immutable and never
+    /// rewritten, so a future writer must still be able to read an older
+    /// segment's format.
+    pub format_version: u32,
+    pub vector_count: u64,
+    pub dimension: u32,
+    /// Inclusive.
+    pub row_id_min: u64,
+    /// Inclusive.
+    pub row_id_max: u64,
+    pub byte_len: u64,
+    /// Empty until S1 W4 populates it. An absent or empty map must always
+    /// fail safe to "must scan" in whatever pruning evaluator W4 writes.
+    #[serde(default)]
+    pub zone_map: HashMap<String, ColumnStats>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
     pub version: u64,
@@ -83,6 +112,13 @@ pub struct Manifest {
     /// still deserialize, same reasoning as `tombstones`/`next_attempt_id`.
     #[serde(default)]
     pub commit_time_high_water: i64,
+    /// Immutable index segments as of this version — see
+    /// `docs/superpowers/specs/2026-07-24-s1-segment-format-w3-migration-design.md`
+    /// §3. Always empty until S1 W3.2 starts writing segments.
+    /// `#[serde(default)]` so manifests written before this field existed
+    /// still deserialize, same reasoning as `tombstones`/`next_attempt_id`.
+    #[serde(default)]
+    pub segments: Vec<SegmentEntry>,
 }
 
 impl Manifest {
@@ -95,6 +131,7 @@ impl Manifest {
             tombstones: Vec::new(),
             next_attempt_id: 0,
             commit_time_high_water: 0,
+            segments: Vec::new(),
         }
     }
 }
@@ -222,6 +259,7 @@ mod tests {
             tombstones: Vec::new(),
             next_attempt_id: 0,
             commit_time_high_water: 0,
+            segments: Vec::new(),
         };
         commit_manifest(&dir, &m0).unwrap();
         let m1 = Manifest {
@@ -242,6 +280,7 @@ mod tests {
             tombstones: Vec::new(),
             next_attempt_id: 0,
             commit_time_high_water: 0,
+            segments: Vec::new(),
         };
         commit_manifest(&dir, &m1).unwrap();
 
@@ -267,6 +306,7 @@ mod tests {
             tombstones: Vec::new(),
             next_attempt_id: 0,
             commit_time_high_water: 0,
+            segments: Vec::new(),
         };
         commit_manifest(&dir, &m0).unwrap();
 
@@ -345,6 +385,7 @@ mod tests {
             tombstones: Vec::new(),
             next_attempt_id: 0,
             commit_time_high_water: 0,
+            segments: Vec::new(),
         };
 
         commit_manifest(&dir, &m0).unwrap();
@@ -444,6 +485,7 @@ mod tests {
             tombstones: Vec::new(),
             next_attempt_id: 0,
             commit_time_high_water: 0,
+            segments: Vec::new(),
         };
         commit_manifest(&dir, &m0).unwrap();
 
@@ -491,5 +533,21 @@ mod tests {
     #[test]
     fn empty_manifest_starts_with_zero_commit_time_high_water() {
         assert_eq!(Manifest::empty().commit_time_high_water, 0);
+    }
+
+    #[test]
+    fn manifest_without_segments_field_deserializes_with_default_empty() {
+        let old_json = serde_json::json!({
+            "version": 0,
+            "data_files": [],
+            "next_row_id": 0,
+        });
+        let deserialized: Manifest = serde_json::from_value(old_json).unwrap();
+        assert!(deserialized.segments.is_empty());
+    }
+
+    #[test]
+    fn empty_manifest_has_no_segments() {
+        assert!(Manifest::empty().segments.is_empty());
     }
 }

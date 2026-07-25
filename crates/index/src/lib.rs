@@ -32,7 +32,9 @@ pub mod graph;
 pub mod hnsw;
 mod node;
 mod node_layout;
+mod node_source;
 mod node_table;
+mod segment_set;
 mod slot_array;
 
 pub use brute_force::{Neighbor, brute_force_search};
@@ -40,3 +42,5 @@ pub use delta_log::{DeltaEntry, read_delta_log, write_delta_log};
 pub use hnsw::{
     EfConstruction, HnswIndex, IndexError, MaxConnections, MaxElements, MaxLayers, VectorMatch,
 };
+pub use node_source::NodeSource;
+pub use segment_set::{IndexPart, SegmentSet};
