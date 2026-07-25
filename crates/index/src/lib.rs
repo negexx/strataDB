@@ -32,6 +32,7 @@ pub mod graph;
 pub mod hnsw;
 mod node;
 mod node_layout;
+mod node_source;
 mod node_table;
 mod slot_array;
 
@@ -40,3 +41,4 @@ pub use delta_log::{DeltaEntry, read_delta_log, write_delta_log};
 pub use hnsw::{
     EfConstruction, HnswIndex, IndexError, MaxConnections, MaxElements, MaxLayers, VectorMatch,
 };
+pub use node_source::NodeSource;

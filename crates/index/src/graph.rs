@@ -727,6 +727,48 @@ impl<D: Distance> Graph<D> {
     }
 }
 
+impl<D: Distance> crate::node_source::NodeSource for Graph<D> {
+    fn entry_point(&self) -> Option<(u64, usize)> {
+        self.entry_point.get()
+    }
+
+    fn level(&self, local: u64) -> Option<usize> {
+        // `Node::level` takes `self` by value (it's `Copy`, not a
+        // reference) so it can't be passed directly to `Option<&Node>::map`
+        // as a function item -- `|node| node.level()` reborrows through
+        // method-call syntax instead.
+        self.nodes.get(local).map(|node| node.level())
+    }
+
+    fn neighbors_into(&self, local: u64, level: usize, out: &mut Vec<u64>) {
+        out.clear();
+        if let Some(node) = self.nodes.get(local)
+            && level <= node.level()
+        {
+            node.layer(level).occupied_into(out);
+        }
+    }
+
+    fn vector(&self, local: u64) -> Option<&[f32]> {
+        self.nodes.get(local).map(Node::vector)
+    }
+
+    fn row_id(&self, local: u64) -> u64 {
+        local
+    }
+
+    fn dimension(&self) -> usize {
+        self.established_dimension()
+    }
+
+    fn is_deleted(&self, local: u64) -> bool {
+        // Same reason as `level` above: `Node::is_deleted` takes `self` by
+        // value, so it's passed through a reborrowing closure rather than
+        // as a bare function item.
+        self.nodes.get(local).is_some_and(|node| node.is_deleted())
+    }
+}
+
 /// Algorithm 3, `SELECT-NEIGHBORS-SIMPLE`: the `m` nearest candidates,
 /// nearest-first. `candidates` need not be pre-sorted.
 // `Graph::insert` calls `select_neighbors_heuristic` (Algorithm 4)
