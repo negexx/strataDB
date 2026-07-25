@@ -28,8 +28,16 @@ pub enum DeltaEntry {
 ///
 /// # Errors
 ///
-/// Returns an [`IndexError::Io`] if `path` can't be written, or
-/// [`IndexError::Serde`] if an entry fails to serialize.
+/// Returns [`IndexError::Io`] if `path` can't be created, `sync_all`-ed, or
+/// if `write_all`'s newline write fails outright. Note that a write failure
+/// that occurs *while `serde_json` is writing an entry* (e.g. disk full
+/// partway through a flush the serializer triggers internally) surfaces as
+/// [`IndexError::Serde`] instead, since `serde_json::to_writer` wraps the
+/// underlying `io::Error` in its own `Error` type — not a bare I/O failure
+/// from this function's own perspective, even though the root cause is I/O.
+/// Either error type is handled identically by every caller today (both
+/// convert to `TxnError::Index` in `crates/txn`), so this only matters if a
+/// caller ever starts branching on the specific variant.
 pub fn write_delta_log(path: &Path, entries: &[DeltaEntry]) -> Result<(), IndexError> {
     use std::io::Write as _;
     let file = std::fs::File::create(path)?;
@@ -37,10 +45,6 @@ pub fn write_delta_log(path: &Path, entries: &[DeltaEntry]) -> Result<(), IndexE
     // BufWriter coalesces them into 64 KiB writes.
     let mut writer = std::io::BufWriter::with_capacity(64 * 1024, file);
     for entry in entries {
-        // Writes directly into the buffered writer instead of building a
-        // per-entry String via to_string() first -- byte-identical output
-        // (same serializer, same bytes), one fewer heap allocation per
-        // entry.
         serde_json::to_writer(&mut writer, entry)?;
         writer.write_all(b"\n")?;
     }
@@ -102,6 +106,40 @@ mod tests {
         let read_back = read_delta_log(&path).unwrap();
 
         assert_eq!(read_back, entries);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn write_delta_log_produces_compact_newline_delimited_json_with_no_trailing_whitespace() {
+        // The round-trip test alone can't catch a whitespace-level format
+        // regression: read_delta_log's serde_json::from_str tolerates
+        // trailing whitespace on a line, so e.g. an accidental
+        // `{...}   \n` would still round-trip green. This asserts the exact
+        // on-disk bytes instead, mirroring the sibling byte-format check in
+        // crates/storage/src/manifest.rs
+        // (commit_manifest_writes_compact_json_not_pretty_printed).
+        let path = temp_path("byte-format");
+        let entries = vec![
+            DeltaEntry::Insert {
+                row_id: 0,
+                vector: vec![1.0, 2.0, 3.0],
+            },
+            DeltaEntry::Tombstone { row_id: 1 },
+        ];
+
+        write_delta_log(&path, &entries).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+
+        let expected = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&entries[0]).unwrap(),
+            serde_json::to_string(&entries[1]).unwrap(),
+        );
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            expected,
+            "expected compact JSON, one entry per line, no extra whitespace"
+        );
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
