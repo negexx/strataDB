@@ -113,10 +113,19 @@ pub enum BatchInsertOutcome {
 /// Below this, per-thread overhead (spawn cost, cache-cold start) isn't
 /// worth it relative to a few more sequential inserts on one thread -- e.g.
 /// a 3-row batch across 8 available cores should not spawn 3 threads for 1
-/// row each. Provisional; confirmed/tuned alongside the 2/4/8-thread
+/// row each. Provisional; confirmed/tuned alongside the 1/4/8-thread
 /// measurement pass cited in `crates/txn/src/dataset.rs`'s
 /// `PARALLEL_INSERT_THREADS`.
 const MIN_ROWS_PER_CHUNK: usize = 64;
+
+/// Test-only sentinel row-id that deterministically panics
+/// [`HnswIndex::insert_owned_chunk`] -- see that method's own comment on the
+/// injection point. `u64::MAX` rather than some arbitrary large constant:
+/// `crates/txn`'s row-id allocator enforces `next_row_id <=
+/// MAX_ROW_ID_CAPACITY` (strictly less than `u64::MAX`), so no real
+/// production row-id can ever collide with this value.
+#[cfg(test)]
+const PANIC_TEST_ROW_ID: u64 = u64::MAX;
 
 /// # Examples
 ///
@@ -431,7 +440,7 @@ impl HnswIndex {
             std::sync::Mutex::new(Vec::with_capacity(rows.len()));
 
         if rows.len() < 2 {
-            return Self::outcome_from(&applied, self.insert_owned_chunk(rows, &applied));
+            return self.run_sequential(rows, &applied);
         }
         // Queried after the tiny/delete-only-batch early return above, not
         // before: no reason to pay this syscall for a batch that's about
@@ -439,7 +448,7 @@ impl HnswIndex {
         let threads = threads
             .min(std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get));
         if threads <= 1 {
-            return Self::outcome_from(&applied, self.insert_owned_chunk(rows, &applied));
+            return self.run_sequential(rows, &applied);
         }
 
         let chunk_size = rows.len().div_ceil(threads).max(MIN_ROWS_PER_CHUNK);
@@ -465,7 +474,7 @@ impl HnswIndex {
             // matching this codebase's "fails safe rather than panicking"
             // convention for provably-unreachable conditions.
             let chunk = chunks.into_iter().next().unwrap_or_default();
-            return Self::outcome_from(&applied, self.insert_owned_chunk(chunk, &applied));
+            return self.run_sequential(chunk, &applied);
         }
 
         // Catches a panic from the fan-out ITSELF -- e.g.
@@ -531,6 +540,35 @@ impl HnswIndex {
         }
     }
 
+    /// Runs `rows` through [`Self::insert_owned_chunk`] on the CALLING
+    /// thread (the sequential-degenerate path: `rows.len() < 2`,
+    /// `threads <= 1`, or `MIN_ROWS_PER_CHUNK` folding everything into one
+    /// chunk) -- but still under the same `catch_unwind` protection as the
+    /// multi-worker fan-out below. Without this, a panic from
+    /// `insert_owned` here would unwind straight out of
+    /// `insert_batch_parallel`, dropping `applied` -- and every row already
+    /// recorded into it -- along with it, exactly the hazard the fan-out's
+    /// own `catch_unwind` exists to close. This path is not the rare case:
+    /// every commit under `MIN_ROWS_PER_CHUNK` rows and every single-core
+    /// host takes it, so leaving it uncaught would silently reopen the gap
+    /// for the common case while only fixing the multi-worker one.
+    fn run_sequential(
+        &self,
+        rows: Vec<(u64, Vec<f32>)>,
+        applied: &std::sync::Mutex<Vec<u64>>,
+    ) -> BatchInsertOutcome {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.insert_owned_chunk(rows, applied)
+        }));
+        match result {
+            Ok(error) => Self::outcome_from(applied, error),
+            Err(payload) => BatchInsertOutcome::WorkerPanicked {
+                applied: into_applied_vec(applied),
+                payload,
+            },
+        }
+    }
+
     fn outcome_from(
         applied: &std::sync::Mutex<Vec<u64>>,
         error: Option<IndexError>,
@@ -569,6 +607,23 @@ impl HnswIndex {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(row_id);
+            // Test-only panic-injection hook (mirrors `crates/txn`'s
+            // `inject_manifest_commit_failure`): a real caller can never
+            // legitimately insert `PANIC_TEST_ROW_ID` (`u64::MAX`), since
+            // `crates/txn`'s row-id allocator never hands it out (see
+            // `MAX_ROW_ID_CAPACITY`'s doc). This is the only way to
+            // deterministically exercise `insert_batch_parallel`'s
+            // `WorkerPanicked` outcome and the `catch_unwind` wrapping
+            // both the sequential path and the multi-worker fan-out --
+            // `insert_owned` itself has no reachable panic path from bad
+            // input (a dimension/row-id problem is a typed `IndexError`,
+            // not a panic), so there is no way to trigger this from real
+            // data.
+            #[cfg(test)]
+            assert_ne!(
+                row_id, PANIC_TEST_ROW_ID,
+                "intentional test panic for insert_batch_parallel's WorkerPanicked coverage"
+            );
             if let Err(error) = self.insert_owned(row_id, vector) {
                 return Some(error);
             }
@@ -1153,6 +1208,83 @@ mod tests {
             parallel_recall >= sequential_recall - 0.15,
             "parallel insert's recall ({parallel_recall:.3}) dropped more than the 0.15 \
              tolerance below sequential insert's ({sequential_recall:.3})"
+        );
+    }
+
+    #[test]
+    fn insert_batch_parallel_reports_worker_panicked_and_every_other_applied_row_on_the_multi_worker_path()
+     {
+        // Exercises the fan-out's own catch_unwind (rows.len() >= 2,
+        // threads > 1, multiple chunks) -- the path
+        // run_chunks_in_parallel_propagates_a_worker_panic_as_a_join_error
+        // already covers the join-conversion step of, but nothing before
+        // this test ever drove insert_batch_parallel itself into
+        // WorkerPanicked. PANIC_TEST_ROW_ID is the last row of the last
+        // chunk (same contiguous-chunking reasoning as the dimension-
+        // mismatch test above), so every other row across every chunk must
+        // still appear in applied.
+        let index = HnswIndex::new(
+            MaxConnections(TEST_MAX_NB_CONNECTION),
+            MaxElements(300),
+            MaxLayers(TEST_MAX_LAYER),
+            EfConstruction(TEST_EF_CONSTRUCTION),
+        )
+        .unwrap();
+        let mut rows = widely_separated_rows(300);
+        rows[299].0 = PANIC_TEST_ROW_ID;
+
+        let outcome = index.insert_batch_parallel(rows, 4);
+        let BatchInsertOutcome::WorkerPanicked {
+            applied,
+            payload: _,
+        } = outcome
+        else {
+            panic!("expected WorkerPanicked, got {outcome:?}");
+        };
+        let applied_set: HashSet<u64> = applied.into_iter().collect();
+        let mut expected: HashSet<u64> = (0..299u64).collect();
+        expected.insert(PANIC_TEST_ROW_ID);
+        assert_eq!(
+            applied_set, expected,
+            "every row from every chunk, including the one that panicked, must still be \
+             recorded applied -- a worker's panic must never cost visibility into what every \
+             OTHER worker already committed to the shared graph"
+        );
+    }
+
+    #[test]
+    fn insert_batch_parallel_reports_worker_panicked_on_the_sequential_degenerate_path() {
+        // Exercises run_sequential's catch_unwind, the fix for the gap
+        // design review found in the reconciled commit: rows.len() < 2 (and
+        // by the same code path, threads <= 1 and the MIN_ROWS_PER_CHUNK
+        // single-chunk fold) run insert_owned_chunk directly on the calling
+        // thread, with no fan-out at all. Before the fix, a panic here
+        // unwound straight out of insert_batch_parallel and dropped
+        // `applied` -- exactly the hazard GraphResidueGuard exists to
+        // prevent -- for what is actually the COMMON case (every commit
+        // under MIN_ROWS_PER_CHUNK rows).
+        let index = HnswIndex::new(
+            MaxConnections(16),
+            MaxElements(10),
+            MaxLayers(16),
+            EfConstruction(200),
+        )
+        .unwrap();
+
+        let outcome =
+            index.insert_batch_parallel(vec![(PANIC_TEST_ROW_ID, vec![1.0, 2.0, 3.0])], 8);
+        let BatchInsertOutcome::WorkerPanicked {
+            applied,
+            payload: _,
+        } = outcome
+        else {
+            panic!("expected WorkerPanicked, got {outcome:?}");
+        };
+        assert_eq!(
+            applied,
+            vec![PANIC_TEST_ROW_ID],
+            "the panicking row must still be recorded applied -- it's marked applied \
+             BEFORE insert_owned runs, precisely so a panic mid-insert can't lose it"
         );
     }
 

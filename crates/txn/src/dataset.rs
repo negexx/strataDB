@@ -1300,16 +1300,19 @@ fn new_hnsw_index(capacity: usize) -> Result<HnswIndex> {
 // there's no real downside to leaving headroom for a wider commit or a
 // higher-core machine.
 //
-// Recall cost: not re-measured against this exact base (that requires the
-// 100k-row vector_search_bench production-scale run, which is unchanged in
-// mechanism by any of the sibling PRs above -- the recall risk is
-// `Graph::insert`'s own shrink-step race, documented on
-// `insert_batch_parallel` itself, not something ef_construction or
-// allocation hoisting affects). Closest same-base evidence is
-// `crates/index`'s own
-// `insert_batch_parallel_recall_matches_sequential_insert_within_tolerance`,
-// which passes on this base with the same generous tolerance. Judged an
-// acceptable trade for the ~2.5x ingest speedup measured above.
+// Recall cost, re-measured via vector_search_bench (100k rows, real Dataset,
+// production-scale) against this same base rather than reusing the earlier
+// branch's citation, since ef_construction's own drop to 100 (PR #21) already
+// spends part of the same recall budget:
+//   recall@10 = 0.9800 (threads=1) -> 0.9780 (threads=8), a 0.2pp drop.
+// Smaller than the earlier branch's citation (0.9850 -> 0.9790, 0.6pp) taken
+// on the pre-PR#21 base -- both are measurements of the same underlying
+// mechanism (`Graph::insert`'s non-atomic shrink-step race, documented on
+// `insert_batch_parallel` itself), and the two runs aren't expected to match
+// exactly, only to confirm the drop stays small. Also covered at unit-test
+// scale by `crates/index`'s own
+// `insert_batch_parallel_recall_matches_sequential_insert_within_tolerance`.
+// Judged an acceptable trade for the ~2.5x ingest speedup measured above.
 const PARALLEL_INSERT_THREADS: usize = 8;
 
 /// Sane ceiling for a manifest's `next_row_id`, enforced at open before any
