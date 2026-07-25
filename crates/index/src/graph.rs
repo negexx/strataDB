@@ -155,8 +155,9 @@ impl Ord for Candidate {
 /// `search_layer`). Safe as plain `RefCell` (not a `Mutex`/atomic): nothing
 /// that borrows `SEARCH_SCRATCH` is ever called reentrantly on the same
 /// thread -- every borrow (`search_layer`'s own use, `Graph::insert`'s two
-/// direct uses, `Graph::k_nn_search`'s two call sites into `search_layer`)
-/// runs to completion and releases before the next one starts, so a nested
+/// direct uses, `k_nn_search_generic`'s two call sites into
+/// `search_layer_generic`) runs to completion and releases before the next
+/// one starts, so a nested
 /// `borrow_mut()` can never happen. This also depends on every closure run
 /// while a borrow is live -- `search_layer`'s caller-supplied `filter`
 /// (threaded through from `HnswIndex::search`/`search_filtered`'s public,
@@ -518,26 +519,7 @@ impl<D: Distance> Graph<D> {
         ef: usize,
         filter: impl Fn(u64) -> bool,
     ) -> Result<Vec<(u64, f32)>, crate::hnsw::IndexError> {
-        let established = self.dimension.load(Ordering::SeqCst);
-        if established != 0 && query.len() != established {
-            return Err(crate::hnsw::IndexError::DimensionMismatch {
-                query_len: query.len(),
-                expected: established,
-            });
-        }
-        let Some((mut entry, mut level)) = self.entry_point.get() else {
-            return Ok(Vec::new());
-        };
-        while level >= 1 {
-            let found = self.search_layer(query, entry, 1, level, &filter, true);
-            if let Some((nearest, _)) = found.first() {
-                entry = *nearest;
-            }
-            level -= 1;
-        }
-        let mut results = self.search_layer(query, entry, ef, 0, &filter, true);
-        results.truncate(k);
-        Ok(results)
+        k_nn_search_generic(self, &self.distance, query, k, ef, filter)
     }
 
     /// Marks `row_id` as deleted — excluded from `k_nn_search` results
@@ -759,6 +741,46 @@ fn search_layer_generic<S: NodeSource, D: Distance>(
         out.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(CmpOrdering::Equal));
         out
     })
+}
+
+/// Algorithm 5, `K-NN-SEARCH`. Descends layers `L..1` with `ef=1` greedy
+/// search, then one real `SEARCH-LAYER` at layer 0 with the caller's actual
+/// `ef`. Returns `(row_id, distance)` pairs, nearest-first, capped at `k`.
+/// Generic over `NodeSource` — see `search_layer_generic`'s doc comment for
+/// the local-id-vs-row-id note, which applies identically here.
+///
+/// # Errors
+///
+/// Returns `IndexError::DimensionMismatch` if `query`'s length doesn't
+/// match `source`'s established dimension.
+fn k_nn_search_generic<S: NodeSource, D: Distance>(
+    source: &S,
+    distance: &D,
+    query: &[f32],
+    k: usize,
+    ef: usize,
+    filter: impl Fn(u64) -> bool,
+) -> Result<Vec<(u64, f32)>, crate::hnsw::IndexError> {
+    let established = source.dimension();
+    if established != 0 && query.len() != established {
+        return Err(crate::hnsw::IndexError::DimensionMismatch {
+            query_len: query.len(),
+            expected: established,
+        });
+    }
+    let Some((mut entry, mut level)) = source.entry_point() else {
+        return Ok(Vec::new());
+    };
+    while level >= 1 {
+        let found = search_layer_generic(source, distance, query, entry, 1, level, &filter, true);
+        if let Some((nearest, _)) = found.first() {
+            entry = *nearest;
+        }
+        level -= 1;
+    }
+    let mut results = search_layer_generic(source, distance, query, entry, ef, 0, &filter, true);
+    results.truncate(k);
+    Ok(results)
 }
 
 impl<D: Distance> NodeSource for Graph<D> {
