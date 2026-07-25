@@ -159,13 +159,15 @@ fn bench_concurrent_non_conflicting_inserts(c: &mut Criterion) {
 
 /// Vector-workload counterpart to `bench_concurrent_non_conflicting_inserts`.
 /// The two `Int64`-only benchmarks above never populate a `"vector"` column,
-/// so no segment is built during them, which is what isolates the
-/// conflict-check cost from the index-build cost: the
-/// "concurrent beats sequential" result they measure comes entirely from
-/// data-file fsync (which runs outside the lock) parallelizing across
-/// threads. This benchmark is what actually exercises the flagship
-/// "atomic row+index commit" workload, where the expensive work (graph
-/// insert) runs *inside* the lock instead. See
+/// so no segment is built during them at all — there is no graph insert to
+/// run anywhere, in-lock or out. That absence is what isolates the
+/// conflict-check cost from the index-build cost: the "concurrent beats
+/// sequential" result they measure comes entirely from data-file fsync
+/// (which runs outside the lock) parallelizing across threads. This
+/// benchmark is what actually exercises the flagship "atomic row+index
+/// commit" workload: here the segment build/serialize/fsync (the expensive
+/// work) runs in `write_phase`, *before* `commit_lock` is ever acquired: the
+/// in-lock step is just a manifest push, not an index mutation. See
 /// `docs/superpowers/specs/2026-07-21-phase-6-concurrent-write-engine-design.md`
 /// §3 for why that placement was a deliberate, but until now unmeasured,
 /// choice.
