@@ -383,8 +383,36 @@ mod tests {
     }
 
     proptest! {
+        // `row_id` is NOT independently random: a bare `any::<u64>()` for
+        // all three fields was tried first and found to have essentially
+        // zero power to catch a boundary off-by-one (verified directly --
+        // injecting `row_id <= base + len` in the reference below and
+        // re-running with independent-random generation still passed
+        // clean, since hitting `row_id == base + len` exactly by pure
+        // chance across u64's range is astronomically unlikely). `row_id`
+        // is instead drawn from a mix of a fully random value AND several
+        // boundary-adjacent candidates relative to `(base, len)` --
+        // `base - 1`, `base`, `base + len - 1`, `base + len`, and
+        // `base + len + 1` (wrapping, so this never panics at u64's own
+        // edges) -- so the exact boundary this range type's contract turns
+        // on is actually exercised, not just plausible-by-volume.
         #[test]
-        fn contains_matches_naive_range_check(base: u64, len: u64, row_id: u64) {
+        fn contains_matches_naive_range_check(
+            (base, len, row_id) in (any::<u64>(), any::<u64>()).prop_flat_map(|(base, len)| {
+                let boundary_candidates = vec![
+                    base.wrapping_sub(1),
+                    base,
+                    base.wrapping_add(len).wrapping_sub(1),
+                    base.wrapping_add(len),
+                    base.wrapping_add(len).wrapping_add(1),
+                ];
+                (
+                    Just(base),
+                    Just(len),
+                    prop_oneof![any::<u64>(), prop::sample::select(boundary_candidates)],
+                )
+            })
+        ) {
             let range = RowIdRange { base, len };
             let actual = range.contains(row_id);
             // Deliberately naive reference: computed with u128 so the
