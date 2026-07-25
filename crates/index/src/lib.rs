@@ -30,6 +30,7 @@ pub mod distance;
 #[doc(hidden)]
 pub mod graph;
 pub mod hnsw;
+pub mod live_set;
 mod node;
 mod node_layout;
 mod node_table;
@@ -41,3 +42,4 @@ pub use hnsw::{
     BatchInsertOutcome, EfConstruction, HnswIndex, IndexError, MaxConnections, MaxElements,
     MaxLayers, VectorMatch,
 };
+pub use live_set::LiveSet;
