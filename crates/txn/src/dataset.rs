@@ -6093,7 +6093,22 @@ mod tests {
 /// single trivial schedule — which is exactly what these two models'
 /// suspiciously fast original runtimes (sub-second) were a symptom of.
 ///
-
+/// **This instrumentation is not free.** Making `SnapshotCell` genuinely
+/// loom-visible (so DPOR actually explores the reader-vs-committer
+/// interleavings above, instead of collapsing them to one trivial schedule)
+/// raised the per-execution cost of every model that touches
+/// `Dataset.current` by roughly 30x. Running the whole `loom_tests` module
+/// as a single test binary invocation can now exceed ten minutes and, on
+/// Windows, can fail with an `ERROR_NO_SYSTEM_RESOURCES` OS error when all
+/// ~9 models run in the same process together -- this is an environmental
+/// resource-exhaustion symptom, not a correctness failure (each model has
+/// been confirmed to pass individually). On Windows especially, prefer
+/// running one model at a time: build per the `Run with` instructions above,
+/// then invoke the resulting binary with a single test's full path and
+/// `--exact` (e.g. `dataset::loom_tests::a_commits_row_and_its_segment_become_visible_as_one_atomic_step
+/// --exact`) rather than filtering to the whole `dataset::loom_tests` module
+/// in one run.
+///
 /// **Model 3 is deliberately absent.** Base design §5 defines it as the
 /// regression gate for deleting `RowIdAllocator.active` / `in_flight` /
 /// collapsing `Snapshot::is_visible` to the tombstone check — explicitly
@@ -7016,11 +7031,13 @@ mod loom_tests {
         // was the tell. `DISTINCT_VERSIONS_OBSERVED` below is the honest
         // check that both branches are now genuinely hit.
         //
-        // A commits successfully; B snapshots and then both scans and
-        // vector-searches THAT SAME snapshot. B must observe either the
-        // complete pre-commit state or the complete post-commit state --
-        // never A's row present under the old manifest version, and never
-        // the version bumped with A's segment absent.
+        // A commits successfully; B snapshots and then reads THAT SAME
+        // snapshot's data-file count (a proxy for row presence -- no real
+        // `scan` is issued here) and also runs a real `vector_search`
+        // against it. B must observe either the complete pre-commit state or
+        // the complete post-commit state -- never A's row present under the
+        // old manifest version, and never the version bumped with A's
+        // segment absent.
         //
         // This is close to trivially true once both live in one `Manifest`
         // published by a single atomic swap, but it is the entire
