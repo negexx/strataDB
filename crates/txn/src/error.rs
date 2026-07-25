@@ -77,6 +77,11 @@ mod tests {
             .to_string(),
             "schema mismatch casting a data file: expected 3 columns, found 2"
         );
+        assert_eq!(
+            TxnError::ClockError("second time provided was later than self".to_string())
+                .to_string(),
+            "system clock error: second time provided was later than self"
+        );
     }
 
     #[test]
