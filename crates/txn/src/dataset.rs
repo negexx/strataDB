@@ -144,7 +144,7 @@ pub(crate) fn data_subdir(dir: &Path) -> PathBuf {
 ///
 /// # Errors
 ///
-/// Returns [`TxnError::ClockError`] if the system clock reports a time
+/// Returns [`TxnError::Clock`] if the system clock reports a time
 /// before the Unix epoch (`SystemTime::now() < UNIX_EPOCH`), or
 /// [`TxnError::TryFromInt`] if the current time in microseconds since the
 /// epoch overflows `i64` (not reachable before the year 292471, but
@@ -157,7 +157,7 @@ fn issue_timestamp(last_issued: &AtomicI64) -> Result<i64> {
     let now_us = i64::try_from(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| TxnError::ClockError(e.to_string()))?
+            .map_err(|e| TxnError::Clock(e.to_string()))?
             .as_micros(),
     )?;
     let prev = last_issued.fetch_max(now_us, std::sync::atomic::Ordering::SeqCst);
@@ -1128,6 +1128,13 @@ impl Transaction {
         if self.pending.is_empty() {
             return Ok((Vec::new(), Vec::new(), None));
         }
+        for batch in &self.pending {
+            for name in HIDDEN_COLUMNS {
+                if batch.schema_ref().index_of(name).is_ok() {
+                    return Err(TxnError::ReservedColumnName((*name).to_string()));
+                }
+            }
+        }
         std::fs::create_dir_all(data_dir)?;
         // SeqCst ordering justification (this pre-lock fetch_add): the
         // only property it needs is per-atomic RMW uniqueness — no two
@@ -1474,8 +1481,9 @@ pub(crate) fn safe_join(data_dir: &Path, name: &str) -> Result<PathBuf> {
     Ok(data_dir.join(candidate))
 }
 
-/// Hidden columns every committed batch may carry alongside its logical
-/// (user) columns — `_row_id` always, `_timestamp` always (since W2).
+/// Hidden columns every committed batch carries alongside its logical
+/// (user) columns: `_row_id` and `_timestamp`, both unconditionally
+/// (since W2).
 /// `cast_batch_to_schema` matches these by *name*, not position; every
 /// other (visible) column is still matched positionally against `schema`'s
 /// fields, so the caller's `schema` must still list its visible fields in
@@ -1885,7 +1893,7 @@ mod tests {
     }
 
     #[test]
-    fn should_scan_file_prunes_using_timestamp_stats() {
+    fn timestamp_gets_a_stats_entry_with_min_equal_to_max() {
         let dir = temp_dir("timestamp-file-pruning");
         let ds = Dataset::create(&dir).unwrap();
 
@@ -1904,6 +1912,81 @@ mod tests {
             stats.min, stats.max,
             "every row in one file shares one timestamp"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn should_scan_file_prunes_files_using_timestamp_stats() {
+        use strata_query::Predicate;
+        use strata_storage::Value;
+
+        let dir = temp_dir("timestamp-real-file-pruning");
+        let ds = Dataset::create(&dir).unwrap();
+
+        let mut txn = ds.begin();
+        txn.insert(
+            RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![1]))]).unwrap(),
+        );
+        txn.commit().unwrap();
+        let ts_after_commit_1 = ds.snapshot().manifest.commit_time_high_water;
+
+        let mut txn = ds.begin();
+        txn.insert(
+            RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![2]))]).unwrap(),
+        );
+        txn.commit().unwrap();
+
+        let snapshot = ds.snapshot();
+        let predicate = Predicate::Gt(
+            TIMESTAMP_COLUMN.to_string(),
+            Value::Int64(ts_after_commit_1),
+        );
+        let explain = snapshot.explain(&predicate);
+        assert_eq!(explain.total_files, 2);
+        assert_eq!(
+            explain.scanned.len(),
+            1,
+            "only the second file's timestamp can be strictly greater than the first commit's own timestamp"
+        );
+        assert_eq!(explain.skipped.len(), 1);
+        assert_eq!(
+            explain.scanned[0],
+            ds.data_files()[1].name,
+            "the surviving file must be the second commit's, not the first"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn insert_rejects_a_batch_whose_schema_reuses_a_reserved_column_name() {
+        let dir = temp_dir("timestamp-reserved-column-name-rejected");
+        let ds = Dataset::create(&dir).unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(ROW_ID_COLUMN, DataType::Int64, false), // user column colliding with the hidden one
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![999])),
+            ],
+        )
+        .unwrap();
+
+        let mut txn = ds.begin();
+        txn.insert(batch);
+        let result = txn.commit();
+        assert!(
+            matches!(result, Err(TxnError::ReservedColumnName(ref name)) if name == ROW_ID_COLUMN),
+            "expected ReservedColumnName(_row_id), got {result:?}"
+        );
+
+        // Nothing must have been written - the dataset stays at version 0.
+        assert_eq!(ds.current_version(), 0);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2878,13 +2961,17 @@ mod tests {
             "all 3 rows share the same timestamp, so all must match"
         );
 
-        // The issuance floor must also survive: commit again post-reopen and
-        // confirm the high-water mark never regressed across the restart.
         let mut txn = reopened.begin();
         txn.insert(
             RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![4]))]).unwrap(),
         );
         txn.commit().unwrap();
+        // Smoke check only - this assertion holds regardless of whether the
+        // restart floor was seeded correctly, since a fresh post-reopen
+        // timestamp is always >= an earlier one by ordinary clock advancement.
+        // The real proof that Dataset::open seeds last_issued_timestamp from
+        // the persisted value is
+        // last_issued_timestamp_is_seeded_from_the_persisted_high_water_mark_on_reopen.
         assert!(
             reopened.snapshot().manifest.commit_time_high_water >= high_water_before_close,
             "commit_time_high_water must not regress across a restart"
@@ -2894,6 +2981,10 @@ mod tests {
     }
 
     #[test]
+    // The three-cluster fixture (near/far/mid, each with its own commit and
+    // category) is what makes this test discriminate "AND narrows correctly"
+    // from "either leaf alone happens to work" - splitting it into a helper
+    // would obscure exactly the structure the test is proving.
     #[allow(clippy::too_many_lines)]
     fn vector_search_with_timestamp_and_category_compound_predicate() {
         use strata_query::Predicate;
@@ -3306,10 +3397,10 @@ mod tests {
         txn.commit().unwrap();
 
         // Caller asks to scan with a schema declaring 2 columns, but the
-        // committed file only has 1 logical column ("id" — the trailing
-        // hidden _row_id doesn't count unless the caller requests it) -
-        // must error, not silently zip/truncate or, worse, cast the hidden
-        // row-id column into the caller's "extra" field.
+        // committed file only has 1 logical column ("id" — the hidden
+        // _row_id and _timestamp columns don't count unless the caller
+        // requests them) - must error, not silently zip/truncate or,
+        // worse, cast a hidden column into the caller's "extra" field.
         let mismatched_schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("extra", DataType::Utf8, false),

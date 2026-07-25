@@ -45,8 +45,12 @@ pub enum TxnError {
     SchemaMismatch { expected: usize, actual: usize },
     #[error("conflict: {contested_row_ids:?} were modified by another transaction")]
     Conflict { contested_row_ids: Vec<u64> },
+    #[error(
+        "column name '{0}' is reserved for internal use and cannot appear in an inserted batch's schema"
+    )]
+    ReservedColumnName(String),
     #[error("system clock error: {0}")]
-    ClockError(String),
+    Clock(String),
 }
 
 pub type Result<T> = std::result::Result<T, TxnError>;
@@ -78,9 +82,12 @@ mod tests {
             "schema mismatch casting a data file: expected 3 columns, found 2"
         );
         assert_eq!(
-            TxnError::ClockError("second time provided was later than self".to_string())
-                .to_string(),
+            TxnError::Clock("second time provided was later than self".to_string()).to_string(),
             "system clock error: second time provided was later than self"
+        );
+        assert_eq!(
+            TxnError::ReservedColumnName("_row_id".to_string()).to_string(),
+            "column name '_row_id' is reserved for internal use and cannot appear in an inserted batch's schema"
         );
     }
 
