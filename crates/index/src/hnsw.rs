@@ -44,6 +44,12 @@ pub enum IndexError {
     Io(#[from] std::io::Error),
     #[error("delta log entry serialization error: {0}")]
     Serde(#[from] serde_json::Error),
+    #[error("cannot build a segment with no vectors")]
+    SegmentEmpty,
+    #[error("segment exceeds the format's size limits: {0}")]
+    SegmentTooLarge(String),
+    #[error("segment is corrupt or was written by an incompatible writer: {0}")]
+    SegmentCorrupt(String),
 }
 
 /// Maximum number of bidirectional links per node per layer (`hnsw_rs`'s
@@ -323,6 +329,40 @@ impl HnswIndex {
                 squared_distance: dist * dist,
             })
             .collect())
+    }
+
+    /// Serializes this index into a complete on-disk segment image, in
+    /// memory — no file I/O (see `crate::segment_writer`'s module doc for
+    /// why the write/fsync lives in `crates/txn` instead).
+    ///
+    /// This index must be a **fresh, per-commit index keyed by
+    /// segment-local ordinals `0..row_ids.len()`**, built by calling
+    /// [`Self::insert_owned`] once per vector with `local` as the key —
+    /// *not* the dataset's global row-ids. `row_ids[local]` supplies the
+    /// global row-id each ordinal stands for, and must be strictly
+    /// ascending. See
+    /// `docs/superpowers/specs/2026-07-25-s1-w3-2-design-amendment.md` §3b.
+    ///
+    /// # Errors
+    ///
+    /// See `crate::segment_writer::encode_segment`: [`IndexError::SegmentEmpty`]
+    /// for an empty `row_ids` or an index with no vectors,
+    /// [`IndexError::SegmentCorrupt`] for a graph that is not a well-formed
+    /// `0..N` keying, [`IndexError::DimensionMismatch`] for a ragged vector,
+    /// and [`IndexError::SegmentTooLarge`] if the image would overflow the
+    /// format's `u32` fields.
+    pub fn to_segment_bytes(&self, row_ids: &[u64]) -> Result<Box<[u8]>, IndexError> {
+        crate::segment_writer::encode_segment(
+            &self.graph,
+            row_ids,
+            crate::segment_format::SegmentParams {
+                m: self.m,
+                mmax0: self.mmax0,
+                mmax: self.mmax,
+                ef_construction: self.ef_construction,
+                m_l: self.m_l,
+            },
+        )
     }
 }
 
