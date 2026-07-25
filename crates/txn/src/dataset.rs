@@ -861,7 +861,7 @@ impl Transaction {
     /// deltas are applied to the graph in pending-batch order, so a later
     /// batch's dimension mismatch was only caught after an earlier batch's
     /// deltas had already landed in the live, shared `HnswIndex`.
-    /// [`validate_delta_dimensions`] now runs before any delta is applied,
+    /// [`validate_vector_dimensions`] now runs before any delta is applied,
     /// rejecting the entire commit — with zero graph mutation — the moment
     /// any two pending batches (or a pending batch and the graph's
     /// already-established dimension) disagree. The residual cases that
@@ -874,8 +874,11 @@ impl Transaction {
         let ts = issue_timestamp(&self.last_issued_timestamp)?;
         let data_dir = data_subdir(&self.dir);
 
-        let (new_data_files, deltas, mut claim) = self.write_phase(&data_dir, ts)?;
-        validate_delta_dimensions(&deltas, &self.graph)?;
+        let (new_data_files, inserts, mut claim) = self.write_phase(&data_dir, ts)?;
+        // Sourced from the current snapshot's segment set rather than from
+        // a live graph handle -- see `validate_vector_dimensions`' doc.
+        let established_dimension = self.current.load().index.established_dimension();
+        validate_vector_dimensions(&inserts, established_dimension)?;
 
         // Test-only rendezvous: row-ids claimed, data files written, but
         // `commit_lock` not yet acquired and the shared graph not yet
@@ -953,16 +956,9 @@ impl Transaction {
         // the very window this whole mechanism closes, with every test
         // still green — see [`GraphResidueGuard`]'s doc.
         let mut residue_guard = GraphResidueGuard::new(Arc::clone(&self.graph));
-        for delta in deltas {
-            match delta {
-                DeltaEntry::Insert { row_id, vector } => {
-                    self.graph.insert_owned(row_id, vector)?;
-                    residue_guard.record(row_id);
-                }
-                DeltaEntry::Tombstone { row_id } => {
-                    tombstones.insert(row_id);
-                }
-            }
+        for insert in inserts {
+            self.graph.insert_owned(insert.row_id, insert.vector)?;
+            residue_guard.record(insert.row_id);
         }
         // Test-only rendezvous: this commit's vectors are physically in the
         // shared graph, but `commit_manifest` below has not yet made them
@@ -1118,7 +1114,7 @@ impl Transaction {
         &self,
         data_dir: &Path,
         ts: i64,
-    ) -> Result<(Vec<DataFileEntry>, Vec<DeltaEntry>, Option<RowIdClaim>)> {
+    ) -> Result<(Vec<DataFileEntry>, Vec<VectorInsert>, Option<RowIdClaim>)> {
         // Skipped entirely when there's nothing to insert: a delete-only
         // transaction writes no new files, so there's no new directory
         // entry to create or fsync and no attempt_id needs reserving.
@@ -1192,9 +1188,8 @@ impl Transaction {
     /// Writes every pending batch's data file and delta-log file to
     /// `data_dir`, assigning row-ids out of `claim` and appending
     /// each batch's `DataFileEntry` to `data_files` in place. Returns every
-    /// `DeltaEntry` produced across all pending batches, in order —
-    /// `Transaction::commit` applies these directly to the shared graph
-    /// instead of re-reading them from disk.
+    /// [`VectorInsert`] produced across all pending batches, in order — the
+    /// segment build consumes these directly.
     ///
     /// `attempt_id` is a collision-free filename-uniqueness token from
     /// `Dataset.write_attempt_counter` — **not** a manifest version. It
@@ -1226,8 +1221,8 @@ impl Transaction {
         claim: &RowIdClaim,
         ts: i64,
         data_files: &mut Vec<DataFileEntry>,
-    ) -> Result<Vec<DeltaEntry>> {
-        let mut all_deltas = Vec::new();
+    ) -> Result<Vec<VectorInsert>> {
+        let mut all_inserts = Vec::new();
         let mut row_id_base = claim.base();
         for (i, batch) in pending.iter().enumerate() {
             // Stats computed on the original, pre-encoding, pre-hidden-column
@@ -1248,7 +1243,7 @@ impl Transaction {
 
             let num_rows = u64::try_from(batch.num_rows())?;
 
-            let deltas = build_delta_entries(batch, row_id_base)?;
+            let inserts = build_vector_inserts(batch, row_id_base)?;
             let with_row_id = append_row_id_column(batch, row_id_base, num_rows)?;
             let with_timestamp = append_timestamp_column(&with_row_id, ts, num_rows)?;
 
@@ -1256,7 +1251,17 @@ impl Transaction {
             let file_name = format!("{attempt_id:020}-{i}.arrow");
             write_batch(&data_dir.join(&file_name), &encoded)?;
 
+            // Still written for now: Task 6 of the S1 W3.2a plan is what
+            // removes the delta-log path, so this task stays a pure
+            // relocation that every existing test proves unchanged.
             let delta_file_name = format!("{attempt_id:020}-{i}.deltalog");
+            let deltas: Vec<DeltaEntry> = inserts
+                .iter()
+                .map(|insert| DeltaEntry::Insert {
+                    row_id: insert.row_id,
+                    vector: insert.vector.clone(),
+                })
+                .collect();
             write_delta_log(&data_dir.join(&delta_file_name), &deltas)?;
 
             data_files.push(DataFileEntry {
@@ -1264,7 +1269,7 @@ impl Transaction {
                 stats,
                 delta_log: delta_file_name,
             });
-            all_deltas.extend(deltas);
+            all_inserts.extend(inserts);
             // Cannot overflow: `write_phase` sized the claim as the checked
             // sum of every pending batch's row count, and the claim itself
             // was bounds-checked against `u64::MAX` before it was handed
@@ -1283,7 +1288,7 @@ impl Transaction {
             claim.base() + claim.len(),
             "every claimed row-id must be consumed, and none beyond them"
         );
-        Ok(all_deltas)
+        Ok(all_inserts)
     }
 }
 
@@ -1377,28 +1382,42 @@ fn replay_index(dir: &Path, manifest: &Manifest) -> Result<(HnswIndex, imbl::Has
     Ok((index, tombstones))
 }
 
-/// Builds one `Insert` delta-log entry per row in `batch` with a non-null
-/// vector, keyed by the row-ids assigned starting at `row_id_base` — see
-/// `.claude/docs/design/phase-4-vector-index-spec.md` §2. A `batch` with no
-/// `"vector"` column at all (a table with no vector column defined) simply
-/// produces no entries — that's not an error, unlike a `"vector"` column
-/// present with the wrong type, which is.
+/// One row's vector, ready to be inserted into a segment's working index.
+/// The in-memory carrier between `write_pending_batches` and the segment
+/// build — the role `strata_index::DeltaEntry` used to play before the
+/// delta log was removed. There is no `Tombstone` counterpart: deletion is
+/// the manifest's versioned `tombstones` list, never an index-level entry
+/// (base design doc §5).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct VectorInsert {
+    pub(crate) row_id: u64,
+    pub(crate) vector: Vec<f32>,
+}
+
+/// Extracts one [`VectorInsert`] per row in `batch` with a non-null vector,
+/// keyed by the row-ids assigned starting at `row_id_base`. A `batch` with
+/// no `"vector"` column at all (a table with no vector column defined)
+/// simply produces no entries — that's not an error, unlike a `"vector"`
+/// column present with the wrong type, which is. A commit that produces
+/// zero entries writes **no segment at all** (see `build_and_write_segment`
+/// and `docs/superpowers/specs/2026-07-25-s1-w3-2-design-amendment.md` §3c).
 ///
 /// Also rejects any row whose vector contains a non-finite (`NaN`/`Infinity`)
-/// component: the delta log is serialized as JSON (`serde_json`), which
-/// silently encodes non-finite `f32`s as `null` and then fails to parse them
-/// back — letting one through here would durably commit a row that
-/// permanently breaks every future `replay_index` (including the very one
-/// `Transaction::commit` runs on its own return path). Must run before any
-/// file for this batch is written to disk — see the call site in
-/// `Transaction::commit`.
+/// component. This guard predates the segment format — it was originally
+/// justified by the delta log's JSON encoding, which silently wrote
+/// non-finite `f32`s as `null` — but the reason to keep it is independent
+/// of any on-disk encoding: a `NaN` component poisons every distance
+/// comparison in `search_layer_generic` (`Candidate::cmp`'s `partial_cmp`
+/// fallback silently treats an incomparable pair as equal), so one bad
+/// vector would corrupt search results for the whole segment. Must run
+/// before any file for this batch is written to disk.
 ///
 /// # Errors
 ///
 /// Returns an error if `batch` has a `"vector"` column that isn't a
 /// `FixedSizeList<Float32>`, or if any row's vector contains a non-finite
 /// component.
-fn build_delta_entries(batch: &RecordBatch, row_id_base: u64) -> Result<Vec<DeltaEntry>> {
+fn build_vector_inserts(batch: &RecordBatch, row_id_base: u64) -> Result<Vec<VectorInsert>> {
     let Ok(vec_idx) = batch.schema_ref().index_of("vector") else {
         return Ok(Vec::new());
     };
@@ -1445,7 +1464,7 @@ fn build_delta_entries(batch: &RecordBatch, row_id_base: u64) -> Result<Vec<Delt
         if row.iter().any(|component| !component.is_finite()) {
             return Err(TxnError::NonFiniteVectorComponent { row_id });
         }
-        entries.push(DeltaEntry::Insert {
+        entries.push(VectorInsert {
             row_id,
             vector: row.to_vec(),
         });
@@ -1453,39 +1472,43 @@ fn build_delta_entries(batch: &RecordBatch, row_id_base: u64) -> Result<Vec<Delt
     Ok(entries)
 }
 
-/// Validates that every [`DeltaEntry::Insert`] in `deltas` shares one
-/// consistent vector dimension — both against each other, and against
-/// `graph`'s already-established dimension (if any) — before any of them
-/// are applied. `HnswIndex::insert`'s only fallible path is dimension
-/// validation (the graph insert underneath it is infallible), so this
-/// closes the common trigger for a partial-graph-mutation-then-fail
-/// scenario: without it, `Insert` deltas are applied to the shared graph
-/// in pending-batch order, and a later batch's dimension mismatch is only
-/// caught after an earlier batch's deltas have already mutated the shared
-/// graph. It is a pre-lock fast path, not the last line of defence —
-/// [`GraphResidueGuard`] is what undoes an already-applied delta when a
-/// commit fails after this check has passed.
+/// Validates that every vector in `inserts` shares one consistent
+/// dimension — both against each other, and against `established` (the
+/// dimension already fixed by whatever has been committed so far, or `0` if
+/// nothing has) — before a segment is built from any of them.
+///
+/// This is a **pre-build, pre-lock** check, and it is what keeps a
+/// half-built segment from ever being fsynced or published: `insert_owned`'s
+/// only fallible path is dimension validation, so without this a ragged
+/// batch would fail partway through the working index's construction after
+/// earlier vectors had already been inserted. The half-built index is
+/// discarded either way, but failing before any I/O keeps the error cheap
+/// and keeps the failure mode identical whichever pending batch is ragged.
+///
+/// `established` is a plain `usize`, not a graph handle: after S1 W3.2a
+/// there is no shared live graph to ask. The caller sources it from the
+/// current snapshot's `SegmentSet::established_dimension()` — available
+/// without opening any segment file. See
+/// `docs/superpowers/specs/2026-07-25-s1-w3-2-design-amendment.md` §2.
 ///
 /// # Errors
 ///
-/// Returns [`TxnError::Index`] wrapping an [`strata_index::IndexError::DimensionMismatch`]
-/// if any `Insert` delta's vector length disagrees with the graph's
-/// established dimension, or with an earlier delta's length in this same
-/// batch of deltas if the graph has no dimension established yet.
-fn validate_delta_dimensions(deltas: &[DeltaEntry], graph: &HnswIndex) -> Result<()> {
-    let mut expected = graph.established_dimension();
-    for delta in deltas {
-        if let DeltaEntry::Insert { vector, .. } = delta {
-            if expected == 0 {
-                expected = vector.len();
-            } else if vector.len() != expected {
-                return Err(TxnError::Index(
-                    strata_index::IndexError::DimensionMismatch {
-                        query_len: vector.len(),
-                        expected,
-                    },
-                ));
-            }
+/// Returns [`TxnError::Index`] wrapping an
+/// [`strata_index::IndexError::DimensionMismatch`] if any vector's length
+/// disagrees with `established`, or with an earlier vector's length in this
+/// same commit when `established` is `0`.
+fn validate_vector_dimensions(inserts: &[VectorInsert], established: usize) -> Result<()> {
+    let mut expected = established;
+    for insert in inserts {
+        if expected == 0 {
+            expected = insert.vector.len();
+        } else if insert.vector.len() != expected {
+            return Err(TxnError::Index(
+                strata_index::IndexError::DimensionMismatch {
+                    query_len: insert.vector.len(),
+                    expected,
+                },
+            ));
         }
     }
     Ok(())
@@ -3609,7 +3632,7 @@ mod tests {
     }
 
     #[test]
-    fn build_delta_entries_skips_null_vector_rows_without_erroring() {
+    fn build_vector_inserts_skips_null_vector_rows_without_erroring() {
         let ids = Arc::new(Int64Array::from(vec![1, 2]));
         let item_field = Arc::new(Field::new("item", DataType::Float32, false));
         let values = Arc::new(arrow::array::Float32Array::from(vec![
@@ -3632,20 +3655,17 @@ mod tests {
         ]));
         let batch = RecordBatch::try_new(schema, vec![ids, vectors]).unwrap();
 
-        let deltas = build_delta_entries(&batch, 0).unwrap();
+        let inserts = build_vector_inserts(&batch, 0).unwrap();
         assert_eq!(
-            deltas.len(),
+            inserts.len(),
             1,
             "the null-vector row must be skipped, not errored on"
         );
-        match &deltas[0] {
-            DeltaEntry::Insert { row_id, .. } => assert_eq!(*row_id, 0),
-            DeltaEntry::Tombstone { .. } => panic!("expected an Insert entry"),
-        }
+        assert_eq!(inserts[0].row_id, 0);
     }
 
     #[test]
-    fn build_delta_entries_produces_the_correct_vector_per_row() {
+    fn build_vector_inserts_produces_the_correct_vector_per_row() {
         // Distinct, easily-distinguishable vectors per row -- a flat-buffer
         // indexing bug (e.g. an off-by-one in row * value_length, or
         // accidentally reading a neighboring row's slice) would surface as
@@ -3669,19 +3689,16 @@ mod tests {
         ]));
         let batch = RecordBatch::try_new(schema, vec![ids, vectors]).unwrap();
 
-        let deltas = build_delta_entries(&batch, 100).unwrap();
-        assert_eq!(deltas.len(), 3);
-        let as_insert = |d: &DeltaEntry| match d {
-            DeltaEntry::Insert { row_id, vector } => (*row_id, vector.clone()),
-            DeltaEntry::Tombstone { .. } => panic!("expected an Insert entry"),
-        };
-        assert_eq!(as_insert(&deltas[0]), (100, vec![1.0, 2.0, 3.0]));
-        assert_eq!(as_insert(&deltas[1]), (101, vec![4.0, 5.0, 6.0]));
-        assert_eq!(as_insert(&deltas[2]), (102, vec![7.0, 8.0, 9.0]));
+        let inserts = build_vector_inserts(&batch, 100).unwrap();
+        assert_eq!(inserts.len(), 3);
+        let as_pair = |i: &VectorInsert| (i.row_id, i.vector.clone());
+        assert_eq!(as_pair(&inserts[0]), (100, vec![1.0, 2.0, 3.0]));
+        assert_eq!(as_pair(&inserts[1]), (101, vec![4.0, 5.0, 6.0]));
+        assert_eq!(as_pair(&inserts[2]), (102, vec![7.0, 8.0, 9.0]));
     }
 
     #[test]
-    fn build_delta_entries_reads_the_correct_vector_from_a_sliced_batch() {
+    fn build_vector_inserts_reads_the_correct_vector_from_a_sliced_batch() {
         // Pins the assumption build_delta_entries's downcast-hoist rewrite
         // rests on: FixedSizeListArray::offset()/Float32Array::offset() are
         // both always 0 in the installed arrow-array version, because
@@ -3712,18 +3729,15 @@ mod tests {
         // [10,11,12], not the first two rows' [1,2,3]/[4,5,6].
         let sliced = batch.slice(2, 2);
 
-        let deltas = build_delta_entries(&sliced, 0).unwrap();
-        assert_eq!(deltas.len(), 2);
-        let as_insert = |d: &DeltaEntry| match d {
-            DeltaEntry::Insert { row_id, vector } => (*row_id, vector.clone()),
-            DeltaEntry::Tombstone { .. } => panic!("expected an Insert entry"),
-        };
-        assert_eq!(as_insert(&deltas[0]), (0, vec![7.0, 8.0, 9.0]));
-        assert_eq!(as_insert(&deltas[1]), (1, vec![10.0, 11.0, 12.0]));
+        let inserts = build_vector_inserts(&sliced, 0).unwrap();
+        assert_eq!(inserts.len(), 2);
+        let as_pair = |i: &VectorInsert| (i.row_id, i.vector.clone());
+        assert_eq!(as_pair(&inserts[0]), (0, vec![7.0, 8.0, 9.0]));
+        assert_eq!(as_pair(&inserts[1]), (1, vec![10.0, 11.0, 12.0]));
     }
 
     #[test]
-    fn build_delta_entries_errors_on_wrong_inner_type_even_with_zero_rows() {
+    fn build_vector_inserts_errors_on_wrong_inner_type_even_with_zero_rows() {
         // Behavior change from the downcast-hoist rewrite: the Float32
         // downcast used to happen lazily inside the per-row loop, so a
         // batch with zero surviving rows (empty, or every vector null)
@@ -3754,7 +3768,7 @@ mod tests {
             RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1])), vectors])
                 .unwrap();
 
-        let result = build_delta_entries(&batch, 0);
+        let result = build_vector_inserts(&batch, 0);
         assert!(
             result.is_err(),
             "a wrong inner type must error even when every row is null: {result:?}"
@@ -3762,7 +3776,7 @@ mod tests {
     }
 
     #[test]
-    fn build_delta_entries_errors_when_vector_column_is_not_a_fixed_size_list() {
+    fn build_vector_inserts_errors_when_vector_column_is_not_a_fixed_size_list() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("vector", DataType::Int64, false), // wrong type
@@ -3776,12 +3790,12 @@ mod tests {
         )
         .unwrap();
 
-        let result = build_delta_entries(&batch, 0);
+        let result = build_vector_inserts(&batch, 0);
         assert!(result.is_err(), "expected an error, got {result:?}");
     }
 
     #[test]
-    fn build_delta_entries_errors_when_vector_inner_type_is_not_float32() {
+    fn build_vector_inserts_errors_when_vector_inner_type_is_not_float32() {
         let item_field = Arc::new(Field::new("item", DataType::Int32, false));
         let values = Arc::new(arrow::array::Int32Array::from(vec![1, 2, 3]));
         let vectors = Arc::new(arrow::array::FixedSizeListArray::new(
@@ -3799,8 +3813,78 @@ mod tests {
             RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1])), vectors])
                 .unwrap();
 
-        let result = build_delta_entries(&batch, 0);
+        let result = build_vector_inserts(&batch, 0);
         assert!(result.is_err(), "expected an error, got {result:?}");
+    }
+
+    #[test]
+    fn validate_vector_dimensions_rejects_a_ragged_commit_against_a_plain_established_dimension() {
+        // The signature change the W3.2 amendment section 2 requires: the
+        // check reads a `usize`, not a live graph handle, because after
+        // W3.2a there is no shared graph to ask.
+        let ragged = vec![
+            VectorInsert {
+                row_id: 0,
+                vector: vec![1.0, 2.0, 3.0],
+            },
+            VectorInsert {
+                row_id: 1,
+                vector: vec![1.0, 2.0],
+            },
+        ];
+        let result = validate_vector_dimensions(&ragged, 0);
+        assert!(
+            matches!(
+                result,
+                Err(TxnError::Index(
+                    strata_index::IndexError::DimensionMismatch {
+                        query_len: 2,
+                        expected: 3
+                    }
+                ))
+            ),
+            "two pending vectors of different lengths must be rejected even with \
+             nothing established yet: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_vector_dimensions_rejects_a_commit_disagreeing_with_the_established_dimension() {
+        let inserts = vec![VectorInsert {
+            row_id: 0,
+            vector: vec![1.0, 2.0],
+        }];
+        let result = validate_vector_dimensions(&inserts, 3);
+        assert!(
+            matches!(
+                result,
+                Err(TxnError::Index(
+                    strata_index::IndexError::DimensionMismatch {
+                        query_len: 2,
+                        expected: 3
+                    }
+                ))
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_vector_dimensions_accepts_an_empty_commit_and_a_consistent_one() {
+        assert!(validate_vector_dimensions(&[], 3).is_ok());
+        assert!(validate_vector_dimensions(&[], 0).is_ok());
+        let consistent = vec![
+            VectorInsert {
+                row_id: 0,
+                vector: vec![1.0, 2.0, 3.0],
+            },
+            VectorInsert {
+                row_id: 1,
+                vector: vec![4.0, 5.0, 6.0],
+            },
+        ];
+        assert!(validate_vector_dimensions(&consistent, 3).is_ok());
+        assert!(validate_vector_dimensions(&consistent, 0).is_ok());
     }
 
     #[test]
@@ -4243,7 +4327,7 @@ mod tests {
         // later pending batch's dimension mismatch was only ever caught
         // after an earlier batch's deltas had already mutated the shared
         // graph -- even though commit() returns Err and the manifest never
-        // advances. See validate_delta_dimensions's doc comment.
+        // advances. See validate_vector_dimensions's doc comment.
         let dir = temp_dir("inconsistent-batch-dimensions");
         let ds = Dataset::create(&dir).unwrap();
 
