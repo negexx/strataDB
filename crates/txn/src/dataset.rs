@@ -2235,6 +2235,113 @@ mod tests {
     }
 
     #[test]
+    fn vector_search_with_compound_predicate_narrows_across_two_columns() {
+        use strata_query::Predicate;
+        use strata_storage::Value;
+
+        let dir = temp_dir("vector-search-filtered-compound");
+        let ds = Dataset::create(&dir).unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("category", DataType::Utf8, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 3),
+                false,
+            ),
+        ]));
+
+        // Three 10-point clusters at increasing distance from the query
+        // point (the origin): near (id=1, category="a", irrelevant noise),
+        // mid (id=2, category="b", distance 500), far (id=2, category="a",
+        // distance 1000). A single-column `id=2` filter alone cannot
+        // distinguish mid from far - both match - and since mid is closer
+        // to the query, an id-only filtered search returns mid. Only
+        // `id=2 AND category="a"` correctly excludes mid and returns far
+        // instead, proving the compound predicate changes the result set
+        // in a way neither leaf alone could, and that resolving it
+        // required both columns to be readable (row_ids_matching's
+        // projection must include both, or `mask` errors on the missing
+        // one).
+        let near_cluster = cluster_vectors(10, [0.0, 0.0, 0.0], 0.01);
+        let mid_cluster = cluster_vectors(10, [500.0, 0.0, 0.0], 0.01);
+        let far_cluster = cluster_vectors(10, [1000.0, 0.0, 0.0], 0.01);
+
+        let mut ids = vec![1i64; 10];
+        ids.extend(vec![2i64; 10]);
+        ids.extend(vec![2i64; 10]);
+        let mut categories = vec!["a"; 10];
+        categories.extend(vec!["b"; 10]);
+        categories.extend(vec!["a"; 10]);
+        let mut vectors = near_cluster;
+        vectors.extend(mid_cluster);
+        vectors.extend(far_cluster);
+        let flat: Vec<f32> = vectors.iter().flatten().copied().collect();
+
+        let id_arr = Arc::new(Int64Array::from(ids));
+        let cat_arr = Arc::new(arrow::array::StringArray::from(categories));
+        let item_field = Arc::new(Field::new("item", DataType::Float32, false));
+        let values = Arc::new(arrow::array::Float32Array::from(flat));
+        let vec_arr = Arc::new(arrow::array::FixedSizeListArray::new(
+            item_field, 3, values, None,
+        ));
+        let batch = RecordBatch::try_new(schema, vec![id_arr, cat_arr, vec_arr]).unwrap();
+
+        let mut txn = ds.begin();
+        txn.insert(batch);
+        txn.commit().unwrap();
+
+        let snapshot = ds.snapshot();
+
+        // id=2 alone: the 20 matching points are the mid (rows 10..20) and
+        // far (rows 20..30) clusters. Nearest to the origin among those 20
+        // is the mid cluster (distance 500 < 1000), so an id-only filtered
+        // search returns mid-cluster row-ids.
+        let id_only = Predicate::Eq("id".to_string(), Value::Int64(2));
+        let id_only_results = snapshot
+            .vector_search(&[0.0, 0.0, 0.0], 3, Some(&id_only))
+            .unwrap();
+        assert_eq!(
+            id_only_results.len(),
+            3,
+            "unexpected results: {id_only_results:?}"
+        );
+        assert!(
+            id_only_results.iter().all(|r| (10..20).contains(&r.row_id)),
+            "id=2 alone must return the closer mid cluster (row-ids 10..20): {id_only_results:?}"
+        );
+
+        // id=2 AND category="a": only the far cluster (rows 20..30)
+        // qualifies - the mid cluster is category "b" and must be
+        // excluded, even though it's closer to the query point.
+        let compound = Predicate::And(
+            Box::new(id_only.clone()),
+            Box::new(Predicate::Eq(
+                "category".to_string(),
+                Value::Utf8("a".to_string()),
+            )),
+        );
+        let compound_results = snapshot
+            .vector_search(&[0.0, 0.0, 0.0], 3, Some(&compound))
+            .unwrap();
+        assert_eq!(
+            compound_results.len(),
+            3,
+            "unexpected results: {compound_results:?}"
+        );
+        assert!(
+            compound_results
+                .iter()
+                .all(|r| (20..30).contains(&r.row_id)),
+            "id=2 AND category=a must exclude the closer but wrong-category mid cluster \
+             and return the far cluster instead (row-ids 20..30): {compound_results:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn reopening_a_dataset_rebuilds_the_vector_index_from_the_delta_log() {
         let dir = temp_dir("delta-log-replay");
         let schema = Arc::new(Schema::new(vec![

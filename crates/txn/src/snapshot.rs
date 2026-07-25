@@ -180,8 +180,8 @@ impl Snapshot {
     /// # Errors
     ///
     /// Returns an error under the same conditions as [`Snapshot::scan`],
-    /// plus if `predicate`'s column doesn't exist or its value's type
-    /// doesn't match the column's Arrow type.
+    /// plus if any of `predicate`'s columns doesn't exist or its value's
+    /// type doesn't match the column's Arrow type.
     pub fn scan_with_predicate(
         &self,
         schema: &SchemaRef,
@@ -243,9 +243,10 @@ impl Snapshot {
     ///
     /// # Errors
     ///
-    /// Returns an error if `predicate` is supplied and its column doesn't
-    /// exist or its value's type doesn't match the column's Arrow type, or
-    /// if `query`'s dimensionality doesn't match the indexed vectors'.
+    /// Returns an error if `predicate` is supplied and any of its columns
+    /// doesn't exist or its value's type doesn't match the column's Arrow
+    /// type, or if `query`'s dimensionality doesn't match the indexed
+    /// vectors'.
     pub fn vector_search(
         &self,
         query: &[f32],
@@ -277,7 +278,7 @@ impl Snapshot {
     /// surviving (per `should_scan_file`) file's raw on-disk batch
     /// directly — not through the public `scan_with_predicate`.
     fn row_ids_matching(&self, predicate: &Predicate) -> Result<Vec<usize>> {
-        // Decode only the predicate's own column and the row-id column, so
+        // Decode only the predicate's own columns and the row-id column, so
         // the embedding column is never turned into an Arrow array.
         //
         // Be clear about what this does *not* buy: Arrow IPC stores a record
@@ -294,11 +295,10 @@ impl Snapshot {
         // genuinely column-chunked file format so a single column can be
         // read without its neighbours — the format change `datafile.rs`'s
         // module doc already defers. Neither is a drive-by change.
-        let projection: Vec<&str> = if predicate.column() == ROW_ID_COLUMN {
-            vec![ROW_ID_COLUMN]
-        } else {
-            vec![predicate.column(), ROW_ID_COLUMN]
-        };
+        let mut projection: Vec<&str> = predicate.columns();
+        projection.push(ROW_ID_COLUMN);
+        projection.sort_unstable();
+        projection.dedup();
         let per_file_ids =
             self.read_surviving_files(Some(predicate), Some(&projection), |batch| {
                 // Apply the selection mask to the row-id column *only*. Using
