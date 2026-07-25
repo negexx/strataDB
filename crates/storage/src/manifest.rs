@@ -68,6 +68,21 @@ pub struct Manifest {
     /// still deserialize, same reasoning as `tombstones` above.
     #[serde(default)]
     pub next_attempt_id: u64,
+    /// The commit-order-monotone envelope of every commit's captured
+    /// timestamp so far — **not** necessarily equal to the max `_timestamp`
+    /// any individual row carries (see
+    /// `docs/superpowers/specs/2026-07-25-s1-w2-timestamp-column-design.md`
+    /// §4 for why: `write_phase` runs outside `commit_lock`, so a row's own
+    /// timestamp capture and its eventual commit order can diverge under
+    /// concurrency). Updated as `.max()` against each commit's own captured
+    /// timestamp, inside the commit lock — which is what makes *this* field
+    /// non-decreasing across versions by construction, even when a specific
+    /// row's own value isn't.
+    ///
+    /// `#[serde(default)]` so manifests written before this field existed
+    /// still deserialize, same reasoning as `tombstones`/`next_attempt_id`.
+    #[serde(default)]
+    pub commit_time_high_water: i64,
 }
 
 impl Manifest {
@@ -79,6 +94,7 @@ impl Manifest {
             next_row_id: 0,
             tombstones: Vec::new(),
             next_attempt_id: 0,
+            commit_time_high_water: 0,
         }
     }
 }
@@ -206,6 +222,7 @@ mod tests {
             next_row_id: 0,
             tombstones: Vec::new(),
             next_attempt_id: 0,
+            commit_time_high_water: 0,
         };
         commit_manifest(&dir, &m0).unwrap();
         let m1 = Manifest {
@@ -225,6 +242,7 @@ mod tests {
             next_row_id: 0,
             tombstones: Vec::new(),
             next_attempt_id: 0,
+            commit_time_high_water: 0,
         };
         commit_manifest(&dir, &m1).unwrap();
 
@@ -249,6 +267,7 @@ mod tests {
             next_row_id: 0,
             tombstones: Vec::new(),
             next_attempt_id: 0,
+            commit_time_high_water: 0,
         };
         commit_manifest(&dir, &m0).unwrap();
 
@@ -326,6 +345,7 @@ mod tests {
             next_row_id: 0,
             tombstones: Vec::new(),
             next_attempt_id: 0,
+            commit_time_high_water: 0,
         };
 
         commit_manifest(&dir, &m0).unwrap();
@@ -424,6 +444,7 @@ mod tests {
             next_row_id: 0,
             tombstones: Vec::new(),
             next_attempt_id: 0,
+            commit_time_high_water: 0,
         };
         commit_manifest(&dir, &m0).unwrap();
 
@@ -452,5 +473,24 @@ mod tests {
         });
         let deserialized: Manifest = serde_json::from_value(old_json).unwrap();
         assert_eq!(deserialized.next_attempt_id, 0);
+    }
+
+    #[test]
+    fn manifest_without_commit_time_high_water_field_deserializes_with_default_zero() {
+        // Simulates a manifest written before `commit_time_high_water` existed
+        // — must still deserialize, defaulting to 0, same as `next_attempt_id`
+        // does for pre-that-field manifests.
+        let old_json = serde_json::json!({
+            "version": 0,
+            "data_files": [],
+            "next_row_id": 0,
+        });
+        let deserialized: Manifest = serde_json::from_value(old_json).unwrap();
+        assert_eq!(deserialized.commit_time_high_water, 0);
+    }
+
+    #[test]
+    fn empty_manifest_starts_with_zero_commit_time_high_water() {
+        assert_eq!(Manifest::empty().commit_time_high_water, 0);
     }
 }

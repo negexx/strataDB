@@ -137,12 +137,15 @@ time is non-decreasing across versions. Exposed for predicates and for zone maps
 - **Invariants:** must not break the existing hidden-row-id-column handling; timestamp is assigned in
   the same place row-ids are, under the same durability guarantee.
 - **Tests:** monotonicity across commits; recovery preserves timestamps; a temporal predicate filters.
-- **Known gap from W1 to resolve here:** `should_scan_file` fails open on a missing-stats column, but
-  `read_batch_columns` hard-errors if a *predicate-referenced* column is genuinely absent from a file's
-  schema. Every W1-era file shares one schema, so this was unreachable in W1. Once this workstream adds
-  a system-populated timestamp column, files written before it lack that column, and a predicate like
-  `timestamp >= X AND category = Y` against such a file must not hard-error — decide here whether an
-  absent column reads as an all-false leaf, prunes the file outright, or is backfilled at read time.
+- **Known gap from W1, resolved here (see
+  `docs/superpowers/specs/2026-07-25-s1-w2-timestamp-column-design.md` §8):** `should_scan_file` fails
+  open on a missing-stats column, but `read_batch_columns` hard-errors if a *predicate-referenced*
+  column is genuinely absent from a file's schema — flagged as a risk once this workstream's timestamp
+  column meant some files could predate it. Resolved as moot: every dataset-creating code path in this
+  repo builds fresh, no persisted fixtures exist, and the timestamp column is assigned at commit time
+  from a dataset's very first commit — there is no reachable "old file predates the column" scenario
+  within one dataset's lifetime under one consistently-versioned build, given this project's existing
+  no-backward-compatibility policy. No special missing-column handling is built in W2.
 - **Exit:** rows carry a queryable, monotonic commit time.
 
 ### 5.3 W3 — Segment format + delta-segment writes + fan-out search (the core migration)

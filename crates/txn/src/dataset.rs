@@ -11,7 +11,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicI64, AtomicU64};
 
 #[cfg(loom)]
 use loom::sync::Mutex;
@@ -27,7 +27,8 @@ use strata_index::{
     write_delta_log,
 };
 use strata_storage::{
-    DataFileEntry, Manifest, commit_manifest, compute_stats, read_current, write_batch,
+    ColumnStats, DataFileEntry, Manifest, Value, commit_manifest, compute_stats, read_current,
+    write_batch,
 };
 
 use crate::commit_log::{CommitLog, ConflictCheck};
@@ -37,19 +38,28 @@ use crate::snapshot::Snapshot;
 
 /// The hidden internal row-id column every committed batch carries
 /// alongside its logical columns. Callers can retrieve it through the
-/// public `scan`/`scan_with_predicate` API, but only under one precondition:
-/// the caller's schema must list every physical column in the same order
-/// data was inserted in, with `ROW_ID_COLUMN` appended last (see the CLI's
-/// `handle_search`, which does exactly this). A schema that omits, reorders,
-/// or partially includes columns will not retrieve row-ids correctly — as
-/// of the `cast_batch_to_schema` column-count check, a mismatched column
-/// count now returns a typed `TxnError::SchemaMismatch` instead of silently
-/// producing wrong data, but column *order* is still the caller's
-/// responsibility. `row_ids_matching` (below) sidesteps this precondition
-/// entirely by reading each file's raw physical batch directly rather than
-/// going through the public schema-based API. See
+/// public `scan`/`scan_with_predicate` API by listing `ROW_ID_COLUMN`
+/// (and/or `TIMESTAMP_COLUMN`) anywhere in their requested schema (see the
+/// CLI's `handle_search`, which does exactly this) — `cast_batch_to_schema`
+/// matches hidden columns by *name*, not position, so any combination of
+/// `_row_id`/`_timestamp` can be requested, in any position, independently
+/// of the other. Only the *visible* (user) columns must still be listed in
+/// the same order the data was inserted in; a mismatched visible-column
+/// count returns a typed `TxnError::SchemaMismatch` instead of silently
+/// producing wrong data. `row_ids_matching` (below) sidesteps this
+/// precondition entirely by reading each file's raw physical batch directly
+/// rather than going through the public schema-based API. See
 /// `.claude/docs/design/phase-0-transaction-and-format-spec.md` §8.
 pub const ROW_ID_COLUMN: &str = "_row_id";
+
+/// The hidden internal commit-time column every committed batch carries
+/// alongside its logical columns and `_row_id` — see
+/// `docs/superpowers/specs/2026-07-25-s1-w2-timestamp-column-design.md`.
+/// Every row in one transaction shares one value: microseconds since the
+/// Unix epoch, captured once per commit. Unlike `_row_id`, this column
+/// *does* get a `should_scan_file`-visible stats entry — see
+/// `write_pending_batches`.
+pub const TIMESTAMP_COLUMN: &str = "_timestamp";
 
 /// Bounded capacity of the in-memory [`CommitLog`] ring buffer — generous
 /// enough that ordinary workloads never evict history still needed by an
@@ -105,6 +115,10 @@ pub struct Dataset {
     /// complex active-transaction-lifetime tracking this was weighed
     /// against. See [`Dataset::insufficient_history_conflict_count`].
     insufficient_history_conflicts: Arc<AtomicU64>,
+    /// Lock-free issuance floor for `_timestamp` values — see
+    /// `issue_timestamp`. Seeded from `Manifest.commit_time_high_water` on
+    /// both `create` and `open`, so this floor survives a restart.
+    last_issued_timestamp: Arc<AtomicI64>,
 }
 
 /// The single source of truth for "where does this dataset's data live,
@@ -115,6 +129,39 @@ pub struct Dataset {
 /// independently.
 pub(crate) fn data_subdir(dir: &Path) -> PathBuf {
     dir.join("data")
+}
+
+/// Captures the current wall-clock time (microseconds since the Unix
+/// epoch) and issues it through `last_issued`, guaranteeing the returned
+/// value is never less than any value this `Dataset` has issued before —
+/// including across a wall-clock regression (an NTP step, a manual clock
+/// change), not just under concurrency. See
+/// `docs/superpowers/specs/2026-07-25-s1-w2-timestamp-column-design.md` §3.
+///
+/// No `Mutex` is needed here, unlike `RowIdAllocator`: there is no paired
+/// state that must advance atomically together, just one independent
+/// integer high-water mark — a single `fetch_max` is sufficient.
+///
+/// # Errors
+///
+/// Returns [`TxnError::Clock`] if the system clock reports a time
+/// before the Unix epoch (`SystemTime::now() < UNIX_EPOCH`), or
+/// [`TxnError::TryFromInt`] if the current time in microseconds since the
+/// epoch overflows `i64` (not reachable before the year 292471, but
+/// checked rather than assumed).
+///
+/// Called once at the top of [`Transaction::commit`], before `write_phase`,
+/// to stamp every row this commit writes with the single shared
+/// `_timestamp` value.
+fn issue_timestamp(last_issued: &AtomicI64) -> Result<i64> {
+    let now_us = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| TxnError::Clock(e.to_string()))?
+            .as_micros(),
+    )?;
+    let prev = last_issued.fetch_max(now_us, std::sync::atomic::Ordering::SeqCst);
+    Ok(prev.max(now_us))
 }
 
 /// Determines the correct starting value for `write_attempt_counter` on
@@ -231,6 +278,7 @@ impl Dataset {
         std::fs::create_dir_all(dir.join("data"))?;
         let manifest = Manifest::empty();
         commit_manifest(&dir, &manifest)?;
+        let last_issued_timestamp = Arc::new(AtomicI64::new(manifest.commit_time_high_water));
         let graph = new_hnsw_index(0)?;
         let row_ids = Arc::new(RowIdAllocator::new(manifest.next_row_id));
         let write_attempt_counter = Arc::new(AtomicU64::new(manifest.next_attempt_id));
@@ -251,6 +299,7 @@ impl Dataset {
             write_attempt_counter,
             commit_lock: Arc::new(Mutex::new(CommitLog::new(commit_log_capacity))),
             insufficient_history_conflicts: Arc::new(AtomicU64::new(0)),
+            last_issued_timestamp,
         })
     }
 
@@ -309,6 +358,7 @@ impl Dataset {
         // its own doc comment.
         let write_attempt_counter =
             Arc::new(AtomicU64::new(seed_write_attempt_counter(&manifest)?));
+        let last_issued_timestamp = Arc::new(AtomicI64::new(manifest.commit_time_high_water));
         let snapshot = Snapshot {
             dir: dir.clone(),
             version: manifest.version,
@@ -332,6 +382,7 @@ impl Dataset {
             write_attempt_counter,
             commit_lock: Arc::new(Mutex::new(CommitLog::new(COMMIT_LOG_CAPACITY))),
             insufficient_history_conflicts: Arc::new(AtomicU64::new(0)),
+            last_issued_timestamp,
         })
     }
 
@@ -377,6 +428,7 @@ impl Dataset {
             write_attempt_counter: Arc::clone(&self.write_attempt_counter),
             commit_lock: Arc::clone(&self.commit_lock),
             insufficient_history_conflicts: Arc::clone(&self.insufficient_history_conflicts),
+            last_issued_timestamp: Arc::clone(&self.last_issued_timestamp),
             #[cfg(any(test, loom))]
             inject_manifest_commit_failure: false,
             #[cfg(test)]
@@ -425,6 +477,9 @@ pub struct Transaction {
     write_attempt_counter: Arc<AtomicU64>,
     commit_lock: Arc<Mutex<CommitLog>>,
     insufficient_history_conflicts: Arc<AtomicU64>,
+    /// Consumed by [`Transaction::commit`] via `issue_timestamp`, as the
+    /// very first step of `commit`, before `write_phase` runs.
+    last_issued_timestamp: Arc<AtomicI64>,
     /// Test-only fault injection: makes [`Transaction::commit`]'s durability
     /// step fail, modelling a recoverable I/O error (e.g. ENOSPC) *after*
     /// this commit's deltas have already reached the shared graph. See
@@ -816,9 +871,10 @@ impl Transaction {
     /// an I/O failure in the manifest commit, or a panic mid-loop — are
     /// covered by [`GraphResidueGuard`] instead.
     pub fn commit(self) -> Result<()> {
+        let ts = issue_timestamp(&self.last_issued_timestamp)?;
         let data_dir = data_subdir(&self.dir);
 
-        let (new_data_files, deltas, mut claim) = self.write_phase(&data_dir)?;
+        let (new_data_files, deltas, mut claim) = self.write_phase(&data_dir, ts)?;
         validate_delta_dimensions(&deltas, &self.graph)?;
 
         // Test-only rendezvous: row-ids claimed, data files written, but
@@ -959,6 +1015,12 @@ impl Transaction {
         manifest.next_attempt_id = self
             .write_attempt_counter
             .load(std::sync::atomic::Ordering::SeqCst);
+        // Non-decreasing across versions by construction: this is a running
+        // max computed under commit_lock, decoupled from any individual
+        // row's own captured value — see
+        // docs/superpowers/specs/2026-07-25-s1-w2-timestamp-column-design.md
+        // §4 for why that decoupling is deliberate, not a gap.
+        manifest.commit_time_high_water = manifest.commit_time_high_water.max(ts);
         // Dedup against both the current in-memory tombstone set and
         // duplicates within this same transaction's own pending_tombstones
         // (e.g. two delete() calls on the same row): without this check,
@@ -1055,6 +1117,7 @@ impl Transaction {
     fn write_phase(
         &self,
         data_dir: &Path,
+        ts: i64,
     ) -> Result<(Vec<DataFileEntry>, Vec<DeltaEntry>, Option<RowIdClaim>)> {
         // Skipped entirely when there's nothing to insert: a delete-only
         // transaction writes no new files, so there's no new directory
@@ -1064,6 +1127,13 @@ impl Transaction {
         // regardless of whether it had anything to write was redundant.
         if self.pending.is_empty() {
             return Ok((Vec::new(), Vec::new(), None));
+        }
+        for batch in &self.pending {
+            for name in HIDDEN_COLUMNS {
+                if batch.schema_ref().index_of(name).is_ok() {
+                    return Err(TxnError::ReservedColumnName((*name).to_string()));
+                }
+            }
         }
         std::fs::create_dir_all(data_dir)?;
         // SeqCst ordering justification (this pre-lock fetch_add): the
@@ -1107,6 +1177,7 @@ impl Transaction {
             data_dir,
             attempt_id,
             &claim,
+            ts,
             &mut new_data_files,
         )?;
         // Fsyncing each data file's *content* (already done inside
@@ -1153,23 +1224,35 @@ impl Transaction {
         data_dir: &Path,
         attempt_id: u64,
         claim: &RowIdClaim,
+        ts: i64,
         data_files: &mut Vec<DataFileEntry>,
     ) -> Result<Vec<DeltaEntry>> {
         let mut all_deltas = Vec::new();
         let mut row_id_base = claim.base();
         for (i, batch) in pending.iter().enumerate() {
-            // Stats computed on the original, pre-encoding, pre-row-id batch — see
-            // .claude/docs/design/phase-3-query-refinement-spec.md §1 for why
-            // (logical values, no dictionary-decode step needed later; _row_id is
-            // an internal column, not a user column subject to file-pruning stats).
-            let stats = compute_stats(batch);
+            // Stats computed on the original, pre-encoding, pre-hidden-column
+            // batch — see .claude/docs/design/phase-3-query-refinement-spec.md
+            // §1 for why (logical values, no dictionary-decode step needed
+            // later). _row_id gets no stats entry (nothing predicates on it);
+            // _timestamp DOES, inserted explicitly below, since every row in
+            // this batch shares one value and it exists specifically to be
+            // predicated on and pruned by — see design doc §7.
+            let mut stats = compute_stats(batch);
+            stats.insert(
+                TIMESTAMP_COLUMN.to_string(),
+                ColumnStats {
+                    min: Value::Int64(ts),
+                    max: Value::Int64(ts),
+                },
+            );
 
             let num_rows = u64::try_from(batch.num_rows())?;
 
             let deltas = build_delta_entries(batch, row_id_base)?;
             let with_row_id = append_row_id_column(batch, row_id_base, num_rows)?;
+            let with_timestamp = append_timestamp_column(&with_row_id, ts, num_rows)?;
 
-            let encoded = strata_storage::encode_batch(&with_row_id)?;
+            let encoded = strata_storage::encode_batch(&with_timestamp)?;
             let file_name = format!("{attempt_id:020}-{i}.arrow");
             write_batch(&data_dir.join(&file_name), &encoded)?;
 
@@ -1398,54 +1481,91 @@ pub(crate) fn safe_join(data_dir: &Path, name: &str) -> Result<PathBuf> {
     Ok(data_dir.join(candidate))
 }
 
-/// Casts every column of `batch` to the corresponding field type in
-/// `schema`, leaving already-matching columns untouched (a cheap `Arc`
-/// clone, not a copy). See [`crate::snapshot::Snapshot::scan`]'s doc comment
-/// for why this is necessary rather than a defensive nicety.
-///
-/// Every committed file physically carries a trailing hidden
-/// [`ROW_ID_COLUMN`] (see `append_row_id_column`). It only counts toward
-/// the batch's *logical* width when the caller's `schema` explicitly
-/// requests it (as the CLI's `search` subcommand does) — otherwise the
-/// positional zip below deliberately drops it. Any other width
-/// disagreement is an error: without the up-front check, `Iterator::zip`
-/// would silently truncate to the shorter side — dropping real columns, or
-/// worse, pairing the hidden row-id column with a caller field and casting
-/// row-ids into the caller's data.
+/// Hidden columns every committed batch carries alongside its logical
+/// (user) columns: `_row_id` and `_timestamp`, both unconditionally
+/// (since W2).
+/// `cast_batch_to_schema` matches these by *name*, not position; every
+/// other (visible) column is still matched positionally against `schema`'s
+/// fields, so the caller's `schema` must still list its visible fields in
+/// the same order the data was inserted in.
+const HIDDEN_COLUMNS: [&str; 2] = [ROW_ID_COLUMN, TIMESTAMP_COLUMN];
+
+/// Casts `batch`'s physical columns to `schema`'s logical field types,
+/// reattaching any hidden column (`_row_id`, `_timestamp`) `schema`
+/// explicitly requests. See
+/// `docs/superpowers/specs/2026-07-25-s1-w2-timestamp-column-design.md` §5
+/// for why matching a *second* hidden column by position was unsound (it
+/// either misfired a spurious `SchemaMismatch`, or — in the mixed-request
+/// case — silently paired the wrong physical column against the wrong
+/// logical field).
 ///
 /// # Errors
 ///
-/// Returns [`TxnError::SchemaMismatch`] if `schema`'s field count doesn't
-/// match `batch`'s logical column count, or an Arrow error if a column
-/// can't be cast to its corresponding field's type.
+/// Returns [`TxnError::SchemaMismatch`] if the number of *visible* columns
+/// `schema` requests doesn't match the number of visible physical columns
+/// in `batch`, an [`TxnError::Arrow`] if `schema` requests a hidden column
+/// not present in `batch`, or an [`TxnError::Arrow`]/[`TxnError`] wrapping
+/// a cast failure if a column's physical type can't convert to its
+/// requested logical type.
 pub(crate) fn cast_batch_to_schema(batch: &RecordBatch, schema: &SchemaRef) -> Result<RecordBatch> {
-    let physical = batch.num_columns();
-    let hidden_row_id = batch.schema_ref().index_of(ROW_ID_COLUMN).is_ok()
-        && schema.index_of(ROW_ID_COLUMN).is_err();
-    let logical = if hidden_row_id {
-        physical.saturating_sub(1)
-    } else {
-        physical
-    };
-    if logical != schema.fields().len() {
+    let physical_schema = batch.schema_ref();
+
+    let mut hidden_physical: std::collections::HashMap<&str, ArrayRef> =
+        std::collections::HashMap::new();
+    let mut visible_physical: Vec<ArrayRef> = Vec::new();
+    for (field, column) in physical_schema.fields().iter().zip(batch.columns()) {
+        if HIDDEN_COLUMNS.contains(&field.name().as_str()) {
+            hidden_physical.insert(field.name().as_str(), Arc::clone(column));
+        } else {
+            visible_physical.push(Arc::clone(column));
+        }
+    }
+
+    let visible_requested = schema
+        .fields()
+        .iter()
+        .filter(|f| !HIDDEN_COLUMNS.contains(&f.name().as_str()))
+        .count();
+    if visible_requested != visible_physical.len() {
         return Err(TxnError::SchemaMismatch {
-            expected: schema.fields().len(),
-            actual: logical,
+            expected: visible_requested,
+            actual: visible_physical.len(),
         });
     }
-    let columns: std::result::Result<Vec<ArrayRef>, arrow::error::ArrowError> = batch
-        .columns()
-        .iter()
-        .zip(schema.fields())
-        .map(|(column, field)| {
-            if column.data_type() == field.data_type() {
-                Ok(Arc::clone(column))
-            } else {
-                cast(column.as_ref(), field.data_type())
+
+    let mut visible_iter = visible_physical.into_iter();
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
+    for field in schema.fields() {
+        let column = if HIDDEN_COLUMNS.contains(&field.name().as_str()) {
+            hidden_physical
+                .get(field.name().as_str())
+                .cloned()
+                .ok_or_else(|| {
+                    TxnError::Arrow(arrow::error::ArrowError::SchemaError(format!(
+                        "requested hidden column '{}' not present in this batch",
+                        field.name()
+                    )))
+                })?
+        } else {
+            // `visible_requested == visible_physical.len()` was already
+            // checked above, so this iterator has exactly as many elements
+            // as there are non-hidden fields in `schema` — it cannot run
+            // dry before this loop does.
+            match visible_iter.next() {
+                Some(column) => column,
+                None => unreachable!(
+                    "visible column count was checked equal to visible field count above"
+                ),
             }
-        })
-        .collect();
-    Ok(RecordBatch::try_new(Arc::clone(schema), columns?)?)
+        };
+        let casted = if column.data_type() == field.data_type() {
+            column
+        } else {
+            cast(column.as_ref(), field.data_type())?
+        };
+        columns.push(casted);
+    }
+    Ok(RecordBatch::try_new(Arc::clone(schema), columns)?)
 }
 
 /// Appends a `_row_id: UInt64` column to `batch`, assigning
@@ -1470,6 +1590,30 @@ fn append_row_id_column(
 
     let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
     columns.push(row_id_array);
+
+    let schema = Arc::new(Schema::new(fields));
+    Ok(RecordBatch::try_new(schema, columns)?)
+}
+
+/// Appends a `_timestamp: Int64` column to `batch`, every row sharing the
+/// single value `ts` — microseconds since the Unix epoch, captured once per
+/// transaction by `issue_timestamp`. See
+/// `docs/superpowers/specs/2026-07-25-s1-w2-timestamp-column-design.md` §2-3.
+fn append_timestamp_column(batch: &RecordBatch, ts: i64, num_rows: u64) -> Result<RecordBatch> {
+    let num_rows = usize::try_from(num_rows)?;
+    let timestamps: Vec<i64> = vec![ts; num_rows];
+    let timestamp_array: ArrayRef = Arc::new(arrow::array::Int64Array::from(timestamps));
+
+    let mut fields: Vec<Field> = batch
+        .schema_ref()
+        .fields()
+        .iter()
+        .map(|f| f.as_ref().clone())
+        .collect();
+    fields.push(Field::new(TIMESTAMP_COLUMN, DataType::Int64, false));
+
+    let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
+    columns.push(timestamp_array);
 
     let schema = Arc::new(Schema::new(fields));
     Ok(RecordBatch::try_new(schema, columns)?)
@@ -1553,8 +1697,298 @@ mod tests {
         std::env::temp_dir().join(format!("strata-txn-test-{label}-{}", std::process::id()))
     }
 
+    #[test]
+    fn issue_timestamp_never_decreases_even_if_the_clock_would() {
+        let last_issued = std::sync::atomic::AtomicI64::new(0);
+
+        let first = issue_timestamp(&last_issued).unwrap();
+        assert!(
+            first > 0,
+            "a real clock read must be positive microseconds-since-epoch"
+        );
+
+        // Simulate a wall-clock regression (an NTP step backward) by seeding
+        // the atomic far ahead of any real clock reading it could compete
+        // against - `fetch_max` must keep the issued value at or above this,
+        // never let a subsequent "now()" that's smaller win.
+        last_issued.store(first + 1_000_000_000, std::sync::atomic::Ordering::SeqCst);
+        let second = issue_timestamp(&last_issued).unwrap();
+        assert_eq!(
+            second,
+            first + 1_000_000_000,
+            "issuance must never go backward, even against a clock read that would be smaller"
+        );
+
+        let third = issue_timestamp(&last_issued).unwrap();
+        assert!(
+            third >= second,
+            "a normal (non-regressing) subsequent issuance must still be non-decreasing"
+        );
+    }
+
     fn test_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]))
+    }
+
+    #[test]
+    fn every_row_in_one_transaction_shares_the_identical_timestamp() {
+        let dir = temp_dir("timestamp-shared-per-txn");
+        let ds = Dataset::create(&dir).unwrap();
+
+        let mut txn = ds.begin();
+        txn.insert(
+            RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![1, 2]))])
+                .unwrap(),
+        );
+        txn.insert(
+            RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![3, 4]))])
+                .unwrap(),
+        );
+        txn.commit().unwrap();
+
+        let snapshot = ds.snapshot();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(TIMESTAMP_COLUMN, DataType::Int64, false),
+        ]));
+        let batch = snapshot.scan(&schema).unwrap();
+        let timestamps = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        let first = timestamps.value(0);
+        assert_eq!(batch.num_rows(), 4);
+        for i in 0..batch.num_rows() {
+            assert_eq!(
+                timestamps.value(i),
+                first,
+                "every row across both pending batches in one transaction must share one timestamp"
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_delete_only_commit_still_advances_commit_time_high_water() {
+        let dir = temp_dir("timestamp-delete-only-advances");
+        let ds = Dataset::create(&dir).unwrap();
+
+        let mut txn = ds.begin();
+        txn.insert(
+            RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![1]))]).unwrap(),
+        );
+        txn.commit().unwrap();
+        let after_insert = ds.snapshot().manifest.commit_time_high_water;
+        assert!(after_insert > 0);
+
+        // Sleep-free: two distinct clock reads are only guaranteed distinct
+        // if enough wall-clock time actually elapses, which isn't
+        // guaranteed in a fast test - so this asserts non-decreasing
+        // (`>=`), matching the spec's own "non-decreasing" wording, not
+        // strictly increasing.
+        let mut txn = ds.begin();
+        txn.delete(0);
+        txn.commit().unwrap();
+        let after_delete = ds.snapshot().manifest.commit_time_high_water;
+        assert!(
+            after_delete >= after_insert,
+            "a delete-only commit must still advance (or at least not regress) the high-water mark"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn commit_time_high_water_is_non_decreasing_across_several_commits() {
+        let dir = temp_dir("timestamp-high-water-monotonic");
+        let ds = Dataset::create(&dir).unwrap();
+
+        let mut last = 0i64;
+        for i in 0..5 {
+            let mut txn = ds.begin();
+            txn.insert(
+                RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![i]))])
+                    .unwrap(),
+            );
+            txn.commit().unwrap();
+            let current = ds.snapshot().manifest.commit_time_high_water;
+            assert!(
+                current >= last,
+                "commit {i}: high-water mark regressed from {last} to {current}"
+            );
+            last = current;
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn commit_time_high_water_does_not_regress_when_a_smaller_timestamp_commits_later() {
+        // Deterministic concurrency, not a race: constructs the exact
+        // adversarial interleaving design doc §1/§3 accepts as possible - a
+        // transaction that captured an EARLIER (smaller) timestamp reaches
+        // commit_lock and actually commits AFTER a transaction that
+        // captured a LATER (larger) one. Proves Layer 2 (the manifest's
+        // commit_time_high_water) stays non-decreasing across versions even
+        // though the current committer's own captured value is smaller
+        // than what a concurrent commit already published. Uses this
+        // file's existing `checkpoint_pair`/`pause_after_row_id_claim`
+        // mechanism (see `in-flight-commit-not-visible-to-reader`-style
+        // tests elsewhere in this module for the same pattern), not a
+        // sleep-raced schedule - only the wall-clock *value* gap uses a
+        // short sleep below, not the interleaving itself.
+        let dir = temp_dir("timestamp-high-water-concurrent-non-regression");
+        let ds = Dataset::create(&dir).unwrap();
+
+        let (claim_point, claimed) = checkpoint_pair();
+
+        // "slow": captures its timestamp first (small - issue_timestamp
+        // runs at the very top of commit(), before write_phase, which is
+        // what pause_after_row_id_claim pauses after), then parks before
+        // acquiring commit_lock.
+        let mut slow = ds.begin();
+        slow.insert(
+            RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![1]))]).unwrap(),
+        );
+        slow.pause_after_row_id_claim(claim_point);
+        let slow_thread = std::thread::spawn(move || slow.commit());
+
+        claimed.wait();
+
+        // Not racing an observation window (this file's other
+        // Checkpoint-based tests correctly avoid that) - only guaranteeing
+        // "fast"'s own clock read is strictly later in wall-clock time,
+        // which real elapsed time already all but guarantees at
+        // microsecond resolution; this removes any doubt.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        // "fast": captures a strictly later (larger) timestamp and commits
+        // to completion, uncontested, while "slow" is parked.
+        let mut fast = ds.begin();
+        fast.insert(
+            RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![2]))]).unwrap(),
+        );
+        fast.commit().unwrap();
+        let high_water_after_fast = ds.snapshot().manifest.commit_time_high_water;
+        assert!(high_water_after_fast > 0);
+
+        // Release "slow" - it builds its manifest from "fast"'s
+        // already-published snapshot (commit_time_high_water ==
+        // high_water_after_fast), then applies `.max(its own smaller
+        // timestamp)` on top of that.
+        claimed.release();
+        slow_thread.join().unwrap().unwrap();
+
+        let high_water_after_slow = ds.snapshot().manifest.commit_time_high_water;
+        assert_eq!(
+            high_water_after_slow, high_water_after_fast,
+            "a later-committing transaction with an EARLIER captured timestamp must not \
+             regress commit_time_high_water below what an already-published concurrent \
+             commit established"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn timestamp_gets_a_stats_entry_with_min_equal_to_max() {
+        let dir = temp_dir("timestamp-file-pruning");
+        let ds = Dataset::create(&dir).unwrap();
+
+        let mut txn = ds.begin();
+        txn.insert(
+            RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![1]))]).unwrap(),
+        );
+        txn.commit().unwrap();
+
+        let files = ds.data_files();
+        assert_eq!(files.len(), 1);
+        let stats = files[0].stats.get(TIMESTAMP_COLUMN).expect(
+            "_timestamp must have a stats entry (unlike _row_id, which deliberately has none)",
+        );
+        assert_eq!(
+            stats.min, stats.max,
+            "every row in one file shares one timestamp"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn should_scan_file_prunes_files_using_timestamp_stats() {
+        use strata_query::Predicate;
+        use strata_storage::Value;
+
+        let dir = temp_dir("timestamp-real-file-pruning");
+        let ds = Dataset::create(&dir).unwrap();
+
+        let mut txn = ds.begin();
+        txn.insert(
+            RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![1]))]).unwrap(),
+        );
+        txn.commit().unwrap();
+        let ts_after_commit_1 = ds.snapshot().manifest.commit_time_high_water;
+
+        let mut txn = ds.begin();
+        txn.insert(
+            RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![2]))]).unwrap(),
+        );
+        txn.commit().unwrap();
+
+        let snapshot = ds.snapshot();
+        let predicate = Predicate::Gt(
+            TIMESTAMP_COLUMN.to_string(),
+            Value::Int64(ts_after_commit_1),
+        );
+        let explain = snapshot.explain(&predicate);
+        assert_eq!(explain.total_files, 2);
+        assert_eq!(
+            explain.scanned.len(),
+            1,
+            "only the second file's timestamp can be strictly greater than the first commit's own timestamp"
+        );
+        assert_eq!(explain.skipped.len(), 1);
+        assert_eq!(
+            explain.scanned[0],
+            ds.data_files()[1].name,
+            "the surviving file must be the second commit's, not the first"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn insert_rejects_a_batch_whose_schema_reuses_a_reserved_column_name() {
+        let dir = temp_dir("timestamp-reserved-column-name-rejected");
+        let ds = Dataset::create(&dir).unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(ROW_ID_COLUMN, DataType::Int64, false), // user column colliding with the hidden one
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![999])),
+            ],
+        )
+        .unwrap();
+
+        let mut txn = ds.begin();
+        txn.insert(batch);
+        let result = txn.commit();
+        assert!(
+            matches!(result, Err(TxnError::ReservedColumnName(ref name)) if name == ROW_ID_COLUMN),
+            "expected ReservedColumnName(_row_id), got {result:?}"
+        );
+
+        // Nothing must have been written - the dataset stays at version 0.
+        assert_eq!(ds.current_version(), 0);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1739,6 +2173,7 @@ mod tests {
             next_row_id: 3,
             tombstones: Vec::new(),
             next_attempt_id: 0, // <-- the exact legacy-deserialize shape
+            commit_time_high_water: 0,
         };
         // The delta log referenced above must exist too (replay_index reads
         // it on open), but can be empty -- this test's batch has no vector
@@ -1863,6 +2298,7 @@ mod tests {
             next_row_id: u64::MAX,
             tombstones: Vec::new(),
             next_attempt_id: 0,
+            commit_time_high_water: 0,
         };
         strata_storage::commit_manifest(&dir, &hostile).unwrap();
 
@@ -1889,6 +2325,7 @@ mod tests {
             next_row_id: 0,
             tombstones: Vec::new(),
             next_attempt_id: 0,
+            commit_time_high_water: 0,
         };
         strata_storage::commit_manifest(&dir, &hostile).unwrap();
         let ds = Dataset::open(&dir).unwrap();
@@ -2057,6 +2494,121 @@ mod tests {
             "_row_id must not appear in scan() output when the caller's schema doesn't ask for it"
         );
         assert!(scanned.schema_ref().index_of(ROW_ID_COLUMN).is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cast_batch_to_schema_reattaches_neither_hidden_column_by_default() {
+        let dir = temp_dir("cast-hidden-neither");
+        let ds = Dataset::create(&dir).unwrap();
+        let mut txn = ds.begin();
+        txn.insert(
+            RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![1, 2]))])
+                .unwrap(),
+        );
+        txn.commit().unwrap();
+
+        let batch = ds.snapshot().scan(&test_schema()).unwrap();
+        assert_eq!(
+            batch.num_columns(),
+            1,
+            "requesting no hidden columns must return just 'id'"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cast_batch_to_schema_reattaches_row_id_only() {
+        let dir = temp_dir("cast-hidden-row-id-only");
+        let ds = Dataset::create(&dir).unwrap();
+        let mut txn = ds.begin();
+        txn.insert(
+            RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![1, 2]))])
+                .unwrap(),
+        );
+        txn.commit().unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(ROW_ID_COLUMN, DataType::UInt64, false),
+        ]));
+        let batch = ds.snapshot().scan(&schema).unwrap();
+        assert_eq!(batch.num_columns(), 2);
+        let row_ids = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(row_ids.values(), &[0, 1]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cast_batch_to_schema_reattaches_timestamp_only() {
+        let dir = temp_dir("cast-hidden-timestamp-only");
+        let ds = Dataset::create(&dir).unwrap();
+        let mut txn = ds.begin();
+        txn.insert(
+            RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![1, 2]))])
+                .unwrap(),
+        );
+        txn.commit().unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(TIMESTAMP_COLUMN, DataType::Int64, false),
+        ]));
+        let batch = ds.snapshot().scan(&schema).unwrap();
+        assert_eq!(batch.num_columns(), 2);
+        let timestamps = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        assert!(timestamps.value(0) > 0);
+        assert_eq!(
+            timestamps.value(0),
+            timestamps.value(1),
+            "this is the exact case that risked a silent miscast under the old positional logic - \
+             both rows must show the SAME real timestamp, not a row-id value reinterpreted as Int64"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cast_batch_to_schema_reattaches_both_hidden_columns() {
+        let dir = temp_dir("cast-hidden-both");
+        let ds = Dataset::create(&dir).unwrap();
+        let mut txn = ds.begin();
+        txn.insert(
+            RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![1, 2]))])
+                .unwrap(),
+        );
+        txn.commit().unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(ROW_ID_COLUMN, DataType::UInt64, false),
+            Field::new(TIMESTAMP_COLUMN, DataType::Int64, false),
+        ]));
+        let batch = ds.snapshot().scan(&schema).unwrap();
+        assert_eq!(batch.num_columns(), 3);
+        let row_ids = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(row_ids.values(), &[0, 1]);
+        let timestamps = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        assert_eq!(timestamps.value(0), timestamps.value(1));
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2342,6 +2894,328 @@ mod tests {
     }
 
     #[test]
+    fn timestamps_and_the_high_water_mark_survive_reopen() {
+        let dir = temp_dir("timestamp-survives-reopen");
+        let ds = Dataset::create(&dir).unwrap();
+
+        let mut txn = ds.begin();
+        txn.insert(
+            RecordBatch::try_new(
+                test_schema(),
+                vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+            )
+            .unwrap(),
+        );
+        txn.commit().unwrap();
+
+        let high_water_before_close = ds.snapshot().manifest.commit_time_high_water;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(TIMESTAMP_COLUMN, DataType::Int64, false),
+        ]));
+        let timestamps_before_close: Vec<i64> = {
+            let batch = ds.snapshot().scan(&schema).unwrap();
+            let col = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .unwrap();
+            (0..batch.num_rows()).map(|i| col.value(i)).collect()
+        };
+        drop(ds);
+
+        // Reopen — this is the actual file-read path (dictionary-encoded,
+        // per design doc §9), not an in-memory batch, so this is the test
+        // that would catch a dictionary-encoding round-trip bug the
+        // in-memory-only tests above cannot.
+        let reopened = Dataset::open(&dir).unwrap();
+        let timestamps_after_reopen: Vec<i64> = {
+            let batch = reopened.snapshot().scan(&schema).unwrap();
+            let col = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .unwrap();
+            (0..batch.num_rows()).map(|i| col.value(i)).collect()
+        };
+        assert_eq!(
+            timestamps_before_close, timestamps_after_reopen,
+            "per-row timestamps must round-trip through the actual (dictionary-encoded) file format"
+        );
+
+        // A predicate against the reopened, dictionary-encoded column must
+        // still work - the comparison kernel unwraps dictionaries
+        // transparently, but this proves it end to end rather than trusting
+        // that in isolation.
+        let predicate = strata_query::Predicate::GtEq(
+            TIMESTAMP_COLUMN.to_string(),
+            strata_storage::Value::Int64(timestamps_after_reopen[0]),
+        );
+        let filtered = reopened
+            .snapshot()
+            .scan_with_predicate(&schema, &predicate)
+            .unwrap();
+        assert_eq!(
+            filtered.num_rows(),
+            3,
+            "all 3 rows share the same timestamp, so all must match"
+        );
+
+        let mut txn = reopened.begin();
+        txn.insert(
+            RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![4]))]).unwrap(),
+        );
+        txn.commit().unwrap();
+        // Smoke check only - this assertion holds regardless of whether the
+        // restart floor was seeded correctly, since a fresh post-reopen
+        // timestamp is always >= an earlier one by ordinary clock advancement.
+        // The real proof that Dataset::open seeds last_issued_timestamp from
+        // the persisted value is
+        // last_issued_timestamp_is_seeded_from_the_persisted_high_water_mark_on_reopen.
+        assert!(
+            reopened.snapshot().manifest.commit_time_high_water >= high_water_before_close,
+            "commit_time_high_water must not regress across a restart"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    // The three-cluster fixture (near/far/mid, each with its own commit and
+    // category) is what makes this test discriminate "AND narrows correctly"
+    // from "either leaf alone happens to work" - splitting it into a helper
+    // would obscure exactly the structure the test is proving.
+    #[allow(clippy::too_many_lines)]
+    fn vector_search_with_timestamp_and_category_compound_predicate() {
+        use strata_query::Predicate;
+        use strata_storage::Value;
+
+        let dir = temp_dir("timestamp-compound-vector-search");
+        let ds = Dataset::create(&dir).unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("category", DataType::Utf8, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 3),
+                false,
+            ),
+        ]));
+
+        // Three commits, three clusters at increasing distance from the
+        // query point (the origin): near (id 0..10, category "a", commit 1
+        // - EARLIEST timestamp), far (id 10..20, category "a", commit 2),
+        // mid (id 20..30, category "b", commit 3 - LATEST timestamp).
+        //
+        // Predicate: timestamp >= ts_after_commit_2 AND category = "a".
+        // - category="a" ALONE matches near+far (0..20); nearest to the
+        //   origin is the near cluster (distance 0) - so category alone
+        //   returns the WRONG answer (near is commit 1, excluded by the
+        //   timestamp leaf).
+        // - timestamp>=ts_after_commit_2 ALONE matches far+mid (10..30);
+        //   nearest to the origin is the mid cluster (distance 500) - so
+        //   timestamp alone ALSO returns the WRONG answer (mid is category
+        //   "b", excluded by the category leaf).
+        // - Only the AND correctly identifies the far cluster (10..20):
+        //   it's the only cluster satisfying both conjuncts, and neither
+        //   leaf alone could identify it.
+        let near_cluster = cluster_vectors(10, [0.0, 0.0, 0.0], 0.01);
+        let far_cluster = cluster_vectors(10, [1000.0, 0.0, 0.0], 0.01);
+        let mid_cluster = cluster_vectors(10, [500.0, 0.0, 0.0], 0.01);
+        let item_field = Arc::new(Field::new("item", DataType::Float32, false));
+
+        let mut txn = ds.begin();
+        txn.insert(
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(arrow::array::StringArray::from(vec!["a"; 10])),
+                    Arc::new(arrow::array::FixedSizeListArray::new(
+                        item_field.clone(),
+                        3,
+                        Arc::new(arrow::array::Float32Array::from(
+                            near_cluster.iter().flatten().copied().collect::<Vec<f32>>(),
+                        )),
+                        None,
+                    )),
+                ],
+            )
+            .unwrap(),
+        );
+        txn.commit().unwrap();
+
+        let mut txn = ds.begin();
+        txn.insert(
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(arrow::array::StringArray::from(vec!["a"; 10])),
+                    Arc::new(arrow::array::FixedSizeListArray::new(
+                        item_field.clone(),
+                        3,
+                        Arc::new(arrow::array::Float32Array::from(
+                            far_cluster.iter().flatten().copied().collect::<Vec<f32>>(),
+                        )),
+                        None,
+                    )),
+                ],
+            )
+            .unwrap(),
+        );
+        txn.commit().unwrap();
+        let ts_after_commit_2 = ds.snapshot().manifest.commit_time_high_water;
+
+        let mut txn = ds.begin();
+        txn.insert(
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(arrow::array::StringArray::from(vec!["b"; 10])),
+                    Arc::new(arrow::array::FixedSizeListArray::new(
+                        item_field,
+                        3,
+                        Arc::new(arrow::array::Float32Array::from(
+                            mid_cluster.iter().flatten().copied().collect::<Vec<f32>>(),
+                        )),
+                        None,
+                    )),
+                ],
+            )
+            .unwrap(),
+        );
+        txn.commit().unwrap();
+
+        let snapshot = ds.snapshot();
+
+        // Control 1: category="a" alone must return the near cluster (the
+        // WRONG answer per the predicate's intent - proves category alone
+        // is insufficient).
+        let category_only = Predicate::Eq("category".to_string(), Value::Utf8("a".to_string()));
+        let category_only_results = snapshot
+            .vector_search(&[0.0, 0.0, 0.0], 5, Some(&category_only))
+            .unwrap();
+        assert_eq!(
+            category_only_results.len(),
+            5,
+            "unexpected: {category_only_results:?}"
+        );
+        assert!(
+            category_only_results.iter().all(|r| r.row_id < 10),
+            "category=a alone must return the near cluster (row-ids 0..10) - proving it alone \
+             is the wrong answer: {category_only_results:?}"
+        );
+
+        // Control 2: timestamp>=ts_after_commit_2 alone must return the mid
+        // cluster (also the WRONG answer - proves timestamp alone is
+        // insufficient too).
+        let timestamp_only = Predicate::GtEq(
+            TIMESTAMP_COLUMN.to_string(),
+            Value::Int64(ts_after_commit_2),
+        );
+        let timestamp_only_results = snapshot
+            .vector_search(&[0.0, 0.0, 0.0], 5, Some(&timestamp_only))
+            .unwrap();
+        assert_eq!(
+            timestamp_only_results.len(),
+            5,
+            "unexpected: {timestamp_only_results:?}"
+        );
+        assert!(
+            timestamp_only_results
+                .iter()
+                .all(|r| (20..30).contains(&r.row_id)),
+            "timestamp>=ts_after_commit_2 alone must return the mid cluster (row-ids 20..30) - \
+             proving it alone is ALSO the wrong answer: {timestamp_only_results:?}"
+        );
+
+        // The AND: only the far cluster satisfies both conjuncts, and
+        // neither control above could identify it alone.
+        let predicate = Predicate::And(
+            Box::new(timestamp_only.clone()),
+            Box::new(category_only.clone()),
+        );
+        let results = snapshot
+            .vector_search(&[0.0, 0.0, 0.0], 5, Some(&predicate))
+            .unwrap();
+        assert_eq!(results.len(), 5, "unexpected results: {results:?}");
+        assert!(
+            results.iter().all(|r| (10..20).contains(&r.row_id)),
+            "timestamp>=ts_after_commit_2 AND category=a must return the far cluster \
+             (row-ids 10..20) - the only cluster satisfying both, which neither leaf alone \
+             (near, for category; mid, for timestamp) could identify: {results:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn last_issued_timestamp_is_seeded_from_the_persisted_high_water_mark_on_reopen() {
+        use strata_query::Predicate;
+        use strata_storage::Value;
+
+        let dir = temp_dir("timestamp-restart-floor-seeding");
+        let ds = Dataset::create(&dir).unwrap();
+        let mut txn = ds.begin();
+        txn.insert(
+            RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![1]))]).unwrap(),
+        );
+        txn.commit().unwrap();
+        drop(ds);
+
+        // Directly overwrite the on-disk manifest with a commit_time_high_water
+        // far in the future - simulating what a real prior session's clock
+        // would eventually produce, without waiting for it. If Dataset::open
+        // does NOT seed last_issued_timestamp from this persisted value (e.g.
+        // seeds from 0, or from a fresh unclamped wall-clock read), the next
+        // commit's real timestamp will land far BELOW this floor, and the
+        // assertions below catch it.
+        let mut manifest = strata_storage::read_current(&dir).unwrap().unwrap();
+        let far_future = manifest.commit_time_high_water + 1_000_000_000_000; // ~11.6 days ahead, in microseconds
+        manifest.commit_time_high_water = far_future;
+        strata_storage::commit_manifest(&dir, &manifest).unwrap();
+
+        let reopened = Dataset::open(&dir).unwrap();
+        assert_eq!(
+            reopened.snapshot().manifest.commit_time_high_water,
+            far_future,
+            "sanity check: the persisted value itself must survive the reopen unchanged"
+        );
+
+        let mut txn = reopened.begin();
+        txn.insert(
+            RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![2]))]).unwrap(),
+        );
+        txn.commit().unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(TIMESTAMP_COLUMN, DataType::Int64, false),
+        ]));
+        let batch = reopened
+            .snapshot()
+            .scan_with_predicate(&schema, &Predicate::Eq("id".to_string(), Value::Int64(2)))
+            .unwrap();
+        let new_row_ts = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap()
+            .value(0);
+        assert!(
+            new_row_ts >= far_future,
+            "the new commit's own timestamp must be >= the persisted restart floor - \
+             last_issued_timestamp must be seeded from commit_time_high_water on open, not \
+             from 0 or an unclamped fresh wall-clock read: new_row_ts={new_row_ts}, far_future={far_future}"
+        );
+        assert!(
+            reopened.snapshot().manifest.commit_time_high_water >= far_future,
+            "commit_time_high_water itself must never regress below the persisted floor"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn reopening_a_dataset_rebuilds_the_vector_index_from_the_delta_log() {
         let dir = temp_dir("delta-log-replay");
         let schema = Arc::new(Schema::new(vec![
@@ -2490,6 +3364,7 @@ mod tests {
             next_row_id: 0,
             tombstones: Vec::new(),
             next_attempt_id: 0,
+            commit_time_high_water: 0,
         };
         strata_storage::commit_manifest(&dir, &hostile).unwrap();
         // The delta log must exist (empty is fine — it replays to zero
@@ -2522,10 +3397,10 @@ mod tests {
         txn.commit().unwrap();
 
         // Caller asks to scan with a schema declaring 2 columns, but the
-        // committed file only has 1 logical column ("id" — the trailing
-        // hidden _row_id doesn't count unless the caller requests it) -
-        // must error, not silently zip/truncate or, worse, cast the hidden
-        // row-id column into the caller's "extra" field.
+        // committed file only has 1 logical column ("id" — the hidden
+        // _row_id and _timestamp columns don't count unless the caller
+        // requests them) - must error, not silently zip/truncate or,
+        // worse, cast a hidden column into the caller's "extra" field.
         let mismatched_schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("extra", DataType::Utf8, false),
