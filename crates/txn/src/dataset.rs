@@ -822,8 +822,14 @@ impl Transaction {
     /// rejected, before any file for that batch is written to disk. Returns
     /// [`TxnError::Index`] wrapping a `DimensionMismatch` if this commit's
     /// vectors disagree with each other or with the dimension already
-    /// established by committed segments — checked before the segment is
-    /// built, so a half-built segment can never be fsynced. Also returns an
+    /// established by committed segments — checked twice: once in
+    /// `write_phase`, before the segment is built (so a half-built segment
+    /// can never be fsynced), against a snapshot that may be stale by the
+    /// time `commit_lock` is acquired; and again inside `commit_lock`,
+    /// against the *freshly reloaded* `latest_snapshot`, which is what
+    /// actually closes the race between two concurrent first-vector commits
+    /// at different dimensions (the pre-lock check alone would let both
+    /// pass when neither has established a dimension yet). Also returns an
     /// error if any pending batch fails to dictionary-encode, if the segment
     /// can't be serialized or written, or if the manifest commit's atomic
     /// rename fails.
@@ -929,7 +935,39 @@ impl Transaction {
         // substituted: a concurrent, non-conflicting transaction's segment
         // that landed after this one began is already in
         // `latest_snapshot.manifest.segments` and must survive.
+        //
+        // **The authoritative dimension check.** `write_phase`'s
+        // `validate_vector_dimensions` ran *before* `commit_lock` was
+        // acquired, against whatever `established_dimension()` was at that
+        // (now possibly stale) moment — it is a cheap pre-lock rejection
+        // for the common case, not the source of truth. Two concurrent
+        // first-vector commits at different dimensions can both read
+        // `established_dimension() == 0` there and both pass. This is the
+        // re-check that actually closes the race: it reads
+        // `latest_snapshot` — the snapshot freshly loaded *inside* this
+        // critical section, above — not `write_phase`'s stale view. Because
+        // every committer must hold this same `commit_lock` to reach this
+        // line, and `self.current` (and therefore `established_dimension()`)
+        // is only ever advanced by a prior lock holder before releasing the
+        // lock, whichever of two racing dimension-mismatched commits gets
+        // here first publishes and establishes the dimension; the second
+        // one's `latest_snapshot` (reloaded fresh under this same lock
+        // acquisition) already reflects that, so a single comparison —
+        // no retry loop — is sufficient. Must run, and fail, before
+        // `manifest.segments.push` below and before `commit_manifest`: a
+        // rejected commit must leave no trace, same as a conflict
+        // rejection above.
         if let Some(published) = &new_segment {
+            let established = latest_snapshot.index.established_dimension();
+            let segment_dimension = usize::try_from(published.entry.dimension)?;
+            if established != 0 && segment_dimension != established {
+                return Err(TxnError::Index(
+                    strata_index::IndexError::DimensionMismatch {
+                        query_len: segment_dimension,
+                        expected: established,
+                    },
+                ));
+            }
             manifest.segments.push(published.entry.clone());
         }
         // The bound and the exclusion set this commit's snapshot will carry,
@@ -1447,10 +1485,13 @@ const MAX_REASONABLE_ROW_ID_CAPACITY: u64 = 1_000_000_000;
 ///
 /// Returns [`TxnError::UnsafeManifestPath`] if a segment name tries to
 /// escape `data/`, [`TxnError::Io`] if a listed segment can't be read,
-/// [`TxnError::CorruptSegment`] if a segment's on-disk length disagrees
-/// with the length the manifest records for it (a truncated or overwritten
-/// file), or [`TxnError::Index`] if a segment fails its own header/body
-/// validation.
+/// [`TxnError::CorruptSegment`] if a segment's on-disk length, format
+/// version, vector count, dimension, or row-id range disagrees with what
+/// the manifest records for it (a truncated/overwritten file, or — as a
+/// second line of defense — a manifest whose `SegmentEntry` was corrupted
+/// or, per this task's Finding 1, briefly permitted to disagree with a
+/// dimension another segment already established), or [`TxnError::Index`]
+/// if a segment fails its own header/body validation.
 fn load_segments(dir: &Path, manifest: &Manifest) -> Result<strata_index::SegmentSet> {
     let data_dir = data_subdir(dir);
     let mut parts = Vec::with_capacity(manifest.segments.len());
@@ -1469,7 +1510,47 @@ fn load_segments(dir: &Path, manifest: &Manifest) -> Result<strata_index::Segmen
                 entry.byte_len
             )));
         }
-        parts.push(Arc::new(strata_index::SegmentReader::from_bytes(&bytes)?));
+        let reader = strata_index::SegmentReader::from_bytes(&bytes)?;
+        // Cross-check every other field the manifest records about this
+        // segment, not just its byte length — same rationale as the
+        // `byte_len` check above, and a second line of defense against
+        // Finding 1's dimension race specifically: a `SegmentEntry` whose
+        // `dimension` ever disagreed with what its own bytes actually
+        // encode is caught here at open-time, independent of whatever
+        // in-lock check ran (or didn't) at commit-time.
+        if reader.format_version() != entry.format_version {
+            return Err(TxnError::CorruptSegment(format!(
+                "segment {} has format_version {} on disk but the manifest records {}",
+                entry.name,
+                reader.format_version(),
+                entry.format_version
+            )));
+        }
+        if u64::try_from(reader.node_count())? != entry.vector_count {
+            return Err(TxnError::CorruptSegment(format!(
+                "segment {} has {} vectors on disk but the manifest records {}",
+                entry.name,
+                reader.node_count(),
+                entry.vector_count
+            )));
+        }
+        if u32::try_from(reader.dimension())? != entry.dimension {
+            return Err(TxnError::CorruptSegment(format!(
+                "segment {} has dimension {} on disk but the manifest records {}",
+                entry.name,
+                reader.dimension(),
+                entry.dimension
+            )));
+        }
+        let (row_id_min, row_id_max) = reader.row_id_range();
+        if row_id_min != entry.row_id_min || row_id_max != entry.row_id_max {
+            return Err(TxnError::CorruptSegment(format!(
+                "segment {} has row-id range [{row_id_min}, {row_id_max}] on disk but the \
+                 manifest records [{}, {}]",
+                entry.name, entry.row_id_min, entry.row_id_max
+            )));
+        }
+        parts.push(Arc::new(reader));
     }
     Ok(strata_index::SegmentSet::from_segments(parts))
 }
@@ -2422,9 +2503,11 @@ mod tests {
     // crafting a hostile manifest with `next_row_id: u64::MAX - 1`. Task 2
     // deferred it because `Dataset::open` -> `replay_index` panicked
     // ("capacity overflow") on such a manifest before `commit` ever ran.
-    // Resolved by Batch 1, Task 4: `replay_index` now rejects any manifest
+    // Resolved by Batch 1, Task 4: `Dataset::open` now rejects any manifest
     // whose `next_row_id` exceeds `MAX_REASONABLE_ROW_ID_CAPACITY` with a
-    // typed `TxnError::UnreasonableCapacity` at open — covered by
+    // typed `TxnError::UnreasonableCapacity`, checked directly (the check
+    // used to live inside `replay_index`, which no longer exists — see
+    // `MAX_REASONABLE_ROW_ID_CAPACITY`'s own doc comment) — covered by
     // `open_errors_instead_of_attempting_a_huge_allocation_on_an_unreasonable_next_row_id`
     // below. The capacity ceiling makes a near-`u64::MAX` `next_row_id`
     // unreachable through `open`, so the originally-specified commit-time
@@ -3417,6 +3500,128 @@ mod tests {
     }
 
     #[test]
+    fn reopening_a_dataset_with_multiple_segments_finds_each_segments_own_cluster() {
+        // Sibling of `reopening_a_dataset_loads_the_vector_index_from_the_manifests_segments`,
+        // which only ever covers exactly one segment -- not enough to catch
+        // a regression that mixes up segments, silently drops one, or maps
+        // a hit back to the wrong global row-id once more than one segment
+        // is in play. This is the direct regression test for "post-reopen
+        // results match pre-reopen results" across multiple segments.
+        let dir = temp_dir("multi-segment-reopen");
+        let ds = Dataset::create(&dir).unwrap();
+
+        // Three well-separated commits, each its own segment (one
+        // vector-carrying commit -> one segment, per
+        // `build_and_write_segment`'s doc comment).
+        let mut txn_a = ds.begin();
+        txn_a.insert(vector_batch(
+            vec![1i64, 2i64, 3i64],
+            cluster_vectors(3, [0.0, 0.0, 0.0], 0.01),
+        ));
+        txn_a.commit().unwrap();
+
+        let mut txn_b = ds.begin();
+        txn_b.insert(vector_batch(
+            vec![4i64, 5i64, 6i64],
+            cluster_vectors(3, [500.0, 500.0, 500.0], 0.01),
+        ));
+        txn_b.commit().unwrap();
+
+        let mut txn_c = ds.begin();
+        txn_c.insert(vector_batch(
+            vec![7i64, 8i64, 9i64],
+            cluster_vectors(3, [900.0, 900.0, 900.0], 0.01),
+        ));
+        txn_c.commit().unwrap();
+
+        assert_eq!(ds.snapshot().manifest.segments.len(), 3);
+        let row_ids_before: Vec<u64> = [
+            [0.0, 0.0, 0.0],
+            [500.0, 500.0, 500.0],
+            [900.0, 900.0, 900.0],
+        ]
+        .iter()
+        .map(|query| ds.snapshot().vector_search(query, 1, None).unwrap()[0].row_id)
+        .collect();
+
+        drop(ds);
+
+        // Force a real load from disk -- the crash-recovery-equivalent path
+        // for the index, same as the single-segment sibling test.
+        let reopened = Dataset::open(&dir).unwrap();
+        assert_eq!(reopened.snapshot().manifest.segments.len(), 3);
+        assert_eq!(
+            reopened.snapshot().index.len(),
+            3,
+            "the loaded segment set must match the manifest's segment list"
+        );
+
+        // A query near EACH commit's own cluster must return that same
+        // commit's own row post-reopen -- not another segment's row, and
+        // not an error from a segment mixed up with the wrong one.
+        for (query, expected_row_id) in [
+            ([0.0, 0.0, 0.0], row_ids_before[0]),
+            ([500.0, 500.0, 500.0], row_ids_before[1]),
+            ([900.0, 900.0, 900.0], row_ids_before[2]),
+        ] {
+            let results = reopened.snapshot().vector_search(&query, 1, None).unwrap();
+            assert_eq!(
+                results.len(),
+                1,
+                "query {query:?} must find exactly one result post-reopen"
+            );
+            assert_eq!(
+                results[0].row_id, expected_row_id,
+                "query {query:?} must find the same row post-reopen as it did \
+                 pre-reopen: {results:?}"
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reopening_a_dataset_with_a_truncated_segment_file_returns_corrupt_segment() {
+        // Zero test coverage existed anywhere in the workspace for
+        // `TxnError::CorruptSegment`, despite `load_segments` constructing
+        // it -- this is that coverage. Mirrors the truncation technique
+        // already used to test `SegmentReader::from_bytes`'s own corruption
+        // handling (`crates/index/src/segment_reader.rs`'s
+        // `a_truncated_file_is_rejected_rather_than_read_past_its_end`), but
+        // exercised through the real commit -> close -> corrupt -> reopen
+        // path, since `load_segments`'s `byte_len` cross-check runs *before*
+        // `SegmentReader::from_bytes` ever sees the bytes.
+        let dir = temp_dir("truncated-segment-on-reopen");
+        let ds = Dataset::create(&dir).unwrap();
+
+        let mut txn = ds.begin();
+        txn.insert(vector_batch(
+            vec![1i64, 2i64],
+            cluster_vectors(2, [0.0, 0.0, 0.0], 0.01),
+        ));
+        txn.commit().unwrap();
+
+        let segment_name = ds.snapshot().manifest.segments[0].name.clone();
+        drop(ds);
+
+        let segment_path = data_subdir(&dir).join(&segment_name);
+        let bytes = std::fs::read(&segment_path).unwrap();
+        assert!(
+            bytes.len() > 8,
+            "precondition: the real segment must be long enough to truncate meaningfully"
+        );
+        std::fs::write(&segment_path, &bytes[..bytes.len() - 8]).unwrap();
+
+        match Dataset::open(&dir) {
+            Err(TxnError::CorruptSegment(_)) => {}
+            Err(other) => panic!("expected CorruptSegment, got a different error: {other}"),
+            Ok(_) => panic!("open must not succeed against a truncated segment"),
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn committing_a_batch_with_a_non_finite_vector_component_is_rejected_cleanly() {
         // Regression test for the Phase 4 final-review finding: a
         // non-finite (NaN/Infinity) vector component used to durably
@@ -3527,6 +3732,53 @@ mod tests {
             matches!(result, Err(TxnError::UnsafeManifestPath(_))),
             "expected UnsafeManifestPath, got {result:?}"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn open_errors_instead_of_traversing_outside_data_dir_on_an_unsafe_segment_entry() {
+        // `SegmentEntry.name` became a second consumer of `safe_join`'s
+        // guard alongside `DataFileEntry.name` (see the sibling test just
+        // above), but had zero test coverage of its own. Unlike a hostile
+        // `DataFileEntry`, which is only checked lazily on the first
+        // `scan`, a hostile `SegmentEntry` is checked eagerly: segments load
+        // during `Dataset::open` itself (`load_segments`), not on first
+        // use — so the assertion here is on `open`'s own return value, not
+        // a later `scan`.
+        let dir = temp_dir("segment-path-traversal");
+        Dataset::create(&dir).unwrap();
+
+        // Simulate a hostile manifest: hand-craft a SegmentEntry whose name
+        // tries to escape data/ via a parent-directory component. No real
+        // commit can ever produce this — segment filenames are always
+        // generated internally from `write_attempt_counter` — so this is
+        // only reachable via a corrupted/hand-edited manifest, exactly the
+        // threat model `safe_join` guards against.
+        let hostile = Manifest {
+            version: 1,
+            data_files: Vec::new(),
+            next_row_id: 0,
+            tombstones: Vec::new(),
+            next_attempt_id: 0,
+            commit_time_high_water: 0,
+            segments: vec![SegmentEntry {
+                name: "../../etc/passwd".to_string(),
+                format_version: strata_index::SEGMENT_FORMAT_VERSION,
+                vector_count: 0,
+                dimension: 0,
+                row_id_min: 0,
+                row_id_max: 0,
+                byte_len: 0,
+                zone_map: std::collections::HashMap::new(),
+            }],
+        };
+        strata_storage::commit_manifest(&dir, &hostile).unwrap();
+
+        match Dataset::open(&dir) {
+            Err(TxnError::UnsafeManifestPath(_)) => {}
+            Err(other) => panic!("expected UnsafeManifestPath, got a different error: {other}"),
+            Ok(_) => panic!("open must not succeed against a hostile segment path"),
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -4525,6 +4777,155 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_first_vector_commits_at_different_dimensions_are_not_both_accepted() {
+        // Regression test for the CRITICAL finding on this task: before
+        // `write_phase` existed, the authoritative dimension check ran
+        // *inside* `commit_lock`, via the in-lock apply loop's call into the
+        // shared graph's `compare_exchange`-based dimension establishment —
+        // so a second concurrent committer at a different dimension got a
+        // clean `DimensionMismatch` and aborted, no matter how the two
+        // transactions interleaved. Moving `validate_vector_dimensions` into
+        // `write_phase` (which runs *before* `commit_lock` is acquired)
+        // dropped that: both of two transactions beginning before either
+        // commits can read `established_dimension() == 0` and pass. Without
+        // an in-lock re-check, both could publish -- a 3-d segment and a
+        // 5-d segment both durably listed in the manifest -- and every
+        // future `vector_search` would then hit `DimensionMismatch` on
+        // whichever segment doesn't match the query's dimension, forever
+        // (nothing at `Dataset::open` used to cross-check dimensions across
+        // segments either -- see the cheap `load_segments` fix alongside
+        // this test).
+        //
+        // Deterministic, not loom: both transactions begin from the same
+        // (empty, dimension-0) snapshot before either commits, then commit
+        // sequentially -- this is the interleaving that exposes the race,
+        // fixed by test order rather than explored, exactly like
+        // `losing_transactions_vectors_never_become_searchable_when_it_conflicts`
+        // below.
+        let dir = temp_dir("concurrent-first-vector-dimension-race");
+        let ds = Dataset::create(&dir).unwrap();
+        assert_eq!(
+            ds.snapshot().index.established_dimension(),
+            0,
+            "precondition: nothing has been committed yet, so no dimension is established"
+        );
+
+        // T2: a 5-dimensional vector, hand-built since mvp_fixtures is fixed
+        // at 3 dimensions. `pause_after_row_id_claim` stops it right after
+        // `write_phase` returns -- its row-id is claimed, its data file and
+        // its 5-d segment are already built and fsynced, and its pre-lock
+        // `validate_vector_dimensions` call has already run and passed
+        // (against `established_dimension() == 0`, since nothing has
+        // committed yet) -- but *before* it acquires `commit_lock`. This is
+        // what makes the race real rather than something the existing
+        // pre-lock check alone would already catch: if T2 ran commit() to
+        // completion before T1 even started, T2's own pre-lock check would
+        // see dimension 0 and pass, same as before this task's cutover, and
+        // this test would prove nothing about the in-lock re-check.
+        let schema_5d = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 5),
+                false,
+            ),
+        ]));
+        let batch_5d = RecordBatch::try_new(
+            schema_5d,
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(arrow::array::FixedSizeListArray::new(
+                    Arc::new(Field::new("item", DataType::Float32, false)),
+                    5,
+                    Arc::new(arrow::array::Float32Array::from(vec![
+                        9.0, 9.0, 9.0, 9.0, 9.0,
+                    ])),
+                    None,
+                )),
+            ],
+        )
+        .unwrap();
+        let (claim_point, claimed) = checkpoint_pair();
+        let mut txn_5d = ds.begin();
+        txn_5d.insert(batch_5d);
+        txn_5d.pause_after_row_id_claim(claim_point);
+        let txn_5d_thread = std::thread::spawn(move || txn_5d.commit());
+
+        // Step 1: T2 has claimed its row-id and fsynced its 5-d segment,
+        // but holds no lock and has published nothing.
+        claimed.wait();
+
+        // Step 2: T1 (3-dimensional, via mvp_fixtures) begins and commits to
+        // completion while T2 sits paused -- establishing the dataset's
+        // dimension at 3 and publishing the dataset's only segment so far.
+        let mut txn_3d = ds.begin();
+        txn_3d.insert(crate::mvp_fixtures::mvp_row(0, "three-d", [1.0, 0.0, 0.0]).unwrap());
+        txn_3d.commit().unwrap();
+        assert_eq!(ds.snapshot().index.established_dimension(), 3);
+        assert_eq!(ds.snapshot().manifest.segments.len(), 1);
+
+        // Step 3: release T2. It now acquires `commit_lock`, re-reads the
+        // *latest* snapshot (established dimension 3, thanks to T1), and
+        // must be rejected by the in-lock re-check this task's fix adds --
+        // not silently accepted alongside T1's segment.
+        claimed.release();
+        let result = txn_5d_thread.join().unwrap();
+        match result {
+            Err(TxnError::Index(strata_index::IndexError::DimensionMismatch {
+                query_len,
+                expected,
+            })) => {
+                assert_eq!(query_len, 5, "the rejected commit's own vector dimension");
+                assert_eq!(expected, 3, "the dimension T1 already established");
+            }
+            other => panic!(
+                "expected TxnError::Index(DimensionMismatch {{ query_len: 5, expected: 3 }}), \
+                 got {other:?}"
+            ),
+        }
+
+        // The dataset must be left exactly as T1's successful commit alone
+        // would leave it -- not bricked, not carrying a trace of T2.
+        let snapshot = ds.snapshot();
+        assert_eq!(
+            snapshot.manifest.segments.len(),
+            1,
+            "T2's rejected commit must not have published a second segment: {:?}",
+            snapshot.manifest.segments
+        );
+        assert_eq!(
+            snapshot.index.len(),
+            1,
+            "the snapshot's segment set must stay in lockstep with the manifest"
+        );
+        assert_eq!(
+            snapshot.index.established_dimension(),
+            3,
+            "T2's rejection must not have disturbed the established dimension"
+        );
+
+        // The dataset must still be fully usable afterward -- not bricked,
+        // unlike the pre-fix failure mode where a second, different-
+        // dimension segment would make every future query error out.
+        let results = snapshot
+            .vector_search(&[1.0, 0.0, 0.0], 1, None)
+            .expect("vector_search must still work after T2's rejection, not error out");
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            // Row-ids are claimed in `write_phase`, before `commit_lock`,
+            // strictly in claim order -- not commit order. T2 (5-d) claimed
+            // first (row-id 0, released back to the allocator as a
+            // permanent gap when its rejected commit's `RowIdClaim` drops),
+            // so T1's row lands at row-id 1, not 0.
+            results[0].row_id,
+            1,
+            "T1's row must still be the only match"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn losing_transactions_vectors_never_become_searchable_when_it_conflicts() {
         // Deterministic, not loom: both transactions begin from the same
         // snapshot, then commit sequentially (not concurrently) so which
@@ -4582,22 +4983,31 @@ mod tests {
 
     #[test]
     fn a_failed_commits_vector_is_never_searchable_after_a_later_commit_advances_the_watermark() {
-        // Regression test for the dangling-search-hit hazard. `commit`
-        // applies this transaction's HNSW `Insert` deltas to the shared
-        // `Arc<HnswIndex>` *before* `commit_manifest` makes the commit
-        // durable. If `commit_manifest` fails (e.g. ENOSPC) — modelled here
-        // by `inject_manifest_commit_failure`, injected at exactly that
-        // step — the failed transaction's vector is left in the shared graph
-        // with no manifest entry backing it, and its row-id was already
-        // allocated by `write_phase`. A *later* successful commit
-        // then persists `manifest.next_row_id` past that residue row-id and
-        // publishes `watermark = next_row_id - 1`, so `Snapshot::is_visible`
-        // starts passing for the residue id. With no manifest-membership
-        // cross-check on the search path, `vector_search` would then return
-        // the residue as a dangling hit — a row `scan` can never see —
-        // violating the flagship "no silently stale vector search results"
-        // claim. The fix soft-deletes a failed commit's graph inserts on the
-        // error path (see `GraphResidueGuard`), so this must hold.
+        // Regression test for the dangling-search-hit hazard. Before S1
+        // W3.2a, `commit` applied this transaction's HNSW `Insert` deltas to
+        // a shared `Arc<HnswIndex>` *before* `commit_manifest` made the
+        // commit durable. If `commit_manifest` failed (e.g. ENOSPC) —
+        // modelled here by `inject_manifest_commit_failure`, injected at
+        // exactly that step — the failed transaction's vector was left in
+        // the shared graph with no manifest entry backing it, and its
+        // row-id was already allocated by `write_phase`. A *later*
+        // successful commit then persisted `manifest.next_row_id` past that
+        // residue row-id and published `watermark = next_row_id - 1`, so
+        // `Snapshot::is_visible` started passing for the residue id. With no
+        // manifest-membership cross-check on the search path,
+        // `vector_search` would then return the residue as a dangling hit —
+        // a row `scan` can never see — violating the flagship "no silently
+        // stale vector search results" claim. `GraphResidueGuard` used to
+        // soft-delete a failed commit's graph inserts on the error path to
+        // close this.
+        //
+        // Since W3.2a this holds *structurally*, not via that compensation
+        // (inert as of this task — see its own doc comment): this
+        // transaction's vector never touches anything shared until publish
+        // — it lives only in this commit's own segment file, built and
+        // fsynced in `write_phase`, which the injected failure below
+        // discards before it ever reaches a manifest. This test remains the
+        // regression test for the property, now guaranteed by construction.
         let dir = temp_dir("failed-commit-no-dangling-search-hit");
         let ds = Dataset::create(&dir).unwrap();
 
@@ -4702,23 +5112,36 @@ mod tests {
         // out: "a transaction's writes are never visible to any other
         // transaction until commit succeeds."
         //
-        // Row-ids are claimed *before* `commit_lock`, in
-        // `write_phase`. The visibility watermark, though, is
-        // published from the *global* row-id counter inside some *other*
-        // transaction's critical section — so that other transaction's
-        // watermark covers row-ids this transaction has claimed but not
-        // committed. Between this transaction's `graph.insert` and its
-        // `commit_manifest`, its vector is therefore both physically in the
-        // shared `Arc<HnswIndex>` and (pre-fix) passing `is_visible` on the
-        // currently published snapshot. Readers take no `commit_lock`
-        // (`Snapshot::vector_search`), so nothing stops one observing it —
-        // a search hit for a row no `scan` can see, roughly one
-        // `commit_manifest` fsync wide.
+        // Row-ids are claimed *before* `commit_lock`, in `write_phase`. The
+        // visibility watermark, though, is published from the *global*
+        // row-id counter inside some *other* transaction's critical section
+        // — so that other transaction's watermark can numerically cover
+        // row-ids this transaction has claimed but not committed.
+        //
+        // Before S1 W3.2a this was a real race: the slow transaction's
+        // vector was applied to a shared `Arc<HnswIndex>` before
+        // `commit_manifest` made the commit durable, so between that apply
+        // and `commit_manifest`, the vector was both physically in the
+        // graph and (pre-fix) passing `is_visible` on the currently
+        // published snapshot — a search hit for a row no `scan` could see,
+        // roughly one `commit_manifest` fsync wide. Since W3.2a, this
+        // transaction's segment is built and fsynced entirely in
+        // `write_phase` and joins no shared structure until commit's
+        // in-lock `latest_snapshot.index.with_appended(...)`, which runs
+        // only after `commit_manifest` succeeds — so even though the
+        // *other* transaction's watermark numerically covers this
+        // transaction's claimed row-id, there is nothing for a reader to
+        // find: the slow transaction's segment isn't part of any published
+        // `SegmentSet` yet. This test is the end-to-end proof that the
+        // guarantee holds under exactly the timing that used to expose the
+        // race, not just structurally.
         //
         // Unlike `a_failed_commits_vector_is_never_searchable_...` above,
         // this is the *success* path: the slow transaction goes on to
         // commit cleanly. `GraphResidueGuard` deliberately does not close
-        // this (see its doc comment) — it closes the permanent-residue case.
+        // this (see its doc comment) — it closes the permanent-residue
+        // case, and is inert here regardless, since W3.2a removed the
+        // shared graph it used to compensate for.
         //
         // The window is one fsync wide, so the schedule is made
         // deterministic with `Checkpoint`s rather than raced with sleeps: a
@@ -4777,9 +5200,10 @@ mod tests {
         claimed.release();
         ready_to_publish.wait();
 
-        // Step 4: a reader thread races the apply loop. It takes no
-        // `commit_lock`, so it runs freely while the slow commit is parked
-        // mid-critical-section.
+        // Step 4: a reader thread reads a fresh snapshot while the slow
+        // commit sits paused inside its critical section, just before
+        // `commit_manifest`. It takes no `commit_lock`, so it runs freely
+        // while the slow commit is parked there.
         let reader_ds = ds.clone();
         let (version, results) = std::thread::spawn(move || {
             let snapshot = reader_ds.snapshot();
@@ -5383,15 +5807,39 @@ mod loom_tests {
         // The interleaving counterpart to
         // `dataset::tests::a_failed_commits_vector_is_never_searchable_after_a_later_commit_advances_the_watermark`.
         // That test fixes the order (fail, then commit); this one lets loom
-        // explore every order in which a *compensating* committer and a
+        // explore every order in which a *failing* committer and a
         // *succeeding* committer reach and release the commit lock.
+        //
+        // **Why this needs a seed commit.** Without a vector-carrying commit
+        // that lands before the racing pair, the snapshot's `SegmentSet` has
+        // zero parts in every interleaving, and `vector_search` returns
+        // `Ok(vec![])` unconditionally regardless of whether the code under
+        // test is correct — the core assertion could never fail no matter
+        // how badly a regression broke this path. The seed commit below
+        // gives the assertion something to discriminate: "the failed
+        // commit's distinctive vector is absent" (correct) versus "search
+        // returns nothing because there is nothing to search" (a vacuous
+        // pass), mirroring how the non-loom sibling test seeds a real row
+        // before checking the failed commit's vector is unreachable.
         //
         // The property under test is a quiescent one: once both committers
         // have returned, no schedule leaves the failed commit's vector
-        // reachable by a search. What it pins down is that
-        // `GraphResidueGuard` fires on the error path under every
-        // interleaving of the two committers, rather than only in the
-        // single order the deterministic sibling test fixes.
+        // reachable by a search, and the manifest's segment list holds
+        // exactly the seed's segment — no orphaned or duplicate entry from
+        // either racing committer, under any interleaving. Since S1 W3.2a
+        // this holds *structurally*, not via `GraphResidueGuard` (inert as
+        // of this task — see its own doc comment): a commit's segment is
+        // built and fsynced entirely in `write_phase`, outside
+        // `commit_lock`, and is only ever appended to a `SegmentSet` by the
+        // in-lock `manifest.segments.push`/`with_appended` pair that runs
+        // strictly after `commit_manifest` succeeds. A commit that fails
+        // before reaching that point — whichever of the two committers below
+        // that turns out to be, under whichever interleaving loom explores —
+        // therefore has no path by which its segment could ever be
+        // referenced, let alone searched. What this model actually pins
+        // down is that this holds under every interleaving of the two
+        // committers, not just the one order the deterministic sibling test
+        // fixes.
         //
         // The complementary *transient* property — that a row is never
         // visible before its commit succeeds, whether or not that commit
@@ -5400,13 +5848,15 @@ mod loom_tests {
         // `a_published_bound_never_covers_another_transactions_outstanding_claim`
         // below (interleavings) and
         // `dataset::tests::a_concurrent_reader_never_sees_an_in_flight_commits_vector`
-        // (a real reader thread racing the apply loop end-to-end).
+        // (a real reader thread racing the slow commit's still-open critical
+        // section end-to-end).
         //
-        // Deliberately minimal: only the failing transaction inserts a
-        // vector (one HNSW node), and the concurrent committer uses a
-        // vector-free batch. `loom::model` re-runs this closure once per
-        // interleaving, and every run does real filesystem I/O, so keeping
-        // per-run work down is what makes the model tractable.
+        // Deliberately minimal otherwise: only the failing transaction
+        // inserts a vector beyond the seed (one HNSW node), and the
+        // concurrent committer uses a vector-free batch. `loom::model`
+        // re-runs this closure once per interleaving, and every run does
+        // real filesystem I/O, so keeping per-run work down is what makes
+        // the model tractable.
         loom::model(|| {
             let dir = tempfile::Builder::new()
                 .prefix(&format!(
@@ -5418,6 +5868,22 @@ mod loom_tests {
                 .unwrap()
                 .keep();
             let ds = crate::Dataset::create(&dir).unwrap();
+
+            // Seed: one durable, vector-carrying commit, run to completion
+            // *before* the racing pair below — see this test's doc comment
+            // for why the assertions are vacuous without it. Spawned (and
+            // joined immediately, so the schedule below is unaffected) for
+            // the stack, not the concurrency: the root thread's 32 KiB
+            // cannot hold a `commit` (see `COMMIT_STACK_SIZE`).
+            let ds_seed = ds.clone();
+            spawn_committer(move || {
+                let mut seed = ds_seed.begin();
+                seed.insert(loom_vector_batch(0, [0.0, 0.0, 0.0]));
+                seed.commit()
+            })
+            .join()
+            .unwrap()
+            .unwrap();
 
             let ds_failing = ds.clone();
             let ds_ok = ds.clone();
@@ -5462,14 +5928,50 @@ mod loom_tests {
             .unwrap()
             .unwrap();
 
-            let results = ds
-                .snapshot()
+            let snapshot = ds.snapshot();
+
+            let results = snapshot
                 .vector_search(&[900.0, 900.0, 900.0], 1, None)
                 .unwrap();
+            // Not `results.is_empty()`: with the seed present, a k=1 search
+            // always returns *some* match (the seed, being the only node in
+            // the index) — the discriminator is that it's the far-away
+            // seed, not the failed commit's own near-zero-distance vector.
             assert!(
-                results.is_empty(),
-                "the failed commit's vector was the only one ever inserted, and it \
-                 must never be searchable under any interleaving: {results:?}"
+                results.is_empty() || results[0].squared_distance > 1000.0,
+                "the failed commit's vector must never be searchable under any \
+                 interleaving: {results:?}"
+            );
+
+            // Positive control: the seed's own vector must still be
+            // findable, so the empty result above means "excluded", not
+            // "search is broken" or "nothing has ever been indexed".
+            let seed_hit = snapshot.vector_search(&[0.0, 0.0, 0.0], 1, None).unwrap();
+            assert_eq!(
+                seed_hit.first().map(|m| m.row_id),
+                Some(0),
+                "the seed commit's row must still be searchable: {seed_hit:?}"
+            );
+
+            // The structural property a leaked failed-commit segment would
+            // actually violate: exactly one segment — the seed's — no
+            // matter which of the two racing committers reached
+            // `commit_lock` first, or in which order they released it. Both
+            // `succeeding` and the final committer above are vector-free
+            // and therefore publish no segment of their own (see
+            // `build_and_write_segment`'s doc comment on why a vector-less
+            // commit writes none).
+            assert_eq!(
+                snapshot.manifest.segments.len(),
+                1,
+                "exactly one vector-carrying commit (the seed) ever succeeded; the \
+                 manifest must list exactly one segment, under every interleaving: {:?}",
+                snapshot.manifest.segments
+            );
+            assert_eq!(
+                snapshot.index.len(),
+                1,
+                "the snapshot's segment set must stay in lockstep with the manifest"
             );
 
             std::fs::remove_dir_all(&dir).ok();
