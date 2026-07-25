@@ -192,6 +192,20 @@ struct SearchScratch {
     heuristic_working: Vec<(u64, f32)>,
 }
 
+// `loom::thread::LocalKey` only implements `.with()`, not the newer
+// `std::thread::LocalKey::with_borrow_mut` -- every call site below uses
+// the older, portable `.with(|cell| { let mut scratch = cell.borrow_mut(); ...
+// })` form (semantically identical: `with_borrow_mut` is itself implemented
+// as exactly that in std) so the same call sites compile against both,
+// letting a loom test exercise the real `search_layer`/`insert` path
+// (needed for the parallel-insert primitive's loom test) instead of a
+// stripped substitute that skips this thread-local scratch entirely.
+#[cfg(loom)]
+loom::thread_local! {
+    static SEARCH_SCRATCH: std::cell::RefCell<SearchScratch> =
+        std::cell::RefCell::new(SearchScratch::default());
+}
+#[cfg(not(loom))]
 thread_local! {
     static SEARCH_SCRATCH: std::cell::RefCell<SearchScratch> =
         std::cell::RefCell::new(SearchScratch::default());
@@ -235,7 +249,16 @@ impl<D: Distance> Graph<D> {
         filter: &impl Fn(u64) -> bool,
         saturate: bool,
     ) -> Vec<(u64, f32)> {
-        SEARCH_SCRATCH.with_borrow_mut(|scratch| {
+        SEARCH_SCRATCH.with(|scratch_cell| {
+            // A `RefMut` guard doesn't support the disjoint-field-borrow
+            // splitting a plain `&mut` reference does (each `scratch.field`
+            // access would otherwise re-deref the WHOLE guard, which the
+            // borrow checker treats as a fresh borrow of all of `scratch`
+            // every time) -- dereferencing once into a plain `&mut
+            // SearchScratch` restores that, matching this closure's
+            // pre-existing behavior under `with_borrow_mut`.
+            let mut scratch_guard = scratch_cell.borrow_mut();
+            let scratch: &mut SearchScratch = &mut scratch_guard;
             scratch.visited.clear();
             scratch.candidates.clear();
             scratch.result.clear();
@@ -495,7 +518,8 @@ impl<D: Distance> Graph<D> {
                 entry = *nearest;
             }
             let capacity = if lc == 0 { mmax0 } else { mmax };
-            let chosen = SEARCH_SCRATCH.with_borrow_mut(|scratch| {
+            let chosen = SEARCH_SCRATCH.with(|scratch_cell| {
+                let mut scratch = scratch_cell.borrow_mut();
                 let mut chosen = Vec::new();
                 select_neighbors_heuristic_into(
                     &candidates,
@@ -521,7 +545,8 @@ impl<D: Distance> Graph<D> {
                     // occupied_buf/heuristic_working are distinct scratch
                     // fields accessed sequentially within this one borrow —
                     // never simultaneously live borrows of the same field.
-                    SEARCH_SCRATCH.with_borrow_mut(|scratch| {
+                    SEARCH_SCRATCH.with(|scratch_cell| {
+                        let mut scratch = scratch_cell.borrow_mut();
                         neighbor_node
                             .layer(lc)
                             .occupied_into(&mut scratch.occupied_buf);
@@ -1997,6 +2022,85 @@ mod loom_tests {
                 Some((2, 2)),
                 "the entry point must settle on the higher-level proposal, \
                  with row_id and level always paired consistently"
+            );
+        });
+    }
+
+    /// Loom coverage for the actual usage shape `HnswIndex::insert_batch_parallel`
+    /// (the graph-construction-cost effort's parallel-insert primitive)
+    /// introduces: multiple threads calling `Graph::insert` concurrently
+    /// for DISTINCT row-ids, going through the real `search_layer` ->
+    /// `SEARCH_SCRATCH` -> connection-building -> shrink path, not just the
+    /// individual primitives (`EntryPoint`, `NodeTable`, `SlotArray`)
+    /// already loom-tested in isolation elsewhere in this crate. Kept
+    /// deliberately tiny (M=1, ef_construction=1, one pre-seeded node, two
+    /// concurrent inserts) to stay inside loom's practical exhaustive-
+    /// exploration budget -- a realistic `ef_construction`-scale insert
+    /// would blow loom's branch budget, per this project's own experience
+    /// tuning other loom tests in this crate.
+    #[test]
+    fn concurrent_inserts_of_distinct_rows_are_all_findable_and_uncorrupted() {
+        loom::model(|| {
+            let graph = loom::sync::Arc::new(Graph::new(crate::distance::L2, 4));
+            // Seeded sequentially, before either thread spawns -- not part
+            // of the interleaving loom explores. Gives both threads a real
+            // entry point and an existing node to connect to/shrink
+            // against, rather than each racing to become the first node
+            // (a much narrower, already-covered case).
+            graph
+                .insert(0, vec![0.0, 0.0, 0.0], 1, 1, 1, 1, 1.0, 1.0, 0.5)
+                .unwrap();
+
+            let g1 = loom::sync::Arc::clone(&graph);
+            let t1 = loom::thread::spawn(move || {
+                g1.insert(1, vec![1.0, 0.0, 0.0], 1, 1, 1, 1, 1.0, 1.0, 0.5)
+            });
+
+            let g2 = loom::sync::Arc::clone(&graph);
+            let t2 = loom::thread::spawn(move || {
+                g2.insert(2, vec![2.0, 0.0, 0.0], 1, 1, 1, 1, 1.0, 1.0, 0.5)
+            });
+
+            t1.join().unwrap().unwrap();
+            t2.join().unwrap().unwrap();
+
+            // Checks the NodeTable and entry point directly rather than
+            // via k_nn_search: at these deliberately tiny parameters
+            // (M=1, ef_construction=1) greedy search can fail to reach the
+            // true nearest neighbor even with a fully correct, purely
+            // SEQUENTIAL insert (confirmed independently: seeding this
+            // same 3-node/M=1/ef=1 fixture with no concurrency at all,
+            // k_nn_search for row 2 returns row 1 instead) -- that's a
+            // recall/graph-shape property this test isn't about (see
+            // `insert_batch_parallel_recall_matches_sequential_insert_within_tolerance`
+            // in hnsw.rs for the dedicated recall check, at a realistic
+            // parameter scale). What THIS test proves is structural: every
+            // row's node exists with its own uncorrupted vector, and the
+            // entry point ends up valid -- regardless of which thread's
+            // insert the scheduler ran first.
+            for (row_id, vector) in [
+                (0u64, vec![0.0f32, 0.0, 0.0]),
+                (1, vec![1.0, 0.0, 0.0]),
+                (2, vec![2.0, 0.0, 0.0]),
+            ] {
+                let node = graph
+                    .nodes
+                    .get(row_id)
+                    .unwrap_or_else(|| panic!("row {row_id} must exist in the node table"));
+                assert_eq!(
+                    node.vector(),
+                    vector.as_slice(),
+                    "row {row_id}'s vector must be exactly what was inserted, not corrupted \
+                     or swapped with another concurrently-inserted row's"
+                );
+            }
+            let (entry_row, _) = graph
+                .entry_point
+                .get()
+                .expect("entry point must be set after any successful insert");
+            assert!(
+                [0, 1, 2].contains(&entry_row),
+                "entry point must be one of the rows actually inserted, not a corrupted value"
             );
         });
     }

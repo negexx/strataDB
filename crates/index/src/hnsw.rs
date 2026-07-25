@@ -5,6 +5,53 @@
 use crate::distance::L2;
 use crate::graph::Graph;
 
+/// Runs `f` over every element of `chunks` on its own spawned thread,
+/// returning each worker's result (or its panic payload) in input order.
+/// Extracted as its own function rather than inlined in
+/// [`HnswIndex::insert_batch_parallel`] so this exact fan-out pattern can be
+/// tested in isolation (see `run_chunks_in_parallel_actually_runs_concurrently_not_serially`)
+/// and reused by any other batch-parallel caller (e.g. a future segment
+/// builder).
+///
+/// Uses two explicit loops -- spawn every worker, THEN join every handle --
+/// rather than a single `chunks.into_iter().map(|c| scope.spawn(...)).map(|h| h.join())`
+/// chain. `Iterator::map` is lazy, so that chained form would spawn one
+/// worker and immediately join it before spawning the next, silently
+/// serializing the whole thing: every functional test would still pass
+/// (every chunk still gets processed correctly), just with zero real
+/// concurrency. Two explicit loops can't be collapsed into that mistake by
+/// a future "simplify this iterator chain" refactor the way one chained
+/// expression could.
+fn run_chunks_in_parallel<T: Send, R: Send>(
+    chunks: Vec<T>,
+    f: impl Fn(T) -> R + Sync,
+) -> Vec<std::thread::Result<R>> {
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(chunks.len());
+        for chunk in chunks {
+            handles.push(scope.spawn(|| f(chunk)));
+        }
+        handles
+            .into_iter()
+            .map(std::thread::ScopedJoinHandle::join)
+            .collect()
+    })
+}
+
+/// Reads out the final contents of an `insert_batch_parallel`-style shared
+/// applied-row-id collector. A clone rather than `into_inner`: every call
+/// site is a plain `&Mutex` (not an owned one it could otherwise consume),
+/// which keeps `insert_batch_parallel`'s several early-return branches from
+/// having to juggle ownership of `applied` across match arms -- the clone
+/// itself is negligible (bounded by one commit's batch size, not a hot
+/// per-row cost).
+fn into_applied_vec(applied: &std::sync::Mutex<Vec<u64>>) -> Vec<u64> {
+    applied
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
 /// One search result: which row-id, and its squared L2 distance to the
 /// query vector. `row_id` is the persistent, global identity from
 /// `.claude/docs/design/phase-0-transaction-and-format-spec.md` §8 — not a
@@ -20,6 +67,56 @@ pub struct VectorMatch {
     pub row_id: u64,
     pub squared_distance: f32,
 }
+
+/// Result of [`HnswIndex::insert_batch_parallel`]. Every variant carries
+/// `applied` -- every row-id that MAY have landed in the shared graph
+/// across ALL worker threads, not just whichever one triggered the outcome
+/// -- so a caller doing failure cleanup (e.g. `crates/txn`'s
+/// `GraphResidueGuard`) always knows the full set to undo, regardless of
+/// how this resolved. "May have": a row-id is recorded before its own
+/// insert attempt runs (not after it succeeds), since `Graph::insert`
+/// publishes a node into the shared table before neighbor-linking
+/// completes -- a panic in that window would otherwise leave a row live
+/// but unrecorded. This makes `applied` a conservative superset that can
+/// include a row whose insert was actually REJECTED (e.g.
+/// `DimensionMismatch`, rejected before ever reaching the graph); that's
+/// harmless, since undoing a never-inserted row-id is a documented no-op
+/// (see `HnswIndex::remove`).
+///
+/// Deliberately not a bare `Result<Vec<u64>, IndexError>`: that shape lets
+/// a caller write `let (_, r) = ...; r?;` and lose the applied-row-ids with
+/// zero friction. This enum forces an explicit match, so `applied` can
+/// never be silently dropped by an unattended `?`.
+#[derive(Debug)]
+pub enum BatchInsertOutcome {
+    /// Every row was attempted with no error or panic; this is every
+    /// attempted row-id.
+    Ok(Vec<u64>),
+    /// A worker hit `IndexError::DimensionMismatch`/`RowIdOutOfRange`.
+    /// `error` is the first such error observed across any worker (in no
+    /// particular order across workers).
+    IndexError {
+        applied: Vec<u64>,
+        error: IndexError,
+    },
+    /// A worker thread itself panicked -- a bug, not an expected/typed
+    /// error condition (see `insert_batch_parallel`'s doc comment). The
+    /// caller is expected to record `applied` first, then propagate
+    /// `payload` (e.g. via `std::panic::resume_unwind`) so a `Drop`-based
+    /// cleanup guard still fires during the resulting unwind.
+    WorkerPanicked {
+        applied: Vec<u64>,
+        payload: Box<dyn std::any::Any + Send + 'static>,
+    },
+}
+
+/// Below this, per-thread overhead (spawn cost, cache-cold start) isn't
+/// worth it relative to a few more sequential inserts on one thread -- e.g.
+/// a 3-row batch across 8 available cores should not spawn 3 threads for 1
+/// row each. Provisional; confirmed/tuned alongside the 2/4/8-thread
+/// measurement pass cited in `crates/txn/src/dataset.rs`'s
+/// `PARALLEL_INSERT_THREADS`.
+const MIN_ROWS_PER_CHUNK: usize = 64;
 
 /// # Examples
 ///
@@ -184,7 +281,10 @@ impl HnswIndex {
         // hnsw_rs's own unseeded RNG). If a real `rand`-crate dependency
         // is preferred instead, swap this for one — flagged here as an
         // explicit, deliberate choice for the implementer/reviewer to
-        // confirm, not a silent placeholder.
+        // confirm, not a silent placeholder. Safe to call concurrently:
+        // `fetch_add` guarantees each call sees a distinct `n`, so
+        // `insert_batch_parallel`'s worker threads can call this directly
+        // without any extra synchronization.
         let n = self
             .row_counter
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -251,6 +351,229 @@ impl HnswIndex {
     /// ```
     pub fn remove(&self, row_id: u64) {
         self.graph.delete(row_id);
+    }
+
+    /// Inserts every `(row_id, vector)` pair in `rows` across up to
+    /// `threads` worker threads into the shared lock-free graph — the
+    /// parallel-construction primitive from the 2026-07-24 ingest+recovery
+    /// performance audit. Order across rows is NOT guaranteed and doesn't
+    /// need to be for correctness: HNSW is already an approximate
+    /// algorithm, and which thread processes which row can produce a
+    /// different graph *shape* than a strictly sequential insert of the
+    /// same rows would (every row still ends up inserted and findable).
+    ///
+    /// **One accepted, explicit behavior change**: today, the live graph's
+    /// per-row level assignment (via the internal `row_counter` atomic)
+    /// happens in the same sequential order `crates/txn`'s `replay_index`
+    /// replays the delta log in, so a live graph and its post-restart
+    /// replayed graph are the same shape. Parallelizing insertion means
+    /// `row_counter.fetch_add` calls interleave nondeterministically across
+    /// worker threads, so the live graph's shape can differ from what a
+    /// restart would replay. Both are valid, complete HNSW graphs and
+    /// every row is findable in either — this is a deliberate cut, not an
+    /// oversight, and doesn't affect Phase 7's chaos harness (its
+    /// assertions are structural — no crash, no data loss, no corruption —
+    /// not pinned to an exact search result).
+    ///
+    /// **Known recall risk, not a safety one**: `Graph::insert`'s shrink
+    /// step (read `occupied`, compute what to keep, `clear_matching`) isn't
+    /// atomic across those three steps, and a full neighbor layer silently
+    /// drops a claimed edge. Both pre-exist this method, but concurrent
+    /// inserts make both fire more often than a sequential insert would —
+    /// every row still ends up inserted and part of a connected graph, but
+    /// recall can be very slightly lower than an equivalent sequential
+    /// insert. Not asserted away here; see `bench/`'s recall benchmarks for
+    /// the production-scale measurement this trades against the ingest
+    /// speedup.
+    ///
+    /// `rows.len() < 2` or `threads <= 1` degrades to a plain sequential
+    /// loop on the calling thread (no `thread::scope` overhead for tiny
+    /// batches). `threads` is clamped to
+    /// `std::thread::available_parallelism()`, and chunk size is floored
+    /// at `MIN_ROWS_PER_CHUNK`, so a small batch never oversplits into
+    /// more worker threads than useful.
+    ///
+    /// Chunking is contiguous (`rows[0..k]`, `rows[k..2k]`, ...), not
+    /// round-robin: if the input batch has any vector-space locality
+    /// (e.g. rows inserted in embedding-similarity order), contiguous
+    /// chunking tends to put different workers in different regions of
+    /// the graph, reducing both `SlotArray` CAS contention and how often
+    /// two workers race to shrink the SAME neighbor's list. Round-robin
+    /// would scatter every worker across the whole batch, maximizing both.
+    /// The shared entry-point CAS is contended identically either way (it's
+    /// global, not per-region).
+    ///
+    /// Bounded by construction: `crates/txn`'s `commit_lock` serializes
+    /// commits, so at most one call to this method is ever in flight at a
+    /// time — `threads` workers here, never `threads` x concurrent-commits
+    /// workers.
+    pub fn insert_batch_parallel(
+        &self,
+        rows: Vec<(u64, Vec<f32>)>,
+        threads: usize,
+    ) -> BatchInsertOutcome {
+        // A single shared collector every worker pushes into AS EACH ROW
+        // LANDS, rather than each worker accumulating its own local Vec and
+        // returning it at the end. This is load-bearing for panic safety:
+        // design review round 1 fixed the case where bailing out on the
+        // first error/panic mid-join-loop would lose every OTHER worker's
+        // fully-successful applied rows, but an EARLIER version of this
+        // fix still had a gap -- if a worker panicked partway through ITS
+        // OWN chunk (or if `std::thread::Scope::spawn` itself panicked,
+        // e.g. the OS refusing to create another thread), that worker's
+        // own already-applied rows died with its unwinding stack, since
+        // they only existed in a local Vec never returned. Writing
+        // directly into a `Mutex` that lives in THIS function's frame
+        // (not any worker's) means a row that lands is recorded
+        // regardless of what happens to it, or any other worker, or the
+        // fan-out itself, afterward.
+        let applied: std::sync::Mutex<Vec<u64>> =
+            std::sync::Mutex::new(Vec::with_capacity(rows.len()));
+
+        if rows.len() < 2 {
+            return Self::outcome_from(&applied, self.insert_owned_chunk(rows, &applied));
+        }
+        // Queried after the tiny/delete-only-batch early return above, not
+        // before: no reason to pay this syscall for a batch that's about
+        // to take the sequential path regardless of core count.
+        let threads = threads
+            .min(std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get));
+        if threads <= 1 {
+            return Self::outcome_from(&applied, self.insert_owned_chunk(rows, &applied));
+        }
+
+        let chunk_size = rows.len().div_ceil(threads).max(MIN_ROWS_PER_CHUNK);
+        // Contiguous, zero-clone chunking: `Vec::drain` MOVES elements out
+        // of `rows` (no `Clone` bound, no per-row Vec<f32> copy) -- unlike
+        // `rows.chunks(n).map(<[_]>::to_vec)`, which would deep-clone every
+        // row's vector via `(u64, Vec<f32>)`'s `Clone` impl and silently
+        // defeat the entire point of taking `rows` by value.
+        let mut rows = rows;
+        let mut chunks = Vec::new();
+        while !rows.is_empty() {
+            let take = chunk_size.min(rows.len());
+            chunks.push(rows.drain(0..take).collect::<Vec<_>>());
+        }
+        if chunks.len() == 1 {
+            // MIN_ROWS_PER_CHUNK folded everything into one chunk despite
+            // threads > 1 -- run it inline rather than paying a thread
+            // spawn (and a cold, freshly-allocated SEARCH_SCRATCH) for
+            // zero actual parallelism. `unwrap_or_default` rather than
+            // `expect`/`unwrap`: provably non-empty by the `len() == 1`
+            // check just above, but falls back to a no-op empty chunk
+            // instead of panicking if that invariant were ever violated,
+            // matching this codebase's "fails safe rather than panicking"
+            // convention for provably-unreachable conditions.
+            let chunk = chunks.into_iter().next().unwrap_or_default();
+            return Self::outcome_from(&applied, self.insert_owned_chunk(chunk, &applied));
+        }
+
+        // Catches a panic from the fan-out ITSELF -- e.g.
+        // `std::thread::Scope::spawn` panicking because the OS refused to
+        // create another thread mid-loop -- as distinct from an
+        // individual WORKER's own panic, which `run_chunks_in_parallel`
+        // already converts into an `Err` inside its returned `Vec` (via
+        // `ScopedJoinHandle::join`) without unwinding past it. Without this
+        // outer catch, that rare fan-out-level panic would propagate
+        // straight out of this function with no `BatchInsertOutcome` at
+        // all, dropping `applied` -- and every row any worker had already
+        // recorded into it -- along with it. `AssertUnwindSafe` is sound
+        // here: nothing after this catch reads `self`/`chunks`/`applied` to
+        // make a decision based on their possibly-mid-panic state -- the
+        // `Err` arm below only reads `applied` (a `Mutex`, whose contents
+        // are never torn even when poisoned, since every mutation is a
+        // single `Vec::push`) and returns a `WorkerPanicked` outcome; it
+        // never touches `self`/`chunks` again.
+        let fan_out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_chunks_in_parallel(chunks, |chunk| self.insert_owned_chunk(chunk, &applied))
+        }));
+        let worker_results = match fan_out {
+            Ok(results) => results,
+            Err(payload) => {
+                return BatchInsertOutcome::WorkerPanicked {
+                    applied: into_applied_vec(&applied),
+                    payload,
+                };
+            }
+        };
+
+        // Collect EVERY worker's result before deciding anything -- do not
+        // bail out on the first error or panic. A worker's failure must
+        // never cost the caller visibility into what every OTHER worker
+        // already committed to the shared graph: `crates/txn`'s
+        // `GraphResidueGuard` needs the FULL applied-row-id list regardless
+        // of how this outcome resolves, to undo exactly what landed (not
+        // guess, and not silently leave live-but-unrecorded rows behind —
+        // see `BatchInsertOutcome`'s own doc comment).
+        let mut worker_panic = None;
+        let mut index_error = None;
+        for result in worker_results {
+            match result {
+                Ok(error) => {
+                    if index_error.is_none() {
+                        index_error = error;
+                    }
+                }
+                Err(payload) => {
+                    if worker_panic.is_none() {
+                        worker_panic = Some(payload);
+                    }
+                }
+            }
+        }
+        let applied = into_applied_vec(&applied);
+        if let Some(payload) = worker_panic {
+            BatchInsertOutcome::WorkerPanicked { applied, payload }
+        } else if let Some(error) = index_error {
+            BatchInsertOutcome::IndexError { applied, error }
+        } else {
+            BatchInsertOutcome::Ok(applied)
+        }
+    }
+
+    fn outcome_from(
+        applied: &std::sync::Mutex<Vec<u64>>,
+        error: Option<IndexError>,
+    ) -> BatchInsertOutcome {
+        let applied = into_applied_vec(applied);
+        match error {
+            None => BatchInsertOutcome::Ok(applied),
+            Some(error) => BatchInsertOutcome::IndexError { applied, error },
+        }
+    }
+
+    // Shared by both the sequential-degenerate path and each parallel
+    // worker inside insert_batch_parallel. Pushes each successfully
+    // inserted row-id into `applied` AS IT LANDS (not accumulated locally
+    // and returned at the end) -- see insert_batch_parallel's own comment
+    // on `applied` for why this matters for panic safety.
+    fn insert_owned_chunk(
+        &self,
+        rows: Vec<(u64, Vec<f32>)>,
+        applied: &std::sync::Mutex<Vec<u64>>,
+    ) -> Option<IndexError> {
+        for (row_id, vector) in rows {
+            // Recorded BEFORE insert_owned runs, not after it returns Ok:
+            // Graph::insert publishes a node into the shared NodeTable (making
+            // it live and potentially reachable as a neighbor) before
+            // neighbor-linking/entry-point-advance complete, so a panic in
+            // that window would otherwise leave a row live but unrecorded
+            // here. Marking a row_id "applied" even when insert_owned goes on
+            // to return an error is harmless: an error means the row was
+            // REJECTED before ever reaching the graph (e.g. a dimension
+            // mismatch, checked before any node is published), and
+            // HnswIndex::remove -- what GraphResidueGuard calls for every
+            // applied row-id -- is a documented no-op for a row-id that was
+            // never actually inserted.
+            applied
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(row_id);
+            if let Err(error) = self.insert_owned(row_id, vector) {
+                return Some(error);
+            }
+        }
+        None
     }
 
     /// The vector dimension established by the first-ever [`Self::insert`]
@@ -378,6 +701,64 @@ mod tests {
     const TEST_MAX_LAYER: usize = 16;
     const TEST_EF_CONSTRUCTION: usize = 1600;
     const TEST_EF_SEARCH: usize = 500;
+
+    #[test]
+    fn run_chunks_in_parallel_actually_runs_concurrently_not_serially() {
+        // Proves genuine concurrency, not just eventual correctness: every
+        // worker blocks on a Barrier until every OTHER worker has also
+        // started. If run_chunks_in_parallel silently serialized (e.g. a
+        // `.map(spawn).map(join)` chain collapsed the spawn/join loops back
+        // together in some future refactor), the first worker would block
+        // forever waiting for a second worker that never gets spawned
+        // until the first returns -- a deadlock, not a wrong answer, which
+        // a purely correctness-focused test (e.g. "every row inserted")
+        // would never catch. Wrapped in a watchdog thread with a timeout
+        // so a real regression fails this test cleanly instead of hanging
+        // the whole suite.
+        const WORKERS: usize = 4;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(WORKERS));
+        let chunks: Vec<usize> = (0..WORKERS).collect();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let results = run_chunks_in_parallel(chunks, move |i| {
+                barrier.wait();
+                i
+            });
+            let _ = tx.send(results);
+        });
+
+        let results = rx.recv_timeout(std::time::Duration::from_secs(10)).expect(
+            "run_chunks_in_parallel deadlocked -- workers are not actually running \
+                 concurrently (every worker is blocked on a Barrier waiting for the others)",
+        );
+        let mut values: Vec<usize> = results
+            .into_iter()
+            .map(std::thread::Result::unwrap)
+            .collect();
+        values.sort_unstable();
+        assert_eq!(values, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn run_chunks_in_parallel_propagates_a_worker_panic_as_a_join_error() {
+        let chunks = vec![1, 2, 3];
+        let results = run_chunks_in_parallel(chunks, |i| {
+            assert_ne!(i, 2, "intentional test panic");
+            i
+        });
+        let mut ok_values: Vec<i32> = Vec::new();
+        let mut panicked = 0;
+        for r in results {
+            match r {
+                Ok(v) => ok_values.push(v),
+                Err(_) => panicked += 1,
+            }
+        }
+        ok_values.sort_unstable();
+        assert_eq!(ok_values, vec![1, 3]);
+        assert_eq!(panicked, 1);
+    }
 
     /// Inserts `count` points scattered within a small cube of side
     /// `spacing` around `center`, with row-ids `start_id..start_id + count`.
@@ -507,6 +888,272 @@ mod tests {
                 expected: 3
             })
         ));
+    }
+
+    /// Widely-separated points (1000 units apart, `TEST_EF_CONSTRUCTION`-
+    /// scale graphs use sub-unit clusters elsewhere in this file), so a
+    /// query at row `i`'s exact coordinates is unambiguously nearest to row
+    /// `i` regardless of graph *shape* -- which is exactly what varies
+    /// between a sequential and a parallel insert of the same rows.
+    #[allow(clippy::cast_precision_loss)] // row-ids here are always < 300, far under f32's exact-integer ceiling
+    fn widely_separated_rows(count: u64) -> Vec<(u64, Vec<f32>)> {
+        (0..count)
+            .map(|i| (i, vec![i as f32 * 1000.0, 0.0, 0.0]))
+            .collect()
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)] // row-ids here are always < 300, far under f32's exact-integer ceiling
+    fn insert_batch_parallel_makes_every_row_findable_across_multiple_threads() {
+        let index = HnswIndex::new(
+            MaxConnections(TEST_MAX_NB_CONNECTION),
+            MaxElements(300),
+            MaxLayers(TEST_MAX_LAYER),
+            EfConstruction(TEST_EF_CONSTRUCTION),
+        )
+        .unwrap();
+        let rows = widely_separated_rows(300);
+
+        let outcome = index.insert_batch_parallel(rows, 4);
+        let BatchInsertOutcome::Ok(_) = outcome else {
+            panic!("expected Ok, got {outcome:?}");
+        };
+
+        for i in 0..300u64 {
+            let query = vec![i as f32 * 1000.0, 0.0, 0.0];
+            let results = index.search(&query, 1, TEST_EF_SEARCH, |_| true).unwrap();
+            assert_eq!(
+                results[0].row_id, i,
+                "row {i} must be findable at its own exact coordinates"
+            );
+        }
+    }
+
+    #[test]
+    fn insert_batch_parallel_returns_every_applied_row_id_on_success() {
+        let index = HnswIndex::new(
+            MaxConnections(TEST_MAX_NB_CONNECTION),
+            MaxElements(300),
+            MaxLayers(TEST_MAX_LAYER),
+            EfConstruction(TEST_EF_CONSTRUCTION),
+        )
+        .unwrap();
+        let rows = widely_separated_rows(300);
+
+        let BatchInsertOutcome::Ok(applied) = index.insert_batch_parallel(rows, 4) else {
+            panic!("expected Ok");
+        };
+        let mut applied_set: HashSet<u64> = applied.into_iter().collect();
+        let expected: HashSet<u64> = (0..300u64).collect();
+        assert_eq!(applied_set.len(), 300, "no row-id should be reported twice");
+        assert_eq!(
+            std::mem::take(&mut applied_set),
+            expected,
+            "every input row-id must appear in the applied set exactly once"
+        );
+    }
+
+    #[test]
+    fn insert_batch_parallel_with_fewer_than_two_rows_runs_sequentially() {
+        let index = HnswIndex::new(
+            MaxConnections(16),
+            MaxElements(10),
+            MaxLayers(16),
+            EfConstruction(200),
+        )
+        .unwrap();
+
+        let BatchInsertOutcome::Ok(applied) =
+            index.insert_batch_parallel(vec![(0, vec![1.0, 2.0, 3.0])], 8)
+        else {
+            panic!("expected Ok");
+        };
+        assert_eq!(applied, vec![0]);
+        let results = index.search(&[1.0, 2.0, 3.0], 1, 50, |_| true).unwrap();
+        assert_eq!(results[0].row_id, 0);
+    }
+
+    #[test]
+    fn insert_batch_parallel_with_one_thread_runs_sequentially() {
+        let index = HnswIndex::new(
+            MaxConnections(16),
+            MaxElements(10),
+            MaxLayers(16),
+            EfConstruction(200),
+        )
+        .unwrap();
+        let rows = widely_separated_rows(10);
+
+        let BatchInsertOutcome::Ok(applied) = index.insert_batch_parallel(rows, 1) else {
+            panic!("expected Ok");
+        };
+        let applied_set: HashSet<u64> = applied.into_iter().collect();
+        assert_eq!(applied_set, (0..10u64).collect());
+    }
+
+    #[test]
+    fn insert_batch_parallel_reports_every_other_workers_applied_rows_on_a_dimension_mismatch() {
+        // 300 rows across 4 threads with MIN_ROWS_PER_CHUNK=64 gives chunk
+        // sizes of 75 each (contiguous) -- the LAST row (299) gets a wrong
+        // dimension, so it's the last element processed by the last chunk:
+        // every other row (0..299), across every chunk/thread, must still
+        // show up in `applied` even though the whole batch's outcome is an
+        // error. This is the property design review round 1's critical
+        // finding was about: a naive implementation that bails out on the
+        // first error/panic during the join loop would lose every OTHER
+        // worker's fully-successful applied rows too, not just row 299's.
+        //
+        // Row 299 itself is ALSO in `applied` here, per a follow-up review
+        // finding: a row-id is recorded before its own insert is attempted
+        // (not after it succeeds), so `applied` is a conservative superset
+        // that can include a row that was actually rejected -- harmless,
+        // since `GraphResidueGuard` undoing a never-inserted row-id is a
+        // documented no-op (see `BatchInsertOutcome`'s own doc comment).
+        let index = HnswIndex::new(
+            MaxConnections(TEST_MAX_NB_CONNECTION),
+            MaxElements(300),
+            MaxLayers(TEST_MAX_LAYER),
+            EfConstruction(TEST_EF_CONSTRUCTION),
+        )
+        .unwrap();
+        let mut rows = widely_separated_rows(300);
+        rows[299].1 = vec![1.0, 2.0]; // wrong dimension (established dim is 3)
+
+        let outcome = index.insert_batch_parallel(rows, 4);
+        let BatchInsertOutcome::IndexError { applied, error } = outcome else {
+            panic!("expected IndexError, got {outcome:?}");
+        };
+        assert!(
+            matches!(
+                error,
+                IndexError::DimensionMismatch {
+                    query_len: 2,
+                    expected: 3
+                }
+            ),
+            "unexpected error: {error:?}"
+        );
+        let applied_set: HashSet<u64> = applied.into_iter().collect();
+        let expected: HashSet<u64> = (0..300u64).collect();
+        assert_eq!(
+            applied_set, expected,
+            "every row, including the one that failed dimension validation, must be recorded \
+             applied (a conservative superset -- see the comment above)"
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss
+    )] // N/DIM/K are small fixed test constants, well within every cast's exact range here
+    fn insert_batch_parallel_recall_matches_sequential_insert_within_tolerance() {
+        // Not a safety assertion (every row is findable regardless, per the
+        // tests above) -- this is the recall-quality check
+        // insert_batch_parallel's own doc comment flags as a known,
+        // measured-not-asserted-away risk: Graph::insert's shrink step
+        // isn't atomic across its read-compute-clear_matching steps, and a
+        // full neighbor layer silently drops a claimed edge, both of which
+        // concurrent inserts can trigger more often than a sequential
+        // insert. Builds the SAME clustered fixture two ways (sequential
+        // insert_owned calls vs. insert_batch_parallel) and compares
+        // recall@10 against exact brute-force ground truth for each.
+        use crate::brute_force::brute_force_search;
+        use arrow::array::{FixedSizeListArray, Float32Array};
+        use arrow::datatypes::{DataType, Field};
+        use std::sync::Arc;
+
+        const N: u64 = 500;
+        const DIM: usize = 8;
+        const K: usize = 10;
+
+        // Deterministic pseudo-random points via a fixed-seed LCG -- no
+        // `rand` dependency, matches this module's existing precedent
+        // (`insert_cluster`'s golden-ratio/sqrt fractional-part generator)
+        // of avoiding a new RNG dependency for test-fixture generation.
+        let mut seed: u64 = 0x9E37_79B9;
+        let mut next = move || {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            #[allow(clippy::cast_precision_loss)]
+            let unit = ((seed >> 11) as f64 / (1u64 << 53) as f64) as f32;
+            unit * 10.0 - 5.0
+        };
+        let vectors: Vec<Vec<f32>> = (0..N).map(|_| (0..DIM).map(|_| next()).collect()).collect();
+        let rows: Vec<(u64, Vec<f32>)> = vectors
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (i as u64, v.clone()))
+            .collect();
+
+        let queries: Vec<Vec<f32>> = vectors.iter().take(50).cloned().collect();
+
+        // Ground truth via brute force over a FixedSizeListArray built from
+        // the same vectors.
+        let item_field = Arc::new(Field::new("item", DataType::Float32, false));
+        let flat: Vec<f32> = vectors.iter().flatten().copied().collect();
+        let values = Arc::new(Float32Array::from(flat));
+        #[allow(clippy::cast_possible_truncation)]
+        let vectors_array = FixedSizeListArray::new(item_field, DIM as i32, values, None);
+        let ground_truth: Vec<HashSet<usize>> = queries
+            .iter()
+            .map(|q| {
+                brute_force_search(&vectors_array, q, K)
+                    .unwrap()
+                    .into_iter()
+                    .map(|n| n.row_index)
+                    .collect()
+            })
+            .collect();
+
+        let recall = |index: &HnswIndex| -> f64 {
+            let mut hits = 0usize;
+            for (qi, q) in queries.iter().enumerate() {
+                let got: HashSet<usize> = index
+                    .search(q, K, TEST_EF_SEARCH, |_| true)
+                    .unwrap()
+                    .into_iter()
+                    .map(|m| m.row_id as usize)
+                    .collect();
+                hits += got.intersection(&ground_truth[qi]).count();
+            }
+            hits as f64 / (queries.len() * K) as f64
+        };
+
+        let sequential = HnswIndex::new(
+            MaxConnections(TEST_MAX_NB_CONNECTION),
+            MaxElements(N as usize),
+            MaxLayers(TEST_MAX_LAYER),
+            EfConstruction(TEST_EF_CONSTRUCTION),
+        )
+        .unwrap();
+        for (row_id, vector) in rows.clone() {
+            sequential.insert_owned(row_id, vector).unwrap();
+        }
+        let sequential_recall = recall(&sequential);
+
+        let parallel = HnswIndex::new(
+            MaxConnections(TEST_MAX_NB_CONNECTION),
+            MaxElements(N as usize),
+            MaxLayers(TEST_MAX_LAYER),
+            EfConstruction(TEST_EF_CONSTRUCTION),
+        )
+        .unwrap();
+        let BatchInsertOutcome::Ok(_) = parallel.insert_batch_parallel(rows, 4) else {
+            panic!("expected Ok");
+        };
+        let parallel_recall = recall(&parallel);
+
+        // Generous tolerance: this is a smoke check that concurrent
+        // shrink/claim races don't grossly degrade recall, not a tight
+        // regression pin -- production-scale recall numbers belong in
+        // bench/, not a unit test with N=500 8-dim points.
+        assert!(
+            parallel_recall >= sequential_recall - 0.15,
+            "parallel insert's recall ({parallel_recall:.3}) dropped more than the 0.15 \
+             tolerance below sequential insert's ({sequential_recall:.3})"
+        );
     }
 
     #[test]

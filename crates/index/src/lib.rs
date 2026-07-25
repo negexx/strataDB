@@ -38,5 +38,6 @@ mod slot_array;
 pub use brute_force::{Neighbor, brute_force_search};
 pub use delta_log::{DeltaEntry, read_delta_log, write_delta_log};
 pub use hnsw::{
-    EfConstruction, HnswIndex, IndexError, MaxConnections, MaxElements, MaxLayers, VectorMatch,
+    BatchInsertOutcome, EfConstruction, HnswIndex, IndexError, MaxConnections, MaxElements,
+    MaxLayers, VectorMatch,
 };
