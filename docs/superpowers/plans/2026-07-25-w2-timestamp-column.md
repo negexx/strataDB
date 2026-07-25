@@ -904,13 +904,26 @@ Add to `crates/txn/src/dataset.rs`'s test module, near the existing `row_id_hidd
 
 - [ ] **Step 2: Run the tests to verify their current status**
 
+**Correction (found during Task 3's review, verified against the actual code — the paragraph below
+replaces an earlier, wrong prediction in this plan; do not trust an "already passing" expectation for
+any of these four tests):** every committed row now unconditionally carries *two* hidden trailing
+columns (`_row_id`, `_timestamp`), and `cast_batch_to_schema`'s current logic (untouched until this
+task) only ever accounts for one. This breaks far more than one test — Task 3's actual result was
+**67 passed, 12 failed** in `strata-txn`'s lib target alone, plus further breakage in
+`crates/txn/tests/mvp_checklist_1_to_5.rs`, `concurrent_snapshot_isolation.rs` (6 sites),
+`phase_3_pruning.rs` (3 sites), `crates/txn/examples/basic_usage.rs`, and every read subcommand in
+`crates/cli/src/main.rs`. All of it is the same single root cause this task fixes — this note exists so
+you don't stop and debug a "surprise" regression that isn't one.
+
 Run: `cargo test -p strata-txn cast_batch_to_schema_reattaches`
-Expected: `..._neither_hidden_column_by_default` and `..._row_id_only` PASS already (today's
-position-based logic still handles zero or exactly one trailing hidden column correctly). `..._
-timestamp_only` and `..._both_hidden_columns` FAIL — the first with a `SchemaMismatch` or a wrong-value
-assertion, the second likely with a `SchemaMismatch` (3 requested fields vs. today's broken
-`logical` computation). This mix of already-passing and failing tests is expected — it's exactly what
-Task 3's step 6 predicted.
+Expected: **all four of these tests currently FAIL**, not just two of them:
+- `..._neither_hidden_column_by_default`: fails with `TxnError::SchemaMismatch { expected: 1, actual: 2 }` — a schema requesting only `id` still sees both hidden columns counted against it.
+- `..._row_id_only`: fails with `TxnError::SchemaMismatch { expected: 2, actual: 3 }` — same mechanism, one field off.
+- `..._timestamp_only`: fails, but **not** with a clean error — `cast_batch_to_schema` returns `Ok` with silently wrong data (the physical `_row_id` column gets cast `UInt64 → Int64` and positionally handed back as if it were `_timestamp`), so this test's own value assertion (`timestamps.value(0) == timestamps.value(1)`, or equivalently a row-id-shaped value where a real timestamp was expected) is what actually catches it. If you want to see this precisely: `hidden_row_id` evaluates `true` for this schema (the physical batch has `_row_id`, the requested schema doesn't), so `logical = physical - 1 = 2` happens to equal the requested field count of 2 — the count check that would normally catch a mismatch passes by coincidence, and the positional `zip` silently mispairs the two hidden columns.
+- `..._both_hidden_columns`: fails with `TxnError::SchemaMismatch { expected: 3, actual: 3... }`-shaped arithmetic gone wrong the same way — verify the exact error rather than assuming.
+
+This is exactly the gap Step 3 below fixes — the point of running these first is to see them fail for
+the *right* reason before you change any code, not to find a mix of already-green and already-red.
 
 - [ ] **Step 3: Rewrite `cast_batch_to_schema`**
 
@@ -1014,7 +1027,20 @@ Expected: now PASSES (Task 3's known, deliberate failure is now fixed by this ta
 
 Run: `cargo test -p strata-txn`
 Expected: full crate PASS, no regressions — this is the first point in the plan where the whole
-`strata-txn` suite is expected to be fully green again.
+`strata-txn` suite is expected to be fully green again. Also run `cargo test --workspace` once here,
+not just `-p strata-txn` — Task 3's review found the interim breakage also reached
+`crates/txn/tests/mvp_checklist_1_to_5.rs`, `concurrent_snapshot_isolation.rs`,
+`phase_3_pruning.rs`, `crates/txn/examples/basic_usage.rs`, and every read subcommand in
+`crates/cli/src/main.rs` — confirm all of those are green too before moving on, not just the lib
+target.
+
+Also update `ROW_ID_COLUMN`'s doc comment (`crates/txn/src/dataset.rs`, right above `pub const
+ROW_ID_COLUMN: &str = "_row_id";`) — it currently describes the old contract ("a mismatched column
+count now returns a typed `TxnError::SchemaMismatch`... column order is still the caller's
+responsibility... with `ROW_ID_COLUMN` appended last"), which is stale now that hidden columns are
+matched by name and only *visible* columns need to stay in physical order. Update it to reflect that:
+hidden columns (`_row_id`, `_timestamp`) are reattached by name if requested, in any combination;
+visible/user columns must still be listed in physical (insertion) order.
 
 - [ ] **Step 5: Commit**
 
