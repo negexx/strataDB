@@ -35,6 +35,7 @@ mod node_layout;
 mod node_source;
 mod node_table;
 mod segment_format;
+mod segment_reader;
 mod segment_set;
 mod segment_writer;
 mod slot_array;
@@ -46,4 +47,5 @@ pub use hnsw::{
 };
 pub use node_source::NodeSource;
 pub use segment_format::SEGMENT_FORMAT_VERSION;
+pub use segment_reader::SegmentReader;
 pub use segment_set::{IndexPart, SegmentSet};
