@@ -13,16 +13,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// `u64::MAX` is never a real row-id.
 pub(crate) const EMPTY: u64 = u64::MAX;
 
-pub(crate) struct SlotArray {
-    slots: Box<[AtomicU64]>,
+pub(crate) struct SlotArray<'a> {
+    slots: &'a [AtomicU64],
 }
 
-impl SlotArray {
-    pub(crate) fn new(capacity: usize) -> Self {
-        let slots = (0..capacity)
-            .map(|_| AtomicU64::new(EMPTY))
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
+impl<'a> SlotArray<'a> {
+    pub(crate) fn new(slots: &'a [AtomicU64]) -> Self {
         Self { slots }
     }
 
@@ -40,7 +36,7 @@ impl SlotArray {
     /// Attempts to claim any empty slot for `neighbor_id`. Returns `true` if
     /// claimed, `false` if every slot is occupied.
     pub(crate) fn claim(&self, neighbor_id: u64) -> bool {
-        for slot in &self.slots[..] {
+        for slot in self.slots {
             if slot
                 .compare_exchange(EMPTY, neighbor_id, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
@@ -58,7 +54,7 @@ impl SlotArray {
     /// caller planned to remove. Never retried — a failed CAS here is a
     /// self-resolving no-op, not an error.
     pub(crate) fn clear_matching(&self, to_remove: &[u64]) {
-        for slot in &self.slots[..] {
+        for slot in self.slots {
             let current = slot.load(Ordering::SeqCst);
             if to_remove.contains(&current) {
                 let _ = slot.compare_exchange(current, EMPTY, Ordering::SeqCst, Ordering::SeqCst);
@@ -108,21 +104,24 @@ mod tests {
 
     #[test]
     fn new_array_has_no_occupied_slots() {
-        let arr = SlotArray::new(4);
+        let backing: Vec<AtomicU64> = (0..4).map(|_| AtomicU64::new(EMPTY)).collect();
+        let arr = SlotArray::new(&backing);
         assert_eq!(arr.capacity(), 4);
         assert!(arr.occupied().is_empty());
     }
 
     #[test]
     fn claim_fills_an_empty_slot() {
-        let arr = SlotArray::new(4);
+        let backing: Vec<AtomicU64> = (0..4).map(|_| AtomicU64::new(EMPTY)).collect();
+        let arr = SlotArray::new(&backing);
         assert!(arr.claim(7));
         assert_eq!(arr.occupied(), vec![7]);
     }
 
     #[test]
     fn claim_fails_once_every_slot_is_occupied() {
-        let arr = SlotArray::new(2);
+        let backing: Vec<AtomicU64> = (0..2).map(|_| AtomicU64::new(EMPTY)).collect();
+        let arr = SlotArray::new(&backing);
         assert!(arr.claim(1));
         assert!(arr.claim(2));
         assert!(!arr.claim(3), "capacity-2 array must reject a third claim");
@@ -133,7 +132,8 @@ mod tests {
 
     #[test]
     fn clear_matching_removes_only_named_values() {
-        let arr = SlotArray::new(4);
+        let backing: Vec<AtomicU64> = (0..4).map(|_| AtomicU64::new(EMPTY)).collect();
+        let arr = SlotArray::new(&backing);
         arr.claim(1);
         arr.claim(2);
         arr.claim(3);
@@ -145,7 +145,8 @@ mod tests {
 
     #[test]
     fn clear_matching_is_a_noop_for_a_value_not_present() {
-        let arr = SlotArray::new(4);
+        let backing: Vec<AtomicU64> = (0..4).map(|_| AtomicU64::new(EMPTY)).collect();
+        let arr = SlotArray::new(&backing);
         arr.claim(1);
         arr.clear_matching(&[99]);
         assert_eq!(arr.occupied(), vec![1]);
@@ -153,7 +154,8 @@ mod tests {
 
     #[test]
     fn after_clearing_a_slot_can_be_reclaimed() {
-        let arr = SlotArray::new(1);
+        let backing: Vec<AtomicU64> = (0..1).map(|_| AtomicU64::new(EMPTY)).collect();
+        let arr = SlotArray::new(&backing);
         assert!(arr.claim(1));
         assert!(!arr.claim(2), "array is full");
         arr.clear_matching(&[1]);
@@ -219,16 +221,17 @@ mod loom_tests {
     #[test]
     fn concurrent_claim_and_shrink_never_corrupts_a_slot() {
         loom::model(|| {
-            let arr = loom::sync::Arc::new(SlotArray::new(2));
+            let backing =
+                loom::sync::Arc::new((0..2).map(|_| AtomicU64::new(EMPTY)).collect::<Vec<_>>());
 
-            let a1 = loom::sync::Arc::clone(&arr);
-            let t1 = loom::thread::spawn(move || a1.claim(1));
+            let b1 = loom::sync::Arc::clone(&backing);
+            let t1 = loom::thread::spawn(move || SlotArray::new(&b1).claim(1));
 
-            let a2 = loom::sync::Arc::clone(&arr);
-            let t2 = loom::thread::spawn(move || a2.claim(2));
+            let b2 = loom::sync::Arc::clone(&backing);
+            let t2 = loom::thread::spawn(move || SlotArray::new(&b2).claim(2));
 
-            let a3 = loom::sync::Arc::clone(&arr);
-            let t3 = loom::thread::spawn(move || a3.clear_matching(&[1]));
+            let b3 = loom::sync::Arc::clone(&backing);
+            let t3 = loom::thread::spawn(move || SlotArray::new(&b3).clear_matching(&[1]));
 
             let claimed1 = t1.join().unwrap();
             let claimed2 = t2.join().unwrap();
@@ -236,7 +239,7 @@ mod loom_tests {
 
             // Every slot must hold EMPTY or a value that was genuinely
             // claimed by t1 or t2 — never a torn/corrupted u64.
-            let final_occupied = arr.occupied();
+            let final_occupied = SlotArray::new(&backing).occupied();
             for value in &final_occupied {
                 assert!(
                     (*value == 1 && claimed1) || (*value == 2 && claimed2),

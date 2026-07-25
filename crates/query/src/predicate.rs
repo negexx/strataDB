@@ -51,10 +51,27 @@ impl Predicate {
 /// its value's type doesn't match the column's actual Arrow type (the
 /// underlying comparison kernel enforces this).
 pub fn filter(batch: &RecordBatch, predicate: &Predicate) -> Result<RecordBatch, ArrowError> {
+    let selection = mask(batch, predicate)?;
+    filter_record_batch(batch, &selection)
+}
+
+/// Computes the boolean selection mask that [`filter`] would apply, without
+/// materialising the filtered batch.
+///
+/// Exists for callers that need only a subset of the columns — applying this
+/// mask to one column with `arrow::compute::filter` avoids copying the rest.
+/// [`filter`] copies *every* column, which is the right default but is
+/// enormously wasteful when the batch carries a wide embedding column and the
+/// caller only wants row-ids out of it.
+///
+/// # Errors
+///
+/// Same as [`filter`]: the predicate's column must exist and its value's type
+/// must match the column's Arrow type.
+pub fn mask(batch: &RecordBatch, predicate: &Predicate) -> Result<BooleanArray, ArrowError> {
     let idx = batch.schema_ref().index_of(predicate.column())?;
     let array = batch.column(idx);
-    let mask = compare(array, predicate)?;
-    filter_record_batch(batch, &mask)
+    compare(array, predicate)
 }
 
 fn compare(array: &ArrayRef, predicate: &Predicate) -> Result<BooleanArray, ArrowError> {

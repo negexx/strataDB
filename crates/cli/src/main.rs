@@ -377,8 +377,11 @@ mod tests {
 
     #[test]
     fn handle_explain_runs_end_to_end_against_a_real_dataset() {
-        let dir =
-            std::env::temp_dir().join(format!("strata-cli-explain-test-{}", std::process::id()));
+        let dir = tempfile::Builder::new()
+            .prefix("strata-cli-explain-test-")
+            .tempdir()
+            .unwrap()
+            .keep();
         let dir_str = dir.to_str().unwrap().to_string();
         strata_txn::Dataset::create(&dir_str).unwrap();
         let ds = strata_txn::Dataset::open(&dir_str).unwrap();
@@ -402,8 +405,11 @@ mod tests {
 
     #[test]
     fn insert_scan_and_filter_subcommands_round_trip_through_the_cli() {
-        let dir =
-            std::env::temp_dir().join(format!("strata-cli-subcommands-{}", std::process::id()));
+        let dir = tempfile::Builder::new()
+            .prefix("strata-cli-subcommands-")
+            .tempdir()
+            .unwrap()
+            .keep();
         let dir_str = dir.to_str().unwrap().to_string();
 
         run(&["strata".to_string(), "create".to_string(), dir_str.clone()]).unwrap();
