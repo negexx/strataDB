@@ -1218,10 +1218,12 @@ impl Transaction {
         // reduced auditability of proving a weaker ordering correct
         // per site. See `.claude/rules/concurrency-txn-layer.md`.
         //
-        // Row-ids are *not* handed out this way. They need the counter
-        // advance and the in-flight registration to happen as one
-        // atomic step, which no lone atomic can give — see
-        // `crate::row_id` and `RowIdAllocator::claim`.
+        // Row-ids are *not* handed out this way. `RowIdAllocator::claim`
+        // needs a *checked* add — an allocation that would run past
+        // `u64::MAX` has to be rejected *before* it consumes any ids —
+        // which no lone atomic can express, so that counter stays behind
+        // a `Mutex`. See `crate::row_id`'s module doc (§Locking) and
+        // `RowIdAllocator::claim`.
         let attempt_id = self
             .write_attempt_counter
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1229,8 +1231,8 @@ impl Transaction {
         // N rows atomically claims the contiguous range `[next_row_id,
         // next_row_id + N)`" — rather than the per-pending-batch claim this
         // replaces, which could interleave one transaction's batches with
-        // another's under concurrency and would put one exclusion entry per
-        // batch into every concurrent snapshot.
+        // another's under concurrency, leaving neither transaction's
+        // row-ids contiguous.
         let total_rows = self.pending.iter().try_fold(0u64, |total, batch| {
             let rows = u64::try_from(batch.num_rows())?;
             total
@@ -1478,10 +1480,11 @@ impl Transaction {
         // `pending` and `claim` arrive as separate parameters, so nothing in
         // the type system ties the claim's size to the rows about to be
         // laid out inside it. If they ever diverge, this hands out row-ids
-        // *past* the claimed range — ids no snapshot's exclusion set covers,
-        // which is exactly the un-hidden-uncommitted-row hazard `claim`
-        // exists to prevent, and it would fail silently. Cheap to assert at
-        // the one place being wrong is invisible.
+        // *past* the claimed range — ids some other transaction's claim
+        // already covers, which is exactly the reuse spec §8 forbids
+        // outright ("gaps are safe, reuse is forbidden"), and it would fail
+        // silently. Cheap to assert at the one place being wrong is
+        // invisible.
         debug_assert_eq!(
             row_id_base,
             claim.base() + claim.len(),
@@ -2049,7 +2052,7 @@ mod tests {
     fn concurrent_claims_hand_out_non_overlapping_ranges() {
         use crate::row_id::RowIdAllocator;
 
-        let allocator = Arc::new(RowIdAllocator::new(0));
+        let allocator = RowIdAllocator::new(0);
         let claims: Vec<_> = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..8)
                 .map(|_| scope.spawn(|| allocator.claim(10).unwrap()))
@@ -5808,9 +5811,9 @@ mod tests {
         assert_eq!(
             // Row-ids are claimed in `write_phase`, before `commit_lock`,
             // strictly in claim order -- not commit order. T2 (5-d) claimed
-            // first (row-id 0, released back to the allocator as a
-            // permanent gap when its rejected commit's `RowIdClaim` drops),
-            // so T1's row lands at row-id 1, not 0.
+            // first (row-id 0, which no successful commit ever consumes, so
+            // it stays a permanent gap), so T1's row lands at row-id 1, not
+            // 0.
             results[0].row_id,
             1,
             "T1's row must still be the only match"
@@ -5938,9 +5941,10 @@ mod tests {
         );
 
         // T2: an unrelated successful commit at its own distinctive
-        // location. This advances `next_row_id` past the residue row-id 1
-        // and publishes a watermark (2) that now covers it — the trigger
-        // that makes the residue visible to `is_visible`.
+        // location. It claims row-id 2 and persists `next_row_id = 3`,
+        // moving the durable allocation high-water mark past the residue
+        // row-id 1 — the condition that used to make the residue pass
+        // `is_visible`, and the one this test still reproduces.
         let mut later = ds.begin();
         later.insert(vector_batch(
             vec![3i64],
@@ -5949,10 +5953,12 @@ mod tests {
         later.commit().unwrap();
 
         let snapshot = ds.snapshot();
-        assert!(
-            snapshot.is_visible(1),
-            "precondition: the later commit must have advanced the watermark \
-             past the residue row-id, or this test isn't exercising the hazard"
+        assert_eq!(
+            snapshot.manifest.next_row_id, 3,
+            "precondition: the seed (row-id 0), the failed commit (row-id 1) \
+             and the later commit (row-id 2) must each have consumed one \
+             row-id, so the later commit really did allocate past the residue \
+             row-id 1, or this test isn't exercising the hazard"
         );
 
         // The discriminating assertion: searching at T1's distinctive
@@ -6129,8 +6135,9 @@ mod tests {
         );
 
         // Positive controls, so "not found" above means *excluded* rather
-        // than "search is broken" or "the exclusion set over-hides". The
-        // first is the other direction of the invariant at `Dataset` level:
+        // than "search is broken" or "this snapshot hides more than the
+        // in-flight row". The first is the other direction of the invariant
+        // at `Dataset` level:
         // the concurrent committer's own row must be visible in the very
         // snapshot it published, even with another claim outstanding.
         assert_eq!(
@@ -6619,11 +6626,11 @@ mod tests {
 /// (`a_reader_never_sees_one_in_flight_commits_row_while_observing_an_unrelated_commits_watermark`),
 /// is the regression gate for deleting `RowIdAllocator.active` / `in_flight`
 /// / collapsing `Snapshot::is_visible` to the tombstone check — see
-/// `.claude/docs/design/phase-s1-segmented-index-spec.md` §6. It is added
-/// here FIRST, against today's watermark+in-flight implementation, as the
-/// "before" half of the required "must pass both before and after the
-/// deletion" proof; the deletion itself (the "after" half) is a follow-up
-/// change to this same test file that re-runs this exact test unmodified.
+/// `.claude/docs/design/phase-s1-segmented-index-spec.md` §6. It was added
+/// here FIRST, against the then-current watermark+in-flight implementation,
+/// as the "before" half of the required "must pass both before and after the
+/// deletion" proof. The deletion has since landed, and this exact test was
+/// re-run completely unmodified afterward and passed — the "after" half.
 #[cfg(loom)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod loom_tests {

@@ -240,8 +240,8 @@ impl Snapshot {
 
     /// Approximate nearest-neighbor search over the vector column, as of
     /// this snapshot's version, optionally narrowed to rows matching
-    /// `predicate`. Visibility (both the snapshot watermark and the
-    /// tombstone set) is enforced by passing `Self::is_visible` into
+    /// `predicate`. Visibility (the tombstone set) is enforced by passing
+    /// `Self::is_visible` into
     /// [`HnswIndex::search`]/[`HnswIndex::search_filtered`] — see
     /// `.claude/docs/design/phase-4-vector-index-spec.md` §3-4 and the
     /// Phase 5 design doc.
