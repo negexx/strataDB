@@ -45,11 +45,11 @@
 //!
 //! Row-ids abandoned by a failed commit are deliberately *not* tracked. They
 //! become permanent gaps (spec §8: "gaps are safe, reuse is forbidden"), and
-//! a gap needs no exclusion entry because nothing exists at it — the data
-//! file never entered a manifest, so `scan` cannot see it, and
-//! `GraphResidueGuard` removes it from the shared graph, so `vector_search`
-//! cannot either. Only *pending* claims need hiding, which is what keeps the
-//! exclusion set from growing without bound.
+//! a gap needs no exclusion entry because nothing exists at it — neither the
+//! data file nor the index segment a failed commit built ever entered a
+//! manifest, so `scan` and `vector_search` can't see either one. Only
+//! *pending* claims need hiding, which is what keeps the exclusion set from
+//! growing without bound.
 //!
 //! # Locking
 //!

@@ -515,10 +515,12 @@ impl<D: Distance> Graph<D> {
     /// to serve as a live traversal waypoint for other queries (Stage 1's
     /// tombstone-flag-only scope — see design doc §1/§3). A no-op if
     /// `row_id` was never inserted.
-    // Reachable in production through `HnswIndex::remove`, which
-    // `crates/txn`'s commit path calls to undo an in-memory insert whose
-    // transaction failed before durably committing (see that crate's
-    // `GraphResidueGuard`).
+    // Before S1 W3.2, reachable in production through `HnswIndex::remove`,
+    // which `crates/txn`'s commit path called to undo an in-memory insert
+    // whose transaction failed before durably committing. That guarantee is
+    // now provided structurally (a failed commit's segment is never
+    // published), so `crates/txn` no longer calls this — it remains
+    // index-internal API for now.
     pub(crate) fn delete(&self, row_id: u64) {
         if let Some(node) = self.nodes.get(row_id) {
             node.mark_deleted();
