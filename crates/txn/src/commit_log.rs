@@ -308,7 +308,22 @@ mod tests {
                         Just(committed),
                         prop_oneof![0u64..1000, prop::sample::select(version_candidates.clone())],
                         prop_oneof![0u64..1000, prop::sample::select(version_candidates)],
-                        prop::collection::vec(0u64..50, 0..8),
+                        // The queried write_set is ALSO not just small-and-
+                        // random: `conflicts_with` branches on
+                        // `write_set.len() > HASH_WRITE_SET_ABOVE` (32) to
+                        // pick a linear scan vs. a hashed lookup, and a
+                        // write_set capped at 7 elements can never reach
+                        // that branch at all -- the hashed path had zero
+                        // coverage from this property test despite the
+                        // plan's own stated reason for writing it being
+                        // "both code paths must agree." Mixing in a
+                        // 33..64-element draw (still from the same 0..50
+                        // pool as `committed`'s write-sets, so overlap with
+                        // them stays likely by pigeonhole) exercises both.
+                        prop_oneof![
+                            prop::collection::vec(0u64..50, 0..8),
+                            prop::collection::vec(0u64..50, 33..64),
+                        ],
                     )
                 })
         ) {

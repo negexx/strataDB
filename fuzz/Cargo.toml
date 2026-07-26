@@ -10,7 +10,12 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 serde_json = "1"
-arrow = "58"
+# Pinned to the exact version the main workspace's Cargo.lock resolves
+# (arrow-rs 58.3.0), not a bare "58" -- this fuzz workspace resolves its own
+# independent lockfile, and without the pin it drifted to 58.4.0, meaning a
+# found-or-not-found IPC decode panic wouldn't actually transfer to the
+# shipped binary.
+arrow = "=58.3.0"
 
 [dependencies.strata-storage]
 path = "../crates/storage"
