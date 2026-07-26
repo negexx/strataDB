@@ -290,12 +290,11 @@ mod tests {
                     // random: exact equality against one of `committed`'s
                     // actual versions is what flips the `(since_version,
                     // up_to_version]` boundary this function's contract
-                    // turns on, and -- same lesson as
-                    // RowIdRange::contains's property test -- independent
-                    // random draws over a 1000-wide range were verified
-                    // directly to have too little power to reliably hit
-                    // that exact equality (an injected off-by-one here
-                    // passed clean across 3 fresh 64-case runs in a row).
+                    // turns on, and independent random draws over a
+                    // 1000-wide range were verified directly to have too
+                    // little power to reliably hit that exact equality (an
+                    // injected off-by-one here passed clean across 3 fresh
+                    // 64-case runs in a row).
                     // Mix in version-adjacent candidates (each committed
                     // version, and one below/above it) alongside fully
                     // random values so the boundary is actually exercised.

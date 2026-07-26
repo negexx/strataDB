@@ -371,15 +371,7 @@ impl HnswIndex {
         live: &LiveSet,
         is_visible: impl Fn(u64) -> bool,
     ) -> Result<Vec<VectorMatch>, IndexError> {
-        // live-set membership and is_visible are composed into ONE
-        // predicate passed straight into k_nn_search -> search_layer,
-        // applied during traversal-time result-set construction — not a
-        // post-filter over an already-capped top-k. This matches
-        // hnsw_rs's original FilterT-based behavior exactly: a live row
-        // deep in the graph is never missed just because it fell outside
-        // some pre-guessed widened candidate window, since the predicate is
-        // evaluated as part of the same search, not after it.
-        let filter = move |id: u64| live.contains(id) && is_visible(id);
+        let filter = build_live_filter_from_live_set(live, is_visible);
         let raw = self.graph.k_nn_search(query, k, ef_search, filter)?;
         Ok(raw
             .into_iter()
@@ -426,9 +418,9 @@ impl HnswIndex {
 }
 
 /// Builds the combined live-ids/visibility predicate used by
-/// `segment_set::SegmentSet::search_filtered_pruned` (the sibling module),
-/// which calls `k_nn_search_generic` directly rather than through
-/// [`HnswIndex`]'s methods — see that module's doc comments for why.
+/// `segment_set::SegmentSet::search_filtered`/`search_filtered_pruned` (the
+/// sibling module), which call `k_nn_search_generic` directly rather than
+/// through [`HnswIndex`]'s methods — see that module's doc comments for why.
 /// Delegates to [`LiveSet`] (the same bitset [`HnswIndex::search_filtered`]
 /// builds) rather than duplicating it, so there is exactly one
 /// live-row-id-membership implementation in this crate.

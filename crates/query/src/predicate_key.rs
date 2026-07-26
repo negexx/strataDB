@@ -65,13 +65,14 @@ impl From<&Value> for KeyValue {
 }
 
 /// Fixed per-interior-node charge `variable_byte_size` adds for every `And`/
-/// `Or` node, on top of its children's own sizes. Approximates one heap
-/// allocation each for the two `Box<Node>` children plus the enum's own
-/// discriminant/tag overhead — deliberately not exact, just non-zero, so a
-/// deeply-nested compound predicate (e.g. `Or(Or(Or(...)))` over many
+/// `Or` node, on top of its children's own sizes. Approximates the two
+/// `Box<Node>` children's heap allocations (`size_of::<Node>()` each, since
+/// `Leaf`'s `String` + `KeyValue` + discriminant dominates the enum's size)
+/// plus the enum's own tag overhead — deliberately not exact, just non-zero,
+/// so a deeply-nested compound predicate (e.g. `Or(Or(Or(...)))` over many
 /// distinct leaves) can't slip past `crates/txn/src/live_set_cache.rs`'s
 /// byte budget uncounted the way a `0`-cost interior node would.
-const NODE_OVERHEAD_BYTES: usize = 64;
+const NODE_OVERHEAD_BYTES: usize = 128;
 
 /// A hashable identity key for a [`Predicate`]: two `PredicateKey`s are equal
 /// if and only if the `Predicate`s they were built from have the exact same

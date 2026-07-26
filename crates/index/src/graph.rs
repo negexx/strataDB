@@ -2172,12 +2172,12 @@ mod loom_tests {
             // same 3-node/M=1/ef=1 fixture with no concurrency at all,
             // k_nn_search for row 2 returns row 1 instead) -- that's a
             // recall/graph-shape property this test isn't about (see
-            // `insert_batch_parallel_recall_matches_sequential_insert_within_tolerance`
-            // in hnsw.rs for the dedicated recall check, at a realistic
-            // parameter scale). What THIS test proves is structural: every
-            // row's node exists with its own uncorrupted vector, and the
-            // entry point ends up valid -- regardless of which thread's
-            // insert the scheduler ran first.
+            // `bench/benches/segment_recall_bench.rs` for the dedicated
+            // recall measurement, at a realistic parameter scale). What
+            // THIS test proves is structural: every row's node exists with
+            // its own uncorrupted vector, and the entry point ends up
+            // valid -- regardless of which thread's insert the scheduler
+            // ran first.
             for (row_id, vector) in [
                 (0u64, vec![0.0f32, 0.0, 0.0]),
                 (1, vec![1.0, 0.0, 0.0]),
