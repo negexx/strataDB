@@ -111,12 +111,12 @@ fn a_snapshot_never_gains_or_loses_rows_after_it_was_taken() {
 
 #[test]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
-fn an_old_snapshot_still_sees_a_row_tombstoned_by_a_later_commit() {
-    // This is the direct regression test for the isolation bug this whole
-    // design exists to fix: a reader's snapshot must NOT lose a row just
-    // because a LATER commit tombstoned it.
+fn an_old_snapshots_scan_never_gains_a_later_commits_rows() {
+    // The direct regression test for the isolation bug this whole design
+    // exists to fix: a reader's snapshot must NOT gain a row committed
+    // after it was taken.
     let dir = tempfile::Builder::new()
-        .prefix("strata-old-snapshot-sees-tombstoned-row-")
+        .prefix("strata-old-snapshot-scan-isolation-")
         .tempdir()
         .unwrap()
         .keep();
@@ -134,13 +134,10 @@ fn an_old_snapshot_still_sees_a_row_tombstoned_by_a_later_commit() {
     );
     txn.commit().unwrap();
 
-    // Take a snapshot BEFORE any tombstoning commit.
+    // Take a snapshot BEFORE the later commit.
     let old_snapshot = dataset.snapshot();
     let old_count = old_snapshot.scan(&mvp_schema()).unwrap().num_rows();
-    assert_eq!(
-        old_count, 3,
-        "expected all 3 seeded rows visible before any tombstone"
-    );
+    assert_eq!(old_count, 3, "expected all 3 seeded rows visible");
 
     // `Transaction::delete` is now a real public API, unlike when this test
     // was first written — but `Snapshot::scan`/`scan_with_predicate` do not
@@ -148,15 +145,17 @@ fn an_old_snapshot_still_sees_a_row_tombstoned_by_a_later_commit() {
     // `Snapshot::vector_search`'s HNSW traversal does, via `is_visible`;
     // see `crates/txn/src/snapshot.rs`). That is a real gap against
     // `.claude/docs/design/phase-0-transaction-and-format-spec.md` §8's
-    // "DELETE semantics" section, which requires "`scan`, `search`, and
+    // "Tombstone GC" paragraph, which requires "`scan`, `search`, and
     // (later) conflict detection must all treat a tombstoned row-id as
-    // dead" — confirmed by deleting a row here and observing `scan()`
-    // still returns it, tracked separately rather than fixed as a drive-by
-    // change in an unrelated test-accuracy PR. Until that's resolved, this
-    // test can only exercise the STRUCTURAL guarantee: re-scanning the SAME
-    // old_snapshot after MORE inserts land still shows exactly the old
-    // snapshot's own row count, proving old_snapshot's manifest/view is
-    // frozen and can never grow after the fact.
+    // dead" — confirmed empirically while writing this test (deleting a row
+    // and observing a fresh snapshot's `scan()` still returns it), and
+    // tracked as its own follow-up task ("Fix Snapshot::scan() ignoring
+    // tombstones entirely") rather than fixed as a drive-by change in an
+    // unrelated test-accuracy PR. Until that's resolved, this test can only
+    // exercise the STRUCTURAL guarantee: re-scanning the SAME old_snapshot
+    // after MORE inserts land still shows exactly the old snapshot's own
+    // row count, proving old_snapshot's manifest/view is frozen and can
+    // never grow after the fact.
     let mut txn2 = dataset.begin();
     txn2.insert(mvp_batch(&[(3, "d", [3.0, 0.0, 0.0]), (4, "e", [4.0, 0.0, 0.0])]).unwrap());
     txn2.commit().unwrap();
@@ -384,7 +383,7 @@ fn an_old_snapshots_vector_search_never_leaks_a_later_commits_rows() {
 #[test]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 fn an_old_snapshots_vector_search_still_sees_a_row_a_later_commit_tombstones() {
-    // The `vector_search` analog of `an_old_snapshot_still_sees_a_row_tombstoned_by_a_later_commit`
+    // The `vector_search` analog of `an_old_snapshots_scan_never_gains_a_later_commits_rows`
     // above, and the complementary property to
     // `an_old_snapshots_vector_search_never_leaks_a_later_commits_rows`: that test proves a later
     // commit's INSERTS never leak into an old snapshot (segment-set isolation, which holds
@@ -426,13 +425,17 @@ fn an_old_snapshots_vector_search_still_sees_a_row_a_later_commit_tombstones() {
     delete_txn.commit().unwrap();
 
     // Query at row 0's OWN exact coordinates with k=1, rather than a larger k against the whole
-    // (here, tiny) point set. This isn't hedging against approximate-search recall — at 3 nodes
-    // with `HNSW_MAX_NB_CONNECTION=16` (`crates/txn/src/dataset.rs`), layer 0 is a complete graph,
-    // so an exact-coordinate query cannot miss its own point. It's simpler than picking a `k` and
-    // reasoning about which other rows would also qualify: a k=1 exact-coordinate self-match
-    // (trivially nearest to itself, distance ~0) is an unambiguous yes/no on "is this exact row
-    // still visible" — the same technique `crates/txn/src/dataset.rs`'s loom "Model 3" uses
-    // (`found_own_point`).
+    // (here, tiny) point set. Three collinear points don't build a complete layer-0 graph — the
+    // neighbor-diversification heuristic prunes the direct 0-2 edge here exactly as
+    // `crates/index/src/graph.rs`'s `search_layer_traverses_through_an_excluded_node_to_reach_a_node_beyond_it`
+    // documents for the identical geometry — but at 3 nodes, `EF_SEARCH_DEFAULT=32`
+    // (`crates/txn/src/snapshot.rs`) far exceeds the graph size, so the layer-0 beam never evicts a
+    // candidate and search is exhaustive over the (connected-by-construction) graph regardless of
+    // which edges the heuristic kept: an exact-coordinate query cannot miss its own point. This is
+    // simpler than picking a `k` and reasoning about which other rows would also qualify: a k=1
+    // exact-coordinate self-match (trivially nearest to itself, distance ~0) is an unambiguous
+    // yes/no on "is this exact row still visible" — the same technique
+    // `crates/txn/src/dataset.rs`'s loom "Model 3" uses (`found_own_point`).
     //
     // old_snapshot's own tombstone set was fixed before this delete committed, so it must still
     // return row 0 here.
