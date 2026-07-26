@@ -67,6 +67,19 @@ git commit -m "build: add proptest as a workspace dev-dependency"
 
 ### Task 2: Property test — `RowIdRange::contains` matches a naive reference
 
+> **Retired at the S1-into-main merge (2026-07-26).** S1's follow-up work
+> deleted `RowIdRange::contains` entirely, along with the whole in-flight
+> exclusion-set mechanism it served (`Snapshot::is_visible` collapsed to a
+> plain tombstone check once the mechanism was proven redundant). This
+> test's proptest coverage was deleted alongside it rather than reformulated
+> — the property it proved ("does this half-open range include this point,
+> without overflowing") has no surviving consumer, and the replacement
+> visibility guarantee is proven by a `loom` model
+> (`crates/txn/src/dataset.rs`'s `loom_tests::a_reader_never_sees_one_in_flight_commits_row_while_observing_an_unrelated_commits_watermark`),
+> strictly stronger evidence than a proptest over an arithmetic helper. Not
+> a coverage gap — recorded here so a future reader doesn't mistake the
+> deletion for an oversight.
+
 **Files:**
 - Modify: `crates/txn/src/row_id.rs` (add to its existing `#[cfg(test)] mod tests`)
 

@@ -16,7 +16,7 @@
 - `unwrap()`/`expect()` are `clippy::warn`, not banned — fine in tests (with `#[allow(clippy::unwrap_used, clippy::expect_used)]` at the test-module level, matching this file's existing pattern), never in non-test code added by this plan.
 - Every task's tests must pass `cargo test -p strata-txn` before moving on; the full workspace gate (`cargo build --workspace`, `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`) must be clean before this phase is marked done, per this project's CLAUDE.md "What done means."
 - Loom-gated tests: **only** `cargo rustc -p strata-txn --lib --profile test -- --cfg loom`, then run the produced test binary filtered to the target module. Never a workspace-wide `RUSTFLAGS="--cfg loom"` invocation — it breaks `strata-index`'s own build (`.claude/rules/concurrency-txn-layer.md`).
-- Per this project's CLAUDE.md model-dispatch table: this work is in `crates/txn/`, the flagship subsystem — escalate to Fable 5 (or Opus 4.8) for Task 6 (the core `commit()` rewrite) specifically, since a wrong call there is expensive to undo. The rest of the tasks are mechanical enough for the default tier.
+- Per this project's CLAUDE.md model-dispatch table: this work is in `crates/txn/`, the flagship subsystem — escalate to Opus 5 for Task 6 (the core `commit()` rewrite) specifically, since a wrong call there is expensive to undo. The rest of the tasks are mechanical enough for the default tier.
 - An Opus reviewer-subagent sign-off is required before this phase is marked done — not optional, not per-task-skippable (CLAUDE.md "What done means").
 
 ## File Structure

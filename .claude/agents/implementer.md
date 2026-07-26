@@ -32,7 +32,7 @@ You are the implementer. You receive a plan and execute it without re-planning. 
 
 ## When to escalate off this agent
 
-You default to Sonnet 5 — right for basic-to-medium complexity. If the plan step you're executing turns out to need real architectural judgment (not just length or file count) — especially anything in the transaction/conflict layer or vector index — stop and tell the main thread this step warrants Fable 5 instead, falling back to Opus 4.8 if Fable 5 isn't available in this environment. Don't push through a genuinely hard design decision on Sonnet just to finish the task.
+You default to Sonnet 5 — right for basic-to-medium complexity. If the plan step you're executing turns out to need real architectural judgment (not just length or file count) — especially anything in the transaction/conflict layer or vector index — stop and tell the main thread this step warrants Opus 5 instead. Don't push through a genuinely hard design decision on Sonnet just to finish the task.
 
 ## When you finish
 

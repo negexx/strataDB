@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-23
 **Trigger:** An external optimization report on `crates/index/` (Section 3 of
-this project's pipeline documentation) was fact-checked by a Fable 5 audit
+this project's pipeline documentation) was fact-checked by a Opus 5 audit
 against the real code. Two of its findings survived verification and are
 independently corroborated by this project's own prior design doc
 (`docs/superpowers/specs/2026-07-19-hnsw-search-performance-improvements-design.md`
@@ -42,7 +42,7 @@ structurally true, and this project's own design doc already reached the
 same conclusion independently before this report existed. Stage B's
 motivating problem — allocator lock contention under concurrent insert — is
 plausible in general but was explicitly found **unmeasured for this
-codebase** by the Fable 5 audit; no benchmark anywhere in this repo touches
+codebase** by the Opus 5 audit; no benchmark anywhere in this repo touches
 allocator behavior on the insert path. Stage B is being built because it was
 the scope explicitly chosen for this plan, not because its necessity is
 proven — its implementation plan must therefore include a real concurrent-
@@ -257,7 +257,7 @@ consumer of the generic type.
   scope here.
 - `docs/superpowers/specs/2026-07-18-lockfree-hnsw-rewrite-design.md` §2 —
   the never-moved/never-freed invariant this design must preserve exactly.
-- This session's Fable 5 audit of the external Section 3 optimization
+- This session's Opus 5 audit of the external Section 3 optimization
   report — the source of both motivating findings (L+4 allocation count,
   the unmeasured-but-plausible allocator-contention claim) and of the
   finding that graph reordering itself remains a genuine use-after-free

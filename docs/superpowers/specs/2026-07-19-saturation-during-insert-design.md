@@ -10,7 +10,7 @@ After that plan landed, a re-run of `lockfree_vs_hnsw_rs_bench` found
 `Graph`'s recall@10 had dropped from 0.9970 (pre-plan) to 0.9890
 (post-plan) — still comfortably above the 0.8 gate and still beating
 `hnsw_rs` (~0.97), but a real, deterministic, code-caused regression, not
-noise (confirmed via a bit-for-bit-identical re-run and a Fable 5
+noise (confirmed via a bit-for-bit-identical re-run and a Opus 5
 architecture audit).
 
 **Root cause, isolated via a real A/B (temporarily toggled, reverted, not
@@ -141,7 +141,7 @@ measurement shows the full-disable cost is unacceptably high.
 - `docs/superpowers/specs/2026-07-19-hnsw-search-performance-improvements-design.md`
   §3 — the original saturation design (Teofili & Lin, ECIR 2025,
   "Patience in Proximity").
-- Fable 5 architecture audit (this session, no separate file — see the
+- Opus 5 architecture audit (this session, no separate file — see the
   conversation transcript) — the empirical A/B that isolated the root
   cause and validated the fix's expected recall recovery before any code
   was written.

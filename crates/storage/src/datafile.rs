@@ -9,6 +9,7 @@
 //! "Alternatives considered" section.
 
 use std::fs::File;
+use std::io::Write as _;
 use std::path::Path;
 
 use arrow::array::RecordBatch;
@@ -32,6 +33,29 @@ pub fn write_batch(path: &Path, batch: &RecordBatch) -> Result<()> {
     let file = writer.into_inner()?;
     file.sync_all()?;
     crate::chaos::chaos_checkpoint(); // data-file content is now durable
+    Ok(())
+}
+
+/// Writes `bytes` to `path` verbatim, fsyncing before returning so the
+/// caller can rely on durability once this returns — the raw-byte twin of
+/// [`write_batch`], for payloads that are already a finished on-disk format
+/// rather than an Arrow batch (today: `crates/index`'s `.seg` segments).
+///
+/// Lives here, not in the caller, so **every** chaos checkpoint in the
+/// commit protocol stays inside `strata-storage` — see
+/// `docs/superpowers/specs/2026-07-25-s1-w3-2-design-amendment.md` §5.
+/// Truncating (`File::create`) exactly like [`write_batch`]: callers derive
+/// their filenames from a collision-free attempt id, so an existing file at
+/// `path` is a bug to overwrite, not content to append to.
+///
+/// # Errors
+///
+/// Returns an error if `path` can't be created, written, or fsynced.
+pub fn write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut file = File::create(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    crate::chaos::chaos_checkpoint(); // segment content is now durable
     Ok(())
 }
 
@@ -201,6 +225,45 @@ mod tests {
         let read_back = read_batch(&path).unwrap();
 
         assert_eq!(batch, read_back);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_bytes_then_read_round_trips_exactly() {
+        let dir = tempfile::Builder::new()
+            .prefix("strata-write-bytes-test-")
+            .tempdir()
+            .unwrap()
+            .keep();
+        let path = dir.join("blob.seg");
+
+        // Deliberately includes a zero byte and a high byte: this is a raw
+        // binary writer, not a text one, and must not transform anything.
+        let payload: Vec<u8> = vec![0x00, 0x53, 0x54, 0xFF, 0x01, 0x00, 0x00, 0x00];
+        write_bytes(&path, &payload).unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), payload);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_bytes_truncates_an_existing_file_rather_than_appending() {
+        // `File::create` semantics, matching `write_batch`. Asserted
+        // explicitly because a segment filename is derived from a unique
+        // attempt id and must never be reused -- if it ever were, silent
+        // appending would produce a file that still passes its own header
+        // CRC while carrying trailing garbage.
+        let dir = tempfile::Builder::new()
+            .prefix("strata-write-bytes-truncate-")
+            .tempdir()
+            .unwrap()
+            .keep();
+        let path = dir.join("blob.seg");
+
+        write_bytes(&path, &[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        write_bytes(&path, &[9, 9]).unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), vec![9, 9]);
         std::fs::remove_dir_all(&dir).ok();
     }
 

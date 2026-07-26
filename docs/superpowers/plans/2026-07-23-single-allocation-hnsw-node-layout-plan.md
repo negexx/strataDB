@@ -5,7 +5,7 @@
 > **Model dispatch — read before starting:** This plan touches `unsafe`,
 > lock-free, correctness-critical code (`crates/index/`). Per this
 > project's `CLAUDE.md` model-dispatch table, do NOT execute this on
-> Sonnet 5 by default — escalate to Fable 5 (Opus 4.8 as fallback) for
+> Sonnet 5 by default — escalate to Opus 5 for
 > Tasks 2, 3, 8, 9, 10 specifically (anything allocating/laying out raw
 > memory or introducing new `unsafe`). Tasks 1, 4, 5, 11 are safe-Rust
 > refactors/tests and may stay on Sonnet 5. Every task, regardless of
@@ -1103,7 +1103,7 @@ git log --oneline main..HEAD
 Identify the commit range covering Tasks 1-5 (the `SlotArray`-as-view
 refactor through the stress test).
 
-- [ ] **Step 2: Dispatch a Fable-5 (or Opus 4.8 if unavailable) soundness review**
+- [ ] **Step 2: Dispatch an Opus 5 soundness review**
 
 Prompt must ask the reviewer to verify, independently, against the actual
 diff (not just read the plan):

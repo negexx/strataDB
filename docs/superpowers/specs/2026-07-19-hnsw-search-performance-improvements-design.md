@@ -18,7 +18,7 @@ isolated per-call measurement (330.64ns) compares the same two vectors
 repeatedly (cache-friendly), while a real search's calls are against
 scattered, unpredictable neighbor vectors (cache-unfriendly).
 
-That finding was investigated further (via a Fable 5 architecture audit,
+That finding was investigated further (via a Opus 5 architecture audit,
 `.superpowers/` session transcript, prompted specifically to check whether
 graph reordering — the classic answer to "scattered neighbor lookups" —
 is safe to build on top of the lock-free `NodeTable`) and produced a more
@@ -41,7 +41,7 @@ already-designed requirement that was never actually turned on.
 
 **Explicitly deferred, not part of this design:** true graph reordering
 (RCM/Gorder-style physical relocation of already-inserted nodes). The
-Fable 5 audit found this is a genuine architectural conflict, not a
+Opus 5 audit found this is a genuine architectural conflict, not a
 tuning question — see §7.
 
 ## 2. Enable `anndists` SIMD
@@ -65,7 +65,7 @@ one-line dependency change plus a rebuild.
 **Verification, not assumption:** rerun
 `cargo bench -p strata-bench --bench lockfree_vs_hnsw_rs_bench` after the
 change and confirm the isolated `l2_distance_eval_only` benchmark's
-reported time actually drops before treating this as a win. The Fable 5
+reported time actually drops before treating this as a win. The Opus 5
 audit's 3-6x estimate is a class-of-improvement estimate for this kernel
 shape, not a number to trust without re-measuring on this exact dataset
 and hardware.
@@ -188,7 +188,7 @@ is unaffected either way; it's purely a latency hint).
 
 ## 7. Explicitly deferred: true graph reordering
 
-The Fable 5 audit (full transcript available via this session) found
+The Opus 5 audit (full transcript available via this session) found
 graph reordering (RCM/Gorder-style physical node relocation) is not a
 tuning knob — it is a genuine architectural conflict with the lock-free
 rewrite's central invariant: **once a node is published, it is never
@@ -260,7 +260,7 @@ design; recorded here so it isn't lost.
 
 ## 9. References
 
-- Fable 5 architecture audit (this session) — full graph-reordering
+- Opus 5 architecture audit (this session) — full graph-reordering
   feasibility analysis, the `anndists` scalar-fallback discovery.
 - `bench/benches/lockfree_vs_hnsw_rs_bench.rs`'s distance-call profiling
   addition (`print_distance_calls_per_search`, `CountingL2`) — the

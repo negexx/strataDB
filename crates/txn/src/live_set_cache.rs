@@ -270,6 +270,47 @@ mod tests {
     }
 
     #[test]
+    fn a_deep_compound_predicates_tree_shape_counts_against_the_budget() {
+        // Same shape of proof as the string-value test above, but for
+        // PredicateKey's recursive And/Or case: a deeply-nested compound
+        // predicate's own Box<Node> allocations must count against the
+        // budget via PredicateKey::variable_byte_size's per-interior-node
+        // charge, not just its leaves' column/value bytes -- otherwise a
+        // caller issuing many distinct deep trees against one long-lived
+        // Snapshot could grow this cache's slot map unboundedly while the
+        // budget accounting saw it as nearly free.
+        let mut deep = strata_query::Predicate::Eq("category".to_string(), Value::Int64(0));
+        for i in 1..50 {
+            deep = strata_query::Predicate::And(
+                Box::new(deep),
+                Box::new(strata_query::Predicate::Eq(
+                    "category".to_string(),
+                    Value::Int64(i),
+                )),
+            );
+        }
+        let deep_key = PredicateKey::from(&deep);
+        let cache = LiveSetCache::new(ENTRY_OVERHEAD_BYTES + 10);
+        let _ = cache.get_or_try_compute(deep_key, || -> Result<LiveSet, Unreachable> {
+            Ok(LiveSet::from_row_ids(&[1]))
+        });
+
+        let calls = AtomicUsize::new(0);
+        let compute = || -> Result<LiveSet, Unreachable> {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Ok(LiveSet::from_row_ids(&[2]))
+        };
+        cache.get_or_try_compute(key(99), compute).unwrap();
+        cache.get_or_try_compute(key(99), compute).unwrap();
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            2,
+            "a deep compound predicate's tree shape must count its own bytes against \
+             the budget, not just the fixed per-entry overhead"
+        );
+    }
+
+    #[test]
     fn computes_once_and_reuses_on_second_call_with_the_same_key() {
         let cache = LiveSetCache::new(64 * 1024 * 1024);
         let calls = AtomicUsize::new(0);

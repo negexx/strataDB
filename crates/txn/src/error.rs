@@ -41,10 +41,18 @@ pub enum TxnError {
     UnreasonableCapacity(u64, u64),
     #[error("manifest references an unsafe file path: {0:?}")]
     UnsafeManifestPath(String),
+    #[error("segment listed in the manifest is unusable: {0}")]
+    CorruptSegment(String),
     #[error("schema mismatch casting a data file: expected {expected} columns, found {actual}")]
     SchemaMismatch { expected: usize, actual: usize },
     #[error("conflict: {contested_row_ids:?} were modified by another transaction")]
     Conflict { contested_row_ids: Vec<u64> },
+    #[error(
+        "column name '{0}' is reserved for internal use and cannot appear in an inserted batch's schema"
+    )]
+    ReservedColumnName(String),
+    #[error("system clock error: {0}")]
+    Clock(String),
 }
 
 pub type Result<T> = std::result::Result<T, TxnError>;
@@ -74,6 +82,14 @@ mod tests {
             }
             .to_string(),
             "schema mismatch casting a data file: expected 3 columns, found 2"
+        );
+        assert_eq!(
+            TxnError::Clock("second time provided was later than self".to_string()).to_string(),
+            "system clock error: second time provided was later than self"
+        );
+        assert_eq!(
+            TxnError::ReservedColumnName("_row_id".to_string()).to_string(),
+            "column name '_row_id' is reserved for internal use and cannot appear in an inserted batch's schema"
         );
     }
 

@@ -13,11 +13,19 @@ use rand::SeedableRng as _;
 const NUM_AGENTS: u64 = 3;
 const OPS_PER_AGENT: u64 = 5;
 /// Comfortably above the total number of checkpoints one full run
-/// produces (each commit passes through `write_batch`'s fsync,
-/// `sync_dir`'s data-dir fsync, `commit_manifest`'s tmp-sync, rename, and
-/// `sync_dir`'s versions-dir fsync — 5 per commit, 15 ops max here — so a
-/// threshold in this range can land anywhere from "crash on the very
-/// first commit" to "never crashes, all ops complete").
+/// produces. A vector-carrying commit passes through six: `write_batch`'s
+/// data-file fsync, `write_bytes`'s segment fsync (added by S1 W3.2a),
+/// `sync_dir`'s data-dir fsync, `commit_manifest`'s tmp-sync, its rename,
+/// and `sync_dir`'s versions-dir fsync. At 6 per commit and 15 ops max
+/// here that is 90 — so a threshold in this range can still land anywhere
+/// from "crash on the very first commit" to "never crashes, all ops
+/// complete". A delete-only commit produces fewer (no data file, no
+/// segment); this workload has none.
+///
+/// `STRATA_CHAOS_ABORT_AT` counts checkpoints since **process start** off
+/// one process-global counter, so this constant must be re-checked
+/// whenever a checkpoint site is added or removed anywhere in
+/// `strata-storage`.
 const MAX_ABORT_THRESHOLD: u64 = 200;
 
 struct RunResult {

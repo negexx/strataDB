@@ -44,7 +44,7 @@ The transaction/conflict layer is an explicit, load-bearing architectural compon
 | Columnar storage format | `crates/storage/` | Fixed-size pages/column chunks, dictionary + RLE encoding, validity bitmaps, append-only files |
 | Manifest & versioning | `crates/storage/` (manifest) | Lists files per version; the commit atomicity boundary (CAS) |
 | Query & execution engine | `crates/query/` | Small expression/filter API (no full SQL parser), vectorized batch operators, predicate pushdown |
-| Vector index | `crates/index/` | HNSW, filtered similarity search, append-only delta log for mutations (not in-place graph edits) |
+| Vector index | `crates/index/` | HNSW, filtered similarity search, immutable per-commit on-disk segments (not in-place graph edits) |
 | Transaction & conflict layer | `crates/txn/` | OCC, snapshot isolation, row/key-range conflict detection, atomic row+index commits — the flagship subsystem |
 | Client bindings | `crates/bindings/` | PyO3 Python bindings (builds `strata_ext`), including an explicit transaction API (`begin`/`commit`/retry-on-conflict) |
 | CLI | `crates/cli/` | Dataset/manifest inspection (`strata` binary) |
@@ -92,15 +92,29 @@ The transaction/conflict layer is an explicit, load-bearing architectural compon
 | 1. Vertical Slice (single-writer) | MVP: create dataset, insert, scan, filter, brute-force NN search, kill -9 + restart recovers last committed version | The 6-step checklist passes |
 | 2. Columnar Core & Vectorized Execution | Real encodings, batch-based scan/filter/project/aggregate | `GROUP BY` over 10M+ rows, correct, benchmarked |
 | 3. Query Layer Refinement | Predicate pushdown, file/chunk pruning | `EXPLAIN` proves a filtered query skips untouched files |
-| 4. Vector Index (HNSW) | Build + search, then filtered ANN | Recall@10/QPS benchmarked on a public embedding dataset |
+| 4. Vector Index (HNSW) | Build + search, then filtered ANN — **the monolithic baseline; superseded as the target layout by Phase S1 below** ([ADR 0008](decisions/0008-adopt-segmented-index-layout.md)) | Recall@10/QPS benchmarked on a public embedding dataset |
 | 5. Single-Writer MVCC & Snapshot Isolation | Manifest-based snapshots, readers never blocked | Concurrent-reader suite passes against a single writer |
 | 6. Multi-Agent Concurrent Write Engine (flagship) | OCC, row-level conflict detection, atomic row+index commits, zero-buffering durability | The "v0.3 concurrent multi-agent write slice" checklist (below) passes under real concurrent load |
 | 7. Correctness Harness / Chaos Testing | Deterministic simulation testing, randomized fault injection | Thousands of randomized concurrent-agent runs, zero invariant violations |
-| 8. Versioning & Dataloader Path | Time travel, compaction, `get_batch`/`iter_shuffled` | A toy training loop reads a full epoch faster than raw Parquet |
+| 8. Versioning & Dataloader Path | Time travel (no read-as-of API exists yet — only `snapshot()`/`current_version()`), compaction, `get_batch`/`iter_shuffled`. **Index-segment compaction/GC is Phase S2 below.** | A toy training loop reads a full epoch faster than raw Parquet |
 | 9. Object Storage Backend | Same format/manifest logic against object storage | Full Phase 1-7 suite passes unmodified against the object-storage backend |
 | 10. Bindings, Hardening, Benchmarking | Python bindings, CLI polish, full benchmark suite, public writeup | Graduation criteria met and documented publicly |
 
 **Flagship milestone — "v0.3: concurrent multi-agent write slice"** (end of Phase 6): N simulated agents issue concurrent transactions (some conflicting, some not) against one shared dataset; every acknowledged write is durable and visible to the next reader; conflicting transactions get a typed error identifying contested rows; a transaction writing a row + updating the index commits both atomically or neither; a reader's open snapshot never sees a partial write from a later commit; the scenario re-runs under randomized process kills for many iterations with zero invariant violations.
+
+### Segmented-layout & branching track ([ADR 0008](decisions/0008-adopt-segmented-index-layout.md))
+
+Branching is a mandatory capability ([ADR 0008](decisions/0008-adopt-segmented-index-layout.md), Accepted), and it is only possible on a segmented immutable index — so the vector index moves off today's monolithic mutable HNSW. These phases are *additional* to 0–10 above, not a renumbering. The gating de-risk (recall-vs-segment-count) **has already run** (`bench/benches/segment_recall_bench.rs`): recall is segment-count-safe (0.974→0.998 across K=1→64), so the cost is latency, not correctness — compaction bounds latency, it is not load-bearing for recall. See [`scope-addendum-v2.md`](scope-addendum-v2.md) for the argument and [`FUTURE.md`](FUTURE.md) for everything deferred/refused.
+
+| Phase | Goal | Exit Criterion |
+|---|---|---|
+| S1. Segmented immutable index layout — **[full spec →](design/phase-s1-segmented-index-spec.md)** | Replace the monolithic mutable HNSW with immutable segment files + a segment manifest; writes land in a new delta segment; queries fan out across segments and merge; recovery loads the manifest instead of rebuilding the graph. Includes per-segment **zone maps** (addendum §1.2 — per-segment min/max in the manifest) and their two prerequisites the current code lacks: **compound predicates** (`Predicate` is a flat `Eq/Lt/…` enum today, no `AND`/`OR`) and a **first-class timestamp/commit-time column** (only integer manifest versions exist now). | Fan-out search holds recall parity with the monolithic baseline (already shown recall-safe by `segment_recall_bench`); `Dataset::open` recovery drops from full-graph-rebuild (measured ~36 s @ 25k rows in `lifecycle_bench`) to a manifest load; a `timestamp ≥ X AND category = Y` predicate prunes whole segments before any vector is touched. |
+| S2. Segment compaction & GC (extends Phase 8) | Merge segments to bound fan-out latency; **physically purge** soft-deleted nodes (real vector deletion + memory reclaim — today the graph only ever grows and deletes are soft); GC segments referenced by no live snapshot or branch (addendum §7 Q1, *unsolved*). | Segment count stays bounded under sustained writes; a deleted vector is provably gone from every segment (precondition for verifiable deletion); the chaos harness never reclaims a segment a live reader or branch still references. |
+| B. Branching — the v2 thesis | `fork → fast abort → branch-scoped snapshot reads → merge`, in the addendum's shipping order, on the S1 layout. Fork is a manifest copy; abort discards a branch's delta segments; reads are snapshot-consistent across a branch's segment set; merge replays the branch's logical insert/delete set and rebuilds affected segments (correct-but-slow is acceptable). | Fork is O(segments) with **no index rebuild**; abort is O(mutations) and genuinely fast (the agentic hot path); ANN on a branch never sees another branch's writes; BranchBench (arXiv 2604.17180) passes under the chaos harness with many concurrent short-lived branches. |
+
+**Where this slots — an open sequencing decision, not settled here.** ADR 0008 argues layout-first because it is *not retrofittable*, which points to landing **S1 before Phase 6/7 harden the monolithic design further.** But the decision was made *after* Phases 4–6 were already largely built monolithic, so S1 is now a **migration** of the built search path, recovery, and the snapshot-isolation mechanism (which currently keys on the shared graph + watermark + soft-delete) — **not** the "near-zero implementation delta" the addendum assumed for a greenfield choice. The real tradeoff — do S1 now (before more is built on monolithic) vs. stabilize the Phase 6/7 correctness work first — is a call for the maintainer; both the cost and the non-retrofittability are real.
+
+**v3 storage primitives** (staleness tracking, verifiable deletion — needs S2, budget-shaped ANN `recall ≥ 0.9 OR cost ≤ X`) stay in [`FUTURE.md`](FUTURE.md); each stops deliberately short of the system that would consume it. Learned indexes: read, don't build (v4+, addendum §3.2).
 
 ## Non-Goals (cut list — revisit only after Phase 7)
 
@@ -111,9 +125,16 @@ The transaction/conflict layer is an explicit, load-bearing architectural compon
 | Full SQL parser/optimizer | Years of work; expression API covers the same queries |
 | IVF-PQ / additional vector index types | HNSW alone is a complete v1; splitting effort steals hours from Phase 6 |
 | Automatic/implicit conflict resolution | Silent resolution hides bugs; explicit surfacing is safer to get right first |
-| Temporal/knowledge-graph memory features | Different skill set (NLP/graph extraction) than storage-engine correctness; possible v2/v3 |
+| Temporal/knowledge-graph memory features | Different skill set (NLP/graph extraction) than storage-engine correctness; memory is a *reference app on* Strata, not built *into* it — see [addendum §5](scope-addendum-v1.md) |
 | Catalog integrations, geospatial, full-text search | Product-surface features, not the differentiator |
 | Object storage as the primary backend | Local disk first; cloud backend is Phase 9 |
+| Derivation engine (IVM over model calls) | That's an orchestrator + separate product; ship the staleness *primitive* and stop — [addendum §4](scope-addendum-v1.md) |
+| Probe optimiser / cost-quality query planning | Requires a query optimiser → a query language; Strata is a storage engine (category error) |
+| Belief semantics (bi-temporal validity, confidence, retraction cascades) | A *data model*; the moment the engine holds opinions about a "claim" it stops being a storage engine — build it *on* Strata (zone maps make temporal *filtering* fast; that's the storage boundary) |
+| Neural databases (NeuroDB / SNH / NGDB) | Approximate range-aggregate query processing over a fixed distribution — a technique, not a database class, orthogonal to Strata ([addendum §4](scope-addendum-v2.md)) |
+| Extreme multi-tenancy (fork) | Architectural fork, not a feature; embeddable-first makes million-tenant ~free (run N instances) |
+
+The rows above come from [Scope Addendum v2](scope-addendum-v2.md) §4 — refused deliberately and recorded so they aren't relitigated as the space moves. Deferred (not refused) items live in [`FUTURE.md`](FUTURE.md).
 
 ## What this doc is NOT
 

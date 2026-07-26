@@ -12,6 +12,6 @@ pub(crate) mod row_id;
 pub mod snapshot;
 
 pub use arrow;
-pub use dataset::{Dataset, ROW_ID_COLUMN, Transaction};
+pub use dataset::{Dataset, ROW_ID_COLUMN, TIMESTAMP_COLUMN, Transaction};
 pub use error::{Result, TxnError};
 pub use snapshot::Snapshot;

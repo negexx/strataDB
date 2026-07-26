@@ -17,7 +17,7 @@ The flagship claim: "correct under concurrent multi-agent writes, with no silent
 - **Linter:** `clippy` (workspace lints in root `Cargo.toml`: `clippy::all` + `clippy::pedantic` at warn, `unwrap_used`/`expect_used` at warn)
 - **Formatter:** `rustfmt` (`rustfmt.toml` — stable-only options; `imports_granularity`/`group_imports` are nightly-only and deliberately not used)
 - **Columnar library:** `arrow` (arrow-rs)
-- **HNSW library:** none — `crates/index` is a from-scratch, fully lock-free HNSW implementation, replacing an earlier `hnsw_rs` dependency (`docs/superpowers/specs/2026-07-18-lockfree-hnsw-rewrite-design.md`; the decision to fully replace rather than wrap/fork is justified narrowly by the lock-freedom requirement alone in `docs/superpowers/specs/2026-07-18-hnsw-rs-wrap-vs-replace-decision.md`). The only remaining external dependency is `anndists` (with the `simdeez_f` feature enabled), used solely for SIMD-accelerated distance kernels. No HNSW library audited (C++ or Rust) exposed graph internals for a native delta log — Strata's transaction shim maintains that log itself regardless.
+- **HNSW library:** none — `crates/index` is a from-scratch, fully lock-free HNSW implementation, replacing an earlier `hnsw_rs` dependency (`docs/superpowers/specs/2026-07-18-lockfree-hnsw-rewrite-design.md`; the decision to fully replace rather than wrap/fork is justified narrowly by the lock-freedom requirement alone in `docs/superpowers/specs/2026-07-18-hnsw-rs-wrap-vs-replace-decision.md`). The only remaining external dependency is `anndists` (with the `simdeez_f` feature enabled), used solely for SIMD-accelerated distance kernels. No HNSW library audited (C++ or Rust) exposed graph internals for the segment serialization Strata's own on-disk format needs — that codec (`crates/index/src/segment_{format,writer,reader}.rs`) is Strata's own code regardless of backing implementation.
 - **Python bindings:** PyO3 (modern `#[pymodule] mod { #[pymodule_export] ... }` form, not the older function-based API) + `maturin` for building wheels
 - **Concurrency correctness:** `loom` (exhaustive interleaving testing of locks/atomics/CAS loops — this is the whole reason Rust was the original recommendation) for `crates/txn`/`crates/index`. Phase 7's correctness harness (`tests/sim`, `crates/chaos-worker`) does NOT use `madsim`/`turmoil` as originally planned here — both were found to be async/tokio-shaped and a poor fit for this codebase's entirely synchronous production code (see `docs/superpowers/specs/2026-07-22-phase-7-correctness-harness-design.md` §2). Phase 7 instead follows Jepsen's methodology: real process spawn, real `std::process::abort()` at instrumented checkpoints, seed-reproducible scenarios. The instrumented checkpoints live behind an off-by-default `chaos-injection` Cargo feature that's functionally inert (no aborts) unless `STRATA_CHAOS_ABORT_AT` is set, and a package-scoped build (e.g. `cargo build --release -p strata-cli`) is fully clean of it — but `cargo build --workspace` (this file's own documented default) unifies `chaos-injection` into the shared `strata-storage` artifact, including the one the `strata` CLI binary links, because `crates/chaos-worker` requests it as a normal workspace dependency. Don't leave `STRATA_CHAOS_ABORT_AT` set in your shell when running a `--workspace`-built `strata` binary — that's the one combination that would actually trigger an unwanted abort.
 
@@ -49,7 +49,7 @@ Client Layer (query API, dataloader API, CLI, Python bindings)
 Cargo workspace layout:
 - `crates/storage/` — columnar file format, manifest/versioning (`strata-storage`)
 - `crates/txn/` — transaction & conflict resolution (the flagship subsystem — see `rules/concurrency-txn-layer.md`) (`strata-txn`)
-- `crates/index/` — HNSW vector index, append-only delta log (see `rules/vector-index.md`) (`strata-index`)
+- `crates/index/` — HNSW vector index and the immutable on-disk segment format it seals into (see `rules/vector-index.md`) (`strata-index`)
 - `crates/query/` — expression/filter API, vectorized scan/filter/agg (`strata-query`)
 - `crates/bindings/` — PyO3 Python bindings, builds `strata_ext` (see `rules/python-bindings.md`)
 - `crates/cli/` — `strata` binary, CLI for inspecting datasets/manifests
@@ -60,12 +60,14 @@ Unit tests live inline per crate (`#[cfg(test)] mod tests`) — idiomatic Rust, 
 
 Full phase-by-phase roadmap and the full architecture diagram: `.claude/docs/architecture.md`. Phase 0's deliverable — the precise definitions of "conflict" and "transaction boundary," and the file format — is done: `.claude/docs/design/phase-0-transaction-and-format-spec.md`. Read it before writing anything real in `crates/txn/` or `crates/storage/`; don't improvise a definition that contradicts it.
 
+Post-MVP scope is in `.claude/docs/scope-addendum-v2.md` (supersedes v1), deferred/refused items in `.claude/docs/FUTURE.md`. **Branching is mandatory, so the index layout is DECIDED: segmented-immutable, not today's monolithic-mutable HNSW** — `.claude/docs/decisions/0008-adopt-segmented-index-layout.md` (Accepted). v1 still ships zero branching; this decides the *layout* only. Consequence for now: don't make a `crates/index`/`crates/storage` change that hardens the monolithic design against the segmented migration, and reserve manifest room for per-segment zone maps (addendum §1.2). The gating de-risk (recall-vs-segment-count) already ran — `bench/benches/segment_recall_bench.rs`: recall is segment-safe, cost is latency, so compaction bounds latency not recall (details in ADR 0008).
+
 ## Conventions
 
 Non-obvious patterns only — see `.claude/docs/conventions.md` for the full Rust style guide.
 
 - **No write is acknowledged until it's durable, conflict-checked, and visible.** No async "we'll get to it" buffering, ever — this is a correctness invariant, not a style preference.
-- **The vector index shares the transaction boundary with row data.** Index mutations are an append-only delta log, never in-place graph mutation, so they can commit atomically alongside row writes.
+- **The vector index shares the transaction boundary with row data.** A committing transaction builds its own immutable index segment outside the commit lock, fsyncs it, and the manifest swap that publishes its rows is the same one that publishes the segment — so row data and index commit atomically. **No published index is ever mutated in place**: a snapshot's segment set is exactly its manifest's segment list. (This replaces the append-only delta log, which existed to reconstruct a graph that was never persisted; S1 W3.2 made the segment itself the durable built graph. The guarantee is unchanged, only the mechanism.)
 - **Isolation level is snapshot isolation, not serializability** — don't add serializability machinery; it's an explicit, documented cut (see `docs/decisions/`).
 - **Conflicts are surfaced via a typed error identifying the contested rows, never silently resolved.** A last-writer-wins mode may exist but must be opt-in.
 - Safe Rust by default; `unsafe` requires a `// SAFETY:` comment justifying the invariant it upholds, and is denied implicitly (`unsafe_op_in_unsafe_fn = "deny"` workspace-wide).
@@ -81,10 +83,10 @@ Pick the tier that matches the task's complexity, not the biggest model availabl
 |------|-------|
 | Trivial — search, read, copy, simple lookups | Haiku 4.5 |
 | Implementation — basic to medium complexity (DEFAULT) | Sonnet 5 |
-| In-depth planning, architecture, highly complex implementation | Fable 5 — fall back to Opus 5 if Fable 5 isn't available |
+| In-depth planning, architecture, highly complex implementation | Opus 5 |
 | Review — every completed task, before it's marked done | Opus 5 (mandatory, not an escalation) |
 
-**Escalate** Sonnet 5 → Fable 5 (→ Opus 5 if Fable 5 is unavailable) when: the task is architectural, security-critical, the approach is genuinely unclear, or a wrong call here is expensive to undo. Given this project's flagship subsystem (Phase 6 concurrency engine) is exactly that kind of work by design, escalate liberally when touching `crates/txn/`.
+**Escalate** Sonnet 5 → Opus 5 when: the task is architectural, security-critical, the approach is genuinely unclear, or a wrong call here is expensive to undo. Given this project's flagship subsystem (Phase 6 concurrency engine) is exactly that kind of work by design, escalate liberally when touching `crates/txn/`.
 
 **Downgrade** back to Sonnet 5 once the approach is settled and the remaining work is mechanical.
 
@@ -135,7 +137,7 @@ Invoke the skill BEFORE acting. A ≥1% chance it applies means you MUST invoke 
 - Don't add dependencies without justifying them in the commit message
 - Don't weaken the "no silent write-buffering" invariant to chase throughput — it's a non-negotiable design principle, not a tunable
 - Don't add serializability, multi-node/distributed transactions, IVF-PQ, a SQL parser, or temporal/graph memory features — see the Non-Goals table in `.claude/docs/architecture.md` before reopening any of these
-- Don't let index mutations happen outside the transaction layer's delta log, even for "just a quick fix"
+- Don't let an index update happen outside the transaction layer's commit path — no writing a `.seg` file, and no publishing a `SegmentEntry`, from anywhere but `Transaction::commit`'s write phase, even for "just a quick fix"
 - Don't reach for `unsafe` to work around the borrow checker instead of restructuring — if `unsafe` is genuinely needed, it needs a `// SAFETY:` comment and extra review scrutiny, not a shortcut
 
 ## External references
