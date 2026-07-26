@@ -7,8 +7,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use arrow::array::{Array, RecordBatch, UInt64Array};
-use arrow::compute::concat_batches;
+use arrow::array::{Array, BooleanArray, RecordBatch, UInt64Array};
+use arrow::compute::{concat_batches, filter_record_batch};
 use arrow::datatypes::SchemaRef;
 use strata_query::{Predicate, filter, mask, should_scan_file};
 use strata_storage::{DataFileEntry, Manifest, read_batch, read_batch_columns};
@@ -136,13 +136,23 @@ impl Snapshot {
     /// Iterates `self.manifest.data_files`, keeping only entries
     /// `should_scan_file` says could match `predicate` (or every entry, if
     /// `predicate` is `None`), reads and joins each surviving file's path
-    /// via [`safe_join`], and applies `process` to each raw batch. Shared
-    /// by [`Snapshot::scan`], [`Snapshot::scan_with_predicate`], and
-    /// [`Snapshot::row_ids_matching`].
+    /// via [`safe_join`], removes any row this snapshot's tombstone set
+    /// covers (see [`Self::filter_tombstoned_rows`]), and applies `process`
+    /// to each resulting raw batch. Shared by [`Snapshot::scan`],
+    /// [`Snapshot::scan_with_predicate`], and [`Snapshot::row_ids_matching`]
+    /// — one enforcement point for tombstone visibility, rather than three
+    /// call sites each independently responsible for remembering it. Per
+    /// `.claude/docs/design/phase-0-transaction-and-format-spec.md` §8's
+    /// "Tombstone GC" paragraph: `scan` must treat a tombstoned row-id as
+    /// dead regardless of whether its bytes are still on disk.
+    ///
     /// `columns`, when `Some`, restricts the Arrow IPC read to those columns
     /// so the rest are never decoded. Callers that need whole rows pass
     /// `None`; callers that only need a couple of scalar columns out of a
-    /// table carrying wide embeddings should not.
+    /// table carrying wide embeddings should not. **Precondition:** when
+    /// `Some`, the slice must include [`ROW_ID_COLUMN`] — tombstone
+    /// filtering needs it, and [`Self::filter_tombstoned_rows`] returns a
+    /// typed error (not a panic, not a silent skip) if it's missing.
     fn read_surviving_files<T>(
         &self,
         predicate: Option<&Predicate>,
@@ -160,9 +170,44 @@ impl Snapshot {
                     Some(cols) => read_batch_columns(&path, cols)?,
                     None => read_batch(&path)?,
                 };
+                let batch = self.filter_tombstoned_rows(batch)?;
                 process(batch)
             })
             .collect()
+    }
+
+    /// Removes every row whose `ROW_ID_COLUMN` value is in
+    /// `self.tombstones` from `batch`. A no-op that returns `batch`
+    /// unchanged (no allocation, no column scan) when this snapshot has no
+    /// tombstones at all — the common case for a dataset that has never
+    /// deleted or updated a row.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `batch` has no `ROW_ID_COLUMN`, or if that
+    /// column isn't `UInt64` — both indicate a caller violated
+    /// [`Self::read_surviving_files`]'s `columns` precondition, not a data
+    /// problem.
+    fn filter_tombstoned_rows(&self, batch: RecordBatch) -> Result<RecordBatch> {
+        if self.tombstones.is_empty() {
+            return Ok(batch);
+        }
+        let row_id_idx = batch.schema_ref().index_of(ROW_ID_COLUMN)?;
+        let row_ids = batch
+            .column(row_id_idx)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| {
+                TxnError::Arrow(arrow::error::ArrowError::CastError(format!(
+                    "{ROW_ID_COLUMN} column must be UInt64"
+                )))
+            })?;
+        let keep: BooleanArray = row_ids
+            .values()
+            .iter()
+            .map(|&id| !self.tombstones.contains(&id))
+            .collect();
+        Ok(filter_record_batch(&batch, &keep)?)
     }
 
     /// Reads every row committed as of this snapshot's version, as a
@@ -973,6 +1018,187 @@ mod tests {
         drop(dataset);
         let reopened = Dataset::open(&dir).unwrap();
         assert_spy_sees_both_zone_maps(&reopened.snapshot());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn scan_never_returns_a_tombstoned_row() {
+        use crate::dataset::Dataset;
+        use crate::mvp_fixtures::{mvp_batch, mvp_schema};
+
+        let dir =
+            std::env::temp_dir().join(format!("strata-scan-tombstone-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dataset = Dataset::create(&dir).unwrap();
+
+        // Row-ids 0, 1, 2 in commit order.
+        let mut txn = dataset.begin();
+        txn.insert(
+            mvp_batch(&[
+                (0, "a", [0.0, 0.0, 0.0]),
+                (1, "b", [1.0, 0.0, 0.0]),
+                (2, "c", [2.0, 0.0, 0.0]),
+            ])
+            .unwrap(),
+        );
+        txn.commit().unwrap();
+
+        let mut delete_txn = dataset.begin();
+        delete_txn.delete(1);
+        delete_txn.commit().unwrap();
+
+        let batch = dataset.snapshot().scan(&mvp_schema()).unwrap();
+        assert_eq!(
+            batch.num_rows(),
+            2,
+            "the tombstoned row must not appear in scan()'s row count"
+        );
+        let names = batch
+            .column(batch.schema_ref().index_of("name").unwrap())
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert!(
+            !(0..names.len()).any(|i| names.value(i) == "b"),
+            "row-id 1 (name \"b\") was tombstoned and must not appear: {names:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_old_snapshot_still_sees_a_row_a_later_delete_tombstones_via_scan() {
+        use crate::dataset::Dataset;
+        use crate::mvp_fixtures::{mvp_batch, mvp_schema};
+
+        let dir = std::env::temp_dir().join(format!(
+            "strata-scan-tombstone-isolation-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dataset = Dataset::create(&dir).unwrap();
+
+        let mut txn = dataset.begin();
+        txn.insert(
+            mvp_batch(&[
+                (0, "a", [0.0, 0.0, 0.0]),
+                (1, "b", [1.0, 0.0, 0.0]),
+                (2, "c", [2.0, 0.0, 0.0]),
+            ])
+            .unwrap(),
+        );
+        txn.commit().unwrap();
+
+        // Take a snapshot BEFORE the delete.
+        let old_snapshot = dataset.snapshot();
+
+        let mut delete_txn = dataset.begin();
+        delete_txn.delete(1);
+        delete_txn.commit().unwrap();
+
+        let old_count = old_snapshot.scan(&mvp_schema()).unwrap().num_rows();
+        assert_eq!(
+            old_count, 3,
+            "a Snapshot taken before a later delete must still see the deleted row via scan() \
+             — tombstones are scoped to the snapshot that observes them, never applied \
+             retroactively to a snapshot taken earlier"
+        );
+
+        let new_count = dataset.snapshot().scan(&mvp_schema()).unwrap().num_rows();
+        assert_eq!(
+            new_count, 2,
+            "a freshly-taken snapshot must reflect the delete"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn scan_with_predicate_never_returns_a_tombstoned_row() {
+        use crate::dataset::Dataset;
+        use crate::mvp_fixtures::{mvp_batch, mvp_schema};
+        use strata_query::Predicate;
+        use strata_storage::Value;
+
+        let dir = std::env::temp_dir().join(format!(
+            "strata-scan-with-predicate-tombstone-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dataset = Dataset::create(&dir).unwrap();
+
+        let mut txn = dataset.begin();
+        txn.insert(mvp_batch(&[(0, "a", [0.0, 0.0, 0.0]), (1, "b", [1.0, 0.0, 0.0])]).unwrap());
+        txn.commit().unwrap();
+
+        let mut delete_txn = dataset.begin();
+        delete_txn.delete(1); // deletes the row named "b"
+        delete_txn.commit().unwrap();
+
+        let predicate = Predicate::Eq("name".to_string(), Value::Utf8("b".to_string()));
+        let batch = dataset
+            .snapshot()
+            .scan_with_predicate(&mvp_schema(), &predicate)
+            .unwrap();
+        assert_eq!(
+            batch.num_rows(),
+            0,
+            "the row matching this predicate was tombstoned and must not be returned: {batch:?}"
+        );
+
+        // Sanity/positive control: a predicate matching the SURVIVING row
+        // still works normally, so the zero-rows result above is "excluded
+        // by the tombstone", not "scan_with_predicate returns nothing now".
+        let surviving_predicate = Predicate::Eq("name".to_string(), Value::Utf8("a".to_string()));
+        let surviving_batch = dataset
+            .snapshot()
+            .scan_with_predicate(&mvp_schema(), &surviving_predicate)
+            .unwrap();
+        assert_eq!(surviving_batch.num_rows(), 1, "{surviving_batch:?}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_update_makes_only_the_new_row_visible_via_scan_not_both() {
+        // Regression test for the concrete consequence of the bug this task
+        // fixes: `Transaction::update` is `delete(row_id)` + `insert(batch)`
+        // committed atomically. Before this fix, `scan()` ignored tombstones
+        // entirely, so an update's OLD row stayed visible forever alongside
+        // its replacement — a silent duplicate-row bug, not just a
+        // stale-delete one.
+        use crate::dataset::Dataset;
+        use crate::mvp_fixtures::{mvp_batch, mvp_row, mvp_schema};
+
+        let dir = std::env::temp_dir().join(format!(
+            "strata-update-no-duplicate-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dataset = Dataset::create(&dir).unwrap();
+
+        let mut txn = dataset.begin();
+        txn.insert(mvp_batch(&[(0, "original", [0.0, 0.0, 0.0])]).unwrap());
+        txn.commit().unwrap();
+
+        let mut update_txn = dataset.begin();
+        update_txn.update(0, mvp_row(0, "replacement", [1.0, 0.0, 0.0]).unwrap());
+        update_txn.commit().unwrap();
+
+        let batch = dataset.snapshot().scan(&mvp_schema()).unwrap();
+        assert_eq!(
+            batch.num_rows(),
+            1,
+            "an update must leave exactly one row visible, not both the pre- and \
+             post-update version: {batch:?}"
+        );
+        let names = batch
+            .column(batch.schema_ref().index_of("name").unwrap())
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(names.value(0), "replacement", "{batch:?}");
 
         std::fs::remove_dir_all(&dir).ok();
     }

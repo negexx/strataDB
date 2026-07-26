@@ -144,23 +144,24 @@ fn an_old_snapshots_scan_never_gains_a_later_commits_rows() {
     let old_count = old_snapshot.scan(&mvp_schema()).unwrap().num_rows();
     assert_eq!(old_count, 3, "expected all 3 seeded rows visible");
 
-    // `Transaction::delete` is now a real public API, unlike when this test
-    // was first written — but `Snapshot::scan`/`scan_with_predicate` do not
-    // currently consult `Snapshot::tombstones` at all (only
-    // `Snapshot::vector_search`'s HNSW traversal does, via `is_visible`;
-    // see `crates/txn/src/snapshot.rs`). That is a real gap against
+    // This comment used to record a real gap: `Snapshot::scan`/
+    // `scan_with_predicate` did not consult `Snapshot::tombstones` at all
+    // (only `Snapshot::vector_search`'s HNSW traversal did, via
+    // `is_visible`), which violated
     // `.claude/docs/design/phase-0-transaction-and-format-spec.md` §8's
-    // "Tombstone GC" paragraph, which requires "`scan`, `search`, and
-    // (later) conflict detection must all treat a tombstoned row-id as
-    // dead" — confirmed empirically while writing this test (deleting a row
-    // and observing a fresh snapshot's `scan()` still returns it), and
-    // tracked as its own follow-up task ("Fix Snapshot::scan() ignoring
-    // tombstones entirely") rather than fixed as a drive-by change in an
-    // unrelated test-accuracy PR. Until that's resolved, this test can only
-    // exercise the STRUCTURAL guarantee: re-scanning the SAME old_snapshot
-    // after MORE inserts land still shows exactly the old snapshot's own
-    // row count, proving old_snapshot's manifest/view is frozen and can
-    // never grow after the fact.
+    // "Tombstone GC" paragraph — "`scan`, `search`, and (later) conflict
+    // detection must all treat a tombstoned row-id as dead". That gap is
+    // now CLOSED: tombstone filtering lives in `read_surviving_files`, the
+    // single helper all three read paths funnel through. Its coverage lives
+    // in `crates/txn/src/snapshot.rs`'s own tests —
+    // `scan_never_returns_a_tombstoned_row` and
+    // `an_old_snapshot_still_sees_a_row_a_later_delete_tombstones_via_scan`
+    // — alongside this file's existing `vector_search` sibling test, so
+    // this test deliberately does NOT duplicate a delete-based check.
+    // What it exercises, and still should, is the STRUCTURAL guarantee:
+    // re-scanning the SAME old_snapshot after MORE inserts land still shows
+    // exactly the old snapshot's own row count, proving old_snapshot's
+    // manifest/view is frozen and can never grow after the fact.
     let mut txn2 = dataset.begin();
     txn2.insert(mvp_batch(&[(3, "d", [3.0, 0.0, 0.0]), (4, "e", [4.0, 0.0, 0.0])]).unwrap());
     txn2.commit().unwrap();
