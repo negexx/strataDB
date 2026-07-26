@@ -8,14 +8,39 @@ use loom::sync::atomic::{AtomicU64, Ordering};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::node_layout::{
-    NodeHeader, alloc_node, layer_byte_offset, layer_slot_count, vector_byte_offset,
+    NodeHeader, alloc_node, dealloc_node, layer_byte_offset, layer_slot_count, vector_byte_offset,
 };
+use crate::node_table::Reclaim;
 use crate::slot_array::SlotArray;
 
 /// A thin, `Copy` handle to a single raw-allocated node block. Never
-/// freed or moved once constructed -- see `alloc_node`'s doc comment.
+/// freed or moved while the `NodeTable` slot holding it is alive; freed
+/// exactly once, via [`Reclaim::reclaim`] (called by `NodeTable`'s
+/// `Drop`), when that slot's table is dropped.
+///
+/// Being `Copy` and owning out-of-band memory is a real tension:
+/// `NodeTable::insert` is a safe function, so nothing in the type system
+/// stops a caller from inserting the *same* `Node` value at two different
+/// row-ids -- `NodeTable`'s `Drop` would then call `reclaim` on it twice,
+/// a double-free. This holds today only because every construction site
+/// (`Graph::insert`) builds one fresh `Node` per call and stores it
+/// exactly once -- see `NodeTable::insert`'s doc comment for the full
+/// invariant. Don't add a second call site that reuses an existing `Node`
+/// value across more than one `insert` without revisiting this.
 #[derive(Clone, Copy)]
 pub(crate) struct Node(std::ptr::NonNull<u8>);
+
+impl Reclaim for Node {
+    unsafe fn reclaim(self) {
+        // SAFETY: `self.0` was produced by `alloc_node` (`Node::new`'s only
+        // constructor), and `NodeTable`'s `Drop` -- the only caller of
+        // `reclaim` -- guarantees this runs at most once, with exclusive
+        // access and no other reference to this node outstanding.
+        unsafe {
+            dealloc_node(self.0.as_ptr());
+        }
+    }
+}
 
 // SAFETY: every field this type's methods read is either immutable after
 // construction (header's row_id/dim/level/mmax0/mmax, the vector bytes) or
@@ -214,6 +239,11 @@ mod tests {
             17,
             "layer 2 uses mmax + 1 headroom slot"
         );
+        // SAFETY: `node` was constructed by this test alone, is never
+        // stored in a `NodeTable`, and nothing else references it.
+        unsafe {
+            node.reclaim();
+        }
     }
 
     #[test]
@@ -221,12 +251,20 @@ mod tests {
         let node = Node::new(0, vec![1.0], 0, 32, 16);
         assert_eq!(node.level(), 0);
         assert_eq!(node.layer(0).capacity(), 33, "mmax0 + 1 headroom slot");
+        // SAFETY: same as above -- test-local, never stored, never aliased.
+        unsafe {
+            node.reclaim();
+        }
     }
 
     #[test]
     fn new_node_is_not_deleted() {
         let node = Node::new(0, vec![1.0], 0, 32, 16);
         assert!(!node.is_deleted());
+        // SAFETY: same as above -- test-local, never stored, never aliased.
+        unsafe {
+            node.reclaim();
+        }
     }
 
     #[test]
@@ -234,6 +272,10 @@ mod tests {
         let node = Node::new(0, vec![1.0], 0, 32, 16);
         node.mark_deleted();
         assert!(node.is_deleted());
+        // SAFETY: same as above -- test-local, never stored, never aliased.
+        unsafe {
+            node.reclaim();
+        }
     }
 
     #[test]
@@ -241,6 +283,10 @@ mod tests {
         let node = Node::new(7, vec![1.0, 2.0, 3.0], 0, 32, 16);
         assert_eq!(node.row_id(), 7);
         assert_eq!(node.vector(), &[1.0, 2.0, 3.0]);
+        // SAFETY: same as above -- test-local, never stored, never aliased.
+        unsafe {
+            node.reclaim();
+        }
     }
 
     #[test]

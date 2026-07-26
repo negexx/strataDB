@@ -139,9 +139,10 @@ pub(crate) fn layer_byte_offset(
 
 /// Allocates and fully initializes a single raw block for a node: header,
 /// vector, and every layer's slots preset to `EMPTY`. The returned
-/// pointer is never freed or moved for the caller's process lifetime,
-/// matching this crate's existing node/chunk-storage invariant -- there
-/// is deliberately no matching `dealloc`/`Drop` anywhere in this crate.
+/// pointer is never freed or moved while any `NodeTable`/`Graph`
+/// referencing it is alive; it is freed exactly once, via
+/// [`dealloc_node`], when the `NodeTable` slot holding it is dropped (see
+/// `node_table::Reclaim` and `NodeTable`'s `Drop` impl).
 ///
 /// # Safety
 /// The caller must ensure the returned pointer is eventually published
@@ -232,6 +233,39 @@ pub(crate) unsafe fn alloc_node(
     ptr
 }
 
+/// Frees a raw node block previously returned by [`alloc_node`].
+/// Recomputes the exact [`Layout`] `alloc_node` used from the header's own
+/// stored `dim`/`level`/`mmax0`/`mmax` fields -- `std::alloc::dealloc`
+/// requires the layout passed here to match the allocation exactly, so
+/// this reads those fields (a read, not a write, so it doesn't race with
+/// anything) before deallocating.
+///
+/// # Safety
+/// `ptr` must have been returned by `alloc_node`, must not already have
+/// been freed, and the caller must have exclusive access to it (no other
+/// reference may read or write through it during or after this call).
+#[allow(clippy::cast_ptr_alignment)]
+pub(crate) unsafe fn dealloc_node(ptr: *mut u8) {
+    // SAFETY: `ptr` was returned by `alloc_node`, which always writes a
+    // fully-initialized `NodeHeader` at offset 0 before returning, and the
+    // caller guarantees `ptr` is still valid and not aliased -- reading the
+    // header back here is sound.
+    let header = unsafe { &*ptr.cast::<NodeHeader>() };
+    let (layout, _) = compute_node_layout(
+        header.dim as usize,
+        header.level as usize,
+        header.mmax0 as usize,
+        header.mmax as usize,
+    );
+    // SAFETY: `layout` is recomputed from the exact same parameters
+    // `alloc_node` used to build this block (the same function, the same
+    // arithmetic), and the caller guarantees `ptr` was returned by
+    // `alloc_node` and is not freed or aliased elsewhere.
+    unsafe {
+        std::alloc::dealloc(ptr, layout);
+    }
+}
+
 #[cfg(all(test, not(loom)))]
 // `cast_ptr_alignment`: the test reads back through the same
 // provably-aligned offsets `compute_node_layout` produced (see the allow
@@ -239,6 +273,7 @@ pub(crate) unsafe fn alloc_node(
 #[allow(clippy::cast_ptr_alignment)]
 mod tests {
     use super::*;
+    use crate::node_table::Reclaim;
 
     #[test]
     fn compute_node_layout_places_header_then_vector_then_layers_in_order() {
@@ -294,6 +329,11 @@ mod tests {
                      for (dim={dim}, level={level}, mmax0={mmax0}, mmax={mmax}, lc={lc})"
                 );
             }
+            // SAFETY: `node` was constructed by this iteration alone, is
+            // never stored in a `NodeTable`, and nothing else references it.
+            unsafe {
+                node.reclaim();
+            }
         }
     }
 
@@ -336,7 +376,36 @@ mod tests {
                 }
             }
         }
-        // Deliberately leaked -- matches this crate's existing "nodes are
-        // never freed" invariant; see the module doc comment on Drop.
+        // SAFETY: `ptr` was returned by `alloc_node` above, has not been
+        // freed, and nothing else holds a reference to it.
+        unsafe {
+            dealloc_node(ptr);
+        }
+    }
+
+    #[test]
+    fn dealloc_node_frees_a_block_with_multiple_layers_without_use_after_free() {
+        // Exercises a node with more than one layer (unlike the single-layer
+        // case above), and reads the header fields `dealloc_node` depends on
+        // *before* deallocating, then frees -- run under
+        // `cargo miri test` this proves both "no leak" (nothing under
+        // `alloc_node` escapes `dealloc_node`'s recomputed `Layout`) and "no
+        // use-after-free" (nothing reads `ptr` afterward).
+        let vector = vec![1.0f32; 512];
+        // SAFETY: test-only call, immediately read back and never shared
+        // across threads before the read.
+        let ptr = unsafe { alloc_node(0, &vector, 4, 32, 16) };
+        // SAFETY: `ptr` is freshly allocated and fully initialized by
+        // `alloc_node`.
+        unsafe {
+            let header = &*ptr.cast::<NodeHeader>();
+            assert_eq!(header.dim, 512);
+            assert_eq!(header.level, 4);
+        }
+        // SAFETY: `ptr` was returned by `alloc_node` above, has not been
+        // freed, and nothing else holds a reference to it.
+        unsafe {
+            dealloc_node(ptr);
+        }
     }
 }
