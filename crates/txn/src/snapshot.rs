@@ -1202,4 +1202,99 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn filter_tombstoned_rows_errors_typed_when_row_id_column_is_missing() {
+        // The `columns: Some(..)` precondition `read_surviving_files`
+        // documents -- the projection must include `ROW_ID_COLUMN` -- is
+        // unreachable through any real caller today, but the error path
+        // that guards it is still real code and deserves direct coverage:
+        // it must return a typed error, never panic.
+        let snapshot = test_snapshot(&[5]);
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow::array::Int64Array::from(vec![1]))],
+        )
+        .unwrap();
+
+        let result = snapshot.filter_tombstoned_rows(batch);
+        assert!(
+            result.is_err(),
+            "a batch with no {ROW_ID_COLUMN} column must return a typed error, never panic"
+        );
+    }
+
+    #[test]
+    fn filter_tombstoned_rows_errors_typed_when_row_id_column_is_the_wrong_type() {
+        let snapshot = test_snapshot(&[5]);
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new(ROW_ID_COLUMN, arrow::datatypes::DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow::array::Int64Array::from(vec![1]))],
+        )
+        .unwrap();
+
+        let result = snapshot.filter_tombstoned_rows(batch);
+        assert!(
+            result.is_err(),
+            "a non-UInt64 {ROW_ID_COLUMN} column must return a typed error, never panic"
+        );
+    }
+
+    #[test]
+    fn scan_handles_a_fully_tombstoned_file_alongside_a_live_one() {
+        // `filter_tombstoned_rows` can reduce a whole file's batch to zero
+        // rows -- confirms that flows cleanly through `concat_batches`
+        // alongside a live file's non-empty batch, rather than erroring or
+        // silently dropping the live file's rows too.
+        use crate::dataset::Dataset;
+        use crate::mvp_fixtures::{mvp_batch, mvp_schema};
+
+        let dir = std::env::temp_dir().join(format!(
+            "strata-scan-fully-tombstoned-file-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dataset = Dataset::create(&dir).unwrap();
+
+        // First commit -- its own data file, one row, row-id 0.
+        let mut txn = dataset.begin();
+        txn.insert(mvp_batch(&[(0, "a", [0.0, 0.0, 0.0])]).unwrap());
+        txn.commit().unwrap();
+
+        // Second commit -- a different data file, two rows, row-ids 1, 2.
+        let mut txn2 = dataset.begin();
+        txn2.insert(mvp_batch(&[(1, "b", [1.0, 0.0, 0.0]), (2, "c", [2.0, 0.0, 0.0])]).unwrap());
+        txn2.commit().unwrap();
+
+        // Delete the ONLY row in the first commit's file -- that file's
+        // batch filters down to zero rows; the second file's is untouched.
+        let mut delete_txn = dataset.begin();
+        delete_txn.delete(0);
+        delete_txn.commit().unwrap();
+
+        let batch = dataset.snapshot().scan(&mvp_schema()).unwrap();
+        assert_eq!(
+            batch.num_rows(),
+            2,
+            "a fully-tombstoned file must contribute zero rows without erroring, while a \
+             live file alongside it is unaffected: {batch:?}"
+        );
+        let names = batch
+            .column(batch.schema_ref().index_of("name").unwrap())
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert!(
+            (0..names.len()).all(|i| names.value(i) != "a"),
+            "the fully-tombstoned file's row must not appear: {names:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
