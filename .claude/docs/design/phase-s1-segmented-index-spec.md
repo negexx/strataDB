@@ -1,6 +1,6 @@
 # Phase S1 — Segmented Immutable Index Layout — Design Spec
 
-**Status:** Design draft. Implementation not started.
+**Status:** Implemented and closed — see the §9 status note (2026-07-26) for the exit-criteria record.
 **Decided by:** [ADR 0008](../decisions/0008-adopt-segmented-index-layout.md) (Accepted) — branching is
 mandatory, only possible on a segmented index. The recall-vs-segment de-risk already ran
 (`bench/benches/segment_recall_bench.rs`): recall is segment-count-safe, cost is latency.
@@ -258,6 +258,37 @@ migration, not just at the end.
   --check` clean; loom green (scoped); **and the chaos harness thorough tier (`STRATA_CHAOS_THOROUGH=1`,
   2000 seeds) still passes** — the migration must not regress crash-recovery correctness.
 - Every task reviewed by the Opus reviewer before being marked done (mandatory, per CLAUDE.md).
+
+> **Status (2026-07-26): Phase S1 exit criteria met — closing.** All five workstreams (W1-W5, see §5)
+> are merged, plus the two follow-up correctness fixes the migration exposed:
+> `Snapshot::is_visible` collapsed to the tombstone check (the row-id in-flight registry the old
+> shared-graph design needed is now provably redundant — see `crates/txn/src/row_id.rs`'s module doc
+> and loom "Model 3"), and `Snapshot::scan`/`scan_with_predicate` now honor tombstones (a real,
+> independently-discovered gap against `.claude/docs/design/phase-0-transaction-and-format-spec.md`
+> §8, not part of the original S1 scope but found and fixed during it). The chaos harness thorough
+> tier ran clean: 2000/2000 seeds, zero invariant violations, ~6.4 minutes
+> (`STRATA_CHAOS_THOROUGH=1 cargo test -p strata-sim --test chaos
+> thorough_tier_satisfies_the_phase_7_exit_criterion --release`). The recovery-latency bullet above
+> (full-graph-rebuild → manifest-driven segment load) is structurally certain — `Dataset::open`'s
+> delta-log replay path no longer exists at all, replaced by an `O(bytes)` segment deserialize — but
+> no fresh benchmark run recorded a specific number against `lifecycle_bench` as part of closing this
+> phase; that re-measurement is optional polish, not a blocker, per the W4 design amendment's own
+> note that it's "not a blocker, since the new integration test doesn't depend on the bench or the ADR
+> table at all."
+>
+> **Read this caveat before treating S1 as fully proven under load, not just "the literal exit
+> criterion's text is satisfied":** the chaos harness's workload
+> (`crates/chaos-worker/src/main.rs`) is insert-only, single-row-per-commit, and constructed so every
+> commit succeeds cleanly — it never exercises a delete, an update, a genuine write-write conflict, a
+> predicate-filtered `scan_with_predicate`/`vector_search` (zone-map pruning), or a multi-batch
+> commit's zone-map merge, all under a crash. So this run proves S1's segment-commit and
+> manifest-recovery mechanism is crash-safe for the scenarios it actually drives — it does not yet
+> prove the *interaction* between S1's segments and Phase 6's conflict/delete machinery is crash-safe
+> under load. That gap, and several other post-S1 correctness-coverage and stale-documentation
+> findings the migration left behind, are this session's own audit findings — not yet written down in
+> a committed doc — and are the intended starting scope for the Phase 6/7 hardening pass
+> `architecture.md`'s "Where this slots" sequencing note calls for after S1; a follow-up plan doc
+> should capture them properly before that work starts.
 
 ## 10. Process
 
