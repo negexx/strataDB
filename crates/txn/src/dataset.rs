@@ -712,59 +712,6 @@ pub(crate) fn checkpoint_pair() -> (Checkpoint, CheckpointControl) {
     )
 }
 
-/// **Inert as of S1 W3.2a. Deleted in W3.2b.**
-///
-/// Until W3.2a, [`Transaction::commit`] applied each insert's vector to a
-/// shared `Arc<HnswIndex>` *before* `commit_manifest` made the commit
-/// durable, so any failure in between left that transaction's vectors in
-/// the shared graph with no manifest entry backing them — and a later
-/// commit's watermark would eventually make them visible to
-/// [`crate::Snapshot::vector_search`] as dangling hits: rows `scan` could
-/// never corroborate. This guard soft-deleted them on the way out (on an
-/// early `?` return *or* a panic).
-///
-/// **That hazard no longer exists, by construction rather than by
-/// compensation.** A commit's vectors now only ever exist in a fresh,
-/// per-commit `HnswIndex` that is dropped with the failed `write_phase`,
-/// plus an orphaned `.seg` file that no manifest references — exactly like
-/// an orphaned row data file, and exactly as invisible. There is no shared
-/// graph left to leave residue in.
-///
-/// The type survives this workstream's first step deliberately, per the
-/// base design doc §4's "migrate the guarantee, then remove the mechanism"
-/// sub-sequencing: the failed-commit tests land against a state where the
-/// old mechanism is still present and provably doing nothing, which proves
-/// the guarantee moved rather than trusting that it did. W3.2b (its own
-/// plan) then deletes the type, its two call sites, and this comment.
-struct GraphResidueGuard {
-    /// Whether this commit is still short of its durability point. Read by
-    /// `Drop` below; set false by [`Self::disarm`] once `commit_manifest`
-    /// has succeeded.
-    armed: bool,
-}
-
-impl GraphResidueGuard {
-    fn new() -> Self {
-        Self { armed: true }
-    }
-
-    /// Marks this commit as past its durability point.
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for GraphResidueGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            // Deliberately empty, not an omission — see this type's doc
-            // comment. A commit that never reached its durability point has
-            // nothing to compensate: its vectors were never published
-            // anywhere a reader can reach.
-        }
-    }
-}
-
 /// A commit's index segment, in the two forms `commit` needs: the manifest
 /// entry that makes it durable, and an already-validated reader over the
 /// same bytes that were just fsynced, so the new snapshot's `SegmentSet`
@@ -824,8 +771,8 @@ impl Transaction {
     /// and fsynced in `write_phase` and its conflict check has passed
     /// in-lock. Models a recoverable I/O failure (e.g. ENOSPC writing the
     /// manifest) — the one failure shape that leaves the process alive and
-    /// therefore exposes the dangling-search-hit hazard [`GraphResidueGuard`]
-    /// used to compensate for. The `chaos-injection` harness cannot stand in
+    /// therefore exposes the dangling-search-hit hazard the old graph-residue
+    /// guard used to compensate for. The `chaos-injection` harness cannot stand in
     /// for this: its `chaos_checkpoint` calls `std::process::abort()`, and
     /// the restart that forces *heals* the hazard, since a restart's
     /// `Dataset::open` loads only manifest-listed segments.
@@ -956,9 +903,9 @@ impl Transaction {
     /// invisible to both [`crate::Snapshot::scan`] (which reads only
     /// manifest-listed data files) and [`crate::Snapshot::vector_search`]
     /// (which searches only manifest-listed segments). There is no shared
-    /// mutable graph for a failed commit to leave residue in — see
-    /// [`GraphResidueGuard`], which is inert as of W3.2a for exactly this
-    /// reason.
+    /// mutable graph for a failed commit to leave residue in — the old
+    /// graph-residue guard that used to compensate for that hazard was
+    /// removed in S1 W3.2b once this structural guarantee took over.
     ///
     /// Two in-memory traces do outlive a failed commit, neither reachable
     /// as data: the row-ids it claimed (never recycled — a row-id gap is
@@ -1041,11 +988,6 @@ impl Transaction {
         // `manifest.segments.push` below, which is part of the same atomic
         // manifest swap that publishes the row data. That is the entire
         // point of the S1 W3.2 migration.
-        //
-        // Declared here, in the position the old graph-compensation guard
-        // occupied, so W3.2b's deletion diff is a straight removal — see
-        // [`GraphResidueGuard`], which is now inert.
-        let mut residue_guard = GraphResidueGuard::new();
 
         // The new manifest is likewise built from the latest snapshot's
         // manifest: this transaction's new data files are *appended* to
@@ -1189,12 +1131,11 @@ impl Transaction {
 
         commit_manifest(&self.dir, &manifest)?;
 
-        // Past the durability point: this commit is now genuinely committed
-        // and must survive the guard's drop. Disarmed here rather than
-        // after the snapshot swap because *this* is the instant the commit
-        // becomes durable — nothing after it may undo it, even if a later
-        // step were to fail.
-        residue_guard.disarm();
+        // This is the durability point: `commit_manifest` has returned
+        // successfully, so this commit's rows and segment are now on disk
+        // and reachable by a future `Dataset::open`. Nothing from here on
+        // may run in a way that could undo the commit — nor does anything
+        // need to, since there is nothing left to compensate for.
 
         // Same instant, same reason: these row-ids are committed, so they
         // must stop being excluded from *later* commits' snapshots. Doing
@@ -5385,13 +5326,13 @@ mod tests {
         // manifest-membership cross-check on the search path,
         // `vector_search` would then return the residue as a dangling hit —
         // a row `scan` can never see — violating the flagship "no silently
-        // stale vector search results" claim. `GraphResidueGuard` used to
+        // stale vector search results" claim. A guard type used to
         // soft-delete a failed commit's graph inserts on the error path to
-        // close this.
+        // close this; S1 W3.2b removed it once the guarantee below took
+        // over.
         //
-        // Since W3.2a this holds *structurally*, not via that compensation
-        // (inert as of this task — see its own doc comment): this
-        // transaction's vector never touches anything shared until publish
+        // Since W3.2a this holds *structurally*, not via that compensation:
+        // this transaction's vector never touches anything shared until publish
         // — it lives only in this commit's own segment file, built and
         // fsynced in `write_phase`, which the injected failure below
         // discards before it ever reaches a manifest. This test remains the
@@ -5526,10 +5467,10 @@ mod tests {
         //
         // Unlike `a_failed_commits_vector_is_never_searchable_...` above,
         // this is the *success* path: the slow transaction goes on to
-        // commit cleanly. `GraphResidueGuard` deliberately does not close
-        // this (see its doc comment) — it closes the permanent-residue
-        // case, and is inert here regardless, since W3.2a removed the
-        // shared graph it used to compensate for.
+        // commit cleanly. The old graph-residue guard never closed this gap
+        // anyway — it only ever handled the permanent-residue case — and is
+        // gone now regardless, since W3.2a removed the shared graph it used
+        // to compensate for.
         //
         // The window is one fsync wide, so the schedule is made
         // deterministic with `Checkpoint`s rather than raced with sleeps: a
@@ -5891,10 +5832,10 @@ mod tests {
     {
         // Flavor 3: a panic, not an early `?` return. This is the shape
         // that would expose a compensating action wired only into the error
-        // path -- and, historically, the shape `GraphResidueGuard`'s `Drop`
-        // existed to survive. After W3.2a nothing needs to survive it,
-        // because nothing shared was ever touched; this test is what proves
-        // that rather than assuming it.
+        // path -- and, historically, the shape the old graph-residue
+        // guard's `Drop` existed to survive. After W3.2a nothing needs to
+        // survive it, because nothing shared was ever touched; this test is
+        // what proves that rather than assuming it.
         let dir = temp_dir("failed-commit-panic-orphan");
         let ds = Dataset::create(&dir).unwrap();
 
@@ -6541,9 +6482,9 @@ mod loom_tests {
         // reachable by a search, and the manifest's segment list holds
         // exactly the seed's segment — no orphaned or duplicate entry from
         // either racing committer, under any interleaving. Since S1 W3.2a
-        // this holds *structurally*, not via `GraphResidueGuard` (inert as
-        // of this task — see its own doc comment): a commit's segment is
-        // built and fsynced entirely in `write_phase`, outside
+        // this holds *structurally*, not via the old graph-residue guard
+        // (removed in W3.2b once this guarantee took over): a commit's
+        // segment is built and fsynced entirely in `write_phase`, outside
         // `commit_lock`, and is only ever appended to a `SegmentSet` by the
         // in-lock `manifest.segments.push`/`with_appended` pair that runs
         // strictly after `commit_manifest` succeeds. A commit that fails
