@@ -1,10 +1,11 @@
 //! The Phase 5 exit criterion: "Concurrent-reader suite passes against a
-//! single writer." One writer thread commits a sequence of transactions
-//! (inserts, then a tombstoning commit) while several reader threads each
-//! hold a `Snapshot` and repeatedly read from it — proving readers never
-//! observe a row committed after their snapshot was taken, and never lose
-//! a row tombstoned after their snapshot was taken (the actual isolation
-//! guarantee, not just "no crash").
+//! single writer." One writer thread commits a sequence of insert-only
+//! transactions while several reader threads each hold a `Snapshot` and
+//! repeatedly read from it — proving readers never observe a row committed
+//! after their snapshot was taken. The tombstone half of the isolation
+//! guarantee (a reader never loses a row tombstoned after their snapshot
+//! was taken) is covered by the single-threaded tests below instead, since
+//! it needs a specific before/after ordering rather than a race.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -141,12 +142,21 @@ fn an_old_snapshot_still_sees_a_row_tombstoned_by_a_later_commit() {
         "expected all 3 seeded rows visible before any tombstone"
     );
 
-    // A later commit that would tombstone row 0 doesn't exist as a public
-    // API yet (Phase 5 doesn't add UPDATE/DELETE) — this test instead
-    // confirms the STRUCTURAL guarantee: re-scanning the SAME old_snapshot
-    // after MORE inserts land still shows exactly the old snapshot's own
-    // row count, proving old_snapshot's manifest/view is frozen and can
-    // never shrink OR grow after the fact.
+    // `Transaction::delete` is now a real public API, unlike when this test
+    // was first written — but `Snapshot::scan`/`scan_with_predicate` do not
+    // currently consult `Snapshot::tombstones` at all (only
+    // `Snapshot::vector_search`'s HNSW traversal does, via `is_visible`;
+    // see `crates/txn/src/snapshot.rs`). That is a real gap against
+    // `.claude/docs/design/phase-0-transaction-and-format-spec.md` §8's
+    // "DELETE semantics" section, which requires "`scan`, `search`, and
+    // (later) conflict detection must all treat a tombstoned row-id as
+    // dead" — confirmed by deleting a row here and observing `scan()`
+    // still returns it, tracked separately rather than fixed as a drive-by
+    // change in an unrelated test-accuracy PR. Until that's resolved, this
+    // test can only exercise the STRUCTURAL guarantee: re-scanning the SAME
+    // old_snapshot after MORE inserts land still shows exactly the old
+    // snapshot's own row count, proving old_snapshot's manifest/view is
+    // frozen and can never grow after the fact.
     let mut txn2 = dataset.begin();
     txn2.insert(mvp_batch(&[(3, "d", [3.0, 0.0, 0.0]), (4, "e", [4.0, 0.0, 0.0])]).unwrap());
     txn2.commit().unwrap();
@@ -172,14 +182,15 @@ fn an_old_snapshot_still_sees_a_row_tombstoned_by_a_later_commit() {
 /// around `center`. Mirrors `crates/txn/src/dataset.rs`'s own
 /// `cluster_vectors` test helper (itself mirroring
 /// `crates/index/src/hnsw.rs`'s `insert_cluster`, see commit `733579f`):
-/// `hnsw_rs`'s `StdRng::from_os_rng()` layer-assignment RNG has no exposed
-/// seed, so tiny (2-3 point) fixtures occasionally produce a graph shape
-/// where greedy search misses the true nearest neighbor. Many points spread
-/// across well-separated clusters makes "which cluster is nearest"
-/// unambiguous regardless of layer-assignment luck. Offsets come from an
-/// irrational-multiplier equidistribution sequence rather than a line/grid,
-/// since collinear near-duplicate points let `hnsw_rs`'s neighbor-
-/// diversification heuristic prune almost all direct links between them.
+/// `crates/index`'s layer assignment (a deterministic, counter-derived hash
+/// draw — see `crates/index/src/hnsw.rs` — not a seeded RNG) can still land
+/// tiny (2-3 point) fixtures on a graph shape where greedy search misses the
+/// true nearest neighbor. Many points spread across well-separated clusters
+/// makes "which cluster is nearest" unambiguous regardless of layer-
+/// assignment luck. Offsets come from an irrational-multiplier
+/// equidistribution sequence rather than a line/grid, since collinear
+/// near-duplicate points let the neighbor-diversification heuristic prune
+/// almost all direct links between them.
 #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 fn cluster_vectors(count: usize, center: [f32; 3], spacing: f32) -> Vec<[f32; 3]> {
     const PHI: f64 = 0.618_033_988_749_895; // fractional part of the golden ratio
@@ -242,8 +253,8 @@ fn an_old_snapshots_vector_search_never_leaks_a_later_commits_rows() {
     // `k` equal to a cluster's full point count is NOT safe even with a
     // well-separated cluster — `ef_search=32` occasionally fails to
     // discover literally every point in a same-sized cluster (a genuine
-    // recall gap of hnsw_rs's unseeded-RNG greedy search, not an isolation
-    // bug; see 9/10 and 10/10-with-one-foreign-point failures observed
+    // recall gap of approximate greedy search over a small graph, not an
+    // isolation bug; see 9/10 and 10/10-with-one-foreign-point failures observed
     // during manual repeated-run validation of an earlier k=cluster_size
     // version of this test). The fix, matching this codebase's own proven
     // pattern in `vector_search_with_predicate_only_returns_matching_rows`
@@ -415,10 +426,12 @@ fn an_old_snapshots_vector_search_still_sees_a_row_a_later_commit_tombstones() {
     delete_txn.commit().unwrap();
 
     // Query at row 0's OWN exact coordinates with k=1, rather than a larger k against the whole
-    // (here, tiny) point set: `hnsw_rs`'s unseeded layer-assignment RNG can occasionally miss the
-    // true nearest neighbor in small fixtures (see `cluster_vectors`'s own doc comment above), but
-    // a k=1 exact-coordinate self-match (trivially nearest to itself, distance ~0) sidesteps that
-    // recall gap entirely — the same technique `crates/txn/src/dataset.rs`'s loom "Model 3" uses
+    // (here, tiny) point set. This isn't hedging against approximate-search recall — at 3 nodes
+    // with `HNSW_MAX_NB_CONNECTION=16` (`crates/txn/src/dataset.rs`), layer 0 is a complete graph,
+    // so an exact-coordinate query cannot miss its own point. It's simpler than picking a `k` and
+    // reasoning about which other rows would also qualify: a k=1 exact-coordinate self-match
+    // (trivially nearest to itself, distance ~0) is an unambiguous yes/no on "is this exact row
+    // still visible" — the same technique `crates/txn/src/dataset.rs`'s loom "Model 3" uses
     // (`found_own_point`).
     //
     // old_snapshot's own tombstone set was fixed before this delete committed, so it must still
