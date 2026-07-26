@@ -53,6 +53,7 @@ pub struct DataFileEntry {
 /// absent/empty `zone_map` must always mean "must scan," never "may prune"
 /// (binding invariant, see the design doc §3).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SegmentEntry {
     /// Relative to the dataset's `data/` directory, e.g. `"{attempt_id:020}.seg"`.
     pub name: String,
@@ -67,8 +68,13 @@ pub struct SegmentEntry {
     /// Inclusive.
     pub row_id_max: u64,
     pub byte_len: u64,
-    /// Empty until S1 W4 populates it. An absent or empty map must always
-    /// fail safe to "must scan" in whatever pruning evaluator W4 writes.
+    /// Computed and populated at commit time since S1 W4a — each commit's
+    /// per-batch `ColumnStats` merged into one map covering every batch in
+    /// that commit (`strata_txn::dataset::merge_zone_map_stats`); see the S1
+    /// W4 design amendment §5 for the merge rule. Nothing prunes using it
+    /// yet (that's W4b, not yet shipped): an absent or empty map must still
+    /// always fail safe to "must scan" in whatever pruning evaluator W4b
+    /// writes.
     #[serde(default)]
     pub zone_map: HashMap<String, ColumnStats>,
 }

@@ -1278,7 +1278,7 @@ impl Transaction {
         })?;
         let claim = self.row_ids.claim(total_rows)?;
         let mut new_data_files = Vec::new();
-        let inserts = Self::write_pending_batches(
+        let (inserts, zone_map) = Self::write_pending_batches(
             &self.pending,
             data_dir,
             attempt_id,
@@ -1294,7 +1294,7 @@ impl Transaction {
         let established_dimension = self.current.load().index.established_dimension();
         validate_vector_dimensions(&inserts, established_dimension)?;
 
-        let segment = Self::build_and_write_segment(data_dir, attempt_id, inserts)?;
+        let segment = Self::build_and_write_segment(data_dir, attempt_id, inserts, zone_map)?;
 
         // Fsyncing each file's *content* (already done inside `write_batch`
         // and `write_bytes`) is not sufficient — the new directory entries
@@ -1324,6 +1324,13 @@ impl Transaction {
     /// positional dump that is ascending by construction, with no remap
     /// pass.
     ///
+    /// `zone_map` is this commit's already-merged per-column stats (see
+    /// [`merge_zone_map_stats`]), attached to the produced `SegmentEntry`
+    /// unchanged (S1 W4a — compute and store only; nothing reads it yet,
+    /// see the design amendment). If this commit carries no vectors, the
+    /// map is simply discarded along with everything else here — there is
+    /// no segment to attach it to.
+    ///
     /// # Errors
     ///
     /// [`TxnError::Index`] if the working index rejects an insert or the
@@ -1334,6 +1341,7 @@ impl Transaction {
         data_dir: &Path,
         attempt_id: u64,
         inserts: Vec<VectorInsert>,
+        zone_map: std::collections::HashMap<String, ColumnStats>,
     ) -> Result<Option<PublishedSegment>> {
         if inserts.is_empty() {
             return Ok(None);
@@ -1401,9 +1409,12 @@ impl Transaction {
             row_id_min,
             row_id_max,
             byte_len: u64::try_from(bytes.len())?,
-            // W3 ships this empty; W4 populates it. An absent or empty zone
-            // map must always mean "must scan", never "may prune".
-            zone_map: std::collections::HashMap::new(),
+            // Computed (merged across this commit's batches) since S1 W4a —
+            // see `merge_zone_map_stats` and the design amendment §5.
+            // Nothing consumes it for pruning yet (that's W4b); an absent or
+            // empty zone map must still always mean "must scan", never "may
+            // prune".
+            zone_map,
         };
         Ok(Some(PublishedSegment {
             entry,
@@ -1415,7 +1426,12 @@ impl Transaction {
     /// `data_dir`, assigning row-ids out of `claim` and appending
     /// each batch's `DataFileEntry` to `data_files` in place. Returns every
     /// [`VectorInsert`] produced across all pending batches, in order — the
-    /// segment build consumes these directly.
+    /// segment build consumes these directly — alongside this commit's
+    /// zone map: each batch's own `ColumnStats` (the same map already
+    /// attached to that batch's `DataFileEntry`, `_timestamp` entry
+    /// included) merged via [`merge_zone_map_stats`] into one map covering
+    /// every batch in this commit. `build_and_write_segment` attaches it,
+    /// unchanged, to the produced `SegmentEntry` (S1 W4a).
     ///
     /// `attempt_id` is a collision-free filename-uniqueness token from
     /// `Dataset.write_attempt_counter` — **not** a manifest version. It
@@ -1447,8 +1463,12 @@ impl Transaction {
         claim: &RowIdClaim,
         ts: i64,
         data_files: &mut Vec<DataFileEntry>,
-    ) -> Result<Vec<VectorInsert>> {
+    ) -> Result<(
+        Vec<VectorInsert>,
+        std::collections::HashMap<String, ColumnStats>,
+    )> {
         let mut all_inserts = Vec::new();
+        let mut zone_map = std::collections::HashMap::new();
         let mut row_id_base = claim.base();
         for (i, batch) in pending.iter().enumerate() {
             // Stats computed on the original, pre-encoding, pre-hidden-column
@@ -1466,6 +1486,12 @@ impl Transaction {
                     max: Value::Int64(ts),
                 },
             );
+
+            // Same per-batch stats map (already including `_timestamp`)
+            // that's about to be attached to this batch's `DataFileEntry`
+            // below — merged into this commit's segment-level zone map
+            // before `stats` is moved into the `DataFileEntry` push.
+            merge_zone_map_stats(&mut zone_map, &stats, i == 0);
 
             let num_rows = u64::try_from(batch.num_rows())?;
 
@@ -1500,8 +1526,74 @@ impl Transaction {
             claim.base() + claim.len(),
             "every claimed row-id must be consumed, and none beyond them"
         );
-        Ok(all_inserts)
+        Ok((all_inserts, zone_map))
     }
+}
+
+/// Merges one batch's `ColumnStats` (`batch_stats`) into a commit's
+/// running segment-level zone map (`accumulated`) — S1 W4a, see the design
+/// amendment §5 for the binding rule this implements: **a column survives
+/// in the merged map only if every batch in the commit contributed a stats
+/// entry for it, and every batch's entry is the same `Value` variant.** A
+/// column any batch is missing stats for, or that disagrees in type across
+/// batches, is dropped from the merged map entirely — never partially
+/// represented — matching the "absent/empty zone map always means must
+/// scan" fail-safe invariant `SegmentEntry::zone_map` already documents.
+///
+/// `Value` derives `PartialOrd`, but Rust's *derived* `PartialOrd` on an
+/// enum returns a real (not `None`) ordering even when comparing different
+/// variants (it orders by declaration position first) — so naively calling
+/// `.partial_cmp()`/`<`/`>` across two `Value`s of different variants would
+/// silently produce a meaningless-but-valid comparison instead of signaling
+/// "can't compare." This matches on `(Value, Value)` variant pairs
+/// explicitly instead, so a cross-variant pair can only ever hit the `_`
+/// arm (drop the column), never a same-variant comparison arm.
+fn merge_zone_map_stats(
+    accumulated: &mut std::collections::HashMap<String, ColumnStats>,
+    batch_stats: &std::collections::HashMap<String, ColumnStats>,
+    is_first_batch: bool,
+) {
+    if is_first_batch {
+        accumulated.clone_from(batch_stats);
+        return;
+    }
+    accumulated.retain(|column, stats| {
+        let Some(other) = batch_stats.get(column) else {
+            return false; // this batch has no stats for this column at all -> drop
+        };
+        match (&stats.min, &other.min, &stats.max, &other.max) {
+            (
+                Value::Int64(a_min),
+                Value::Int64(b_min),
+                Value::Int64(a_max),
+                Value::Int64(b_max),
+            ) => {
+                stats.min = Value::Int64((*a_min).min(*b_min));
+                stats.max = Value::Int64((*a_max).max(*b_max));
+                true
+            }
+            (
+                Value::Float64(a_min),
+                Value::Float64(b_min),
+                Value::Float64(a_max),
+                Value::Float64(b_max),
+            ) => {
+                stats.min = Value::Float64(a_min.min(*b_min));
+                stats.max = Value::Float64(a_max.max(*b_max));
+                true
+            }
+            (Value::Utf8(a_min), Value::Utf8(b_min), Value::Utf8(a_max), Value::Utf8(b_max)) => {
+                if b_min < a_min {
+                    stats.min = Value::Utf8(b_min.clone());
+                }
+                if b_max > a_max {
+                    stats.max = Value::Utf8(b_max.clone());
+                }
+                true
+            }
+            _ => false, // type mismatch across batches for this column -> drop, never partially represented
+        }
+    });
 }
 
 // HNSW parameter defaults — tuned via benchmarks, not guessed, per
@@ -3327,6 +3419,279 @@ mod tests {
                 .all(|r| (20..30).contains(&r.row_id)),
             "id=2 AND category=a must exclude the closer but wrong-category mid cluster \
              and return the far cluster instead (row-ids 20..30): {compound_results:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- S1 W4a: SegmentEntry.zone_map compute-and-store tests ---
+    //
+    // Nothing prunes with the zone map yet (W4b); these tests only assert
+    // what gets computed and stored at commit time.
+
+    fn zone_map_test_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("category", DataType::Utf8, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 3),
+                false,
+            ),
+        ]))
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
+    fn zone_map_batch(ids: Vec<i64>, categories: Vec<&str>, vectors: Vec<[f32; 3]>) -> RecordBatch {
+        let id_arr = Arc::new(Int64Array::from(ids));
+        let cat_arr = Arc::new(arrow::array::StringArray::from(categories));
+        let item_field = Arc::new(Field::new("item", DataType::Float32, false));
+        let flat: Vec<f32> = vectors.iter().flatten().copied().collect();
+        let values = Arc::new(arrow::array::Float32Array::from(flat));
+        let vec_arr = Arc::new(arrow::array::FixedSizeListArray::new(
+            item_field, 3, values, None,
+        ));
+        RecordBatch::try_new(zone_map_test_schema(), vec![id_arr, cat_arr, vec_arr]).unwrap()
+    }
+
+    #[test]
+    fn single_batch_commit_populates_the_segments_zone_map() {
+        let dir = temp_dir("zone-map-single-batch");
+        let ds = Dataset::create(&dir).unwrap();
+
+        let batch = zone_map_batch(
+            vec![30, 10, 20],
+            vec!["banana", "apple", "cherry"],
+            cluster_vectors(3, [0.0, 0.0, 0.0], 0.01),
+        );
+        let mut txn = ds.begin();
+        txn.insert(batch);
+        txn.commit().unwrap();
+
+        let snapshot = ds.snapshot();
+        assert_eq!(snapshot.manifest.segments.len(), 1);
+        let zone_map = &snapshot.manifest.segments[0].zone_map;
+
+        assert_eq!(
+            zone_map.get("id"),
+            Some(&ColumnStats {
+                min: Value::Int64(10),
+                max: Value::Int64(30),
+            }),
+            "must match what compute_stats alone produces for this batch: {zone_map:?}"
+        );
+        assert_eq!(
+            zone_map.get("category"),
+            Some(&ColumnStats {
+                min: Value::Utf8("apple".to_string()),
+                max: Value::Utf8("cherry".to_string()),
+            }),
+            "must match what compute_stats alone produces for this batch: {zone_map:?}"
+        );
+        let ts_stats = zone_map
+            .get(TIMESTAMP_COLUMN)
+            .expect("zone map must include a _timestamp entry");
+        assert_eq!(
+            ts_stats.min, ts_stats.max,
+            "a single-batch commit's _timestamp zone map is always a single point"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn multi_batch_commit_merges_zone_map_across_every_batch_not_just_the_first() {
+        let dir = temp_dir("zone-map-multi-batch-merge");
+        let ds = Dataset::create(&dir).unwrap();
+
+        let mut txn = ds.begin();
+        // First batch: mid-range values (45..=60). Neither the true global
+        // min nor max comes from here, so a merge that (bug) kept only the
+        // first batch's stats, or a merge that never widens past it, would
+        // both be caught by the assertions below.
+        txn.insert(zone_map_batch(
+            vec![50, 60],
+            vec!["m1", "m2"],
+            cluster_vectors(2, [0.0, 0.0, 0.0], 0.01),
+        ));
+        // Second batch: carries the true global min (10).
+        txn.insert(zone_map_batch(
+            vec![10, 55],
+            vec!["m3", "m4"],
+            cluster_vectors(2, [100.0, 100.0, 100.0], 0.01),
+        ));
+        // Third batch: carries the true global max (90).
+        txn.insert(zone_map_batch(
+            vec![90, 45],
+            vec!["m5", "m6"],
+            cluster_vectors(2, [200.0, 200.0, 200.0], 0.01),
+        ));
+        txn.commit().unwrap();
+
+        let snapshot = ds.snapshot();
+        let zone_map = &snapshot.manifest.segments[0].zone_map;
+        let id_stats = zone_map.get("id").unwrap();
+        assert_eq!(
+            id_stats.min,
+            Value::Int64(10),
+            "global min (10) lives only in the second batch, not the first (50..=60): {zone_map:?}"
+        );
+        assert_eq!(
+            id_stats.max,
+            Value::Int64(90),
+            "global max (90) lives only in the third batch, not the first (50..=60): {zone_map:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn column_absent_from_one_batch_is_dropped_from_the_merged_zone_map() {
+        let dir = temp_dir("zone-map-column-absent-in-one-batch");
+        let ds = Dataset::create(&dir).unwrap();
+
+        let mut txn = ds.begin();
+        txn.insert(zone_map_batch(
+            vec![1, 2],
+            vec!["a", "b"],
+            cluster_vectors(2, [0.0, 0.0, 0.0], 0.01),
+        ));
+
+        // Second batch's schema has no "category" column at all - a batch
+        // is free to carry a different schema than an earlier one in the
+        // same transaction (`Transaction::insert` enforces no cross-batch
+        // schema consistency; that's only checked later, at read time, by
+        // `cast_batch_to_schema`).
+        let schema_without_category = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 3),
+                false,
+            ),
+        ]));
+        let vectors = cluster_vectors(2, [100.0, 100.0, 100.0], 0.01);
+        let flat: Vec<f32> = vectors.iter().flatten().copied().collect();
+        let id_arr = Arc::new(Int64Array::from(vec![3, 4]));
+        let item_field = Arc::new(Field::new("item", DataType::Float32, false));
+        let values = Arc::new(arrow::array::Float32Array::from(flat));
+        let vec_arr = Arc::new(arrow::array::FixedSizeListArray::new(
+            item_field, 3, values, None,
+        ));
+        let batch_without_category =
+            RecordBatch::try_new(schema_without_category, vec![id_arr, vec_arr]).unwrap();
+        txn.insert(batch_without_category);
+        txn.commit().unwrap();
+
+        let snapshot = ds.snapshot();
+        let zone_map = &snapshot.manifest.segments[0].zone_map;
+        assert!(
+            !zone_map.contains_key("category"),
+            "a column missing from one batch must be absent from the merged zone map \
+             entirely, not partially represented: {zone_map:?}"
+        );
+        assert!(
+            zone_map.contains_key("id"),
+            "a column present in every batch must still survive the merge: {zone_map:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn column_with_mismatched_type_across_batches_is_dropped_from_the_merged_zone_map() {
+        let dir = temp_dir("zone-map-type-mismatch-across-batches");
+        let ds = Dataset::create(&dir).unwrap();
+
+        let item_field = Arc::new(Field::new("item", DataType::Float32, false));
+        let vector_field = || {
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(item_field.clone(), 3),
+                false,
+            )
+        };
+
+        let mut txn = ds.begin();
+
+        // First batch: "code" is Int64.
+        let schema_int_code = Arc::new(Schema::new(vec![
+            Field::new("code", DataType::Int64, false),
+            vector_field(),
+        ]));
+        let vectors_a = cluster_vectors(2, [0.0, 0.0, 0.0], 0.01);
+        let flat_a: Vec<f32> = vectors_a.iter().flatten().copied().collect();
+        let code_arr_a = Arc::new(Int64Array::from(vec![1, 2]));
+        let values_a = Arc::new(arrow::array::Float32Array::from(flat_a));
+        let vec_arr_a = Arc::new(arrow::array::FixedSizeListArray::new(
+            item_field.clone(),
+            3,
+            values_a,
+            None,
+        ));
+        let batch_a = RecordBatch::try_new(schema_int_code, vec![code_arr_a, vec_arr_a]).unwrap();
+        txn.insert(batch_a);
+
+        // Second batch: same column name "code", genuinely a different
+        // type (Utf8) this time - realistically constructible because
+        // `Transaction::insert`/the commit path enforce no dataset-wide
+        // fixed schema across a commit's own batches (only within a single
+        // batch), each batch is encoded to its own independent data file.
+        let schema_utf8_code = Arc::new(Schema::new(vec![
+            Field::new("code", DataType::Utf8, false),
+            vector_field(),
+        ]));
+        let vectors_b = cluster_vectors(2, [100.0, 100.0, 100.0], 0.01);
+        let flat_b: Vec<f32> = vectors_b.iter().flatten().copied().collect();
+        let code_arr_b = Arc::new(arrow::array::StringArray::from(vec!["x", "y"]));
+        let values_b = Arc::new(arrow::array::Float32Array::from(flat_b));
+        let vec_arr_b = Arc::new(arrow::array::FixedSizeListArray::new(
+            item_field, 3, values_b, None,
+        ));
+        let batch_b = RecordBatch::try_new(schema_utf8_code, vec![code_arr_b, vec_arr_b]).unwrap();
+        txn.insert(batch_b);
+
+        txn.commit().unwrap();
+
+        let snapshot = ds.snapshot();
+        let zone_map = &snapshot.manifest.segments[0].zone_map;
+        assert!(
+            !zone_map.contains_key("code"),
+            "a column whose Value variant disagrees across batches must be dropped from the \
+             merged zone map entirely, never partially or wrongly represented: {zone_map:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn segment_zone_map_survives_dataset_reopen() {
+        let dir = temp_dir("zone-map-reopen-roundtrip");
+        let ds = Dataset::create(&dir).unwrap();
+
+        let batch = zone_map_batch(
+            vec![30, 10, 20],
+            vec!["banana", "apple", "cherry"],
+            cluster_vectors(3, [0.0, 0.0, 0.0], 0.01),
+        );
+        let mut txn = ds.begin();
+        txn.insert(batch);
+        txn.commit().unwrap();
+
+        let zone_map_before = ds.snapshot().manifest.segments[0].zone_map.clone();
+        assert!(
+            !zone_map_before.is_empty(),
+            "sanity check: the commit must have actually populated a zone map"
+        );
+        drop(ds);
+
+        // Force a real load from disk, not an in-memory shortcut - the same
+        // pattern used by this file's other reopen tests.
+        let reopened = Dataset::open(&dir).unwrap();
+        let zone_map_after = &reopened.snapshot().manifest.segments[0].zone_map;
+        assert_eq!(
+            &zone_map_before, zone_map_after,
+            "the zone map computed at commit time must round-trip through Dataset::open unchanged"
         );
 
         std::fs::remove_dir_all(&dir).ok();
