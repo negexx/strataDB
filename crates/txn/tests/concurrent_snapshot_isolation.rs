@@ -205,17 +205,34 @@ fn cluster_vectors(count: usize, center: [f32; 3], spacing: f32) -> Vec<[f32; 3]
     clippy::cast_possible_wrap
 )]
 fn an_old_snapshots_vector_search_never_leaks_a_later_commits_rows() {
-    // The single most load-bearing property of the whole Phase 5 design:
-    // the vector index is ONE shared, ever-growing `Arc<HnswIndex>` graph
-    // object. A later commit's vectors become physically present in the
-    // SAME graph object an old `Snapshot` points at — the ONLY thing
-    // preventing those newer vectors from leaking into an old snapshot's
-    // `vector_search` results is the watermark/tombstone filter
-    // (`Snapshot::is_visible`). `scan()`'s isolation is covered by the two
-    // tests above; this test is the `vector_search` analog, going through
-    // the real `Dataset`/`Transaction`/`commit` path (not `HnswIndex`
-    // directly), and therefore through `Snapshot::vector_search`'s
-    // no-predicate branch's PRODUCTION HNSW parameters
+    // A later commit's INSERTS never leak into an old snapshot's
+    // `vector_search` results. Since S1 (`crates/index`'s segmented
+    // immutable index — see `.claude/rules/vector-index.md`), a
+    // `Snapshot`'s index is its OWN `SegmentSet`: an immutable list of
+    // segments fixed at the instant that snapshot was published
+    // (`Snapshot.index`, `crates/txn/src/snapshot.rs`). A later commit
+    // builds a brand-new segment and appends it to a NEW `SegmentSet` via
+    // `SegmentSet::with_appended` (`crates/index/src/segment_set.rs`),
+    // which never mutates the old snapshot's own `SegmentSet` — there is
+    // no shared, ever-growing graph object for a later commit's vectors to
+    // become "physically present" in from an old snapshot's point of view.
+    // This is what the near/far-cluster checks below prove: the far
+    // cluster's segment simply never exists in `old_snapshot.index`.
+    //
+    // This property holds regardless of what `Snapshot::is_visible` does —
+    // it would pass even if `is_visible` were hardcoded to `true`. The
+    // complementary property — that a later commit's DELETE (tombstone) is
+    // scoped to snapshots taken after it, which IS `is_visible`'s actual
+    // remaining job — is a sibling test, since it needs a different
+    // mechanism to discriminate:
+    // `an_old_snapshots_vector_search_still_sees_a_row_a_later_commit_tombstones`.
+    //
+    // `scan()`'s analogous insert-isolation is covered by the two tests
+    // above; this test is the `vector_search` analog, going through the
+    // real `Dataset`/`Transaction`/`commit` path (not
+    // `HnswIndex`/`SegmentSet` directly), and therefore through
+    // `Snapshot::vector_search`'s no-predicate branch's PRODUCTION HNSW
+    // parameters
     // (`HNSW_MAX_NB_CONNECTION=16`, `HNSW_EF_CONSTRUCTION`,
     // `EF_SEARCH_DEFAULT=32` in `crates/txn/src/dataset.rs` /
     // `crates/txn/src/snapshot.rs`) — weaker than the elevated test-only
@@ -272,9 +289,9 @@ fn an_old_snapshots_vector_search_never_leaks_a_later_commits_rows() {
     );
 
     // Second commit: a 20-point cluster centered 100,000 units away, with
-    // DIFFERENT row-ids (20..39). These vectors are inserted directly into
-    // the SAME shared `HnswIndex` graph object `old_snapshot.index` (an
-    // `Arc` inside its `SegmentSet`) points at.
+    // DIFFERENT row-ids (20..39). This builds a brand-new segment and
+    // appends it to a NEW `SegmentSet` (`with_appended`) — `old_snapshot`'s
+    // own `SegmentSet`, taken before this commit, is untouched by it.
     let far_center = [100_000.0, 0.0, 0.0];
     let far_cluster = cluster_vectors(CLUSTER_SIZE, far_center, 0.01);
     let far_rows: Vec<(i64, &str, [f32; 3])> = (0..CLUSTER_SIZE)
@@ -284,9 +301,10 @@ fn an_old_snapshots_vector_search_never_leaks_a_later_commits_rows() {
     txn2.insert(mvp_batch(&far_rows).unwrap());
     txn2.commit().unwrap();
 
-    // Re-run vector_search on the SAME old_snapshot. Even though the far
-    // cluster's vectors now physically exist in the shared graph, the old
-    // snapshot's watermark/tombstone filter must keep them invisible.
+    // Re-run vector_search on the SAME old_snapshot. The far cluster's
+    // segment was appended only to the NEW SegmentSet the second commit
+    // published — old_snapshot's own SegmentSet, fixed when it was taken,
+    // never gained it.
     let old_results_again = old_snapshot
         .vector_search(&[0.0, 0.0, 0.0], K, None)
         .unwrap();
@@ -294,34 +312,34 @@ fn an_old_snapshots_vector_search_never_leaks_a_later_commits_rows() {
         old_results_again.len(),
         K,
         "an old snapshot's vector_search must still return {K} near-cluster rows after a later \
-         commit inserts more vectors into the shared graph: {old_results_again:?}"
+         commit publishes a new segment: {old_results_again:?}"
     );
     assert!(
         old_results_again
             .iter()
             .all(|r| r.row_id < CLUSTER_SIZE as u64),
-        "an old snapshot's vector_search must NEVER return a row from a later commit, even \
-         though that row's vector is now physically present in the same shared HnswIndex graph \
-         object the old snapshot's Arc<HnswIndex> points at: {old_results_again:?}"
+        "an old snapshot's vector_search must NEVER return a row from a later commit — its own \
+         SegmentSet never gained that commit's segment in the first place: {old_results_again:?}"
     );
 
     // The two checks above query near the origin, where the far cluster
     // (100,000 units away) is never a plausible nearest-neighbor candidate
-    // regardless of whether the watermark filter works — so they can't
+    // regardless of whether segment-set isolation works — so they can't
     // actually distinguish "isolation enforced" from "isolation broken."
     // This is the check that can: query old_snapshot AT the far cluster's
-    // own center. If the watermark filter were silently disabled, the far
-    // cluster's rows are genuinely nearest here and WOULD be returned. With
-    // the filter correctly enforced, old_snapshot must fall back to the
-    // near cluster instead — proving is_visible is doing real
-    // (unfavorable-geometry) work, not merely reflecting cluster distance.
+    // own center. If old_snapshot's SegmentSet somehow DID gain the far
+    // cluster's segment, the far cluster's rows are genuinely nearest here
+    // and WOULD be returned. With segment-set isolation correctly enforced,
+    // old_snapshot must fall back to the near cluster instead — proving
+    // its SegmentSet is doing real (unfavorable-geometry) work, not merely
+    // reflecting cluster distance.
     let old_results_at_far_center = old_snapshot.vector_search(&far_center, K, None).unwrap();
     assert_eq!(
         old_results_at_far_center.len(),
         K,
         "an old snapshot querying AT the far cluster's own center must still fall back to \
-         returning {K} near-cluster rows (the far cluster is invisible to it): \
-         {old_results_at_far_center:?}"
+         returning {K} near-cluster rows (the far cluster's segment is absent from its \
+         SegmentSet): {old_results_at_far_center:?}"
     );
     assert!(
         old_results_at_far_center
@@ -329,8 +347,8 @@ fn an_old_snapshots_vector_search_never_leaks_a_later_commits_rows() {
             .all(|r| r.row_id < CLUSTER_SIZE as u64),
         "an old snapshot querying AT the far cluster's own center must NEVER return a \
          far-cluster row (row_id >= {CLUSTER_SIZE}), even though those rows are the genuine \
-         nearest neighbors there — if this fails, the watermark filter is not actually being \
-         applied: {old_results_at_far_center:?}"
+         nearest neighbors there — if this fails, the far cluster's segment leaked into \
+         old_snapshot's SegmentSet: {old_results_at_far_center:?}"
     );
 
     // A freshly-taken snapshot, in contrast, must see the far cluster: query
@@ -347,6 +365,92 @@ fn an_old_snapshots_vector_search_never_leaks_a_later_commits_rows() {
         new_results.iter().all(|r| r.row_id >= CLUSTER_SIZE as u64),
         "a fresh snapshot's vector_search near the far cluster's center must return only \
          far-cluster rows (row_id >= {CLUSTER_SIZE}): {new_results:?}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn an_old_snapshots_vector_search_still_sees_a_row_a_later_commit_tombstones() {
+    // The `vector_search` analog of `an_old_snapshot_still_sees_a_row_tombstoned_by_a_later_commit`
+    // above, and the complementary property to
+    // `an_old_snapshots_vector_search_never_leaks_a_later_commits_rows`: that test proves a later
+    // commit's INSERTS never leak into an old snapshot (segment-set isolation, which holds
+    // regardless of what `Snapshot::is_visible` does). This test proves the other direction — a
+    // later commit's DELETE (tombstone) is scoped to snapshots taken after it, never applied
+    // retroactively to a snapshot taken before it — which is `Snapshot::is_visible`'s actual
+    // remaining job: `is_visible(row_id)` is exactly `!self.tombstones.contains(&row_id)`
+    // (`crates/txn/src/snapshot.rs`), where `tombstones` is captured from `Manifest.tombstones` as
+    // of THAT snapshot's own version.
+    //
+    // Deletion never rewrites a segment (`.claude/rules/vector-index.md`) — a deleted row's vector
+    // stays physically present in its segment forever; only the manifest's tombstone set (and
+    // therefore what `is_visible` filters) changes.
+    let dir = tempfile::Builder::new()
+        .prefix("strata-old-snapshot-vector-search-tombstone-")
+        .tempdir()
+        .unwrap()
+        .keep();
+    Dataset::create(&dir).unwrap();
+    let dataset = Dataset::open(&dir).unwrap();
+
+    let row_0_vector = [0.0f32, 0.0, 0.0];
+    let mut txn = dataset.begin();
+    txn.insert(
+        mvp_batch(&[
+            (0, "a", row_0_vector),
+            (1, "b", [1.0, 0.0, 0.0]),
+            (2, "c", [2.0, 0.0, 0.0]),
+        ])
+        .unwrap(),
+    );
+    txn.commit().unwrap();
+
+    // Take a snapshot BEFORE the tombstoning commit.
+    let old_snapshot = dataset.snapshot();
+
+    let mut delete_txn = dataset.begin();
+    delete_txn.delete(0);
+    delete_txn.commit().unwrap();
+
+    // Query at row 0's OWN exact coordinates with k=1, rather than a larger k against the whole
+    // (here, tiny) point set: `hnsw_rs`'s unseeded layer-assignment RNG can occasionally miss the
+    // true nearest neighbor in small fixtures (see `cluster_vectors`'s own doc comment above), but
+    // a k=1 exact-coordinate self-match (trivially nearest to itself, distance ~0) sidesteps that
+    // recall gap entirely — the same technique `crates/txn/src/dataset.rs`'s loom "Model 3" uses
+    // (`found_own_point`).
+    //
+    // old_snapshot's own tombstone set was fixed before this delete committed, so it must still
+    // return row 0 here.
+    let old_self_match_after_delete = old_snapshot.vector_search(&row_0_vector, 1, None).unwrap();
+    assert_eq!(
+        old_self_match_after_delete.first().map(|m| m.row_id),
+        Some(0),
+        "a Snapshot taken before a later delete must still see the deleted row — tombstones are \
+         scoped to the snapshot that observes them, never applied retroactively to a snapshot \
+         taken earlier: {old_self_match_after_delete:?}"
+    );
+
+    // A freshly-taken snapshot, in contrast, must never return row 0: its own tombstone set
+    // (captured from the manifest as of ITS version) includes it, and `Snapshot::is_visible`
+    // filters it out during traversal — even though row 0's vector is still physically present in
+    // the segment.
+    let post_delete_snapshot = dataset.snapshot();
+    let post_delete_self_match = post_delete_snapshot
+        .vector_search(&row_0_vector, 1, None)
+        .unwrap();
+    assert!(
+        !post_delete_self_match.is_empty(),
+        "sanity: rows 1 and 2 are still live after deleting row 0, so a k=1 query at row 0's old \
+         coordinates must still return something, or this test isn't exercising the hazard: \
+         {post_delete_self_match:?}"
+    );
+    assert_ne!(
+        post_delete_self_match[0].row_id, 0,
+        "a snapshot taken after a delete must never return the deleted row, even querying at its \
+         own exact coordinates — if this fails, Snapshot::is_visible's tombstone check is not \
+         actually being applied: {post_delete_self_match:?}"
     );
 
     std::fs::remove_dir_all(&dir).ok();
