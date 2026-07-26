@@ -1220,10 +1220,13 @@ mod tests {
         )
         .unwrap();
 
-        let result = snapshot.filter_tombstoned_rows(batch);
+        let err = snapshot
+            .filter_tombstoned_rows(batch)
+            .expect_err("a batch with no ROW_ID_COLUMN must return a typed error, never panic");
+        let message = err.to_string();
         assert!(
-            result.is_err(),
-            "a batch with no {ROW_ID_COLUMN} column must return a typed error, never panic"
+            !message.contains("must be UInt64"),
+            "this must fail at the missing-column lookup, not the wrong-type downcast: {message}"
         );
     }
 
@@ -1239,10 +1242,13 @@ mod tests {
         )
         .unwrap();
 
-        let result = snapshot.filter_tombstoned_rows(batch);
+        let err = snapshot
+            .filter_tombstoned_rows(batch)
+            .expect_err("a non-UInt64 ROW_ID_COLUMN must return a typed error, never panic");
         assert!(
-            result.is_err(),
-            "a non-UInt64 {ROW_ID_COLUMN} column must return a typed error, never panic"
+            err.to_string().contains("must be UInt64"),
+            "this must fail at the wrong-type downcast specifically, matching \
+             filter_tombstoned_rows's own CastError message: {err}"
         );
     }
 
@@ -1278,7 +1284,17 @@ mod tests {
         delete_txn.delete(0);
         delete_txn.commit().unwrap();
 
-        let batch = dataset.snapshot().scan(&mvp_schema()).unwrap();
+        let snapshot = dataset.snapshot();
+        assert_eq!(
+            snapshot.data_files().len(),
+            2,
+            "this test's premise is two SEPARATE data files, one of which the delete above must \
+             fully empty -- if a future change ever coalesced both commits into one file, this \
+             test would keep passing at 2 rows below while no longer covering the \
+             empty-batch-through-concat_batches case it exists for"
+        );
+
+        let batch = snapshot.scan(&mvp_schema()).unwrap();
         assert_eq!(
             batch.num_rows(),
             2,
