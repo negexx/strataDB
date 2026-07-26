@@ -46,7 +46,7 @@ pub trait NodeSource {
     /// graph overrides this to check `Node::is_deleted()`, since `Graph`'s
     /// soft-delete flag (`Graph::delete`/`Node::mark_deleted`) still exists
     /// as index-internal API even though nothing in `crates/txn`'s commit
-    /// path calls it anymore as of S1 W3.2b (see the amendment's §2 for why
+    /// path calls it anymore as of S1 W3.2a (see the amendment's §2 for why
     /// this default can't be omitted).
     fn is_deleted(&self, _local: u64) -> bool {
         false
