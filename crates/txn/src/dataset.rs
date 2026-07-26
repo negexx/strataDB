@@ -6675,12 +6675,15 @@ mod tests {
 /// --exact`) rather than filtering to the whole `dataset::loom_tests` module
 /// in one run.
 ///
-/// **Model 3 is deliberately absent.** Base design §5 defines it as the
-/// regression gate for deleting `RowIdAllocator.active` / `in_flight` /
-/// collapsing `Snapshot::is_visible` to the tombstone check — explicitly
-/// "its own PR after W3.3 is green", not folded into this workstream. It
-/// belongs in that PR, where it must pass both before and after the
-/// deletion.
+/// **Model 3**, below
+/// (`a_reader_never_sees_one_in_flight_commits_row_while_observing_an_unrelated_commits_watermark`),
+/// is the regression gate for deleting `RowIdAllocator.active` / `in_flight`
+/// / collapsing `Snapshot::is_visible` to the tombstone check — see
+/// `.claude/docs/design/phase-s1-segmented-index-spec.md` §6. It is added
+/// here FIRST, against today's watermark+in-flight implementation, as the
+/// "before" half of the required "must pass both before and after the
+/// deletion" proof; the deletion itself (the "after" half) is a follow-up
+/// change to this same test file that re-runs this exact test unmodified.
 #[cfg(loom)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod loom_tests {
@@ -7717,6 +7720,186 @@ mod loom_tests {
              only one side means DPOR collapsed this model to a single \
              trivial schedule again (see the module doc comment above `mod \
              loom_tests`)"
+        );
+    }
+
+    #[test]
+    fn a_reader_never_sees_one_in_flight_commits_row_while_observing_an_unrelated_commits_watermark()
+     {
+        // Base design §6 ("The snapshot-isolation simplification (benefit +
+        // hazard)") / this file's own note above `mod loom_tests` --
+        // "Model 3", the regression gate for deleting
+        // `RowIdAllocator.active`/`in_flight` and collapsing
+        // `Snapshot::is_visible` to the tombstone check.
+        //
+        // The specific hazard `crate::row_id`'s module doc names: row-ids
+        // are claimed *before* `commit_lock`, from a single *global*
+        // counter. Two concurrent, non-conflicting (disjoint-row,
+        // insert-only) commits can therefore claim in either order but
+        // publish (commit) in either order too. If transaction A claims a
+        // row-id and is still inside `commit()` when unrelated transaction
+        // B claims a later row-id and fully commits, B's published
+        // watermark is read from the SAME global counter A already
+        // advanced by claiming -- so B's watermark numerically covers A's
+        // row-id, even though A has not committed.
+        //
+        // What actually prevents a reader from finding A's row in that
+        // situation (proven here, not assumed): B's published snapshot's
+        // `SegmentSet`/`manifest.data_files` are built from B's OWN commit
+        // only. A's segment/data file are never added to them, regardless
+        // of what B's watermark numerically covers -- there is no shared,
+        // eagerly-mutated structure for A's in-flight write to leak into.
+        // So a reader's `vector_search` hit for a vector and that same
+        // row's presence in the SAME snapshot's `scan()` must always
+        // agree, for every writer, independent of which watermark happens
+        // to be published at the moment the reader's snapshot was taken.
+        //
+        // A commits id=1 at [900,900,900]; B commits id=2 at [100,100,100]
+        // -- disjoint rows, so both always succeed regardless of
+        // interleaving, and a hit for either is unambiguous.
+        //
+        // Budget: root + committer_a + committer_b + reader = 4 of loom's
+        // 5-created-threads-per-execution cap.
+        //
+        // **Preemption-bounded at 3, deliberately not exhaustive -- a
+        // scoped exception for this one model.** Every other model in this
+        // module runs unbounded through `loom::model(...)` and stays that
+        // way; this is not a signal to bound them. An unbounded run of
+        // *this* model explores for ~22 minutes and then dies inside
+        // `generator`'s stack allocator with Windows OS error 1455,
+        // `ERROR_COMMITMENT_LIMIT` ("Il file di paging e' troppo piccolo
+        // per essere completato" -- the paging file is too small to
+        // complete the operation): it runs the machine out of commit
+        // charge, it does not fail an assertion. That is the same class of
+        // environmental exhaustion the module doc comment above already
+        // records for running all ~9 models in one process, reached here
+        // by a single model -- this one creates 4 threads per execution
+        // and races two full `Transaction::commit`s where Model 2 above
+        // creates 3 and races one. Measured cost per preemption level was
+        // ~10x: bound 1 = 1.3s, bound 2 = 21s, bound 3 = 211s, unbounded =
+        // 1364s and then the crash.
+        //
+        // Bounding costs little here because the schedule this model
+        // targets is coarse-grained: one transaction pausing for a long
+        // stretch, anywhere inside `commit()`, while an unrelated one runs
+        // to completion. Expressing that needs few preemptions, and
+        // `OBSERVED` below is the evidence rather than the assumption --
+        // all three reachable states were already observed at bounds 1 and
+        // 2, so 3 is genuine margin over the minimum sufficient depth, not
+        // a bound tuned down until the test passed.
+        //
+        // `Builder::new()` seeds `preemption_bound` from
+        // `LOOM_MAX_PREEMPTIONS`; assigning it after overrides that, so
+        // this gate explores the same space regardless of the environment.
+        static OBSERVED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+        let mut model = loom::model::Builder::new();
+        model.preemption_bound = Some(3);
+        model.check(|| {
+            let dir = tempfile::Builder::new()
+                .prefix(&format!(
+                    "strata-loom-model-3-{}-{:?}-",
+                    std::process::id(),
+                    loom::thread::current().id()
+                ))
+                .tempdir()
+                .unwrap()
+                .keep();
+            let ds = crate::Dataset::create(&dir).unwrap();
+
+            let ds_a = ds.clone();
+            let committer_a = spawn_committer(move || {
+                let mut txn = ds_a.begin();
+                txn.insert(loom_vector_batch(1, &[900.0, 900.0, 900.0]));
+                txn.commit()
+            });
+
+            let ds_b = ds.clone();
+            let committer_b = spawn_committer(move || {
+                let mut txn = ds_b.begin();
+                txn.insert(loom_vector_batch(2, &[100.0, 100.0, 100.0]));
+                txn.commit()
+            });
+
+            let ds_reader = ds.clone();
+            let reader = spawn_committer(move || {
+                let snapshot = ds_reader.snapshot();
+                let schema = loom_vector_batch(0, &[0.0, 0.0, 0.0]).schema();
+                let ids: std::collections::HashSet<i64> = snapshot
+                    .scan(&schema)
+                    .unwrap()
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+                    .collect();
+                let a_committed = ids.contains(&1);
+                let b_committed = ids.contains(&2);
+                // `k=1` always returns the single nearest node once the
+                // index holds ANY point -- it is never empty just because
+                // the OTHER writer's row is the only one present. A's
+                // query for [900,900,900] against an index holding only
+                // B's [100,100,100] still returns a hit (B's point, at
+                // squared distance 3*800^2 = 1_920_000) -- that is not A
+                // being visible, it is HNSW doing exactly its job on the
+                // one point that exists. The real question is whether the
+                // returned hit IS the queried point itself, which a top-1
+                // exact-coordinate query answers by distance: ~0 if A's
+                // own row is in the index, ~1_920_000 if only B's is (or
+                // no hit at all if neither is). 1.0 is a huge safety
+                // margin between those two cases.
+                let found_own_point = |hits: &[strata_index::VectorMatch]| {
+                    hits.first().is_some_and(|hit| hit.squared_distance < 1.0)
+                };
+                let a_hit = found_own_point(
+                    &snapshot
+                        .vector_search(&[900.0, 900.0, 900.0], 1, None)
+                        .unwrap(),
+                );
+                let b_hit = found_own_point(
+                    &snapshot
+                        .vector_search(&[100.0, 100.0, 100.0], 1, None)
+                        .unwrap(),
+                );
+                (snapshot.version, a_committed, b_committed, a_hit, b_hit)
+            });
+
+            committer_a.join().unwrap().unwrap();
+            committer_b.join().unwrap().unwrap();
+            let (version, a_committed, b_committed, a_hit, b_hit) = reader.join().unwrap();
+
+            assert_eq!(
+                a_hit, a_committed,
+                "A's vector must be searchable if and only if A's row is durably \
+                 committed in THIS snapshot -- version {version}"
+            );
+            assert_eq!(
+                b_hit, b_committed,
+                "B's vector must be searchable if and only if B's row is durably \
+                 committed in THIS snapshot -- version {version}"
+            );
+
+            let bit: u8 = match (a_committed, b_committed) {
+                (false, false) => 0b001,
+                (true, false) | (false, true) => 0b010,
+                (true, true) => 0b100,
+            };
+            OBSERVED.fetch_or(bit, std::sync::atomic::Ordering::Relaxed);
+
+            std::fs::remove_dir_all(&dir).ok();
+        });
+
+        let observed = OBSERVED.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            observed, 0b111,
+            "loom must observe all three reachable states -- neither committed, \
+             exactly one committed, and both committed -- bitmask {observed:#05b}. \
+             Seeing fewer means DPOR collapsed this model to a narrower set of \
+             schedules than it should explore (see the module doc comment above \
+             `mod loom_tests`)."
         );
     }
 }
