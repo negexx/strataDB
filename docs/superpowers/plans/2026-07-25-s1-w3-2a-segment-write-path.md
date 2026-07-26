@@ -34,6 +34,14 @@ The base design doc §4 splits "per-commit segment, built outside the lock" (W3.
 
 **W3.3 is therefore re-scoped to:** zone-map-based segment pruning (consuming W4's populated `SegmentEntry.zone_map`), the integration-level recall-parity test against a monolithic reference index (with tolerance calibrated against a *fresh* measurement at `ef_construction = 100`, not ADR 0008's stale `ef=200` table — see the pre-W3.1 amendment's "benign drifts"), and the `explain`-shaped "which segments were consulted" assertion. The **merge mechanics themselves are this plan's job** and must be tested here.
 
+> **Correction (2026-07-26):** the "W3.3" re-scoping above is retired — see
+> [`2026-07-26-s1-w4-zone-map-design-amendment.md`](../specs/2026-07-26-s1-w4-zone-map-design-amendment.md)
+> §1. It conflated two originally-separate workstreams (W3's fan-out, shipped above, and W4's
+> zone-map pruning) under one label and, followed literally, would have an implementer write pruning
+> against a field ("consuming W4's populated `zone_map`") that no plan ever populates. The remaining
+> work is W4, staged W4a (compute+store)/W4b (prune+explain); the recall-parity test is pulled out as
+> separate, unstaged work landing first, on its own.
+
 **Two costs of this decision, accepted and recorded rather than discovered later:**
 1. `SegmentSet::with_appended` clones the parts slice on every commit — O(segments) `Arc` clones per commit, O(n²) across a session. Accepted for S1: the spec explicitly accepts "one segment per commit," and S2 compaction is what bounds `n`.
 2. Search cost is linear in segment count with no pruning until W4. A single-row-per-commit workload (e.g. `bench/benches/concurrent_commit_bench.rs`) accumulates one segment per row. This is inherent to the accepted S1 layout, not introduced here; do not "fix" it by batching commits or by deferring segment writes — that would violate the no-silent-buffering invariant.

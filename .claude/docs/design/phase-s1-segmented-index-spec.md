@@ -174,6 +174,14 @@ in the manifest segment entry; prune segments a compound predicate cannot match 
   whose ranges overlap; recall unaffected on the surviving segments.
 - **Exit:** a selective temporal query skips whole segments.
 
+> **Status (2026-07-26):** not yet implemented. See
+> [`2026-07-26-s1-w4-zone-map-design-amendment.md`](../../../docs/superpowers/specs/2026-07-26-s1-w4-zone-map-design-amendment.md)
+> before implementing — it corrects the "wiring, not a new mechanism" framing above (`crates/index`
+> cannot depend on `strata-query`/`strata-storage`, so this needs new `SegmentSet` API, not a
+> straight `should_scan_file` call from inside `crates/index`), stages the work as W4a
+> (compute+store)/W4b (prune+explain), and pulls the recall-parity integration test (§5.3's own exit
+> criterion) out as separate, unstaged validation debt on already-shipped W3 code.
+
 ### 5.5 W5 — Manifest-load recovery
 
 Change `Dataset::open` to deserialize the manifest's segments instead of replaying delta logs to
@@ -182,6 +190,16 @@ rebuild. Decide the delta log's residual role (§7 Q1).
   same graph state that a rebuild would have (recall parity after reopen); **the chaos harness thorough
   tier still passes** — this is the gate that the cutover did not regress crash recovery.
 - **Exit:** `lifecycle_bench` recovery time collapses from ~36 s to a segment load.
+
+> **Status (2026-07-26):** implemented. This entire workstream shipped inside S1 W3.2a (PR #33,
+> `Dataset::open` → `load_segments`, reading `manifest.segments` directly — no delta log remains to
+> decide a residual role for; it was deleted in the same PR) rather than as its own later step, per
+> the W3 design doc's own approved deviation
+> (`docs/superpowers/specs/2026-07-24-s1-segment-format-w3-migration-design.md` §4's "Approved
+> deviation from the written spec's workstream split"). Recorded here now, late, exactly because that
+> doc said to record it "when W3 is opened, don't let it be a silent divergence" and it wasn't — the
+> resulting confusion between this section's still-open-looking text and the actual shipped state is
+> what produced the "W3.3 vs W4" circularity the 2026-07-26 amendment above had to resolve.
 
 ## 6. The snapshot-isolation simplification (benefit + hazard)
 
