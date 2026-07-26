@@ -1221,8 +1221,8 @@ impl Transaction {
         // Row-ids are *not* handed out this way. `RowIdAllocator::claim`
         // needs a *checked* add — an allocation that would run past
         // `u64::MAX` has to be rejected *before* it consumes any ids —
-        // which no lone atomic can express, so that counter stays behind
-        // a `Mutex`. See `crate::row_id`'s module doc (§Locking) and
+        // which a bare `fetch_add` cannot express, so that counter stays
+        // behind a `Mutex`. See `crate::row_id`'s module doc (§Locking) and
         // `RowIdAllocator::claim`.
         let attempt_id = self
             .write_attempt_counter
@@ -5526,8 +5526,8 @@ mod tests {
         // The 4th commit's own pending batch has exactly 1 row (1 new
         // segment, keyed 0..1). Publishing it must not require touching the
         // 3 earlier commits' segment files at all — confirmed indirectly
-        // here by checking the resulting snapshot's watermark/row count
-        // match "3 history rows + 1 new row", which would only be wrong if
+        // here by checking the resulting snapshot's row count matches
+        // "3 history rows + 1 new row", which would only be wrong if
         // either too few (this commit's row lost) or suspiciously
         // history-dependent logic silently reprocessed old entries into a
         // wrong count.
@@ -5910,7 +5910,7 @@ mod tests {
 
         // Seed: one durable row (system row-id 0), far from the residue's
         // distinctive coordinates. Establishes the graph's dimension and
-        // gives the post-seed watermark a meaningful value of 0.
+        // gives the row-id counter a meaningful starting point.
         let mut seed = ds.begin();
         seed.insert(vector_batch(
             vec![1i64],
@@ -5965,8 +5965,9 @@ mod tests {
         // coordinates must not return its residue vector. Pre-fix, the
         // residue (row-id 1 at [900,900,900]) is both physically in the graph
         // and now visible, so it comes back with ~0 squared distance.
-        // Post-fix it was soft-deleted on T1's error path, so the nearest
-        // live match is the far-away seed/T2 data.
+        // Post-fix its segment and data never entered any manifest, so this
+        // snapshot cannot reach it at all and the nearest live match is the
+        // far-away seed/T2 data.
         let results = snapshot
             .vector_search(&[900.0, 900.0, 900.0], 1, None)
             .unwrap();
@@ -6012,11 +6013,13 @@ mod tests {
         // out: "a transaction's writes are never visible to any other
         // transaction until commit succeeds."
         //
-        // Row-ids are claimed *before* `commit_lock`, in `write_phase`. The
-        // visibility watermark, though, is published from the *global*
-        // row-id counter inside some *other* transaction's critical section
-        // — so that other transaction's watermark can numerically cover
-        // row-ids this transaction has claimed but not committed.
+        // Row-ids are claimed *before* `commit_lock`, in `write_phase`,
+        // while `manifest.next_row_id` is published from the *global* row-id
+        // counter inside some *other* transaction's critical section — so an
+        // unrelated commit's manifest numerically covers row-ids this
+        // transaction has claimed but not committed. Back when visibility
+        // was a `row_id <= watermark` bound, that alone was enough to make
+        // the uncommitted row-id look visible.
         //
         // Before S1 W3.2a this was a real race: the slow transaction's
         // vector was applied to a shared `Arc<HnswIndex>` before
@@ -6029,9 +6032,9 @@ mod tests {
         // `write_phase` and joins no shared structure until commit's
         // in-lock `latest_snapshot.index.with_appended(...)`, which runs
         // only after `commit_manifest` succeeds — so even though the
-        // *other* transaction's watermark numerically covers this
-        // transaction's claimed row-id, there is nothing for a reader to
-        // find: the slow transaction's segment isn't part of any published
+        // *other* transaction's published `next_row_id` numerically covers
+        // this transaction's claimed row-id, there is nothing for a reader
+        // to find: the slow transaction's segment isn't part of any published
         // `SegmentSet` yet. This test is the end-to-end proof that the
         // guarantee holds under exactly the timing that used to expose the
         // race, not just structurally.
@@ -6050,7 +6053,7 @@ mod tests {
         let ds = Dataset::create(&dir).unwrap();
 
         // Seed row-id 0: establishes the graph's dimension and gives the
-        // pre-existing watermark a meaningful value.
+        // row-id counter a meaningful pre-existing value.
         let mut seed = ds.begin();
         seed.insert(vector_batch(
             vec![1i64],
@@ -6079,8 +6082,9 @@ mod tests {
         // Step 2: an unrelated transaction commits. It claims row-id 2 and
         // publishes `manifest.next_row_id = 3` — read from the global
         // counter, which already includes the slow transaction's claim — so
-        // its watermark (2) covers the slow transaction's uncommitted
-        // row-id 1. An insert-only transaction has an empty write-set, so
+        // under the old `row_id <= watermark` rule its watermark (2) would
+        // have covered the slow transaction's uncommitted row-id 1. An
+        // insert-only transaction has an empty write-set, so
         // this cannot conflict with the slow one.
         let mut other = ds.begin();
         other.insert(vector_batch(
@@ -6094,9 +6098,9 @@ mod tests {
         // no manifest references it, so -- unlike before W3.2a, when its
         // vector was physically in the shared graph at this instant -- there
         // is nothing for a reader to observe even in principle. The
-        // assertion below is now a structural guarantee rather than a
-        // race the in-flight registry has to win; it is kept because it is
-        // the end-to-end proof that the guarantee actually moved.
+        // assertion below is now a structural guarantee rather than a race
+        // the in-flight registry had to win; it is kept because it is the
+        // end-to-end proof that the guarantee actually moved.
         claimed.release();
         ready_to_publish.wait();
 

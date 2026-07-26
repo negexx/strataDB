@@ -76,7 +76,7 @@ The manifest remains the single source of truth published by the same atomic swa
 ### 4.3 Fan-out search + merge
 
 A vector search asks **each segment in the current manifest** for its local top-k, then merges the
-per-segment results into a global top-k. Visibility (watermark / tombstones) is still applied *during*
+per-segment results into a global top-k. Visibility (tombstones) is still applied *during*
 each segment's traversal, exactly as today — not as a post-filter. **This shape is already prototyped
 and measured recall-safe** in `bench/benches/segment_recall_bench.rs`; reuse it directly. For a
 filtered search, zone-map pruning (§4.5) first drops segments that cannot match, then the surviving
