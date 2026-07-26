@@ -42,3 +42,13 @@ expect_used = "warn"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
+
+# Cargo's own defaults (codegen-units = 16, no LTO) favor compile speed over
+# runtime speed; this is a production database engine, not a fast-iterating
+# app, so trade a slower release build for cross-crate inlining -- this
+# matters concretely for `crates/index`'s hot loops (distance evaluation,
+# neighbor-slot scans), which call across the `strata-index`/`anndists`
+# crate boundary constantly.
+[profile.release]
+lto = "thin"
+codegen-units = 1

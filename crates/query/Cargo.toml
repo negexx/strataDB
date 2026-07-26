@@ -10,6 +10,12 @@ workspace = true
 [dependencies]
 arrow.workspace = true
 strata-storage = { path = "../storage" }
+# group_by's hot loop hashes a `Row<'_>` (an owned byte-slice view) per
+# input row; the default SipHash is unnecessarily slow for this
+# internal, non-network-facing key. foldhash is already resolved
+# elsewhere in this workspace's dependency graph (pulled in transitively
+# by other crates), so this doesn't add a new hash-implementation family.
+foldhash = "0.1"
 
 [dev-dependencies]
 proptest = { workspace = true }

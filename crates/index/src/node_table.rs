@@ -14,25 +14,81 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 /// `1_000_000_000 / 65536 ≈ 15259` chunk pointers, ~122KB — cheap
 /// regardless of how many chunks are ever actually allocated, since
 /// chunks themselves are demand-allocated.
+///
+/// Under `--cfg loom`, both this and `MAX_ROW_ID_CAPACITY` are far
+/// smaller (still comfortably larger than any row-id this crate's loom
+/// tests use — see e.g. `graph.rs`'s `concurrent_inserts_of_distinct_rows_
+/// are_all_findable_and_uncorrupted`, which only reaches row-id 2).
+/// `NodeTable`'s `Drop` scans every directory slot, and every slot of
+/// every *allocated* chunk, to find what to reclaim — at the real
+/// production sizes that's ~80,000 atomic loads on every single dropped
+/// table, and loom accounts for every atomic operation in its
+/// exhaustive-interleaving budget even when (as here) the scan runs
+/// single-threaded after every spawned thread has already joined. Confirmed
+/// empirically: two loom tests that passed before `Drop` existed started
+/// failing with "Model exceeded maximum number of branches" once it did,
+/// and shrinking these two constants under loom alone (with the real
+/// production values completely unchanged) fixed both without touching
+/// any test's logic or assertions.
+#[cfg(loom)]
+const CHUNK_SIZE: usize = 64;
+#[cfg(not(loom))]
 const CHUNK_SIZE: usize = 65536;
 
 /// Absolute ceiling on row-ids this table can address — matches
 /// `crates/txn`'s own enforced limit (`MAX_REASONABLE_ROW_ID_CAPACITY` in
-/// `crates/txn/src/dataset.rs`). The directory is always sized for this
-/// ceiling rather than `NodeTable::new`'s `expected_capacity` hint: sizing
-/// from the hint instead would panic on out-of-bounds directory access
-/// for any row-id beyond it, directly contradicting the "never a hard
-/// cap" contract `HnswIndex::new`'s existing `MaxElements` doc comment
-/// already promises. Since chunks are demand-allocated, sizing the
-/// (pointer-only) directory for the full ceiling costs a fixed ~122KB no
-/// matter how small the actual graph is.
+/// `crates/txn/src/dataset.rs`) in non-loom builds. The directory is
+/// always sized for this ceiling rather than `NodeTable::new`'s
+/// `expected_capacity` hint: sizing from the hint instead would panic on
+/// out-of-bounds directory access for any row-id beyond it, directly
+/// contradicting the "never a hard cap" contract `HnswIndex::new`'s
+/// existing `MaxElements` doc comment already promises. Since chunks are
+/// demand-allocated, sizing the (pointer-only) directory for the full
+/// ceiling costs a fixed ~122KB no matter how small the actual graph is.
+/// See `CHUNK_SIZE`'s doc comment for why this is far smaller under loom.
+#[cfg(loom)]
+const MAX_ROW_ID_CAPACITY: usize = CHUNK_SIZE * 4;
+#[cfg(not(loom))]
 const MAX_ROW_ID_CAPACITY: usize = 1_000_000_000;
 
-struct Chunk<T> {
+/// Types stored in a [`NodeTable`] that own memory *beyond* the `Box`
+/// wrapper `NodeTable` itself manages (e.g. `crate::node::Node`'s separate
+/// `alloc_node`-allocated block) must implement this so `NodeTable`'s
+/// `Drop` can free it. `Node` cannot implement `Drop` directly -- it
+/// derives `Copy`, and Rust forbids a type being both `Copy` and `Drop`
+/// (a `Copy` value can be implicitly duplicated, so a `Drop` impl on it
+/// would risk freeing the same out-of-band memory more than once) -- so
+/// this trait is the seam `NodeTable` uses instead.
+pub(crate) trait Reclaim {
+    /// Frees any memory owned by `self` beyond its own in-place bytes (a
+    /// no-op for a type with nothing extra to free, such as a plain
+    /// integer).
+    ///
+    /// # Safety
+    /// Must be called at most once per value, with no other reference to
+    /// it outstanding. `NodeTable`'s `Drop` is the only caller in this
+    /// crate, which satisfies this via `&mut self`'s exclusive access.
+    unsafe fn reclaim(self);
+}
+
+// No out-of-band memory to free -- plain integers, used only by this
+// module's own generic tests (production code only ever instantiates
+// `NodeTable<crate::node::Node>`). Gated out of production builds so the
+// only `Reclaim` impl a non-test build ever sees is `Node`'s.
+#[cfg(any(test, loom))]
+impl Reclaim for u32 {
+    unsafe fn reclaim(self) {}
+}
+#[cfg(any(test, loom))]
+impl Reclaim for u64 {
+    unsafe fn reclaim(self) {}
+}
+
+struct Chunk<T: Reclaim> {
     slots: Box<[AtomicPtr<T>]>,
 }
 
-impl<T> Chunk<T> {
+impl<T: Reclaim> Chunk<T> {
     fn new() -> Self {
         let slots = (0..CHUNK_SIZE)
             .map(|_| AtomicPtr::new(ptr::null_mut()))
@@ -42,25 +98,77 @@ impl<T> Chunk<T> {
     }
 }
 
-pub(crate) struct NodeTable<T> {
+impl<T: Reclaim> Drop for Chunk<T> {
+    fn drop(&mut self) {
+        // `Ordering::Relaxed`, not `.get_mut()`: `&mut self` already gives
+        // exclusive access (no concurrent reader/writer can exist), so no
+        // ordering stronger than Relaxed buys anything here -- and unlike
+        // `.get_mut()`, `.load()` exists on both `std`'s and `loom`'s
+        // `AtomicPtr`, so this compiles under `--cfg loom` too.
+        for slot in &self.slots {
+            let value_ptr = slot.load(Ordering::Relaxed);
+            if value_ptr.is_null() {
+                continue;
+            }
+            // SAFETY: a non-null slot was published by `NodeTable::insert`'s
+            // `Box::into_raw(Box::new(value))` (or `insert_ptr`, whose own
+            // safety contract requires the same eventual single reclaim)
+            // and never freed or moved since -- `&mut self` here means no
+            // other reference to this `Chunk` (or anything it points to)
+            // exists, so reconstructing and dropping the box exactly once
+            // is sound.
+            let boxed: Box<T> = unsafe { Box::from_raw(value_ptr) };
+            let value: T = *boxed;
+            // SAFETY: this value has never had `reclaim` called on it
+            // before (it was only ever stored, never read out until this
+            // drop), and nothing else can reference it now.
+            unsafe {
+                value.reclaim();
+            }
+        }
+    }
+}
+
+pub(crate) struct NodeTable<T: Reclaim> {
     chunks: Box<[AtomicPtr<Chunk<T>>]>,
+}
+
+impl<T: Reclaim> Drop for NodeTable<T> {
+    fn drop(&mut self) {
+        // Same `Relaxed`-load-not-`get_mut()` reasoning as `Chunk::drop`.
+        for slot in &self.chunks {
+            let chunk_ptr = slot.load(Ordering::Relaxed);
+            if chunk_ptr.is_null() {
+                continue;
+            }
+            // SAFETY: a non-null directory slot was published by
+            // `get_or_create_chunk`'s successful compare_exchange and
+            // never freed or moved since -- `&mut self` here means no
+            // other reference to this table (or any chunk it points to)
+            // exists, so reconstructing and dropping the box exactly once
+            // is sound. Dropping `Box<Chunk<T>>` runs `Chunk`'s own `Drop`,
+            // which reclaims every value the chunk holds.
+            drop(unsafe { Box::from_raw(chunk_ptr) });
+        }
+    }
 }
 
 /// Returned by [`NodeTable::insert`] when `row_id` lies beyond the table's
 /// addressable range (`MAX_ROW_ID_CAPACITY`).
 ///
-/// The value is dropped unstored rather than placed — nothing is leaked —
-/// and the caller turns this into a typed error. `crates/txn` already rejects
-/// such row-ids before commit (its own `MAX_REASONABLE_ROW_ID_CAPACITY`
-/// check), so through the normal commit path this is unreachable; it exists
-/// so the `pub` `HnswIndex::insert` is self-defending against any other
-/// caller instead of relying on that cross-crate convention to avoid a panic.
+/// The value is never stored, and `insert` explicitly reclaims it (see its
+/// own doc comment) before returning this error — nothing is leaked. The
+/// caller turns this into a typed error. `crates/txn` already rejects such
+/// row-ids before commit (its own `MAX_REASONABLE_ROW_ID_CAPACITY` check),
+/// so through the normal commit path this is unreachable; it exists so the
+/// `pub` `HnswIndex::insert` is self-defending against any other caller
+/// instead of relying on that cross-crate convention to avoid a panic.
 #[derive(Debug)]
 pub(crate) struct CapacityExceeded {
     pub(crate) capacity: u64,
 }
 
-impl<T> NodeTable<T> {
+impl<T: Reclaim> NodeTable<T> {
     /// `expected_capacity` is accepted for API symmetry with
     /// `HnswIndex::new`'s existing `MaxElements` sizing hint but is
     /// otherwise unused — the chunk-pointer directory is always sized for
@@ -148,12 +256,35 @@ impl<T> NodeTable<T> {
     /// not a CAS (there is no per-node contention to resolve, only the
     /// chunk-allocation race above).
     ///
+    /// **Load-bearing beyond that:** each distinct `value` may be passed to
+    /// `insert` (across *any* row-id, on *any* table) at most once. This
+    /// method is safe to call, but `T: Reclaim` means `NodeTable`'s `Drop`
+    /// will call `reclaim()` on every stored copy independently — for
+    /// `crate::node::Node`, which is `Copy`, inserting the same value twice
+    /// (e.g. `table.insert(a, node)` then `table.insert(b, node)`) stores
+    /// two handles to the *same* `alloc_node` block and reclaims it twice,
+    /// which is a double-free. Nothing in the type system prevents this;
+    /// every current caller (`Graph::insert`) constructs a fresh `Node` per
+    /// call and inserts it exactly once, so the invariant holds today by
+    /// construction, not by enforcement — keep it that way if `Node`
+    /// construction sites ever change.
+    ///
     /// # Errors
     ///
     /// Returns [`CapacityExceeded`] if `row_id` is beyond the table's
     /// addressable range. The bound is checked *before* the value is boxed,
-    /// so the out-of-range path neither allocates nor leaks — `value` is
-    /// dropped by returning.
+    /// so nothing is ever boxed on this path — but `value` may still own
+    /// out-of-band memory of its own (e.g. `crate::node::Node`'s
+    /// `alloc_node` block), so this reclaims it explicitly before
+    /// returning, rather than relying on `value`'s own drop glue (which,
+    /// for a `Copy` type like `Node`, does nothing).
+    ///
+    /// **On `Err`, `value` has already been reclaimed by this call.** For a
+    /// `Copy` type like `Node`, `insert` taking `value` by value does *not*
+    /// stop the caller's own binding from still being in scope after this
+    /// returns — that binding is now a dangling handle. Do not read
+    /// through, or pass onward, `value` after an `Err` return; treat it the
+    /// same as a value that was moved out and dropped.
     pub(crate) fn insert(&self, row_id: u64, value: T) -> Result<(), CapacityExceeded> {
         let (chunk_idx, offset) = Self::chunk_index(row_id);
         let Some(chunk) = self.get_or_create_chunk(chunk_idx) else {
@@ -163,6 +294,12 @@ impl<T> NodeTable<T> {
             // soft constant so the error means precisely what it says. (Any
             // id that reaches here is `>= this`, hence also `> 1e9`, so it is
             // genuinely beyond `crates/txn`'s own upstream limit too.)
+            // SAFETY: `value` was never stored anywhere (this returns before
+            // any `Box`/slot is created), so this is the only handle to it
+            // and reclaiming it here is a single, final reclaim.
+            unsafe {
+                value.reclaim();
+            }
             return Err(CapacityExceeded {
                 capacity: self.addressable_capacity(),
             });
@@ -187,13 +324,22 @@ impl<T> NodeTable<T> {
     /// # Safety
     /// `ptr` must be non-null, must point to a validly initialized `T`,
     /// and must never be freed or mutated through any other handle for
-    /// the table's lifetime (this table never reclaims it, matching
-    /// every other pointer this table stores).
+    /// the table's lifetime. **`ptr` must also have come from
+    /// `Box::into_raw(Box::new(value))`** (exactly what [`Self::insert`]
+    /// does internally) — `NodeTable`'s `Drop` reconstructs every stored
+    /// pointer via `Box::from_raw` to reclaim it, so a pointer from any
+    /// other allocation (e.g. a future bump/arena allocator, which is
+    /// this method's intended eventual caller) would be unsound to free
+    /// that way. Whoever wires up an arena-backed caller for this method
+    /// must revisit `NodeTable`'s `Drop` at the same time — it cannot stay
+    /// a blanket `Box::from_raw` once a non-`Box` source exists.
     // Not called by any production code path yet — reserved for Stage B's
     // `NodeArena` (Task 10 of the single-allocation-node plan), where it
     // removes a real, large per-node allocation. Exercised today by this
     // module's own `insert_ptr_then_get_round_trips` test (same pattern as
-    // the not-yet-consumed accessors in `node.rs`/`slot_array.rs`).
+    // the not-yet-consumed accessors in `node.rs`/`slot_array.rs`) — that
+    // test's pointer *does* come from `Box::new`, so it round-trips
+    // through `Drop` soundly today.
     #[allow(dead_code)]
     ///
     /// # Errors
@@ -317,6 +463,54 @@ mod tests {
         // A normal row-id still works on the same table.
         table.insert(5, 99).unwrap();
         assert_eq!(table.get(5), Some(&99));
+    }
+
+    /// Same scenario as `a_row_id_past_capacity_is_rejected_without_panicking`
+    /// above, but with a real `Node` instead of a `u32` -- `u32::reclaim` is
+    /// a no-op, so that test cannot exercise (or catch a regression in)
+    /// `insert`'s error-path `value.reclaim()` call at all. This one can:
+    /// under `cargo miri test`, a real `Node`'s `alloc_node` block would
+    /// show up as a leaked allocation if that reclaim call were ever
+    /// removed or skipped.
+    #[test]
+    fn a_row_id_past_capacity_reclaims_a_real_node_instead_of_leaking_it() {
+        let table: NodeTable<crate::node::Node> = NodeTable::new(1);
+        let past_capacity = 10_000_000_000_u64;
+        let node = crate::node::Node::new(0, vec![1.0, 2.0, 3.0], 0, 32, 16);
+        let err = table
+            .insert(past_capacity, node)
+            .expect_err("insert past capacity must be rejected");
+        assert!(err.capacity >= MAX_ROW_ID_CAPACITY as u64);
+        assert!(
+            table.get(past_capacity).is_none(),
+            "a row-id past capacity was never stored, so get must return None"
+        );
+        // A normal insert still works on the same table afterward.
+        let ok_node = crate::node::Node::new(5, vec![4.0, 5.0, 6.0], 0, 32, 16);
+        table.insert(5, ok_node).unwrap();
+        assert_eq!(table.get(5).unwrap().vector(), &[4.0, 5.0, 6.0]);
+    }
+
+    /// Not a leak-detector by itself under `cargo test` -- the point of
+    /// this test is `cargo miri test -p strata-index --lib
+    /// node_table::tests::dropping_a_table_of_real_nodes_frees_every_node
+    /// --exact`, which fails with a "memory leaked" diagnostic on the
+    /// pre-fix code (no `Drop` for `NodeTable`/`Chunk`, `Node`'s
+    /// `alloc_node` block never freed) and passes cleanly once `Reclaim`
+    /// is wired through. Spans multiple chunks and multiple layers per
+    /// node so both the chunk-directory free path and the multi-layer
+    /// `dealloc_node` layout recomputation are exercised, not just the
+    /// single-slot/single-layer case.
+    #[test]
+    fn dropping_a_table_of_real_nodes_frees_every_node() {
+        let table: NodeTable<crate::node::Node> = NodeTable::new(3);
+        for i in 0..3u64 {
+            let row_id = i * CHUNK_SIZE as u64; // forces 3 distinct chunks
+            let node = crate::node::Node::new(row_id, vec![1.0, 2.0, 3.0], 2, 32, 16);
+            table.insert(row_id, node).unwrap();
+        }
+        assert_eq!(table.get(0).unwrap().vector(), &[1.0, 2.0, 3.0]);
+        drop(table);
     }
 }
 
