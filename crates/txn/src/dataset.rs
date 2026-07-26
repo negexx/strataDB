@@ -1417,9 +1417,9 @@ impl Transaction {
             byte_len: u64::try_from(bytes.len())?,
             // Computed (merged across this commit's batches) since S1 W4a —
             // see `merge_zone_map_stats` and the design amendment §5.
-            // Nothing consumes it for pruning yet (that's W4b); an absent or
-            // empty zone map must still always mean "must scan", never "may
-            // prune".
+            // Consumed for pruning since S1 W4b by `Snapshot::vector_search`
+            // via `zone_map_permits_scan`; an absent or empty zone map must
+            // still always mean "must scan", never "may prune".
             zone_map,
         };
         Ok(Some(PublishedSegment {
@@ -3433,8 +3433,10 @@ mod tests {
 
     // --- S1 W4a: SegmentEntry.zone_map compute-and-store tests ---
     //
-    // Nothing prunes with the zone map yet (W4b); these tests only assert
-    // what gets computed and stored at commit time.
+    // These tests only assert what gets computed and stored at commit time;
+    // the pruning consumer (`Snapshot::vector_search`, via
+    // `zone_map_permits_scan`) is exercised separately in
+    // `crates/txn/src/snapshot.rs` (S1 W4b).
 
     fn zone_map_test_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
@@ -4024,6 +4026,23 @@ mod tests {
             "timestamp>=ts_after_commit_2 AND category=a must return the far cluster \
              (row-ids 10..20) - the only cluster satisfying both, which neither leaf alone \
              (near, for category; mid, for timestamp) could identify: {results:?}"
+        );
+
+        // The spec's own §5.4 exit criterion wants an `explain`-shaped
+        // assertion over this compound predicate, not just correct results.
+        // Each of the three segments corresponds to one commit here (near,
+        // far, mid): near's zone map has timestamp < ts_after_commit_2, so
+        // the timestamp conjunct alone proves it can't match; mid's zone map
+        // has category="b" only, so the category conjunct alone proves it
+        // can't match. far's zone map (timestamp==ts_after_commit_2,
+        // category="a") satisfies both conjuncts, so it's the only segment
+        // that must be scanned - exactly 2 of the 3 segments are skipped.
+        let explain = snapshot.explain(&predicate);
+        assert_eq!(
+            explain.segments_skipped.len(),
+            2,
+            "the compound predicate must prune the near segment (timestamp too old) and the mid \
+             segment (wrong category), leaving only the far segment to scan: {explain:?}"
         );
 
         std::fs::remove_dir_all(&dir).ok();

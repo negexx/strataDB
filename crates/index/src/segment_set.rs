@@ -376,6 +376,38 @@ mod tests {
         (reader, points)
     }
 
+    /// As [`build_sealed_with_points`], but at a caller-chosen dimension
+    /// instead of the fixed 3 — needed by
+    /// `search_filtered_pruned_never_traverses_a_rejected_part_with_a_mismatched_dimension`,
+    /// which needs a part whose vectors are a *different* dimension from
+    /// the accepted part's.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    fn build_sealed_with_dimension(
+        n: usize,
+        row_id_base: u64,
+        offset: f32,
+        dim: usize,
+    ) -> Arc<crate::SegmentReader> {
+        let index = HnswIndex::new(
+            MaxConnections(4),
+            MaxElements(n + 1),
+            MaxLayers(16),
+            EfConstruction(20),
+        )
+        .unwrap();
+        let coeffs = [PHI, SQRT2, SQRT3];
+        for local in 0..n as u64 {
+            let f = local as f64;
+            let vector: Vec<f32> = (0..dim)
+                .map(|d| offset + ((f * coeffs[d % coeffs.len()]).fract() * 100.0) as f32)
+                .collect();
+            index.insert_owned(local, vector).unwrap();
+        }
+        let row_ids: Vec<u64> = (row_id_base..row_id_base + n as u64).collect();
+        let bytes = index.to_segment_bytes(&row_ids).unwrap();
+        Arc::new(crate::SegmentReader::from_bytes(&bytes).unwrap())
+    }
+
     #[test]
     fn search_over_one_sealed_part_matches_searching_its_source_graph_directly() {
         // The successor to W3.1's Live-part equivalence tests: one part,
@@ -759,6 +791,43 @@ mod tests {
             hits.iter().all(|m| (500..530).contains(&m.row_id)),
             "a rejected part must contribute nothing, even when it is nearer to \
              the query than every accepted part: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn search_filtered_pruned_never_traverses_a_rejected_part_with_a_mismatched_dimension() {
+        // If a rejected part were traversed anyway (excluded only from the
+        // merged result, not from traversal), `k_nn_search_generic` would
+        // compare this 3-d query against the 2-d part's vectors and return
+        // `Err(IndexError::DimensionMismatch { .. })` -- so a passing
+        // `Ok(...)` here is proof the rejected part was never traversed at
+        // all, not merely excluded from the final list (which
+        // `search_filtered_pruned_excludes_a_part_its_gate_rejects` already
+        // proves for same-dimension parts).
+        struct Accept3d;
+        struct Reject2d;
+        let three_d = build_sealed(30, 0, 0.0); // 3-d, row-ids 0..30
+        let two_d = build_sealed_with_dimension(30, 500, 0.0, 2); // 2-d, row-ids 500..530
+        let set = SegmentSet::from_segments(vec![
+            (three_d, Arc::new(Accept3d) as Arc<dyn Any + Send + Sync>),
+            (two_d, Arc::new(Reject2d) as Arc<dyn Any + Send + Sync>),
+        ]);
+
+        let hits = set
+            .search_filtered_pruned(
+                &[50.0, 50.0, 50.0],
+                5,
+                32,
+                &(0..30).chain(500..530).collect::<Vec<usize>>(),
+                |_| true,
+                |zone_map| zone_map.downcast_ref::<Accept3d>().is_some(),
+            )
+            .unwrap();
+
+        assert!(!hits.is_empty());
+        assert!(
+            hits.iter().all(|m| (0..30).contains(&m.row_id)),
+            "all hits must come from the accepted 3-d segment: {hits:?}"
         );
     }
 

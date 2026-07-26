@@ -755,12 +755,18 @@ mod tests {
         let snapshot = reopened.snapshot();
         let predicate = Predicate::Eq("category".to_string(), Value::Utf8("b".to_string()));
 
+        // `Snapshot::explain` reads `self.manifest.segments` directly, never
+        // the `SegmentSet` payload `load_segments` builds - so this proves
+        // the zone map survives the manifest's own serde round-trip, not
+        // that `load_segments`'s re-pairing into the `SegmentSet` is
+        // correct. The `vector_search` call below is what actually
+        // exercises that pairing.
         let explain = snapshot.explain(&predicate);
         assert_eq!(
             explain.segments_skipped.len(),
             1,
-            "the zone map reloaded by `load_segments` must still prune segment \
-             \"a\" after `Dataset::open`: {explain:?}"
+            "the zone map must survive the manifest round-trip and still prove segment \
+             \"a\" cannot match after `Dataset::open`: {explain:?}"
         );
 
         let results = snapshot
@@ -897,5 +903,142 @@ mod tests {
             "a payload that isn't a `HashMap<String, ColumnStats>` must fail \
              open (must scan), never panic"
         );
+    }
+
+    /// Closes the gap the other pruning tests leave open: they only prove
+    /// pruning produces correct *results*, which would also happen if the
+    /// gate were fed an empty zone map, since `live_ids` already narrows
+    /// results at the node level independent of the gate. This test spies
+    /// on `search_filtered_pruned`'s own gate closure to prove the *actual*
+    /// per-segment `zone_map` reaches it, at both construction sites:
+    /// `with_appended` (an in-memory snapshot straight off `Transaction::commit`)
+    /// and `from_segments` (`load_segments`, after a full `drop` + `Dataset::open`).
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn search_filtered_pruned_feeds_the_actual_zone_map_payload_to_its_gate() {
+        use crate::dataset::Dataset;
+        use arrow::array::{Float32Array, Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::cell::RefCell;
+        use std::sync::Arc as StdArc;
+
+        fn assert_spy_sees_both_zone_maps(snapshot: &Snapshot) {
+            let expected_a = snapshot.manifest.segments[0].zone_map.clone();
+            let expected_b = snapshot.manifest.segments[1].zone_map.clone();
+
+            let seen: RefCell<Vec<std::collections::HashMap<String, strata_storage::ColumnStats>>> =
+                RefCell::new(Vec::new());
+            let hits = snapshot
+                .index
+                .search_filtered_pruned(
+                    &[0.0, 0.0, 0.0],
+                    10,
+                    64,
+                    &[0, 1],
+                    |_| true,
+                    |zone_map| {
+                        let map = zone_map
+                            .downcast_ref::<std::collections::HashMap<String, strata_storage::ColumnStats>>()
+                            .expect("every part in this test carries a real zone map")
+                            .clone();
+                        seen.borrow_mut().push(map);
+                        true
+                    },
+                )
+                .unwrap();
+            assert_eq!(hits.len(), 2, "{hits:?}");
+
+            let seen = seen.into_inner();
+            assert_eq!(
+                seen.len(),
+                2,
+                "the gate must be consulted exactly once per part: {seen:?}"
+            );
+            assert!(
+                !expected_a.is_empty() && !expected_b.is_empty(),
+                "sanity: both segments must have a non-empty zone map to make this test \
+                 meaningful"
+            );
+            assert!(
+                seen.contains(&expected_a),
+                "one recorded payload must equal segment a's real zone map from the manifest: \
+                 {seen:?} vs {expected_a:?}"
+            );
+            assert!(
+                seen.contains(&expected_b),
+                "one recorded payload must equal segment b's real zone map from the manifest: \
+                 {seen:?} vs {expected_b:?}"
+            );
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "strata-w4b-zone-map-payload-spy-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dataset = Dataset::create(&dir).unwrap();
+
+        let schema = StdArc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("category", DataType::Utf8, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    StdArc::new(Field::new("item", DataType::Float32, false)),
+                    3,
+                ),
+                false,
+            ),
+        ]));
+
+        // Segment 0 ("a"), row-id 0.
+        let mut txn = dataset.begin();
+        txn.insert(
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    StdArc::new(Int64Array::from(vec![1])),
+                    StdArc::new(StringArray::from(vec!["a"])),
+                    StdArc::new(arrow::array::FixedSizeListArray::new(
+                        StdArc::new(Field::new("item", DataType::Float32, false)),
+                        3,
+                        StdArc::new(Float32Array::from(vec![0.0, 0.0, 0.0])),
+                        None,
+                    )),
+                ],
+            )
+            .unwrap(),
+        );
+        txn.commit().unwrap();
+
+        // Segment 1 ("b"), row-id 1.
+        let mut txn = dataset.begin();
+        txn.insert(
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    StdArc::new(Int64Array::from(vec![2])),
+                    StdArc::new(StringArray::from(vec!["b"])),
+                    StdArc::new(arrow::array::FixedSizeListArray::new(
+                        StdArc::new(Field::new("item", DataType::Float32, false)),
+                        3,
+                        StdArc::new(Float32Array::from(vec![9_000.0, 9_000.0, 9_000.0])),
+                        None,
+                    )),
+                ],
+            )
+            .unwrap(),
+        );
+        txn.commit().unwrap();
+
+        // In-memory snapshot: exercises `with_appended` (`Transaction::commit`).
+        assert_spy_sees_both_zone_maps(&dataset.snapshot());
+
+        // Drop and reopen entirely: exercises `from_segments` (`load_segments`).
+        drop(dataset);
+        let reopened = Dataset::open(&dir).unwrap();
+        assert_spy_sees_both_zone_maps(&reopened.snapshot());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -174,13 +174,15 @@ in the manifest segment entry; prune segments a compound predicate cannot match 
   whose ranges overlap; recall unaffected on the surviving segments.
 - **Exit:** a selective temporal query skips whole segments.
 
-> **Status (2026-07-26):** not yet implemented. See
-> [`2026-07-26-s1-w4-zone-map-design-amendment.md`](../../../docs/superpowers/specs/2026-07-26-s1-w4-zone-map-design-amendment.md)
-> before implementing — it corrects the "wiring, not a new mechanism" framing above (`crates/index`
-> cannot depend on `strata-query`/`strata-storage`, so this needs new `SegmentSet` API, not a
-> straight `should_scan_file` call from inside `crates/index`), stages the work as W4a
-> (compute+store)/W4b (prune+explain), and pulls the recall-parity integration test (§5.3's own exit
-> criterion) out as separate, unstaged validation debt on already-shipped W3 code.
+> **Status (2026-07-26):** implemented. Shipped in two stages exactly as staged by
+> [`2026-07-26-s1-w4-zone-map-design-amendment.md`](../../../docs/superpowers/specs/2026-07-26-s1-w4-zone-map-design-amendment.md):
+> W4a (compute+store, PR #36) added `SegmentEntry.zone_map`; W4b (prune+explain,
+> `feat/s1-w4b-zone-map-pruning`) added `crates/index`'s opaque per-part zone-map payload and
+> `SegmentSet::search_filtered_pruned`, and wired `Snapshot::vector_search` to gate fan-out through
+> it via `zone_map_permits_scan` (`strata_query::should_scan_file` underneath). The amendment's
+> corrected framing held: `crates/index` never depends on `strata-query`/`strata-storage` — pruning
+> decisions are computed in `crates/txn` and passed down as an opaque `Arc<dyn Any + Send + Sync>`
+> gate closure.
 
 ### 5.5 W5 — Manifest-load recovery
 

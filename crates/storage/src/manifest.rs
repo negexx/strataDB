@@ -81,10 +81,11 @@ pub struct SegmentEntry {
     /// Computed and populated at commit time since S1 W4a — each commit's
     /// per-batch `ColumnStats` merged into one map covering every batch in
     /// that commit (`strata_txn::dataset::merge_zone_map_stats`); see the S1
-    /// W4 design amendment §5 for the merge rule. Nothing prunes using it
-    /// yet (that's W4b, not yet shipped): an absent or empty map must still
-    /// always fail safe to "must scan" in whatever pruning evaluator W4b
-    /// writes.
+    /// W4 design amendment §5 for the merge rule. Consumed for pruning since
+    /// S1 W4b by `strata_txn::snapshot::zone_map_permits_scan` (which feeds
+    /// `strata_query::should_scan_file`), called from `Snapshot::vector_search`'s
+    /// predicate path via `SegmentSet::search_filtered_pruned`. An absent or
+    /// empty map must still always fail safe to "must scan".
     #[serde(default)]
     pub zone_map: HashMap<String, ColumnStats>,
 }
