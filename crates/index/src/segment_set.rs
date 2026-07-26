@@ -9,8 +9,19 @@
 //! each part's local ordinals back to global row-ids, merge by ascending
 //! distance, dedup by row-id, and truncate to `k`. The over-fetch is
 //! deliberate: it is *why* recall rises with segment count (ADR 0008), not
-//! an accident to tune away. Zone-map-based pruning of parts that provably
-//! cannot match is W4's job; nothing here prunes.
+//! an accident to tune away.
+//!
+//! [`SegmentSet::search_filtered_pruned`] is the one entry point that skips
+//! a part entirely (no traversal, no distance evaluations against it at
+//! all) when the caller's `should_scan_part` gate rejects that part's
+//! opaque zone-map payload — see `docs/superpowers/specs/2026-07-26-s1-w4-zone-map-design-amendment.md`
+//! §2. This crate never interprets that payload: `crates/index`'s
+//! dependency list (`anndists`, `arrow`, `bytemuck`, `crc32c`, `thiserror`
+//! only) deliberately excludes `strata-storage`/`strata-query`, so a
+//! `ColumnStats`-typed zone map cannot be a concrete type this crate names.
+//! `Arc<dyn Any + Send + Sync>` is how a part carries that payload anyway,
+//! opaquely, without either crate compromising: `crates/txn` is the only
+//! code that ever downcasts it back to a `HashMap<String, ColumnStats>`.
 //!
 //! Dedup by row-id is a no-op in S1 (each row-id lives in exactly one
 //! segment, since there is no compaction yet) and is implemented now so
@@ -25,7 +36,20 @@
 //! a runtime surprise. That forcing property is exactly what
 //! `docs/superpowers/specs/2026-07-25-s1-w3-2-design-amendment.md` §1
 //! required when `Live` was removed.
+//!
+//! The zone-map payload lives *inside* [`IndexPart::Sealed`] itself, next
+//! to the `Arc<SegmentReader>` it describes, rather than in a second
+//! `Vec` a caller would have to zip by index against `self.parts`. A
+//! positional pairing (`manifest.segments[i]` <-> `self.parts[i]`) was the
+//! original design and is a silent-wrong-results hazard the moment any
+//! future change (a reordering, a skipped/duplicated append) breaks strict
+//! correspondence — see the design amendment §3. Carrying the payload
+//! structurally, populated once when a part is constructed
+//! ([`SegmentSet::from_segments`]/[`SegmentSet::with_appended`]), makes "is
+//! this the right part's zone map" a type-level guarantee instead of an
+//! unstated invariant.
 
+use std::any::Any;
 use std::sync::Arc;
 
 use crate::graph::k_nn_search_generic;
@@ -35,8 +59,14 @@ use crate::segment_reader::SegmentReader;
 /// One part of a segment set.
 pub enum IndexPart {
     /// One immutable on-disk segment, loaded once and shared by every
-    /// snapshot whose manifest lists it.
-    Sealed(Arc<SegmentReader>),
+    /// snapshot whose manifest lists it, plus an opaque payload describing
+    /// it for pruning purposes (in production, a
+    /// `HashMap<String, ColumnStats>` this crate never names — see this
+    /// module's doc comment).
+    Sealed {
+        reader: Arc<SegmentReader>,
+        zone_map: Arc<dyn Any + Send + Sync>,
+    },
 }
 
 /// The set of index parts a snapshot searches. Cheap to clone (`Arc<[_]>`).
@@ -56,17 +86,22 @@ impl SegmentSet {
     }
 
     /// Builds a segment set over already-loaded sealed segments, in
-    /// manifest order. `Dataset::open`'s constructor.
+    /// manifest order. `Dataset::open`'s constructor. Each part's opaque
+    /// zone-map payload travels alongside its reader in the same tuple, so
+    /// the two can never be paired up wrong by a caller-side zip.
     #[must_use]
-    pub fn from_segments(parts: Vec<Arc<SegmentReader>>) -> Self {
+    pub fn from_segments(parts: Vec<(Arc<SegmentReader>, Arc<dyn Any + Send + Sync>)>) -> Self {
         Self {
-            parts: parts.into_iter().map(IndexPart::Sealed).collect(),
+            parts: parts
+                .into_iter()
+                .map(|(reader, zone_map)| IndexPart::Sealed { reader, zone_map })
+                .collect(),
         }
     }
 
-    /// A new set holding this set's parts plus `reader`, in that order.
-    /// `self` is untouched — an already-published snapshot must never see
-    /// a segment committed after it was taken.
+    /// A new set holding this set's parts plus `reader`/`zone_map`, in
+    /// that order. `self` is untouched — an already-published snapshot
+    /// must never see a segment committed after it was taken.
     ///
     /// This clones the parts slice, so it is O(parts) per commit and
     /// O(parts²) across a session. Accepted for S1, which explicitly
@@ -74,14 +109,24 @@ impl SegmentSet {
     /// part count. Do not "fix" it by deferring or batching segment
     /// publication — that would break the no-silent-buffering invariant.
     #[must_use]
-    pub fn with_appended(&self, reader: Arc<SegmentReader>) -> Self {
+    pub fn with_appended(
+        &self,
+        reader: Arc<SegmentReader>,
+        zone_map: Arc<dyn Any + Send + Sync>,
+    ) -> Self {
         let mut parts: Vec<IndexPart> = Vec::with_capacity(self.parts.len() + 1);
         for part in self.parts.iter() {
             match part {
-                IndexPart::Sealed(sealed) => parts.push(IndexPart::Sealed(Arc::clone(sealed))),
+                IndexPart::Sealed {
+                    reader: existing_reader,
+                    zone_map: existing_zone_map,
+                } => parts.push(IndexPart::Sealed {
+                    reader: Arc::clone(existing_reader),
+                    zone_map: Arc::clone(existing_zone_map),
+                }),
             }
         }
-        parts.push(IndexPart::Sealed(reader));
+        parts.push(IndexPart::Sealed { reader, zone_map });
         Self {
             parts: Arc::from(parts),
         }
@@ -101,25 +146,38 @@ impl SegmentSet {
         self.parts.is_empty()
     }
 
-    /// Queries every part and merges the results — see this module's doc
-    /// comment for the merge contract.
+    /// Queries every part whose opaque zone-map payload `should_scan_part`
+    /// accepts, and merges the results — see this module's doc comment for
+    /// the merge contract. A rejected part is skipped entirely: no
+    /// traversal, no distance evaluation against it at all.
     ///
-    /// Generic over the filter type (rather than `&dyn Fn(u64) -> bool`) so
-    /// the compiler can monomorphize and inline the filter closure into
-    /// `search_layer_generic`'s two admission-gate call sites — a `dyn Fn`
-    /// would force a vtable call at both, defeating the whole point of
-    /// [`build_live_filter`]'s dense-bitset design (see its own doc comment).
-    fn fan_out<F: Fn(u64) -> bool>(
+    /// Generic over both the node-level filter and the part-level gate
+    /// (rather than `&dyn Fn`) so the compiler can monomorphize and inline
+    /// the filter closure into `search_layer_generic`'s two admission-gate
+    /// call sites — a `dyn Fn` would force a vtable call at both, defeating
+    /// the whole point of [`build_live_filter`]'s dense-bitset design (see
+    /// its own doc comment). `should_scan_part` is only called once per
+    /// part (not per node), so this is purely a style choice for it, not a
+    /// performance one.
+    fn fan_out<F, G>(
         &self,
         query: &[f32],
         k: usize,
         ef_search: usize,
         filter: &F,
-    ) -> Result<Vec<VectorMatch>, IndexError> {
+        should_scan_part: &G,
+    ) -> Result<Vec<VectorMatch>, IndexError>
+    where
+        F: Fn(u64) -> bool,
+        G: Fn(&(dyn Any + Send + Sync)) -> bool,
+    {
         let mut merged: Vec<(u64, f32)> = Vec::new();
         for part in self.parts.iter() {
             match part {
-                IndexPart::Sealed(reader) => {
+                IndexPart::Sealed { reader, zone_map } => {
+                    if !should_scan_part(zone_map.as_ref()) {
+                        continue;
+                    }
                     let raw = k_nn_search_generic(
                         reader.as_ref(),
                         &crate::distance::L2,
@@ -156,7 +214,10 @@ impl SegmentSet {
 
     /// Approximate nearest-neighbor search across every part, gated by
     /// `is_visible` during traversal (never as a post-filter over an
-    /// already-capped top-k).
+    /// already-capped top-k). No part is ever skipped — there is no
+    /// predicate to prune with on this path; see
+    /// [`Self::search_filtered_pruned`] for the predicate-aware entry
+    /// point.
     ///
     /// # Errors
     ///
@@ -169,7 +230,13 @@ impl SegmentSet {
         ef_search: usize,
         is_visible: impl Fn(u64) -> bool,
     ) -> Result<Vec<VectorMatch>, IndexError> {
-        self.fan_out(query, k, ef_search, &is_visible)
+        self.fan_out(
+            query,
+            k,
+            ef_search,
+            &is_visible,
+            &|_: &(dyn Any + Send + Sync)| true,
+        )
     }
 
     /// As [`Self::search`], additionally restricted to `live_ids`.
@@ -189,7 +256,36 @@ impl SegmentSet {
         is_visible: impl Fn(u64) -> bool,
     ) -> Result<Vec<VectorMatch>, IndexError> {
         let filter = build_live_filter(live_ids, is_visible);
-        self.fan_out(query, k, ef_search, &filter)
+        self.fan_out(
+            query,
+            k,
+            ef_search,
+            &filter,
+            &|_: &(dyn Any + Send + Sync)| true,
+        )
+    }
+
+    /// As [`Self::search_filtered`], additionally skipping any part whose
+    /// opaque zone-map payload `should_scan_part` rejects — S1 W4b. A
+    /// skipped part contributes nothing to the merged result and is never
+    /// traversed. `should_scan_part` must fail open (return `true`) for a
+    /// payload it cannot make sense of; this crate enforces nothing about
+    /// that, since it never interprets the payload itself.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::search`].
+    pub fn search_filtered_pruned(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+        live_ids: &[usize],
+        is_visible: impl Fn(u64) -> bool,
+        should_scan_part: impl Fn(&(dyn Any + Send + Sync)) -> bool,
+    ) -> Result<Vec<VectorMatch>, IndexError> {
+        let filter = build_live_filter(live_ids, is_visible);
+        self.fan_out(query, k, ef_search, &filter, &should_scan_part)
     }
 
     /// The vector dimension this set's parts were built at, or `0` if the
@@ -205,7 +301,7 @@ impl SegmentSet {
         self.parts
             .iter()
             .map(|part| match part {
-                IndexPart::Sealed(reader) => reader.dimension(),
+                IndexPart::Sealed { reader, .. } => reader.dimension(),
             })
             .find(|&dim| dim != 0)
             .unwrap_or(0)
@@ -230,6 +326,13 @@ mod tests {
     const PHI: f64 = 0.618_033_988_749_895;
     const SQRT2: f64 = 0.414_213_562_373_095;
     const SQRT3: f64 = 0.732_050_807_568_877;
+
+    /// No test in this module cares about zone-map *content* except the
+    /// pruning-specific ones below — this is the shared "opaque, always
+    /// present, semantically meaningless" placeholder for every other test.
+    fn no_zone_map() -> Arc<dyn Any + Send + Sync> {
+        Arc::new(())
+    }
 
     /// Builds one sealed segment over `n` quasi-random 3-d points whose
     /// global row-ids start at `row_id_base` — the exact shape
@@ -273,6 +376,38 @@ mod tests {
         (reader, points)
     }
 
+    /// As [`build_sealed_with_points`], but at a caller-chosen dimension
+    /// instead of the fixed 3 — needed by
+    /// `search_filtered_pruned_never_traverses_a_rejected_part_with_a_mismatched_dimension`,
+    /// which needs a part whose vectors are a *different* dimension from
+    /// the accepted part's.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    fn build_sealed_with_dimension(
+        n: usize,
+        row_id_base: u64,
+        offset: f32,
+        dim: usize,
+    ) -> Arc<crate::SegmentReader> {
+        let index = HnswIndex::new(
+            MaxConnections(4),
+            MaxElements(n + 1),
+            MaxLayers(16),
+            EfConstruction(20),
+        )
+        .unwrap();
+        let coeffs = [PHI, SQRT2, SQRT3];
+        for local in 0..n as u64 {
+            let f = local as f64;
+            let vector: Vec<f32> = (0..dim)
+                .map(|d| offset + ((f * coeffs[d % coeffs.len()]).fract() * 100.0) as f32)
+                .collect();
+            index.insert_owned(local, vector).unwrap();
+        }
+        let row_ids: Vec<u64> = (row_id_base..row_id_base + n as u64).collect();
+        let bytes = index.to_segment_bytes(&row_ids).unwrap();
+        Arc::new(crate::SegmentReader::from_bytes(&bytes).unwrap())
+    }
+
     #[test]
     fn search_over_one_sealed_part_matches_searching_its_source_graph_directly() {
         // The successor to W3.1's Live-part equivalence tests: one part,
@@ -306,8 +441,9 @@ mod tests {
         }
         let row_ids: Vec<u64> = (0..n as u64).collect();
         let bytes = index.to_segment_bytes(&row_ids).unwrap();
-        let set = SegmentSet::from_segments(vec![Arc::new(
-            crate::SegmentReader::from_bytes(&bytes).unwrap(),
+        let set = SegmentSet::from_segments(vec![(
+            Arc::new(crate::SegmentReader::from_bytes(&bytes).unwrap()),
+            no_zone_map(),
         )]);
         let query = [500.0_f32, 500.0, 500.0];
 
@@ -356,6 +492,11 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        assert!(
+            set.search_filtered_pruned(&[0.0, 0.0, 0.0], 5, 32, &[0, 1, 2], |_| true, |_| true)
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(set.established_dimension(), 0);
     }
 
@@ -365,7 +506,8 @@ mod tests {
         // part is keyed 0..n, so a missing row_id_at() map returns
         // ordinals that look exactly like plausible row-ids. Row-id base
         // 1_000_000 makes the two impossible to confuse.
-        let set = SegmentSet::from_segments(vec![build_sealed(30, 1_000_000, 0.0)]);
+        let set =
+            SegmentSet::from_segments(vec![(build_sealed(30, 1_000_000, 0.0), no_zone_map())]);
         let hits = set.search(&[50.0, 50.0, 50.0], 5, 32, |_| true).unwrap();
         assert!(!hits.is_empty());
         assert!(
@@ -383,7 +525,7 @@ mod tests {
         // for the other.
         let near = build_sealed(30, 0, 0.0); // row-ids 0..30 around the origin
         let far = build_sealed(30, 500, 10_000.0); // row-ids 500..530, far away
-        let set = SegmentSet::from_segments(vec![near, far]);
+        let set = SegmentSet::from_segments(vec![(near, no_zone_map()), (far, no_zone_map())]);
         assert_eq!(set.len(), 2);
 
         let near_hits = set.search(&[50.0, 50.0, 50.0], 3, 32, |_| true).unwrap();
@@ -407,9 +549,9 @@ mod tests {
     #[test]
     fn merged_results_are_ordered_by_ascending_distance_and_capped_at_k() {
         let set = SegmentSet::from_segments(vec![
-            build_sealed(30, 0, 0.0),
-            build_sealed(30, 500, 10_000.0),
-            build_sealed(30, 900, 50_000.0),
+            (build_sealed(30, 0, 0.0), no_zone_map()),
+            (build_sealed(30, 500, 10_000.0), no_zone_map()),
+            (build_sealed(30, 900, 50_000.0), no_zone_map()),
         ]);
         let hits = set.search(&[50.0, 50.0, 50.0], 4, 32, |_| true).unwrap();
         assert_eq!(hits.len(), 4, "k must cap the merged set, not each part");
@@ -424,8 +566,8 @@ mod tests {
     #[test]
     fn a_visibility_predicate_is_applied_uniformly_across_every_part() {
         let set = SegmentSet::from_segments(vec![
-            build_sealed(30, 0, 0.0),
-            build_sealed(30, 500, 10_000.0),
+            (build_sealed(30, 0, 0.0), no_zone_map()),
+            (build_sealed(30, 500, 10_000.0), no_zone_map()),
         ]);
         // Hide every row-id below 500 -- i.e. the whole first segment.
         let hits = set
@@ -444,8 +586,8 @@ mod tests {
     #[test]
     fn search_filtered_applies_its_live_id_set_across_every_part() {
         let set = SegmentSet::from_segments(vec![
-            build_sealed(30, 0, 0.0),
-            build_sealed(30, 500, 10_000.0),
+            (build_sealed(30, 0, 0.0), no_zone_map()),
+            (build_sealed(30, 500, 10_000.0), no_zone_map()),
         ]);
         // Only even row-ids from the far segment are live.
         let live_ids: Vec<usize> = (500..530).step_by(2).collect();
@@ -463,8 +605,8 @@ mod tests {
     fn with_appended_leaves_the_original_set_untouched() {
         // Snapshots are immutable and share their parts; publishing a new
         // segment must never mutate an already-published snapshot's view.
-        let base = SegmentSet::from_segments(vec![build_sealed(10, 0, 0.0)]);
-        let grown = base.with_appended(build_sealed(10, 500, 10_000.0));
+        let base = SegmentSet::from_segments(vec![(build_sealed(10, 0, 0.0), no_zone_map())]);
+        let grown = base.with_appended(build_sealed(10, 500, 10_000.0), no_zone_map());
 
         assert_eq!(base.len(), 1, "the original set must not have grown");
         assert_eq!(grown.len(), 2);
@@ -484,7 +626,7 @@ mod tests {
 
     #[test]
     fn established_dimension_reads_the_first_non_empty_part() {
-        let set = SegmentSet::from_segments(vec![build_sealed(5, 0, 0.0)]);
+        let set = SegmentSet::from_segments(vec![(build_sealed(5, 0, 0.0), no_zone_map())]);
         assert_eq!(set.established_dimension(), 3);
         assert_eq!(SegmentSet::empty().established_dimension(), 0);
     }
@@ -500,7 +642,7 @@ mod tests {
         // be correct for it.
         let near = build_sealed(10, 0, 0.0); // row-ids 0..10, clustered near the origin
         let far = build_sealed(10, 0, 10_000.0); // SAME row-ids 0..10, clustered far away
-        let set = SegmentSet::from_segments(vec![near, far]);
+        let set = SegmentSet::from_segments(vec![(near, no_zone_map()), (far, no_zone_map())]);
 
         // k=15 is deliberately larger than the 10 *unique* row-ids that
         // exist: only 10 rows exist in total, so the merged result can
@@ -561,7 +703,11 @@ mod tests {
         let (seg_a, points_a) = build_sealed_with_points(40, 0, 0.0);
         let (seg_b, points_b) = build_sealed_with_points(40, 1_000, 5_000.0);
         let (seg_c, points_c) = build_sealed_with_points(40, 2_000, 20_000.0);
-        let set = SegmentSet::from_segments(vec![seg_a, seg_b, seg_c]);
+        let set = SegmentSet::from_segments(vec![
+            (seg_a, no_zone_map()),
+            (seg_b, no_zone_map()),
+            (seg_c, no_zone_map()),
+        ]);
 
         let mut all_points: Vec<(u64, Vec<f32>)> = Vec::new();
         all_points.extend(points_a);
@@ -608,5 +754,105 @@ mod tests {
              full 120-point union; recall@{k} = {recall:.2}. got {hit_row_ids:?}, \
              truth {truth_row_ids:?}"
         );
+    }
+
+    #[test]
+    fn search_filtered_pruned_excludes_a_part_its_gate_rejects() {
+        // The core new behavior: a part whose gate returns false must be
+        // fully excluded from the merged result, even when it holds the
+        // objectively nearest points to the query. Tagging each part's
+        // opaque payload with a distinct marker type and gating on it
+        // proves the gate is actually consulted per part, not ignored.
+        struct Near;
+        struct Far;
+        let near = build_sealed(30, 0, 0.0); // row-ids 0..30, at the origin
+        let far = build_sealed(30, 500, 10_000.0); // row-ids 500..530, far from the origin
+        let set = SegmentSet::from_segments(vec![
+            (near, Arc::new(Near) as Arc<dyn Any + Send + Sync>),
+            (far, Arc::new(Far) as Arc<dyn Any + Send + Sync>),
+        ]);
+
+        // Query sits right next to the near segment's cluster, but the
+        // gate only accepts the far segment -- a plain `search` would
+        // return only near-segment rows here.
+        let hits = set
+            .search_filtered_pruned(
+                &[50.0, 50.0, 50.0],
+                5,
+                32,
+                &(0..30).chain(500..530).collect::<Vec<usize>>(),
+                |_| true,
+                |zone_map| zone_map.downcast_ref::<Far>().is_some(),
+            )
+            .unwrap();
+
+        assert!(!hits.is_empty());
+        assert!(
+            hits.iter().all(|m| (500..530).contains(&m.row_id)),
+            "a rejected part must contribute nothing, even when it is nearer to \
+             the query than every accepted part: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn search_filtered_pruned_never_traverses_a_rejected_part_with_a_mismatched_dimension() {
+        // If a rejected part were traversed anyway (excluded only from the
+        // merged result, not from traversal), `k_nn_search_generic` would
+        // compare this 3-d query against the 2-d part's vectors and return
+        // `Err(IndexError::DimensionMismatch { .. })` -- so a passing
+        // `Ok(...)` here is proof the rejected part was never traversed at
+        // all, not merely excluded from the final list (which
+        // `search_filtered_pruned_excludes_a_part_its_gate_rejects` already
+        // proves for same-dimension parts).
+        struct Accept3d;
+        struct Reject2d;
+        let three_d = build_sealed(30, 0, 0.0); // 3-d, row-ids 0..30
+        let two_d = build_sealed_with_dimension(30, 500, 0.0, 2); // 2-d, row-ids 500..530
+        let set = SegmentSet::from_segments(vec![
+            (three_d, Arc::new(Accept3d) as Arc<dyn Any + Send + Sync>),
+            (two_d, Arc::new(Reject2d) as Arc<dyn Any + Send + Sync>),
+        ]);
+
+        let hits = set
+            .search_filtered_pruned(
+                &[50.0, 50.0, 50.0],
+                5,
+                32,
+                &(0..30).chain(500..530).collect::<Vec<usize>>(),
+                |_| true,
+                |zone_map| zone_map.downcast_ref::<Accept3d>().is_some(),
+            )
+            .unwrap();
+
+        assert!(!hits.is_empty());
+        assert!(
+            hits.iter().all(|m| (0..30).contains(&m.row_id)),
+            "all hits must come from the accepted 3-d segment: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn search_filtered_pruned_with_an_always_true_gate_matches_search_filtered() {
+        // Sanity check that threading a gate through fan_out changed
+        // nothing about the existing merge/filter behavior when nothing is
+        // actually pruned.
+        let set = SegmentSet::from_segments(vec![
+            (build_sealed(30, 0, 0.0), no_zone_map()),
+            (build_sealed(30, 500, 10_000.0), no_zone_map()),
+        ]);
+        let live_ids: Vec<usize> = (0..30).chain(500..530).collect();
+
+        let via_filtered = set
+            .search_filtered(&[50.0, 50.0, 50.0], 5, 32, &live_ids, |_| true)
+            .unwrap();
+        let via_pruned = set
+            .search_filtered_pruned(&[50.0, 50.0, 50.0], 5, 32, &live_ids, |_| true, |_| true)
+            .unwrap();
+
+        assert_eq!(via_filtered.len(), via_pruned.len());
+        for (a, b) in via_filtered.iter().zip(&via_pruned) {
+            assert_eq!(a.row_id, b.row_id);
+            assert!((a.squared_distance - b.squared_distance).abs() < f32::EPSILON);
+        }
     }
 }
