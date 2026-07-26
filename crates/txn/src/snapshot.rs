@@ -566,11 +566,17 @@ mod tests {
         );
 
         // Existing fields must be completely unaffected by the new ones --
-        // both data files must still be considered scan-worthy, since
-        // `category` also appears in the row files' own per-file stats and
-        // segment 0's row file also only ever holds "a".
+        // `category` also appears in each row file's own per-file stats
+        // (segment 0's file only ever holds "a", segment 1's only "b"), so
+        // file-level pruning was already skipping file 0 for this predicate
+        // before this task added the segment fields at all: file-level
+        // pruning being unaffected by segment-level pruning means the file
+        // that survives (file 1) and the segment that survives
+        // (segments_scanned[0]) still agree, not that every file is
+        // scan-worthy.
         assert_eq!(explain.total_files, 2);
-        assert_eq!(explain.scanned.len() + explain.skipped.len(), 2);
+        assert_eq!(explain.scanned.len(), 1, "{explain:?}");
+        assert_eq!(explain.skipped.len(), 1, "{explain:?}");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -667,5 +673,229 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn vector_search_prunes_correctly_after_reopening_the_dataset_through_load_segments() {
+        use crate::dataset::Dataset;
+        use arrow::array::{Float32Array, Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc as StdArc;
+        use strata_query::Predicate;
+        use strata_storage::Value;
+
+        let dir = std::env::temp_dir().join(format!(
+            "strata-w4b-load-segments-reopen-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dataset = Dataset::create(&dir).unwrap();
+
+        let schema = StdArc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("category", DataType::Utf8, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    StdArc::new(Field::new("item", DataType::Float32, false)),
+                    3,
+                ),
+                false,
+            ),
+        ]));
+
+        // Segment 0 ("a"): clustered at the origin -- nearest to the query
+        // below, but must never be returned once filtered to category "b".
+        let mut txn = dataset.begin();
+        txn.insert(
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    StdArc::new(Int64Array::from(vec![1])),
+                    StdArc::new(StringArray::from(vec!["a"])),
+                    StdArc::new(arrow::array::FixedSizeListArray::new(
+                        StdArc::new(Field::new("item", DataType::Float32, false)),
+                        3,
+                        StdArc::new(Float32Array::from(vec![0.0, 0.0, 0.0])),
+                        None,
+                    )),
+                ],
+            )
+            .unwrap(),
+        );
+        txn.commit().unwrap();
+
+        // Segment 1 ("b"): far from the query, but the only segment that
+        // can satisfy `category == "b"`.
+        let mut txn = dataset.begin();
+        txn.insert(
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    StdArc::new(Int64Array::from(vec![2])),
+                    StdArc::new(StringArray::from(vec!["b"])),
+                    StdArc::new(arrow::array::FixedSizeListArray::new(
+                        StdArc::new(Field::new("item", DataType::Float32, false)),
+                        3,
+                        StdArc::new(Float32Array::from(vec![9_000.0, 9_000.0, 9_000.0])),
+                        None,
+                    )),
+                ],
+            )
+            .unwrap(),
+        );
+        txn.commit().unwrap();
+
+        // Drop the in-memory handle entirely so the reopened dataset's
+        // `SegmentSet` is built exclusively by `load_segments` reading the
+        // manifest back off disk, never `with_appended`.
+        drop(dataset);
+
+        let reopened = Dataset::open(&dir).unwrap();
+        let snapshot = reopened.snapshot();
+        let predicate = Predicate::Eq("category".to_string(), Value::Utf8("b".to_string()));
+
+        let explain = snapshot.explain(&predicate);
+        assert_eq!(
+            explain.segments_skipped.len(),
+            1,
+            "the zone map reloaded by `load_segments` must still prune segment \
+             \"a\" after `Dataset::open`: {explain:?}"
+        );
+
+        let results = snapshot
+            .vector_search(&[0.0, 0.0, 0.0], 5, Some(&predicate))
+            .unwrap();
+        assert_eq!(results.len(), 1, "{results:?}");
+        assert_eq!(
+            results[0].row_id, 1,
+            "row-id 1 is category \"b\"'s only row, even though it is far \
+             from the query and row-id 0 (category \"a\", pruned) is much \
+             nearer, and even after the zone map was reloaded from disk: \
+             {results:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Direct unit test of `zone_map_permits_scan` itself, using the real
+    /// per-segment zone maps a commit actually produces (not hand-built
+    /// stand-ins). Closes the gap the existing `explain`/`vector_search`
+    /// pruning tests leave open: both of those narrow `live_ids` down to
+    /// just the matching row before the zone-map gate ever runs, so they
+    /// would still pass even if `zone_map_permits_scan` were replaced with
+    /// `|_, _| true`, or if either construction site paired segments with an
+    /// empty zone map. This test calls the gate directly and would catch
+    /// exactly that regression.
+    #[test]
+    fn zone_map_permits_scan_prunes_segment_a_and_permits_segment_b_for_category_b() {
+        use crate::dataset::Dataset;
+        use arrow::array::{Float32Array, Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc as StdArc;
+        use strata_query::Predicate;
+        use strata_storage::Value;
+
+        let dir = std::env::temp_dir().join(format!(
+            "strata-w4b-zone-map-permits-scan-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dataset = Dataset::create(&dir).unwrap();
+
+        let schema = StdArc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("category", DataType::Utf8, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    StdArc::new(Field::new("item", DataType::Float32, false)),
+                    3,
+                ),
+                false,
+            ),
+        ]));
+
+        // Segment 0: every row tagged "a".
+        let mut txn = dataset.begin();
+        txn.insert(
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    StdArc::new(Int64Array::from(vec![1])),
+                    StdArc::new(StringArray::from(vec!["a"])),
+                    StdArc::new(arrow::array::FixedSizeListArray::new(
+                        StdArc::new(Field::new("item", DataType::Float32, false)),
+                        3,
+                        StdArc::new(Float32Array::from(vec![0.0, 0.0, 0.0])),
+                        None,
+                    )),
+                ],
+            )
+            .unwrap(),
+        );
+        txn.commit().unwrap();
+
+        // Segment 1: every row tagged "b".
+        let mut txn = dataset.begin();
+        txn.insert(
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    StdArc::new(Int64Array::from(vec![2])),
+                    StdArc::new(StringArray::from(vec!["b"])),
+                    StdArc::new(arrow::array::FixedSizeListArray::new(
+                        StdArc::new(Field::new("item", DataType::Float32, false)),
+                        3,
+                        StdArc::new(Float32Array::from(vec![9_000.0, 9_000.0, 9_000.0])),
+                        None,
+                    )),
+                ],
+            )
+            .unwrap(),
+        );
+        txn.commit().unwrap();
+
+        let snapshot = dataset.snapshot();
+        assert_eq!(snapshot.manifest.segments.len(), 2, "sanity: two segments");
+
+        // `manifest.segments` is append-only (`Transaction::commit` pushes
+        // its own new entry), so segment 0 is the "a" commit and segment 1
+        // is the "b" commit.
+        let zone_map_of_a = snapshot.manifest.segments[0].zone_map.clone();
+        let zone_map_of_b = snapshot.manifest.segments[1].zone_map.clone();
+
+        let predicate = Predicate::Eq("category".to_string(), Value::Utf8("b".to_string()));
+
+        let segment_a: Arc<dyn std::any::Any + Send + Sync> = Arc::new(zone_map_of_a);
+        let segment_b: Arc<dyn std::any::Any + Send + Sync> = Arc::new(zone_map_of_b);
+
+        assert!(
+            !zone_map_permits_scan(&*segment_a, &predicate),
+            "segment a's zone map is category \"a\" only, which cannot \
+             satisfy category == \"b\""
+        );
+        assert!(
+            zone_map_permits_scan(&*segment_b, &predicate),
+            "segment b's zone map is category \"b\", which satisfies the \
+             predicate"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn zone_map_permits_scan_fails_open_for_a_payload_that_is_not_a_column_stats_map() {
+        use strata_query::Predicate;
+        use strata_storage::Value;
+
+        let predicate = Predicate::Eq("x".to_string(), Value::Int64(1));
+        let not_a_zone_map: Arc<dyn std::any::Any + Send + Sync> = Arc::new(42u32);
+
+        assert!(
+            zone_map_permits_scan(&*not_a_zone_map, &predicate),
+            "a payload that isn't a `HashMap<String, ColumnStats>` must fail \
+             open (must scan), never panic"
+        );
     }
 }
