@@ -972,7 +972,7 @@ impl Transaction {
     /// # Panics
     ///
     /// Only in test/loom builds, and only if this transaction's caller
-    /// explicitly armed [`Self::inject_panic_before_manifest_commit`]: this
+    /// explicitly armed `Self::inject_panic_before_manifest_commit`: this
     /// then panics at the instant this commit's segment is fsynced but its
     /// manifest is not, modelling a crash there. Absent entirely from
     /// production builds and never triggered otherwise.

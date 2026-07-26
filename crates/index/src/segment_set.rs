@@ -174,7 +174,7 @@ impl SegmentSet {
 
     /// As [`Self::search`], additionally restricted to `live_ids`.
     /// `live_ids` membership and `is_visible` are composed into ONE
-    /// predicate by [`build_live_filter`] — built **once here** and shared
+    /// predicate by `build_live_filter` — built **once here** and shared
     /// by every part, never rebuilt per part.
     ///
     /// # Errors
