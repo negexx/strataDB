@@ -4,8 +4,13 @@
 //! repeatedly read from it — proving readers never observe a row committed
 //! after their snapshot was taken. The tombstone half of the isolation
 //! guarantee (a reader never loses a row tombstoned after their snapshot
-//! was taken) is covered by the single-threaded tests below instead, since
-//! it needs a specific before/after ordering rather than a race.
+//! was taken) needs a specific before/after ordering rather than a race,
+//! so it's covered by a single-threaded test below instead --
+//! `an_old_snapshots_vector_search_still_sees_a_row_a_later_commit_tombstones`.
+//! `scan`'s tombstone half is currently untestable: `Snapshot::scan` doesn't
+//! consult tombstones at all yet (see the note in
+//! `an_old_snapshots_scan_never_gains_a_later_commits_rows` below, and the
+//! tracked follow-up task to fix it).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -430,8 +435,10 @@ fn an_old_snapshots_vector_search_still_sees_a_row_a_later_commit_tombstones() {
     // `crates/index/src/graph.rs`'s `search_layer_traverses_through_an_excluded_node_to_reach_a_node_beyond_it`
     // documents for the identical geometry — but at 3 nodes, `EF_SEARCH_DEFAULT=32`
     // (`crates/txn/src/snapshot.rs`) far exceeds the graph size, so the layer-0 beam never evicts a
-    // candidate and search is exhaustive over the (connected-by-construction) graph regardless of
-    // which edges the heuristic kept: an exact-coordinate query cannot miss its own point. This is
+    // candidate (and the saturation early-exit can't fire either -- it's measured as a fraction of
+    // `ef`, so 3 results out of 32 never reaches its threshold) -- search is exhaustive over the
+    // (connected-by-construction) graph regardless of which edges the heuristic kept: an
+    // exact-coordinate query cannot miss its own point. This is
     // simpler than picking a `k` and reasoning about which other rows would also qualify: a k=1
     // exact-coordinate self-match (trivially nearest to itself, distance ~0) is an unambiguous
     // yes/no on "is this exact row still visible" — the same technique
