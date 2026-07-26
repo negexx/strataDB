@@ -6737,10 +6737,21 @@ mod loom_tests {
     /// than another committer — the seed was added by Task 10 to make its
     /// search assertion non-vacuous, see that test's own doc comment);
     /// `a_commits_row_and_its_segment_become_visible_as_one_atomic_step` sits
-    /// at 3 of 5 (root + a committer + a reader racing it directly). One more
-    /// `spawn_committer` in any model already at the cap trips an assert
-    /// inside loom, so a commit that only needs the stack — not the
+    /// at 3 of 5 (root + a committer + a reader racing it directly);
+    /// `a_reader_never_sees_one_in_flight_commits_row_while_observing_an_unrelated_commits_watermark`
+    /// ("Model 3") sits at 4 of 5 (root + committer_a + committer_b + reader).
+    /// One more `spawn_committer` in any model already at the cap trips an
+    /// assert inside loom, so a commit that only needs the stack — not the
     /// concurrency — still costs a hard-capped slot.
+    ///
+    /// **Exactly one model is preemption-bounded rather than run
+    /// exhaustively:** Model 3 above races two full `Transaction::commit`s
+    /// across 4 threads and, unbounded, exhausts the machine's commit charge
+    /// before it finishes; it runs through `loom::model::Builder` with
+    /// `preemption_bound = Some(3)` instead. Every other model here runs
+    /// unbounded through `loom::model(...)` and stays that way — this is a
+    /// scoped exception, not a precedent for a new model. See that test's own
+    /// comment for the measurements behind the bound.
     ///
     /// loom documents this value as bytes while `generator` consumes it as
     /// words, so the real stack is 8 MiB today. Left uncompensated on
@@ -7783,19 +7794,33 @@ mod loom_tests {
         // targets is coarse-grained: one transaction pausing for a long
         // stretch, anywhere inside `commit()`, while an unrelated one runs
         // to completion. Expressing that needs few preemptions, and
-        // `OBSERVED` below is the evidence rather than the assumption --
-        // all three reachable states were already observed at bounds 1 and
-        // 2, so 3 is genuine margin over the minimum sufficient depth, not
-        // a bound tuned down until the test passed.
+        // `OBSERVED` below is the evidence rather than the assumption.
+        // Measured per bound: bound 1 reaches only 0b1011 -- it never
+        // schedules B ahead of A, so the hazard-adjacent "only B committed
+        // while A is still in flight" state goes unexplored; bound 2 is the
+        // minimum that reaches all four (0b1111). 3 is therefore one level
+        // of genuine margin over the minimum sufficient depth, not a bound
+        // tuned down until the test passed. (Bound 1's shortfall is also
+        // why `OBSERVED` distinguishes the two single-committed directions
+        // instead of folding them into one bit: folded, bound 1 would have
+        // looked fully covered while missing the exact schedule this model
+        // exists to check.)
         //
         // `Builder::new()` seeds `preemption_bound` from
         // `LOOM_MAX_PREEMPTIONS`; assigning it after overrides that, so
         // this gate explores the same space regardless of the environment.
         static OBSERVED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
+        // Built once, outside the model: the reader only needs the projection
+        // schema, and constructing a whole throwaway `RecordBatch` (two Arrow
+        // arrays plus a `FixedSizeListArray`) per explored execution just to
+        // call `.schema()` on it is pure overhead. `SchemaRef` is an
+        // `Arc<Schema>`, so cloning it into the reader thread is free.
+        let schema = loom_vector_batch(0, &[0.0, 0.0, 0.0]).schema();
+
         let mut model = loom::model::Builder::new();
         model.preemption_bound = Some(3);
-        model.check(|| {
+        model.check(move || {
             let dir = tempfile::Builder::new()
                 .prefix(&format!(
                     "strata-loom-model-3-{}-{:?}-",
@@ -7822,11 +7847,11 @@ mod loom_tests {
             });
 
             let ds_reader = ds.clone();
+            let reader_schema = schema.clone();
             let reader = spawn_committer(move || {
                 let snapshot = ds_reader.snapshot();
-                let schema = loom_vector_batch(0, &[0.0, 0.0, 0.0]).schema();
                 let ids: std::collections::HashSet<i64> = snapshot
-                    .scan(&schema)
+                    .scan(&reader_schema)
                     .unwrap()
                     .column(0)
                     .as_any()
@@ -7883,9 +7908,10 @@ mod loom_tests {
             );
 
             let bit: u8 = match (a_committed, b_committed) {
-                (false, false) => 0b001,
-                (true, false) | (false, true) => 0b010,
-                (true, true) => 0b100,
+                (false, false) => 0b0001,
+                (true, false) => 0b0010,
+                (false, true) => 0b0100,
+                (true, true) => 0b1000,
             };
             OBSERVED.fetch_or(bit, std::sync::atomic::Ordering::Relaxed);
 
@@ -7894,12 +7920,16 @@ mod loom_tests {
 
         let observed = OBSERVED.load(std::sync::atomic::Ordering::Relaxed);
         assert_eq!(
-            observed, 0b111,
-            "loom must observe all three reachable states -- neither committed, \
-             exactly one committed, and both committed -- bitmask {observed:#05b}. \
-             Seeing fewer means DPOR collapsed this model to a narrower set of \
-             schedules than it should explore (see the module doc comment above \
-             `mod loom_tests`)."
+            observed, 0b1111,
+            "loom must observe all four reachable states -- neither committed, \
+             only A, only B, and both committed -- bitmask {observed:#06b}. In \
+             particular, 'only B committed while A is still in flight' (0b0100) \
+             is the specific hazard-adjacent direction this model exists to \
+             check; seeing it unreached would mean DPOR never explored the \
+             schedule this test is for. Seeing fewer than all four in general \
+             means DPOR collapsed this model to a narrower set of schedules than \
+             it should explore (see the module doc comment above `mod \
+             loom_tests`)."
         );
     }
 }
