@@ -3794,6 +3794,154 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn vector_search_fan_out_matches_brute_force_ground_truth_across_overlapping_segments() {
+        // Phase S1 W3's exit criterion
+        // (`.claude/docs/design/phase-s1-segmented-index-spec.md` §5.3):
+        // "recall parity with the pre-migration monolithic baseline
+        // (integration test, not just the bench)". The fan-out search this
+        // validates (`SegmentSet::search` merging results across segments)
+        // shipped in S1 W3.2a; this is the exit-criterion test that was
+        // never actually written for it, lifted one layer up from
+        // `crates/index/src/segment_set.rs`'s
+        // `merged_top_k_matches_brute_force_ground_truth_over_the_full_point_set`
+        // (which proves `SegmentSet::search`'s merge itself is correct) to
+        // `Dataset`/`Snapshot` (which proves the whole commit -> segment ->
+        // fan-out path preserves that correctness end to end, through real
+        // transactions and real on-disk segments rather than a
+        // hand-assembled `SegmentSet`).
+        //
+        // Unlike `reopening_a_dataset_with_multiple_segments_finds_each_segments_own_cluster`
+        // and its siblings, whose clusters sit 500+ units apart specifically
+        // so each query trivially resolves to "its own" segment, a test for
+        // cross-segment *merging* needs the true top-k to genuinely span
+        // more than one segment -- a widely-separated layout can't
+        // discriminate a merge bug that only ever consults the first part.
+        // So the three 20-point cluster centers below are only 40 units
+        // apart, closer than each cluster's own 60-unit spacing: cluster
+        // A's points span roughly x=[0,60), cluster B's span x=[40,100),
+        // cluster C's span x=[80,140) -- heavily overlapping bounding
+        // regions rather than disjoint neighborhoods, with y/z offsets
+        // drawn from the identical [0,60) range in every cluster. A query
+        // at [50,30,30] with k=10 was verified by direct computation
+        // (mirroring `cluster_vectors`' own golden-ratio/sqrt2/sqrt3
+        // offset sequence) to draw its true nearest neighbors from both
+        // commit 0's (row-ids 0..20) and commit 1's (row-ids 20..40)
+        // ranges -- see the accompanying report for the computed
+        // neighbor list.
+        let dir = temp_dir("recall-parity-overlapping-segments");
+        let ds = Dataset::create(&dir).unwrap();
+
+        let count = 20usize;
+        let spacing = 60.0f32;
+        let centers = [[0.0f32, 0.0, 0.0], [40.0, 0.0, 0.0], [80.0, 0.0, 0.0]];
+
+        // Every (row_id, vector) pair committed, in commit order, so
+        // `brute_force_search`'s `row_index` maps 1:1 onto this Vec's
+        // index -- the same care the `crates/index`-level sibling test
+        // takes.
+        let mut all_points: Vec<(u64, Vec<f32>)> = Vec::new();
+        // Disjoint row-id ranges, one per commit (0..20, 20..40, 40..60).
+        // Each commit is its own segment (one vector-carrying commit -> one
+        // segment), so these ranges double as "which segment did this
+        // row-id come from" for the cross-segment assertions below.
+        let mut commit_ranges: Vec<std::ops::Range<u64>> = Vec::new();
+
+        for center in &centers {
+            let vectors = cluster_vectors(count, *center, spacing);
+            let base = i64::try_from(all_points.len()).unwrap();
+            let ids: Vec<i64> = (base..base + i64::try_from(count).unwrap()).collect();
+
+            let mut txn = ds.begin();
+            txn.insert(vector_batch(ids, vectors.clone()));
+            txn.commit().unwrap();
+
+            let range_start = u64::try_from(all_points.len()).unwrap();
+            for v in &vectors {
+                let row_id = u64::try_from(all_points.len()).unwrap();
+                all_points.push((row_id, v.to_vec()));
+            }
+            let range_end = u64::try_from(all_points.len()).unwrap();
+            commit_ranges.push(range_start..range_end);
+        }
+        assert_eq!(ds.snapshot().manifest.segments.len(), 3);
+
+        // A FixedSizeListArray built in the SAME order as `all_points`, so
+        // `brute_force_search`'s `row_index` maps 1:1 onto
+        // `all_points[row_index].0`'s row-id -- identical technique to the
+        // `crates/index`-level sibling test.
+        let flat: Vec<f32> = all_points
+            .iter()
+            .flat_map(|(_, v)| v.iter().copied())
+            .collect();
+        let values = Arc::new(arrow::array::Float32Array::from(flat));
+        let field = Arc::new(Field::new("item", DataType::Float32, false));
+        let vectors_arr = arrow::array::FixedSizeListArray::new(field, 3, values, None);
+
+        let query = [50.0f32, 30.0, 30.0];
+        let k = 10;
+
+        let truth = strata_index::brute_force_search(&vectors_arr, &query, k).unwrap();
+        let truth_row_ids: std::collections::HashSet<u64> = truth
+            .iter()
+            .map(|neighbor| all_points[neighbor.row_index].0)
+            .collect();
+
+        // Fixture sanity check: if the true top-k didn't actually span 2+
+        // segments, this test would not be exercising what it claims to.
+        // The geometry was verified by direct computation before writing
+        // this test (see the report); re-asserting it here means a future
+        // edit to the centers/spacing/query that accidentally collapses
+        // the top-k back into one segment fails loudly here, rather than
+        // silently degrading this into a single-segment test that still
+        // passes.
+        let truth_ranges_represented = commit_ranges
+            .iter()
+            .filter(|r| truth_row_ids.iter().any(|id| r.contains(id)))
+            .count();
+        assert!(
+            truth_ranges_represented >= 2,
+            "fixture regression: the brute-force ground truth top-{k} no longer spans \
+             2+ segments, so this test can no longer discriminate a cross-segment merge \
+             bug; truth row-ids {truth_row_ids:?} against ranges {commit_ranges:?}"
+        );
+
+        let hits = ds.snapshot().vector_search(&query, k, None).unwrap();
+        assert_eq!(hits.len(), k, "{hits:?}");
+        let hit_row_ids: std::collections::HashSet<u64> = hits.iter().map(|m| m.row_id).collect();
+
+        let recall = hit_row_ids.intersection(&truth_row_ids).count() as f64 / k as f64;
+        assert!(
+            recall >= 0.9,
+            "merged top-{k} must closely match exact brute-force ground truth over the \
+             full 60-point union spanning 3 overlapping segments; recall@{k} = {recall:.2}. \
+             got {hit_row_ids:?}, truth {truth_row_ids:?}"
+        );
+
+        // The assertion that actually proves cross-segment fan-out
+        // happened, rather than relying on recall alone: a regression that
+        // only ever queries the first segment could still score
+        // deceptively high recall if that segment happens to dominate the
+        // true top-k by coincidence. This fixture's true top-k spans 2 of
+        // the 3 commit ranges (asserted above), so a fan-out that silently
+        // collapsed to single-segment search could return results from at
+        // most 1 range here -- this assertion is what would actually catch
+        // that regression.
+        let hit_ranges_represented = commit_ranges
+            .iter()
+            .filter(|r| hit_row_ids.iter().any(|id| r.contains(id)))
+            .count();
+        assert!(
+            hit_ranges_represented >= 2,
+            "results must span at least 2 of the 3 committed segments -- a result set \
+             confined to a single commit's row-id range would mean the fan-out only \
+             consulted one segment: got {hit_row_ids:?} against ranges {commit_ranges:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn reopening_a_dataset_with_a_truncated_segment_file_returns_corrupt_segment() {
         // Zero test coverage existed anywhere in the workspace for
         // `TxnError::CorruptSegment`, despite `load_segments` constructing
