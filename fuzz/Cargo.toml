@@ -18,7 +18,11 @@ serde_json = "1"
 # confirmed directly: with only that pin in place, `arrow-ipc` (a separate
 # sub-crate `arrow`/`strata-storage` both pull in transitively) still
 # independently resolved to 58.4.0 on a fresh lockfile. Pin each sub-crate
-# actually exercised by a fuzz target explicitly, not just the aggregate.
+# transitively pulled in by strata-storage explicitly, not just the
+# aggregate. Neither entry is imported directly by any fuzz target --
+# these exist purely as version constraints on strata-storage's own
+# resolution. Do not remove as apparently-unused; that's what silently
+# reintroduces the drift.
 arrow = "=58.3.0"
 arrow-ipc = "=58.3.0"
 

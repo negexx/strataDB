@@ -73,8 +73,7 @@ pub fn sync_dir(dir: &Path) -> Result<()> {
 /// a real fuzzing find — see this module's own regression tests, and the
 /// upstream report filed at
 /// <https://github.com/apache/arrow-rs/issues/10437>). Unlike this project's
-/// other
-/// panic-recovery paths (`crates/index`/`crates/txn`'s worker-thread
+/// other panic-recovery paths (`crates/index`/`crates/txn`'s worker-thread
 /// panics, which are deliberately re-raised via `resume_unwind` once
 /// residue bookkeeping is recorded, per those crates' own doc comments),
 /// a panic caught here is fully swallowed and converted, never re-raised —
@@ -250,9 +249,12 @@ mod tests {
         let path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/malformed_ipc_type_none.arrow");
         let err = read_batch_columns(&path, &["id"]).unwrap_err();
+        let StorageError::CorruptDataFile(_, message) = &err else {
+            panic!("expected CorruptDataFile, got a different error: {err}");
+        };
         assert!(
-            matches!(err, StorageError::CorruptDataFile(_, _)),
-            "expected CorruptDataFile, got a different error: {err}"
+            message.contains("Type NONE"),
+            "expected the arrow-ipc \"Type NONE not supported\" panic specifically, got: {message}"
         );
     }
 
