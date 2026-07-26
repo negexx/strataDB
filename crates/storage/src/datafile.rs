@@ -68,11 +68,40 @@ pub fn sync_dir(dir: &Path) -> Result<()> {
 /// Arrow IPC file, or if it contains no record batch at all.
 pub fn read_batch(path: &Path) -> Result<RecordBatch> {
     let file = File::open(path)?;
-    let mut reader = FileReader::try_new(file, None)?;
-    let batch = reader
-        .next()
-        .ok_or_else(|| StorageError::EmptyDataFile(path.to_path_buf()))??;
-    Ok(batch)
+    // Arrow IPC schema parsing (`arrow_ipc::convert::get_data_type`) uses
+    // `panic!`/`unimplemented!()` for several malformed-but-structurally-
+    // plausible flatbuffer discriminants instead of returning a `Result` --
+    // confirmed at arrow-ipc 58.3.0 (this crate's own pinned version, not
+    // just a newer one) via a real fuzzing find, not a hypothetical; see
+    // this module's own regression test. `catch_unwind` is sound here:
+    // everything in the closure (`file`, `reader`, `batch`) is local to
+    // this call, single-threaded, and touches no shared state, so a panic
+    // partway through leaves nothing outside this function in a torn
+    // state to observe.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut reader = FileReader::try_new(file, None)?;
+        let batch = reader
+            .next()
+            .ok_or_else(|| StorageError::EmptyDataFile(path.to_path_buf()))??;
+        Ok(batch)
+    }))
+    .unwrap_or_else(|payload| {
+        Err(StorageError::CorruptedDataFile(
+            path.to_path_buf(),
+            panic_message(&*payload),
+        ))
+    })
+}
+
+/// Extracts a printable message from a caught panic's payload, falling
+/// back to a generic description for anything that isn't a `String`/`&str`
+/// (the two types `panic!`/`unimplemented!()` actually produce).
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+        .unwrap_or_else(|| "non-string panic payload".to_string())
 }
 
 /// Reads the first `RecordBatch` from an Arrow IPC file, decoding **only**
@@ -97,16 +126,27 @@ pub fn read_batch(path: &Path) -> Result<RecordBatch> {
 /// As [`read_batch`], plus an error if any name in `columns` is not a field
 /// of this file's schema.
 pub fn read_batch_columns(path: &Path, columns: &[&str]) -> Result<RecordBatch> {
-    let schema = FileReader::try_new(File::open(path)?, None)?.schema();
-    let projection = columns
-        .iter()
-        .map(|name| schema.index_of(name))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let mut reader = FileReader::try_new(File::open(path)?, Some(projection))?;
-    let batch = reader
-        .next()
-        .ok_or_else(|| StorageError::EmptyDataFile(path.to_path_buf()))??;
-    Ok(batch)
+    // See `read_batch`'s doc comment on why `catch_unwind` is needed and
+    // sound here — same arrow-ipc panic surface, reached from either of
+    // this function's two `FileReader::try_new` call sites.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let schema = FileReader::try_new(File::open(path)?, None)?.schema();
+        let projection = columns
+            .iter()
+            .map(|name| schema.index_of(name))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut reader = FileReader::try_new(File::open(path)?, Some(projection))?;
+        let batch = reader
+            .next()
+            .ok_or_else(|| StorageError::EmptyDataFile(path.to_path_buf()))??;
+        Ok(batch)
+    }))
+    .unwrap_or_else(|payload| {
+        Err(StorageError::CorruptedDataFile(
+            path.to_path_buf(),
+            panic_message(&*payload),
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -137,6 +177,31 @@ mod tests {
 
         assert_eq!(batch, read_back);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_batch_errors_instead_of_panicking_on_a_malformed_ipc_schema() {
+        // Regression test for a real find, not a hypothetical: fuzzing
+        // `crates/storage`'s `datafile_parse` cargo-fuzz target hit this
+        // exact input in under 30 seconds. A structurally-plausible but
+        // semantically-malformed Arrow IPC schema (a field's flatbuffer
+        // `Type` union set to `NONE`) makes arrow-ipc's own
+        // `arrow_ipc::convert::get_data_type` panic via `unimplemented!()`
+        // instead of returning a `Result::Err` -- confirmed present at
+        // `arrow-ipc-58.3.0/src/convert.rs:514`, the exact version this
+        // crate depends on (not just a newer one). This is exactly the
+        // untrusted-input surface `read_batch` exists to guard: a
+        // corrupted disk, a downgraded binary, or a hostile actor with
+        // filesystem access could all hand a reader exactly this file.
+        // Fixture is the literal bytes libFuzzer minimized the crash down
+        // to (`crates/storage/testdata/malformed_ipc_type_none.arrow`).
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/malformed_ipc_type_none.arrow");
+        let err = read_batch(&path).unwrap_err();
+        assert!(
+            matches!(err, StorageError::CorruptedDataFile(_, _)),
+            "expected CorruptedDataFile, got a different error: {err}"
+        );
     }
 
     #[test]
