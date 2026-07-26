@@ -5974,7 +5974,7 @@ mod tests {
         assert!(
             results.is_empty() || results[0].squared_distance > 1000.0,
             "a failed commit's vector must never be searchable, even after a \
-             later commit advances the watermark past its row-id: {results:?}"
+             later commit advances the row-id counter past its row-id: {results:?}"
         );
 
         // Positive controls, so the assertion above can't pass vacuously.
@@ -6974,9 +6974,12 @@ mod loom_tests {
         //
         // The complementary *transient* property — that a row is never
         // visible before its commit succeeds, whether or not that commit
-        // eventually does — belongs to the in-flight claim registry, and is
-        // covered by
-        // `a_published_bound_never_covers_another_transactions_outstanding_claim`
+        // eventually does — is now structural (a snapshot's `SegmentSet` is
+        // exactly its own manifest's segment list, so an uncommitted
+        // transaction's row/segment can never appear in an already-published
+        // snapshot regardless of what its watermark numerically covers), and
+        // is covered by
+        // `a_reader_never_sees_one_in_flight_commits_row_while_observing_an_unrelated_commits_watermark`
         // below (interleavings) and
         // `dataset::tests::a_concurrent_reader_never_sees_an_in_flight_commits_vector`
         // (a real reader thread racing the slow commit's still-open critical
