@@ -230,9 +230,9 @@ dependencies = [
 
 [[package]]
 name = "arrow-ipc"
-version = "58.4.0"
+version = "58.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29a908a11fcfb3fb2f6730f4ac15e367bc644e419155e96238f68cf3adde572b"
+checksum = "238438f0834483703d88896db6fe5a7138b2230debc31b34c0336c2996e3c64f"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -1152,6 +1152,7 @@ name = "strata-storage-fuzz"
 version = "0.0.0"
 dependencies = [
  "arrow",
+ "arrow-ipc",
  "libfuzzer-sys",
  "serde_json",
  "strata-index",

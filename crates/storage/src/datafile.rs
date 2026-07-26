@@ -65,19 +65,45 @@ pub fn sync_dir(dir: &Path) -> Result<()> {
 /// # Errors
 ///
 /// Returns an error if `path` can't be opened/read, if it isn't a valid
-/// Arrow IPC file, or if it contains no record batch at all.
+/// Arrow IPC file, or if it contains no record batch at all. Also returns
+/// [`StorageError::CorruptDataFile`] — rather than panicking — for a
+/// structurally-plausible but semantically-malformed schema that trips one
+/// of several `panic!`/`unimplemented!()` sites in arrow-ipc's own schema
+/// parser (confirmed at arrow-ipc 58.3.0, this crate's pinned version, via
+/// a real fuzzing find — see this module's own regression tests, and the
+/// upstream report filed at
+/// <https://github.com/apache/arrow-rs/issues/10437>). Unlike this project's
+/// other
+/// panic-recovery paths (`crates/index`/`crates/txn`'s worker-thread
+/// panics, which are deliberately re-raised via `resume_unwind` once
+/// residue bookkeeping is recorded, per those crates' own doc comments),
+/// a panic caught here is fully swallowed and converted, never re-raised —
+/// the right call for untrusted external input, but a real divergence from
+/// that convention worth knowing about if this code is ever used as a
+/// template elsewhere. Two residual gaps `catch_unwind` cannot close:
+/// allocation failure on an attacker-controlled length aborts rather than
+/// unwinds, and `get_data_type` recurses through nested field types
+/// (`List`/`LargeList`/`Map`/`Struct`) with no depth bound, so a
+/// sufficiently deeply-nested schema is an uncatchable stack overflow —
+/// this closes the panic class fuzzing actually found, not every way a
+/// malformed file could crash the process. `catch_unwind` is also inert
+/// under `panic = "abort"`; nothing in this workspace sets that today, but
+/// it would silently defeat this guarantee if a release profile ever does.
+/// Caller-visible cost: the default panic hook still runs before
+/// `catch_unwind` observes anything, so a corrupt file still prints a full
+/// panic message and backtrace hint to stderr even though this function
+/// returns cleanly — for an embedded engine (especially loaded into a host
+/// process via the `PyO3` bindings) that can read as a crash in logs even
+/// when it isn't one. Not suppressed here: `std::panic::set_hook` is
+/// process-global and would race any other thread's panics.
 pub fn read_batch(path: &Path) -> Result<RecordBatch> {
     let file = File::open(path)?;
-    // Arrow IPC schema parsing (`arrow_ipc::convert::get_data_type`) uses
-    // `panic!`/`unimplemented!()` for several malformed-but-structurally-
-    // plausible flatbuffer discriminants instead of returning a `Result` --
-    // confirmed at arrow-ipc 58.3.0 (this crate's own pinned version, not
-    // just a newer one) via a real fuzzing find, not a hypothetical; see
-    // this module's own regression test. `catch_unwind` is sound here:
-    // everything in the closure (`file`, `reader`, `batch`) is local to
-    // this call, single-threaded, and touches no shared state, so a panic
-    // partway through leaves nothing outside this function in a torn
-    // state to observe.
+    // `catch_unwind` is sound here: everything in the closure (`file`,
+    // `reader`, `batch`) is local to this call and touches no state
+    // observable outside it (`file` is dropped, closing the fd, whether
+    // this returns normally or via the caught panic), so a panic partway
+    // through leaves nothing for a caller who catches this error and
+    // retries to observe as torn.
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut reader = FileReader::try_new(file, None)?;
         let batch = reader
@@ -86,7 +112,7 @@ pub fn read_batch(path: &Path) -> Result<RecordBatch> {
         Ok(batch)
     }))
     .unwrap_or_else(|payload| {
-        Err(StorageError::CorruptedDataFile(
+        Err(StorageError::CorruptDataFile(
             path.to_path_buf(),
             panic_message(&*payload),
         ))
@@ -142,7 +168,7 @@ pub fn read_batch_columns(path: &Path, columns: &[&str]) -> Result<RecordBatch> 
         Ok(batch)
     }))
     .unwrap_or_else(|payload| {
-        Err(StorageError::CorruptedDataFile(
+        Err(StorageError::CorruptDataFile(
             path.to_path_buf(),
             panic_message(&*payload),
         ))
@@ -198,9 +224,35 @@ mod tests {
         let path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/malformed_ipc_type_none.arrow");
         let err = read_batch(&path).unwrap_err();
+        // Pinned to the actual panic message, not just the variant: this
+        // fixture must be proven to still exercise the specific arrow-ipc
+        // bug being regression-tested, not just any panic that happens to
+        // land in `CorruptDataFile` (e.g. if a future arrow-ipc upgrade
+        // changed the panic site or message but happened to still panic
+        // somewhere else in the same call).
+        let StorageError::CorruptDataFile(_, message) = &err else {
+            panic!("expected CorruptDataFile, got a different error: {err}");
+        };
         assert!(
-            matches!(err, StorageError::CorruptedDataFile(_, _)),
-            "expected CorruptedDataFile, got a different error: {err}"
+            message.contains("Type NONE"),
+            "expected the arrow-ipc \"Type NONE not supported\" panic specifically, got: {message}"
+        );
+    }
+
+    #[test]
+    fn read_batch_columns_errors_instead_of_panicking_on_a_malformed_ipc_schema() {
+        // Same fixture and same underlying arrow-ipc bug as
+        // `read_batch_errors_instead_of_panicking_on_a_malformed_ipc_schema`
+        // above, but for `read_batch_columns`'s own `catch_unwind` --
+        // a distinct code path with two `FileReader::try_new` call sites
+        // (schema resolution, then the projected read) rather than one,
+        // so it isn't provably covered by the sibling test alone.
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/malformed_ipc_type_none.arrow");
+        let err = read_batch_columns(&path, &["id"]).unwrap_err();
+        assert!(
+            matches!(err, StorageError::CorruptDataFile(_, _)),
+            "expected CorruptDataFile, got a different error: {err}"
         );
     }
 

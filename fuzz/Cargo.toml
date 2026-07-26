@@ -14,8 +14,13 @@ serde_json = "1"
 # (arrow-rs 58.3.0), not a bare "58" -- this fuzz workspace resolves its own
 # independent lockfile, and without the pin it drifted to 58.4.0, meaning a
 # found-or-not-found IPC decode panic wouldn't actually transfer to the
-# shipped binary.
+# shipped binary. Pinning the aggregate `arrow` crate alone isn't enough --
+# confirmed directly: with only that pin in place, `arrow-ipc` (a separate
+# sub-crate `arrow`/`strata-storage` both pull in transitively) still
+# independently resolved to 58.4.0 on a fresh lockfile. Pin each sub-crate
+# actually exercised by a fuzz target explicitly, not just the aggregate.
 arrow = "=58.3.0"
+arrow-ipc = "=58.3.0"
 
 [dependencies.strata-storage]
 path = "../crates/storage"
