@@ -225,8 +225,9 @@ fn main() {
 
     let mut results: Vec<PhaseResult> = Vec::new();
 
-    // ---- Phase 1: ingest + commit (write path: encode, delta log, HNSW
-    // insert, fsync). Batched to model real ingestion. -------------------
+    // ---- Phase 1: ingest + commit (write path: encode data file, build +
+    // serialize + fsync an index segment, publish both atomically).
+    // Batched to model real ingestion. --------------------------------
     let ds = Dataset::create(&dir).unwrap();
     let m = phase_start();
     let t = Instant::now();
@@ -250,8 +251,9 @@ fn main() {
         mem: phase_end(m),
     });
 
-    // ---- Phase 2: recovery — drop, reopen (replay every delta log, rebuild
-    // the whole HNSW graph from scratch). ---------------------------------
+    // ---- Phase 2: recovery — drop, reopen (load every index segment from
+    // the manifest: O(bytes) per segment, no distance evaluations, no graph
+    // reconstruction). ------------------------------------------------
     drop(ds);
     let m = phase_start();
     let t = Instant::now();
@@ -259,10 +261,10 @@ fn main() {
     let wall = t.elapsed();
     results.push(PhaseResult {
         name: "recovery (reopen)",
-        kind: "CPU (HNSW rebuild) + I/O",
+        kind: "I/O + validation (segment load, no graph rebuild)",
         wall,
         detail: format!(
-            "replayed {n} rows, {:.0} rows/s",
+            "loaded {n} rows, {:.0} rows/s",
             n as f64 / wall.as_secs_f64()
         ),
         mem: phase_end(m),

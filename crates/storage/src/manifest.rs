@@ -96,13 +96,14 @@ pub struct Manifest {
     /// Row-ids tombstoned (deleted, or superseded by `update`) as of this
     /// version. Accumulated across every committed version, same as
     /// `data_files` — see Phase 6's design doc for why this lives directly
-    /// in the manifest rather than a delta-log file: a delete-only
-    /// transaction has no data file to attach one to, since there is no
-    /// dataset-wide fixed schema to fabricate an empty batch from.
+    /// in the manifest rather than in some per-commit artifact: a
+    /// delete-only transaction has no data file (no dataset-wide fixed
+    /// schema to fabricate an empty batch from) and no index segment (no
+    /// vectors to build one from) to attach a tombstone record to.
     #[serde(default)]
     pub tombstones: Vec<u64>,
     /// The next filename-uniqueness "attempt id" to hand out for data/
-    /// delta-log filenames — see `strata_txn::Dataset.write_attempt_counter`.
+    /// segment filenames — see `strata_txn::Dataset.write_attempt_counter`.
     /// Persisted (rather than always restarting at 0) so that
     /// `Dataset::open` never regenerates a filename a prior session already
     /// committed: `write_batch` truncates via `File::create`, so a filename

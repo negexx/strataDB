@@ -67,11 +67,11 @@ fn widen_ef(base_ef: usize, snapshot: &Snapshot, predicate: &Predicate) -> usize
 impl Snapshot {
     /// Whether `row_id` is visible under this snapshot: committed at or
     /// before this snapshot's version, and not tombstoned as of this
-    /// snapshot's version. No delta-log schema change is needed for this
-    /// to be correct — the version boundary comes from *when* a `Snapshot`
-    /// was built (immediately after the commit that produced it), not from
-    /// a stored version per tombstone entry. See the design doc's
-    /// "Tombstone mechanism" section.
+    /// snapshot's version. No per-tombstone version needs to be stored for
+    /// this to be correct — the version boundary comes from *when* a
+    /// `Snapshot` was built (immediately after the commit that produced
+    /// it), and tombstones are just row-ids in `Manifest.tombstones` as of
+    /// that version. See the design doc's "Tombstone mechanism" section.
     ///
     /// "Committed" is `watermark` *minus* `in_flight`, not `watermark`
     /// alone. The watermark comes from the global row-id counter, which

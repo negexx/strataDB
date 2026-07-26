@@ -9,10 +9,11 @@
 //! CAS — §8 now records the design below instead, so don't read the current
 //! text expecting the older rule. Phase 6 moved the claim *before* the
 //! commit lock, because the row-id is baked into both
-//! the data file's `_row_id` column and the delta-log entries, and those
+//! the data file's `_row_id` column and the index segment built from it
+//! (segment-local ordinals map back to these exact row-ids), and those
 //! files are written (and fsynced) outside the lock on purpose — see
 //! `Transaction::commit`. Pulling allocation back inside the lock would drag
-//! every data-file fsync in with it.
+//! every data-file and segment fsync in with it.
 //!
 //! That divergence broke a property §8 was silently relying on. Visibility
 //! used to be a single scalar high-water mark, `watermark = next_row_id - 1`,

@@ -181,7 +181,7 @@ pub struct Dataset {
     /// registry does not yet list. See [`crate::row_id`].
     row_ids: Arc<RowIdAllocator>,
     /// Monotonic counter whose sole job is generating a collision-free
-    /// filename prefix for each commit *attempt*'s data/delta-log files —
+    /// filename prefix for each commit *attempt*'s data/segment files —
     /// deliberately independent of both the row-id allocator and the real
     /// manifest version. See `Transaction::commit` for why filenames must
     /// not be derived from `base_version`.
@@ -261,7 +261,7 @@ fn issue_timestamp(last_issued: &AtomicI64) -> Result<i64> {
 /// every commit (see `Manifest.next_attempt_id`'s doc comment). A manifest
 /// that genuinely went through the current commit path always has
 /// `next_attempt_id >= 1` after its very first commit — the counter is
-/// `fetch_add`'d before every data/delta-log file write and persisted
+/// `fetch_add`'d before every data/segment file write and persisted
 /// forward every time.
 ///
 /// A manifest written BEFORE `next_attempt_id` existed as a field
@@ -2567,7 +2567,7 @@ mod tests {
         // `write_attempt_counter` was reseeded to 0 on every `Dataset::open`,
         // so a session that reopened an existing dataset and committed
         // again would regenerate the exact same `{attempt_id:020}-{i}`
-        // data/delta-log filenames a prior session already committed.
+        // data/segment filenames a prior session already committed.
         // `write_batch` uses `File::create`, which truncates — silently
         // destroying the prior session's already-durable data file, while
         // the manifest ended up referencing the same filename twice. The
@@ -3714,7 +3714,7 @@ mod tests {
 
     #[test]
     fn reopening_a_dataset_loads_the_vector_index_from_the_manifests_segments() {
-        let dir = temp_dir("delta-log-replay");
+        let dir = temp_dir("segment-replay");
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new(
@@ -5012,8 +5012,8 @@ mod tests {
         }
 
         // The 4th commit's own pending batch has exactly 1 row (1 new
-        // delta entry). Applying it must not require touching the 3
-        // earlier commits' delta-log files at all — confirmed indirectly
+        // segment, keyed 0..1). Publishing it must not require touching the
+        // 3 earlier commits' segment files at all — confirmed indirectly
         // here by checking the resulting snapshot's watermark/row count
         // match "3 history rows + 1 new row", which would only be wrong if
         // either too few (this commit's row lost) or suspiciously
