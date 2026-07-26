@@ -725,7 +725,7 @@ mod tests {
     }
 
     #[test]
-    fn search_filtered_pruned_never_traverses_a_part_its_gate_rejects() {
+    fn search_filtered_pruned_excludes_a_part_its_gate_rejects() {
         // The core new behavior: a part whose gate returns false must be
         // fully excluded from the merged result, even when it holds the
         // objectively nearest points to the query. Tagging each part's
@@ -748,7 +748,7 @@ mod tests {
                 &[50.0, 50.0, 50.0],
                 5,
                 32,
-                &(500..530).collect::<Vec<usize>>(),
+                &(0..30).chain(500..530).collect::<Vec<usize>>(),
                 |_| true,
                 |zone_map| zone_map.downcast_ref::<Far>().is_some(),
             )
