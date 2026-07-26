@@ -1545,9 +1545,9 @@ impl Transaction {
 /// variants (it orders by declaration position first) — so naively calling
 /// `.partial_cmp()`/`<`/`>` across two `Value`s of different variants would
 /// silently produce a meaningless-but-valid comparison instead of signaling
-/// "can't compare." This matches on `(Value, Value)` variant pairs
-/// explicitly instead, so a cross-variant pair can only ever hit the `_`
-/// arm (drop the column), never a same-variant comparison arm.
+/// "can't compare." This matches explicitly on the 4-tuple `(min, other_min,
+/// max, other_max)` instead, so a cross-variant tuple can only ever hit the
+/// `_` arm (drop the column), never a same-variant comparison arm.
 fn merge_zone_map_stats(
     accumulated: &mut std::collections::HashMap<String, ColumnStats>,
     batch_stats: &std::collections::HashMap<String, ColumnStats>,
@@ -3540,6 +3540,76 @@ mod tests {
             id_stats.max,
             Value::Int64(90),
             "global max (90) lives only in the third batch, not the first (50..=60): {zone_map:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn multi_batch_commit_merges_float64_zone_map_across_every_batch() {
+        // Analogous to
+        // `multi_batch_commit_merges_zone_map_across_every_batch_not_just_the_first`
+        // but for the `Float64` merge arm, which had no dedicated coverage:
+        // a review traced it as safe (NaN operands are discarded by
+        // `f64::min`/`f64::max`, so a batch that yields only NaN contributes
+        // nothing to the merged range — the correct fail-safe direction),
+        // but that reasoning should be encoded as a test, not left implicit.
+        let dir = temp_dir("zone-map-multi-batch-float64-merge");
+        let ds = Dataset::create(&dir).unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("score", DataType::Float64, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 3),
+                false,
+            ),
+        ]));
+        let make_batch = |scores: Vec<f64>, vectors: Vec<[f32; 3]>| -> RecordBatch {
+            let score_arr = Arc::new(arrow::array::Float64Array::from(scores));
+            let item_field = Arc::new(Field::new("item", DataType::Float32, false));
+            let flat: Vec<f32> = vectors.iter().flatten().copied().collect();
+            let values = Arc::new(arrow::array::Float32Array::from(flat));
+            let vec_arr = Arc::new(arrow::array::FixedSizeListArray::new(
+                item_field, 3, values, None,
+            ));
+            RecordBatch::try_new(schema.clone(), vec![score_arr, vec_arr]).unwrap()
+        };
+
+        let mut txn = ds.begin();
+        // First batch: mid-range values (50.5..=60.5). Neither the true
+        // global min nor max comes from here, same discriminating structure
+        // as the Int64 test above.
+        txn.insert(make_batch(
+            vec![50.5, 60.5],
+            cluster_vectors(2, [0.0, 0.0, 0.0], 0.01),
+        ));
+        // Second batch: carries the true global min (10.25).
+        txn.insert(make_batch(
+            vec![10.25, 55.0],
+            cluster_vectors(2, [100.0, 100.0, 100.0], 0.01),
+        ));
+        // Third batch: carries the true global max (90.75).
+        txn.insert(make_batch(
+            vec![90.75, 45.0],
+            cluster_vectors(2, [200.0, 200.0, 200.0], 0.01),
+        ));
+        txn.commit().unwrap();
+
+        let snapshot = ds.snapshot();
+        let zone_map = &snapshot.manifest.segments[0].zone_map;
+        let score_stats = zone_map.get("score").unwrap();
+        assert_eq!(
+            score_stats.min,
+            Value::Float64(10.25),
+            "global min (10.25) lives only in the second batch, not the first \
+             (50.5..=60.5): {zone_map:?}"
+        );
+        assert_eq!(
+            score_stats.max,
+            Value::Float64(90.75),
+            "global max (90.75) lives only in the third batch, not the first \
+             (50.5..=60.5): {zone_map:?}"
         );
 
         std::fs::remove_dir_all(&dir).ok();
