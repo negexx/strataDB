@@ -2000,6 +2000,7 @@ name = "strata-query"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "foldhash",
  "proptest",
  "strata-storage",
 ]
