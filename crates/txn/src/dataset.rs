@@ -3823,11 +3823,14 @@ mod tests {
         // cluster C's span x=[80,140) -- heavily overlapping bounding
         // regions rather than disjoint neighborhoods, with y/z offsets
         // drawn from the identical [0,60) range in every cluster. A query
-        // at [50,30,30] with k=10 was verified by direct computation
+        // at [64,15,15] with k=10 was verified by direct computation
         // (mirroring `cluster_vectors`' own golden-ratio/sqrt2/sqrt3
-        // offset sequence) to draw its true nearest neighbors from both
-        // commit 0's (row-ids 0..20) and commit 1's (row-ids 20..40)
-        // ranges -- see the accompanying report for the computed
+        // offset sequence) to draw its true top-10 nearest neighbors 3
+        // from commit 0's (row-ids 0..20), 4 from commit 1's (row-ids
+        // 20..40), and 3 from commit 2's (row-ids 40..60) ranges -- a
+        // genuine 3-way split, so dropping ANY one segment's worth of
+        // results measurably drops recall below this test's 0.9
+        // threshold. See the accompanying report for the computed
         // neighbor list.
         let dir = temp_dir("recall-parity-overlapping-segments");
         let ds = Dataset::create(&dir).unwrap();
@@ -3864,7 +3867,16 @@ mod tests {
             let range_end = u64::try_from(all_points.len()).unwrap();
             commit_ranges.push(range_start..range_end);
         }
-        assert_eq!(ds.snapshot().manifest.segments.len(), 3);
+        assert_eq!(
+            ds.snapshot().manifest.segments.len(),
+            3,
+            "three vector-carrying commits must produce three segments"
+        );
+        assert_eq!(
+            ds.snapshot().index.len(),
+            3,
+            "the loaded segment set must match the manifest's segment list"
+        );
 
         // A FixedSizeListArray built in the SAME order as `all_points`, so
         // `brute_force_search`'s `row_index` maps 1:1 onto
@@ -3878,7 +3890,7 @@ mod tests {
         let field = Arc::new(Field::new("item", DataType::Float32, false));
         let vectors_arr = arrow::array::FixedSizeListArray::new(field, 3, values, None);
 
-        let query = [50.0f32, 30.0, 30.0];
+        let query = [64.0f32, 15.0, 15.0];
         let k = 10;
 
         let truth = strata_index::brute_force_search(&vectors_arr, &query, k).unwrap();
@@ -3887,23 +3899,26 @@ mod tests {
             .map(|neighbor| all_points[neighbor.row_index].0)
             .collect();
 
-        // Fixture sanity check: if the true top-k didn't actually span 2+
-        // segments, this test would not be exercising what it claims to.
-        // The geometry was verified by direct computation before writing
-        // this test (see the report); re-asserting it here means a future
-        // edit to the centers/spacing/query that accidentally collapses
-        // the top-k back into one segment fails loudly here, rather than
-        // silently degrading this into a single-segment test that still
-        // passes.
+        // Fixture sanity check: if the true top-k didn't actually span all 3
+        // segments, this test would not be exercising what it claims to --
+        // a top-k that only ever spans 2 of the 3 ranges can't discriminate
+        // a fan-out bug that silently drops the one segment it happens to
+        // exclude. The geometry was verified by direct computation before
+        // writing this test (see the report); re-asserting it here means a
+        // future edit to the centers/spacing/query that accidentally
+        // collapses the top-k back into fewer segments fails loudly here,
+        // rather than silently degrading this into a weaker test that
+        // still passes.
         let truth_ranges_represented = commit_ranges
             .iter()
             .filter(|r| truth_row_ids.iter().any(|id| r.contains(id)))
             .count();
-        assert!(
-            truth_ranges_represented >= 2,
+        assert_eq!(
+            truth_ranges_represented, 3,
             "fixture regression: the brute-force ground truth top-{k} no longer spans \
-             2+ segments, so this test can no longer discriminate a cross-segment merge \
-             bug; truth row-ids {truth_row_ids:?} against ranges {commit_ranges:?}"
+             all 3 segments, so this test can no longer discriminate a fan-out bug that \
+             drops any single segment; truth row-ids {truth_row_ids:?} against ranges \
+             {commit_ranges:?}"
         );
 
         let hits = ds.snapshot().vector_search(&query, k, None).unwrap();
@@ -3920,22 +3935,22 @@ mod tests {
 
         // The assertion that actually proves cross-segment fan-out
         // happened, rather than relying on recall alone: a regression that
-        // only ever queries the first segment could still score
-        // deceptively high recall if that segment happens to dominate the
-        // true top-k by coincidence. This fixture's true top-k spans 2 of
-        // the 3 commit ranges (asserted above), so a fan-out that silently
-        // collapsed to single-segment search could return results from at
-        // most 1 range here -- this assertion is what would actually catch
-        // that regression.
+        // only ever queries a subset of segments could still score
+        // deceptively high recall if the segments it does consult happen
+        // to dominate the true top-k. This fixture's true top-k spans all
+        // 3 commit ranges with a genuine 3/4/3 split (asserted above), so
+        // a fan-out that silently dropped ANY one segment could return
+        // results from at most 2 ranges here -- this assertion is what
+        // would actually catch that regression.
         let hit_ranges_represented = commit_ranges
             .iter()
             .filter(|r| hit_row_ids.iter().any(|id| r.contains(id)))
             .count();
-        assert!(
-            hit_ranges_represented >= 2,
-            "results must span at least 2 of the 3 committed segments -- a result set \
-             confined to a single commit's row-id range would mean the fan-out only \
-             consulted one segment: got {hit_row_ids:?} against ranges {commit_ranges:?}"
+        assert_eq!(
+            hit_ranges_represented, 3,
+            "results must span all 3 committed segments -- a result set missing any one \
+             commit's row-id range would mean the fan-out failed to consult that segment: \
+             got {hit_row_ids:?} against ranges {commit_ranges:?}"
         );
 
         std::fs::remove_dir_all(&dir).ok();
