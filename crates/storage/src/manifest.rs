@@ -52,7 +52,18 @@ pub struct DataFileEntry {
 /// "field present but empty" indistinguishable, which is required: an
 /// absent/empty `zone_map` must always mean "must scan," never "may prune"
 /// (binding invariant, see the design doc §3).
+///
+/// `#[serde(deny_unknown_fields)]`: unlike `DataFileEntry`, `SegmentEntry`
+/// was introduced in S1 W3.1 with exactly its current field set and has
+/// never had a field removed since — so no manifest this crate has ever
+/// written can carry a segment entry with a field this code doesn't know
+/// about, and denying unknown fields cannot reject any of them. It only
+/// rejects a manifest carrying a field this code has never heard of (a
+/// future field written by a newer version and then rolled back to this
+/// one, or on-disk corruption/hand-editing) — the same "fail loudly instead
+/// of silently dropping data" reasoning as on `DataFileEntry` above.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SegmentEntry {
     /// Relative to the dataset's `data/` directory, e.g. `"{attempt_id:020}.seg"`.
     pub name: String,
@@ -67,8 +78,13 @@ pub struct SegmentEntry {
     /// Inclusive.
     pub row_id_max: u64,
     pub byte_len: u64,
-    /// Empty until S1 W4 populates it. An absent or empty map must always
-    /// fail safe to "must scan" in whatever pruning evaluator W4 writes.
+    /// Computed and populated at commit time since S1 W4a — each commit's
+    /// per-batch `ColumnStats` merged into one map covering every batch in
+    /// that commit (`strata_txn::dataset::merge_zone_map_stats`); see the S1
+    /// W4 design amendment §5 for the merge rule. Nothing prunes using it
+    /// yet (that's W4b, not yet shipped): an absent or empty map must still
+    /// always fail safe to "must scan" in whatever pruning evaluator W4b
+    /// writes.
     #[serde(default)]
     pub zone_map: HashMap<String, ColumnStats>,
 }
