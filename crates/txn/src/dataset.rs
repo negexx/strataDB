@@ -35,7 +35,7 @@ use strata_storage::{
 
 use crate::commit_log::{CommitLog, ConflictCheck};
 use crate::error::{Result, TxnError};
-use crate::row_id::{RowIdAllocator, RowIdClaim};
+use crate::row_id::{RowIdAllocator, RowIdRange};
 use crate::snapshot::Snapshot;
 
 /// The hidden internal row-id column every committed batch carries
@@ -173,12 +173,10 @@ impl SnapshotCell {
 pub struct Dataset {
     dir: PathBuf,
     current: Arc<SnapshotCell>,
-    /// Hands out row-id ranges *and* tracks which of them belong to
-    /// transactions still in flight, so a published watermark can exclude
-    /// them. Replaces the bare `AtomicU64` counter this used to be: the
-    /// counter advance and the in-flight registration have to be one atomic
-    /// step, or a publisher can observe a bound that covers a claim the
-    /// registry does not yet list. See [`crate::row_id`].
+    /// Hands out contiguous row-id ranges from a single global counter.
+    /// See [`crate::row_id`] for why the counter needs a lock rather than a
+    /// bare `AtomicU64`, and for why this no longer also tracks which
+    /// claims are still in flight.
     row_ids: Arc<RowIdAllocator>,
     /// Monotonic counter whose sole job is generating a collision-free
     /// filename prefix for each commit *attempt*'s data/segment files —
@@ -193,10 +191,9 @@ pub struct Dataset {
     ///
     /// **Lock order: this, then `row_ids`' internal lock — never the
     /// reverse.** It is the outer of the crate's two locks: `commit`
-    /// acquires `row_ids`' lock (via `claim`/`visibility_bound_excluding`/
-    /// `RowIdClaim::release`) both before taking this one and while holding
-    /// it, but nothing ever reaches for this one from inside `row_ids`. See
-    /// [`crate::row_id`]'s module doc.
+    /// acquires `row_ids`' lock (via `claim`/`next_row_id`) both before
+    /// taking this one and while holding it, but nothing ever reaches for
+    /// this one from inside `row_ids`. See [`crate::row_id`]'s module doc.
     commit_lock: Arc<Mutex<CommitLog>>,
     /// Counts every commit that hit `ConflictCheck::InsufficientHistory` —
     /// its read-version aged out of `COMMIT_LOG_CAPACITY` before it could
@@ -374,9 +371,6 @@ impl Dataset {
         let snapshot = Snapshot {
             dir: dir.clone(),
             version: manifest.version,
-            watermark: manifest.next_row_id.saturating_sub(1),
-            // A freshly created dataset has no transaction in flight.
-            in_flight: Vec::new().into(),
             manifest: Arc::new(manifest),
             // A brand-new dataset has committed no vectors, so it has no
             // segments — not an empty graph. `vector_search` on it returns
@@ -473,15 +467,6 @@ impl Dataset {
         let snapshot = Snapshot {
             dir: dir.clone(),
             version: manifest.version,
-            watermark: manifest.next_row_id.saturating_sub(1),
-            // Nothing is in flight in a process that has just opened this
-            // dataset. A *prior* session's abandoned claims need no entry
-            // either: `manifest.next_row_id` may cover them, but their data
-            // files never entered a manifest, and their segments were never
-            // listed in a manifest, so nothing exists at those ids to be
-            // found. That is why this hazard was only ever transient, never
-            // survivable across a restart.
-            in_flight: Vec::new().into(),
             manifest: Arc::new(manifest),
             index,
             tombstones: Arc::new(tombstones),
@@ -928,7 +913,7 @@ impl Transaction {
         let ts = issue_timestamp(&self.last_issued_timestamp)?;
         let data_dir = data_subdir(&self.dir);
 
-        let (new_data_files, new_segment, mut claim) = self.write_phase(&data_dir, ts)?;
+        let (new_data_files, new_segment) = self.write_phase(&data_dir, ts)?;
 
         // Test-only rendezvous: row-ids claimed, data files written, this
         // commit's segment (if any) already fsynced, but `commit_lock` not
@@ -1045,20 +1030,12 @@ impl Transaction {
             }
             manifest.segments.push(published.entry.clone());
         }
-        // The bound and the exclusion set this commit's snapshot will carry,
-        // read as one unit under the allocator lock so they cannot disagree
-        // — the disagreement being precisely the bug this closes. Every
-        // *other* transaction's outstanding claim is excluded; this one's
-        // own is not, because it is about to become durable and an
-        // acknowledged write must be immediately visible.
-        //
         // Read here, while `commit_lock` is held, so no other transaction
         // can publish a snapshot between this read and the store below.
         // `next_row_id` is the allocation high-water mark, which is what
         // the manifest must persist for restart safety (a reopened dataset
         // must never reuse an id, committed or abandoned — spec §8).
-        let visibility = self.row_ids.visibility_bound_excluding(claim.as_ref());
-        manifest.next_row_id = visibility.next_row_id;
+        manifest.next_row_id = self.row_ids.next_row_id();
         // SeqCst ordering justification for the `.load()` below (distinct
         // from the pre-lock fetch_add's justification in `write_phase`): it must
         // observe a value at least as large as every commit that landed
@@ -1138,24 +1115,11 @@ impl Transaction {
         // may run in a way that could undo the commit — nor does anything
         // need to, since there is nothing left to compensate for.
 
-        // Same instant, same reason: these row-ids are committed, so they
-        // must stop being excluded from *later* commits' snapshots. Doing
-        // it explicitly here rather than leaving it to the claim's `Drop`
-        // keeps the release inside `commit_lock`, so no other transaction
-        // can publish a snapshot between the durability point and the
-        // release and briefly hide rows that are already durable. On any
-        // earlier return the `Drop` still fires and the ids simply become
-        // permanent gaps, which spec §8 explicitly allows.
-        if let Some(claim) = &mut claim {
-            claim.release();
-        }
-
         commit_log.push(new_version, self.write_set);
 
         // Only after commit_manifest succeeds does the new state become
         // visible to future Dataset::snapshot() calls — the in-memory swap
         // must never run ahead of the on-disk durability point.
-        let watermark = manifest.next_row_id.saturating_sub(1);
         // The new snapshot's segment set is the previous snapshot's parts
         // plus a reader over the very bytes just fsynced — no read-back.
         let index = match new_segment {
@@ -1178,8 +1142,6 @@ impl Transaction {
             version: new_version,
             manifest: Arc::new(manifest),
             index,
-            watermark,
-            in_flight: visibility.in_flight,
             tombstones: Arc::new(tombstones),
         };
         self.current.store(Arc::new(snapshot));
@@ -1208,12 +1170,9 @@ impl Transaction {
     /// just an orphaned file nothing points to — exactly like today's
     /// orphaned row data files.
     ///
-    /// Returns the new `DataFileEntry`s, this commit's published segment
+    /// Returns the new `DataFileEntry`s and this commit's published segment
     /// (`None` for a commit that carries no vectors — see
-    /// [`Self::build_and_write_segment`]), and the row-id claim to hold
-    /// until the commit reaches its durability point (`None` for a
-    /// delete-only transaction, which inserts no rows, claims no row-ids,
-    /// and has nothing to hide from concurrent readers).
+    /// [`Self::build_and_write_segment`]).
     ///
     /// # Errors
     ///
@@ -1226,11 +1185,7 @@ impl Transaction {
         &self,
         data_dir: &Path,
         ts: i64,
-    ) -> Result<(
-        Vec<DataFileEntry>,
-        Option<PublishedSegment>,
-        Option<RowIdClaim>,
-    )> {
+    ) -> Result<(Vec<DataFileEntry>, Option<PublishedSegment>)> {
         // Skipped entirely when there's nothing to insert: a delete-only
         // transaction writes no new files, so there's no new directory
         // entry to create or fsync and no attempt_id needs reserving.
@@ -1238,7 +1193,7 @@ impl Transaction {
         // per `Dataset` lifetime; recreating it on every single commit
         // regardless of whether it had anything to write was redundant.
         if self.pending.is_empty() {
-            return Ok((Vec::new(), None, None));
+            return Ok((Vec::new(), None));
         }
         for batch in &self.pending {
             for name in HIDDEN_COLUMNS {
@@ -1308,7 +1263,7 @@ impl Transaction {
         // leave a file's bytes durable while the file itself is absent.
         // Must happen before the manifest commit.
         strata_storage::sync_dir(data_dir)?;
-        Ok((new_data_files, segment, Some(claim)))
+        Ok((new_data_files, segment))
     }
 
     /// Builds this commit's index segment from `inserts`, writes and fsyncs
@@ -1466,7 +1421,7 @@ impl Transaction {
         pending: &[RecordBatch],
         data_dir: &Path,
         attempt_id: u64,
-        claim: &RowIdClaim,
+        claim: &RowIdRange,
         ts: i64,
         data_files: &mut Vec<DataFileEntry>,
     ) -> Result<(
@@ -2079,17 +2034,19 @@ mod tests {
     const TEST_COMMIT_LOG_CAPACITY: usize = 8;
 
     /// Proves 8 concurrent claims hand out non-overlapping, contiguous
-    /// ranges, and that every one of them is registered as in-flight while
-    /// it is held. Previously asserted this of a bare
-    /// `AtomicU64::fetch_add`, which is no longer how row-ids are
-    /// allocated — a `fetch_add` cannot advance the counter and register
-    /// the claim as one step, which is the whole point of
-    /// [`crate::row_id::RowIdAllocator`]. Uses `std::thread::scope` rather
-    /// than `unsafe { transmute }` to borrow the stack-local safely — see
-    /// Task 5's brief for why the `transmute` draft was rejected (this
-    /// workspace's "safe Rust by default" convention).
+    /// ranges — no id handed out twice, and none skipped. Uses
+    /// `std::thread::scope` rather than `unsafe { transmute }` to borrow
+    /// the stack-local safely — see Task 5's brief for why the `transmute`
+    /// draft was rejected (this workspace's "safe Rust by default"
+    /// convention).
+    ///
+    /// Previously also asserted that every claim was registered as
+    /// in-flight while held, and released once dropped. That registry no
+    /// longer exists — see [`crate::row_id`]'s module doc for why it became
+    /// redundant once a snapshot's index became exactly its own manifest's
+    /// segment list.
     #[test]
-    fn concurrent_claims_hand_out_non_overlapping_ranges_and_all_register() {
+    fn concurrent_claims_hand_out_non_overlapping_ranges() {
         use crate::row_id::RowIdAllocator;
 
         let allocator = Arc::new(RowIdAllocator::new(0));
@@ -2100,7 +2057,7 @@ mod tests {
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
 
-        let mut bases: Vec<u64> = claims.iter().map(super::RowIdClaim::base).collect();
+        let mut bases: Vec<u64> = claims.iter().map(super::RowIdRange::base).collect();
         bases.sort_unstable();
         for (i, base) in bases.iter().enumerate() {
             assert_eq!(
@@ -2110,24 +2067,10 @@ mod tests {
             );
         }
 
-        // Every claim is still held, so every one must be excluded from a
-        // snapshot published now — the property a bare counter can't give.
-        let bound = allocator.visibility_bound_excluding(None);
-        assert_eq!(bound.next_row_id, 80);
-        for base in &bases {
-            assert!(
-                bound.in_flight.iter().any(|range| range.contains(*base)),
-                "row-id {base} is claimed but not committed, so it must be excluded"
-            );
-        }
-
-        drop(claims);
-        assert!(
-            allocator
-                .visibility_bound_excluding(None)
-                .in_flight
-                .is_empty(),
-            "and released once every claim is dropped"
+        assert_eq!(
+            allocator.next_row_id(),
+            80,
+            "the counter must cover every id handed out"
         );
     }
 
@@ -5591,15 +5534,12 @@ mod tests {
 
         let snapshot = dataset.snapshot();
         assert_eq!(
-            snapshot.watermark, 3,
-            "expected exactly 4 rows total (system row-ids 0..=3)"
-        );
-        assert_eq!(
             snapshot
                 .scan(&crate::mvp_fixtures::mvp_schema())
                 .unwrap()
                 .num_rows(),
-            4
+            4,
+            "expected exactly 4 rows total (system row-ids 0..=3)"
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -6926,120 +6866,6 @@ mod loom_tests {
             assert!(thread_b.join().unwrap().is_ok());
 
             std::fs::remove_dir_all(&dir).ok();
-        });
-    }
-
-    #[test]
-    fn a_published_bound_never_covers_another_transactions_outstanding_claim() {
-        // The interleaving proof for the snapshot-isolation fix, and the
-        // `loom` test `.claude/rules/concurrency-txn-layer.md` requires for
-        // the counter-advance step (spec §8 names it explicitly: "the
-        // counter-bump-plus-CAS step needs a `loom` interleaving test
-        // proving it is genuinely atomic under concurrent commit
-        // attempts").
-        //
-        // The hazard is a *torn pair*: if a claim could ever be observed
-        // after its row-ids were reflected in `next_row_id` but before it
-        // appeared in the in-flight registry, a publisher reading that
-        // instant would stamp a watermark covering an uncommitted row-id
-        // with nothing excluding it — which is exactly the bug being
-        // closed. `RowIdAllocator` makes the advance and the registration
-        // one locked step; this asserts no interleaving can pull them
-        // apart.
-        //
-        // Modelled on the allocator directly rather than through
-        // `Dataset::commit`: the pair's atomicity is the whole property,
-        // and a model with no filesystem I/O in it explores exhaustively in
-        // a fraction of the time. The end-to-end consequence is covered
-        // deterministically by
-        // `dataset::tests::a_concurrent_reader_never_sees_an_in_flight_commits_vector`.
-        loom::model(|| {
-            let allocator = StdArc::new(crate::row_id::RowIdAllocator::new(0));
-
-            // Thread A models a transaction between its pre-lock row-id
-            // claim and its commit: it claims and *keeps* the claim, so it
-            // is still in flight when the assertions below run.
-            let a_allocator = StdArc::clone(&allocator);
-            // Unsized on purpose — see `COMMIT_STACK_SIZE`. This model and
-            // the next touch only a `Mutex`, an integer add and a tiny
-            // `Vec`; no `commit`, so no Arrow/serde/HNSW frames, and 32 KiB
-            // is ample. Sizing them would burn 8 MiB per thread per
-            // execution for nothing and blur the rule into "size
-            // everything", losing why it exists.
-            let in_flight = loom::thread::spawn(move || a_allocator.claim(1).unwrap());
-
-            // Thread B models a committer publishing a snapshot: claim,
-            // then read the bound it will stamp into that snapshot,
-            // excluding only its own about-to-be-durable claim.
-            let b_allocator = StdArc::clone(&allocator);
-            let publisher = loom::thread::spawn(move || {
-                let claim = b_allocator.claim(1).unwrap();
-                let bound = b_allocator.visibility_bound_excluding(Some(&claim));
-                (claim, bound)
-            });
-
-            let in_flight_claim = in_flight.join().unwrap();
-            let (published_claim, bound) = publisher.join().unwrap();
-
-            // `Snapshot::is_visible` is `row_id <= watermark`, and
-            // `watermark` is `next_row_id - 1` — so "covered by the bound"
-            // is exactly `id < next_row_id`.
-            let covered = |id: u64| id < bound.next_row_id;
-            let excluded = |id: u64| bound.in_flight.iter().any(|range| range.contains(id));
-
-            assert!(
-                covered(published_claim.base()) && !excluded(published_claim.base()),
-                "a publisher must never hide its own rows: an acknowledged write is \
-                 immediately visible"
-            );
-            assert!(
-                !covered(in_flight_claim.base()) || excluded(in_flight_claim.base()),
-                "no interleaving may publish a bound that covers a still-outstanding \
-                 claim without excluding it — that is a row visible before its commit \
-                 succeeded (spec §2)"
-            );
-        });
-    }
-
-    #[test]
-    fn no_interleaving_strands_a_claim_in_the_registry() {
-        // The other half of the property: exclusion must be *temporary*.
-        // A claim that outlived its transaction would blind every later
-        // reader to that stretch of row-ids permanently — turning a
-        // too-visible bug into a too-invisible one. `RowIdClaim`'s `Drop`
-        // is what guarantees it, so this exercises both exit paths (an
-        // explicit `release` on the durable path, a bare drop on the
-        // abandoned path) against each other.
-        loom::model(|| {
-            let allocator = StdArc::new(crate::row_id::RowIdAllocator::new(0));
-
-            let committed_allocator = StdArc::clone(&allocator);
-            let committed = loom::thread::spawn(move || {
-                let mut claim = committed_allocator.claim(2).unwrap();
-                claim.release();
-            });
-
-            let abandoned_allocator = StdArc::clone(&allocator);
-            let abandoned = loom::thread::spawn(move || {
-                // Dropped without releasing — an early `?` out of `commit`.
-                let _claim = abandoned_allocator.claim(3).unwrap();
-            });
-
-            committed.join().unwrap();
-            abandoned.join().unwrap();
-
-            let bound = allocator.visibility_bound_excluding(None);
-            assert!(
-                bound.in_flight.is_empty(),
-                "every claim must be released by the time its transaction returns, \
-                 under every interleaving: {:?}",
-                bound.in_flight
-            );
-            assert_eq!(
-                bound.next_row_id, 5,
-                "both claims consumed their ids regardless of outcome — gaps are \
-                 safe, reuse is forbidden (spec §8)"
-            );
         });
     }
 
