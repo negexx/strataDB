@@ -43,9 +43,11 @@ pub trait NodeSource {
     /// Whether `local` is tombstoned. Defaults to `false` — a segment (from
     /// W3.2) has no per-node deleted flag; deletion there is a manifest-level
     /// tombstone applied by the caller's `filter`, not this method. The live
-    /// graph overrides this to check `Node::is_deleted()`, since
-    /// `GraphResidueGuard`'s soft-delete mechanism is still active through
-    /// W3.2a (see the amendment's §2 for why this default can't be omitted).
+    /// graph overrides this to check `Node::is_deleted()`, since `Graph`'s
+    /// soft-delete flag (`Graph::delete`/`Node::mark_deleted`) still exists
+    /// as index-internal API even though nothing in `crates/txn`'s commit
+    /// path calls it anymore as of S1 W3.2b (see the amendment's §2 for why
+    /// this default can't be omitted).
     fn is_deleted(&self, _local: u64) -> bool {
         false
     }

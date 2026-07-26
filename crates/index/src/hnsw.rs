@@ -225,14 +225,17 @@ impl HnswIndex {
     /// clears the flag.
     ///
     /// **Sole intended use: undoing an insert that never became durable.**
-    /// `crates/txn`'s commit path calls this to drop a transaction's
-    /// vectors back out of the shared graph when that transaction failed
-    /// before its manifest commit (see that crate's `GraphResidueGuard`).
-    /// That is sound precisely because such a row-id was never committed in
-    /// *any* version, so no snapshot should ever observe it, and because
-    /// row-ids are never reused
-    /// (`.claude/docs/design/phase-0-transaction-and-format-spec.md` §8) —
-    /// a soft-deleted id can never legitimately reappear.
+    /// Before S1 W3.2, `crates/txn`'s commit path called this to drop a
+    /// transaction's vectors back out of a shared graph when that
+    /// transaction failed before its manifest commit. That guarantee is now
+    /// provided structurally instead — a commit's vectors live only in its
+    /// own per-commit segment, which a failed commit never gets to publish
+    /// — so nothing in `crates/txn`'s commit path calls this method
+    /// anymore. It remains index-internal API, sound on the same terms it
+    /// always was: such a row-id was never committed in *any* version, so
+    /// no snapshot should ever observe it, and because row-ids are never
+    /// reused (`.claude/docs/design/phase-0-transaction-and-format-spec.md`
+    /// §8) — a soft-deleted id can never legitimately reappear.
     ///
     /// **Do not use this to implement a user-level DELETE.** That is
     /// `crates/txn`'s versioned `Snapshot::tombstones` set, which is

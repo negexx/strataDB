@@ -982,6 +982,7 @@ impl Transaction {
         // transaction's stale begin()-time view), so a clean commit
         // composes with everything that landed in between.
         let mut tombstones = latest_snapshot.tombstones.as_ref().clone();
+
         // **No index mutation happens here, or anywhere else inside this
         // lock.** This commit's segment was built and fsynced in
         // `write_phase`, outside the lock; publishing it is the
