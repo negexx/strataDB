@@ -44,7 +44,7 @@ The transaction/conflict layer is an explicit, load-bearing architectural compon
 | Columnar storage format | `crates/storage/` | Fixed-size pages/column chunks, dictionary + RLE encoding, validity bitmaps, append-only files |
 | Manifest & versioning | `crates/storage/` (manifest) | Lists files per version; the commit atomicity boundary (CAS) |
 | Query & execution engine | `crates/query/` | Small expression/filter API (no full SQL parser), vectorized batch operators, predicate pushdown |
-| Vector index | `crates/index/` | HNSW, filtered similarity search, append-only delta log for mutations (not in-place graph edits) |
+| Vector index | `crates/index/` | HNSW, filtered similarity search, immutable per-commit on-disk segments (not in-place graph edits) |
 | Transaction & conflict layer | `crates/txn/` | OCC, snapshot isolation, row/key-range conflict detection, atomic row+index commits — the flagship subsystem |
 | Client bindings | `crates/bindings/` | PyO3 Python bindings (builds `strata_ext`), including an explicit transaction API (`begin`/`commit`/retry-on-conflict) |
 | CLI | `crates/cli/` | Dataset/manifest inspection (`strata` binary) |

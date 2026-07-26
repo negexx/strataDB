@@ -23,17 +23,25 @@ use crate::stats::ColumnStats;
 /// One committed data file's name and the per-column statistics computed
 /// for it at commit time — see
 /// `.claude/docs/design/phase-3-query-refinement-spec.md` §1.
+///
+/// `#[serde(deny_unknown_fields)]`: a pre-S1-W3.2 manifest's `DataFileEntry`
+/// still carries a `delta_log` field (removed with no compatibility shim,
+/// per the design doc §0.3 cut). Without this, `delta_log` would be silently
+/// dropped by serde's default "ignore unknown fields" behavior and
+/// `Manifest.segments` would default to empty via its own
+/// `#[serde(default)]` — the dataset would *open*, `scan()` would return
+/// rows correctly, and `vector_search()` would silently return `Ok(vec![])`
+/// forever. Denying unknown fields turns that into a loud deserialization
+/// error at `read_current`/`Dataset::open`, which is what the design doc
+/// actually promises: a pre-migration dataset does not open.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DataFileEntry {
     /// Relative to the dataset's `data/` directory.
     pub name: String,
     /// Column name -> stats. Absent key means "no stats for this column in
     /// this file" (non-orderable type, or all-null) — never a wrong entry.
     pub stats: HashMap<String, ColumnStats>,
-    /// Relative to the dataset's `data/` directory. This commit's vector-
-    /// index delta-log entries — see
-    /// `.claude/docs/design/phase-4-vector-index-spec.md` §2.
-    pub delta_log: String,
 }
 
 /// One immutable index segment listed in the manifest — see
@@ -65,7 +73,18 @@ pub struct SegmentEntry {
     pub zone_map: HashMap<String, ColumnStats>,
 }
 
+/// `#[serde(deny_unknown_fields)]`: every field `Manifest` has ever gained
+/// (`tombstones`, `next_attempt_id`, `commit_time_high_water`, `segments`)
+/// was added with `#[serde(default)]` and no top-level field has ever been
+/// *removed* the way `DataFileEntry.delta_log` was — so every manifest this
+/// crate has ever written is a subset of today's field set, and denying
+/// unknown fields cannot reject any of them. It only rejects a manifest
+/// carrying a field this code has never heard of (a future field written by
+/// a newer version and then rolled back to this one, or on-disk
+/// corruption/hand-editing) — the same "fail loudly instead of silently
+/// dropping data" reasoning as on `DataFileEntry` above.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub version: u64,
     /// Accumulated across every committed version so far.
@@ -77,13 +96,14 @@ pub struct Manifest {
     /// Row-ids tombstoned (deleted, or superseded by `update`) as of this
     /// version. Accumulated across every committed version, same as
     /// `data_files` — see Phase 6's design doc for why this lives directly
-    /// in the manifest rather than a delta-log file: a delete-only
-    /// transaction has no data file to attach one to, since there is no
-    /// dataset-wide fixed schema to fabricate an empty batch from.
+    /// in the manifest rather than in some per-commit artifact: a
+    /// delete-only transaction has no data file (no dataset-wide fixed
+    /// schema to fabricate an empty batch from) and no index segment (no
+    /// vectors to build one from) to attach a tombstone record to.
     #[serde(default)]
     pub tombstones: Vec<u64>,
     /// The next filename-uniqueness "attempt id" to hand out for data/
-    /// delta-log filenames — see `strata_txn::Dataset.write_attempt_counter`.
+    /// segment filenames — see `strata_txn::Dataset.write_attempt_counter`.
     /// Persisted (rather than always restarting at 0) so that
     /// `Dataset::open` never regenerates a filename a prior session already
     /// committed: `write_batch` truncates via `File::create`, so a filename
@@ -253,7 +273,6 @@ mod tests {
             data_files: vec![DataFileEntry {
                 name: "a.arrow".to_string(),
                 stats: HashMap::new(),
-                delta_log: "d.deltalog".to_string(),
             }],
             next_row_id: 0,
             tombstones: Vec::new(),
@@ -268,12 +287,10 @@ mod tests {
                 DataFileEntry {
                     name: "a.arrow".to_string(),
                     stats: HashMap::new(),
-                    delta_log: "d.deltalog".to_string(),
                 },
                 DataFileEntry {
                     name: "b.arrow".to_string(),
                     stats: HashMap::new(),
-                    delta_log: "d.deltalog".to_string(),
                 },
             ],
             next_row_id: 0,
@@ -300,7 +317,6 @@ mod tests {
             data_files: vec![DataFileEntry {
                 name: "a.arrow".to_string(),
                 stats: HashMap::new(),
-                delta_log: "d.deltalog".to_string(),
             }],
             next_row_id: 0,
             tombstones: Vec::new(),
@@ -379,7 +395,6 @@ mod tests {
             data_files: vec![DataFileEntry {
                 name: "data.arrow".to_string(),
                 stats,
-                delta_log: "d.deltalog".to_string(),
             }],
             next_row_id: 0,
             tombstones: Vec::new(),
@@ -479,7 +494,6 @@ mod tests {
             data_files: vec![DataFileEntry {
                 name: "a.arrow".to_string(),
                 stats: HashMap::new(),
-                delta_log: "d.deltalog".to_string(),
             }],
             next_row_id: 0,
             tombstones: Vec::new(),
@@ -549,5 +563,27 @@ mod tests {
     #[test]
     fn empty_manifest_has_no_segments() {
         assert!(Manifest::empty().segments.is_empty());
+    }
+
+    #[test]
+    fn legacy_data_file_entry_with_delta_log_field_fails_to_deserialize() {
+        // Simulates a manifest written before S1 W3.2 removed
+        // `DataFileEntry.delta_log` (no compatibility shim, per the design
+        // doc §0.3 cut). Before `deny_unknown_fields`, `delta_log` would be
+        // silently dropped and `Manifest.segments` would quietly default to
+        // empty via its own `#[serde(default)]` — the dataset would open,
+        // `scan()` would work, and `vector_search()` would silently return
+        // `Ok(vec![])` forever. This must instead be a loud deserialization
+        // error.
+        let legacy_json = serde_json::json!({
+            "name": "a.arrow",
+            "stats": {},
+            "delta_log": "d.deltalog",
+        });
+        let result: std::result::Result<DataFileEntry, _> = serde_json::from_value(legacy_json);
+        assert!(
+            result.is_err(),
+            "a legacy DataFileEntry with a delta_log field must fail to deserialize, not silently drop it"
+        );
     }
 }

@@ -26,10 +26,19 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
 [dependencies]
 anndists = { version = "0.1", features = ["simdeez_f"] }
 arrow.workspace = true
-serde.workspace = true
-serde_json.workspace = true
+# Checked typed-slice casts for the `.seg` segment codec (u8 <-> u64/u32/f32).
+# Already in this workspace's dependency graph via `arrow`, so this adds no
+# new crate -- only a direct edge. Chosen over hand-rolled `from_le_bytes`
+# loops because it makes the alignment precondition a checked API call
+# rather than a comment.
+bytemuck = "1"
+# CRC32C (Castagnoli) for the segment header/body checksums the format
+# requires (segment-format design doc section 1). Hardware-accelerated where
+# available with a portable software fallback; no transitive runtime
+# dependencies. `crc32fast` is NOT a substitute -- it implements CRC-32
+# (IEEE), a different polynomial than the format specifies.
+crc32c = "0.6"
 thiserror.workspace = true
 
 [dev-dependencies]
 loom = "0.7"
-tempfile = { workspace = true }

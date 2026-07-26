@@ -40,10 +40,18 @@ pub enum IndexError {
     DimensionMismatch { query_len: usize, expected: usize },
     #[error("row_id {row_id} is beyond the index's addressable capacity of {capacity} rows")]
     RowIdOutOfRange { row_id: u64, capacity: u64 },
+    // No producer in this crate today (segment (de)serialization is
+    // entirely in-memory; file I/O belongs to `crates/txn`). Retained so a
+    // future consumer that does own I/O has a variant to use, and because
+    // removing it would churn `TxnError`'s `#[from]` conversion for nothing.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("delta log entry serialization error: {0}")]
-    Serde(#[from] serde_json::Error),
+    #[error("cannot build a segment with no vectors")]
+    SegmentEmpty,
+    #[error("segment exceeds the format's size limits: {0}")]
+    SegmentTooLarge(String),
+    #[error("segment is corrupt or was written by an incompatible writer: {0}")]
+    SegmentCorrupt(String),
 }
 
 /// Maximum number of bidirectional links per node per layer (`hnsw_rs`'s
@@ -151,22 +159,22 @@ impl HnswIndex {
     /// Returns [`IndexError::DimensionMismatch`] if `vector`'s length
     /// doesn't match the dimensionality of the first vector ever inserted.
     /// Checked upfront (inside `Graph::insert`'s own
-    /// `check_or_establish_dimension` call) so a corrupted delta-log entry
-    /// with a wrong-length vector can never reach the distance function.
+    /// `check_or_establish_dimension` call) so a wrong-length vector can
+    /// never reach the distance function.
     pub fn insert(&self, row_id: u64, vector: &[f32]) -> Result<(), IndexError> {
         self.insert_owned(row_id, vector.to_vec())
     }
 
     /// Same as [`Self::insert`], but takes ownership of `vector` and moves
     /// it straight into the graph instead of cloning a borrowed slice.
-    /// `crates/txn`'s commit-apply loop and recovery replay both already
-    /// own a freshly-deserialized/freshly-built `Vec<f32>` at their call
-    /// site — routing through `insert`'s `&[f32]` there would force a
-    /// wasted clone of the full 512-dim embedding on every insert, on top
-    /// of the one copy already paid getting the vector out of Arrow (or
-    /// out of the delta log) in the first place. `Graph::insert` moves
-    /// `vector` into `Node::new` from there, not a further copy — so this
-    /// takes the vector from two copies down to one, not three to two.
+    /// `crates/txn`'s per-commit segment builder already owns a
+    /// freshly-built `Vec<f32>` at its call site — routing through
+    /// `insert`'s `&[f32]` there would force a wasted clone of the full
+    /// 512-dim embedding on every insert, on top of the one copy already
+    /// paid getting the vector out of Arrow in the first place.
+    /// `Graph::insert` moves `vector` into `Node::new` from there, not a
+    /// further copy — so this takes the vector from two copies down to one,
+    /// not three to two.
     ///
     /// # Errors
     ///
@@ -323,6 +331,40 @@ impl HnswIndex {
                 squared_distance: dist * dist,
             })
             .collect())
+    }
+
+    /// Serializes this index into a complete on-disk segment image, in
+    /// memory — no file I/O (see `crate::segment_writer`'s module doc for
+    /// why the write/fsync lives in `crates/txn` instead).
+    ///
+    /// This index must be a **fresh, per-commit index keyed by
+    /// segment-local ordinals `0..row_ids.len()`**, built by calling
+    /// [`Self::insert_owned`] once per vector with `local` as the key —
+    /// *not* the dataset's global row-ids. `row_ids[local]` supplies the
+    /// global row-id each ordinal stands for, and must be strictly
+    /// ascending. See
+    /// `docs/superpowers/specs/2026-07-25-s1-w3-2-design-amendment.md` §3b.
+    ///
+    /// # Errors
+    ///
+    /// See `crate::segment_writer::encode_segment`: [`IndexError::SegmentEmpty`]
+    /// for an empty `row_ids` or an index with no vectors,
+    /// [`IndexError::SegmentCorrupt`] for a graph that is not a well-formed
+    /// `0..N` keying, [`IndexError::DimensionMismatch`] for a ragged vector,
+    /// and [`IndexError::SegmentTooLarge`] if the image would overflow the
+    /// format's `u32` fields.
+    pub fn to_segment_bytes(&self, row_ids: &[u64]) -> Result<Box<[u8]>, IndexError> {
+        crate::segment_writer::encode_segment(
+            &self.graph,
+            row_ids,
+            crate::segment_format::SegmentParams {
+                m: self.m,
+                mmax0: self.mmax0,
+                mmax: self.mmax,
+                ef_construction: self.ef_construction,
+                m_l: self.m_l,
+            },
+        )
     }
 }
 

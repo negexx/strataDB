@@ -1,9 +1,11 @@
-//! HNSW vector index, append-only delta log. See
-//! `.claude/rules/vector-index.md` and
-//! `.claude/docs/design/phase-0-transaction-and-format-spec.md` §4/§6.
+//! HNSW vector index: a lock-free in-memory graph plus the immutable,
+//! self-contained on-disk segment format that graph is sealed into, one
+//! segment per committing transaction. See `.claude/rules/vector-index.md`,
+//! `.claude/docs/design/phase-0-transaction-and-format-spec.md` §4/§6, and
+//! `docs/superpowers/specs/2026-07-24-s1-segment-format-w3-migration-design.md`
+//! §1 for the format.
 
 pub mod brute_force;
-pub mod delta_log;
 // `#[doc(hidden)] pub`, not a `internal-benchmarks` Cargo feature: an
 // earlier version of this gated `pub` behind a feature so `graph`/
 // `distance` stayed private in every "normal" build. That doesn't
@@ -34,13 +36,17 @@ mod node;
 mod node_layout;
 mod node_source;
 mod node_table;
+mod segment_format;
+mod segment_reader;
 mod segment_set;
+mod segment_writer;
 mod slot_array;
 
 pub use brute_force::{Neighbor, brute_force_search};
-pub use delta_log::{DeltaEntry, read_delta_log, write_delta_log};
 pub use hnsw::{
     EfConstruction, HnswIndex, IndexError, MaxConnections, MaxElements, MaxLayers, VectorMatch,
 };
 pub use node_source::NodeSource;
+pub use segment_format::SEGMENT_FORMAT_VERSION;
+pub use segment_reader::SegmentReader;
 pub use segment_set::{IndexPart, SegmentSet};

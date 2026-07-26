@@ -278,6 +278,15 @@ historical-data migration because none exists.
 - **W3.2b** deletes `GraphResidueGuard` once those tests are green against the segment-publish path,
   proving the guarantee moved before the old mechanism is removed rather than trusting it moved.
 
+> **Status (2026-07-25):** W3.2a is implemented by
+> [`docs/superpowers/plans/2026-07-25-s1-w3-2a-segment-write-path.md`](../plans/2026-07-25-s1-w3-2a-segment-write-path.md).
+> That plan takes one decision this document deferred: **basic multi-part
+> fan-out search ships in W3.2a, not W3.3** — otherwise the second commit
+> after W3.2a lands is a silent recall regression. W3.3 is correspondingly
+> re-scoped to zone-map pruning, the monolithic-baseline recall-parity test,
+> and the `explain`-shaped segment-consultation assertion. See that plan's
+> "Scope decision" section.
+
 *Proof it's still correct:* `manifest.segments.len() == N` after N insert-commits; the failed-commit
 test (§5) in its I/O-failure and typed-conflict flavors; concurrent-commit and snapshot-isolation suites
 green; `Dataset::open` after a fresh multi-commit sequence reproduces the same search results as before
