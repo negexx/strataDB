@@ -189,6 +189,7 @@ impl CommitLog {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn empty_log_reports_clean_for_any_range() {
@@ -263,5 +264,135 @@ mod tests {
         log.push(2, vec![20]);
         log.push(3, vec![30]); // evicts version 1's entry
         assert_eq!(log.conflicts_with(0, 3, &[]), ConflictCheck::Clean);
+    }
+
+    proptest! {
+        // 64 cases (this file's original choice, picked for per-case cost:
+        // up to 20 pushes plus a full scan) turned out too few to reliably
+        // hit the joint condition an injected boundary bug needs to
+        // surface -- a since_version/up_to_version boundary-correlated
+        // committed version, AND a write-set overlap with that same entry.
+        // Verified directly: an injected off-by-one here passed clean
+        // across multiple fresh 64-case runs, but reliably failed (with a
+        // real shrunk counterexample) at 5000 cases. 2000 stays well under
+        // a second (verified) with comfortable margin above the ~232
+        // successes it took to first trigger the bug at 5000.
+        #![proptest_config(ProptestConfig::with_cases(2000))]
+        #[test]
+        fn conflicts_with_matches_a_naive_reference(
+            (committed, since_version, up_to_version, write_set) in
+                prop::collection::vec(
+                    (1u64..1000, prop::collection::vec(0u64..50, 0..8)),
+                    0..20,
+                )
+                .prop_flat_map(|committed| {
+                    // `since_version`/`up_to_version` are NOT independently
+                    // random: exact equality against one of `committed`'s
+                    // actual versions is what flips the `(since_version,
+                    // up_to_version]` boundary this function's contract
+                    // turns on, and -- same lesson as
+                    // RowIdRange::contains's property test -- independent
+                    // random draws over a 1000-wide range were verified
+                    // directly to have too little power to reliably hit
+                    // that exact equality (an injected off-by-one here
+                    // passed clean across 3 fresh 64-case runs in a row).
+                    // Mix in version-adjacent candidates (each committed
+                    // version, and one below/above it) alongside fully
+                    // random values so the boundary is actually exercised.
+                    let mut version_candidates: Vec<u64> = committed
+                        .iter()
+                        .flat_map(|(v, _)| [v.saturating_sub(1), *v, v.saturating_add(1)])
+                        .collect();
+                    version_candidates.push(0); // always non-empty, even if committed is empty
+                    (
+                        Just(committed),
+                        prop_oneof![0u64..1000, prop::sample::select(version_candidates.clone())],
+                        prop_oneof![0u64..1000, prop::sample::select(version_candidates)],
+                        // The queried write_set is ALSO not just small-and-
+                        // random: `conflicts_with` branches on
+                        // `write_set.len() > HASH_WRITE_SET_ABOVE` (32) to
+                        // pick a linear scan vs. a hashed lookup, and a
+                        // write_set capped at 7 elements can never reach
+                        // that branch at all -- the hashed path had zero
+                        // coverage from this property test despite the
+                        // plan's own stated reason for writing it being
+                        // "both code paths must agree." Mixing in a
+                        // 33..64-element draw (still from the same 0..50
+                        // pool as `committed`'s write-sets, so overlap with
+                        // them stays likely by pigeonhole) exercises both.
+                        prop_oneof![
+                            prop::collection::vec(0u64..50, 0..8),
+                            prop::collection::vec(0u64..50, 33..64),
+                        ],
+                    )
+                })
+        ) {
+            // `committed` as generated is independently-random and
+            // unordered/possibly-duplicated -- but CommitLog::push has an
+            // implicit precondition (its own doc comment, and the
+            // front()-is-oldest logic conflicts_with relies on) that
+            // pushes happen in strictly ascending version order, matching
+            // every real caller (always `latest_version + 1` under
+            // `commit_lock`). Sorting and deduplicating by version before
+            // both the push loop AND the naive reference below makes the
+            // input realistic without changing what either side computes:
+            // `.min()` and the `contested` filter/collect below are already
+            // order-independent over the same set of (version, write_set)
+            // pairs, so this only removes inputs `CommitLog` itself could
+            // never actually be given, not inputs the naive reference
+            // needs to disagree over.
+            let mut committed = committed;
+            committed.sort_by_key(|(v, _)| *v);
+            committed.dedup_by_key(|(v, _)| *v);
+
+            let mut log = CommitLog::new(64); // capacity well above `committed`'s max length (20), so nothing evicts
+            for (version, ws) in &committed {
+                log.push(*version, ws.clone());
+            }
+
+            let actual = log.conflicts_with(since_version, up_to_version, &write_set);
+
+            // Naive reference: since capacity (64) never evicts here, "the
+            // log's oldest entry is newer than since_version" can only be
+            // true if `committed` itself never covers back that far -- an
+            // empty log with a non-empty requested range is the same case.
+            let history_gap = match committed.iter().map(|(v, _)| *v).min() {
+                Some(oldest) => oldest > since_version + 1,
+                None => up_to_version > since_version,
+            };
+            let naive = if write_set.is_empty() || up_to_version <= since_version {
+                ConflictCheck::Clean
+            } else if history_gap {
+                ConflictCheck::InsufficientHistory
+            } else {
+                let mut contested: Vec<u64> = committed
+                    .iter()
+                    .filter(|(v, _)| *v > since_version && *v <= up_to_version)
+                    .flat_map(|(_, ws)| ws.iter().copied())
+                    .filter(|row| write_set.contains(row))
+                    .collect();
+                contested.sort_unstable();
+                contested.dedup();
+                if contested.is_empty() {
+                    ConflictCheck::Clean
+                } else {
+                    ConflictCheck::Conflict(contested)
+                }
+            };
+
+            // Conflict(_)'s row-id ORDER isn't part of its contract (only
+            // which rows are contested), so compare as sorted+deduped sets
+            // rather than requiring the real implementation's iteration
+            // order to match the naive reference's.
+            let normalize = |c: ConflictCheck| match c {
+                ConflictCheck::Conflict(mut rows) => {
+                    rows.sort_unstable();
+                    rows.dedup();
+                    ConflictCheck::Conflict(rows)
+                }
+                other => other,
+            };
+            prop_assert_eq!(normalize(actual), normalize(naive));
+        }
     }
 }

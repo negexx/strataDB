@@ -53,7 +53,8 @@ use std::any::Any;
 use std::sync::Arc;
 
 use crate::graph::k_nn_search_generic;
-use crate::hnsw::{IndexError, VectorMatch, build_live_filter};
+use crate::hnsw::{IndexError, VectorMatch, build_live_filter, build_live_filter_from_live_set};
+use crate::live_set::LiveSet;
 use crate::segment_reader::SegmentReader;
 
 /// One part of a segment set.
@@ -285,6 +286,27 @@ impl SegmentSet {
         should_scan_part: impl Fn(&(dyn Any + Send + Sync)) -> bool,
     ) -> Result<Vec<VectorMatch>, IndexError> {
         let filter = build_live_filter(live_ids, is_visible);
+        self.fan_out(query, k, ef_search, &filter, &should_scan_part)
+    }
+
+    /// As [`Self::search_filtered_pruned`], but takes an already-built
+    /// [`LiveSet`] rather than rebuilding one from a raw `&[usize]` on every
+    /// call — for a caller (e.g. `crates/txn`'s per-`(Snapshot, Predicate)`
+    /// cache) that resolves the same live set across many queries.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::search`].
+    pub fn search_filtered_pruned_live(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+        live: &LiveSet,
+        is_visible: impl Fn(u64) -> bool,
+        should_scan_part: impl Fn(&(dyn Any + Send + Sync)) -> bool,
+    ) -> Result<Vec<VectorMatch>, IndexError> {
+        let filter = build_live_filter_from_live_set(live, is_visible);
         self.fan_out(query, k, ef_search, &filter, &should_scan_part)
     }
 
@@ -829,6 +851,29 @@ mod tests {
             hits.iter().all(|m| (0..30).contains(&m.row_id)),
             "all hits must come from the accepted 3-d segment: {hits:?}"
         );
+    }
+
+    #[test]
+    fn search_filtered_pruned_live_with_a_prebuilt_live_set_matches_search_filtered_pruned() {
+        let set = SegmentSet::from_segments(vec![
+            (build_sealed(30, 0, 0.0), no_zone_map()),
+            (build_sealed(30, 500, 10_000.0), no_zone_map()),
+        ]);
+        let live_ids: Vec<usize> = (0..30).chain(500..530).step_by(2).collect();
+        let live_set = LiveSet::from_row_ids(&live_ids);
+
+        let via_ids = set
+            .search_filtered_pruned(&[50.0, 50.0, 50.0], 5, 32, &live_ids, |_| true, |_| true)
+            .unwrap();
+        let via_live_set = set
+            .search_filtered_pruned_live(&[50.0, 50.0, 50.0], 5, 32, &live_set, |_| true, |_| true)
+            .unwrap();
+
+        assert_eq!(via_ids.len(), via_live_set.len());
+        for (a, b) in via_ids.iter().zip(&via_live_set) {
+            assert_eq!(a.row_id, b.row_id);
+            assert!((a.squared_distance - b.squared_distance).abs() < f32::EPSILON);
+        }
     }
 
     #[test]

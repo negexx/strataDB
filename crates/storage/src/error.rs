@@ -26,6 +26,8 @@ pub enum StorageError {
     EmptyDataFile(PathBuf),
     #[error("corrupt manifest at {0}: {1}")]
     CorruptManifest(PathBuf, String),
+    #[error("corrupt data file at {0}: {1}")]
+    CorruptDataFile(PathBuf, String),
 }
 
 pub type Result<T> = std::result::Result<T, StorageError>;

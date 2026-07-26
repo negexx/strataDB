@@ -186,6 +186,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::datatypes::{DataType, Field, Schema};
+    use proptest::prelude::*;
 
     use super::*;
 
@@ -717,5 +718,55 @@ mod tests {
             ),
             "OR must scan if either side could still match"
         );
+    }
+
+    proptest! {
+        #[test]
+        fn mask_matches_a_naive_per_row_reference(
+            (values, threshold) in prop::collection::vec(any::<i64>(), 0..30)
+                .prop_flat_map(|values| {
+                    // threshold is NOT independently random -- see this
+                    // task's own "Design note" above. Predicate::Eq's
+                    // naive arm needs threshold to actually equal one of
+                    // values' entries some of the time, or that variant's
+                    // true branch is never meaningfully exercised.
+                    let mut candidates = values.clone();
+                    candidates.push(0); // always non-empty, even if values is empty
+                    (Just(values), prop_oneof![any::<i64>(), prop::sample::select(candidates)])
+                }),
+            variant in 0..5u8,
+        ) {
+            let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![Arc::new(Int64Array::from(values.clone()))],
+            ).unwrap();
+
+            let predicate = match variant {
+                0 => Predicate::Eq("id".to_string(), Value::Int64(threshold)),
+                1 => Predicate::Lt("id".to_string(), Value::Int64(threshold)),
+                2 => Predicate::LtEq("id".to_string(), Value::Int64(threshold)),
+                3 => Predicate::Gt("id".to_string(), Value::Int64(threshold)),
+                _ => Predicate::GtEq("id".to_string(), Value::Int64(threshold)),
+            };
+
+            let actual = mask(&batch, &predicate).unwrap();
+
+            let naive: Vec<bool> = values
+                .iter()
+                .map(|&v| match variant {
+                    0 => v == threshold,
+                    1 => v < threshold,
+                    2 => v <= threshold,
+                    3 => v > threshold,
+                    _ => v >= threshold,
+                })
+                .collect();
+
+            prop_assert_eq!(actual.len(), naive.len());
+            for (i, expected) in naive.iter().enumerate() {
+                prop_assert_eq!(actual.value(i), *expected, "row {}", i);
+            }
+        }
     }
 }

@@ -369,6 +369,50 @@ fn main() {
         mem: phase_end(m),
     });
 
+    // ---- Phase 7b: vector search, filtered, predicate varies per query ----
+    // Same shape as Phase 7, but each query gets its own `category` predicate
+    // instead of reusing one `pred` across all `queries_n` calls. Phase 7
+    // alone cannot distinguish "resolving live-ids is expensive" from
+    // "resolving live-ids the FIRST time for a given predicate is expensive,
+    // and every later call in this loop is a free repeat" — the two have
+    // very different implications for a per-snapshot cache keyed by
+    // predicate. This phase is the honest cold-path baseline.
+    //
+    // Cycles the 9 categories OTHER than `pred`'s (category = 3), not all
+    // 10 — this phase shares `snap` (and so its live-set cache) with Phase
+    // 7 above, which already resolved category = 3 against it. Including 3
+    // here would make one of the 10 "cold" misses actually a cache hit
+    // left over from Phase 7, silently inflating this phase's hit count
+    // and shrinking its true miss count from 10 to 9 without the numbers
+    // saying so.
+    let categories: Vec<i64> = (0..10).filter(|&c| c != 3).collect();
+    let varying_preds: Vec<Predicate> = (0..queries_n)
+        .map(|i| {
+            Predicate::Eq(
+                "category".to_string(),
+                Value::Int64(categories[i % categories.len()]),
+            )
+        })
+        .collect();
+    let m = phase_start();
+    let t = Instant::now();
+    let mut vhits = 0;
+    for (q, p) in queries.iter().zip(&varying_preds) {
+        vhits += snap.vector_search(q, k, Some(p)).unwrap().len();
+    }
+    let wall = t.elapsed();
+    results.push(PhaseResult {
+        name: "vector search (filtered, varying predicate)",
+        kind: "I/O-bound (row-id resolve) + CPU",
+        wall,
+        detail: format!(
+            "{queries_n} queries, {:.2} ms/query, {vhits} hits, predicate cycles 9 categories \
+             disjoint from phase 7's category=3",
+            wall.as_secs_f64() * 1000.0 / queries_n as f64
+        ),
+        mem: phase_end(m),
+    });
+
     // ---- Phase 8: concurrent non-conflicting commits ---------------------
     let per_thread = 3usize;
     let base_id = n as i64;

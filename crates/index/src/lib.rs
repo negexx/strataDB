@@ -32,6 +32,7 @@ pub mod distance;
 #[doc(hidden)]
 pub mod graph;
 pub mod hnsw;
+pub mod live_set;
 mod node;
 mod node_layout;
 mod node_source;
@@ -46,6 +47,7 @@ pub use brute_force::{Neighbor, brute_force_search};
 pub use hnsw::{
     EfConstruction, HnswIndex, IndexError, MaxConnections, MaxElements, MaxLayers, VectorMatch,
 };
+pub use live_set::LiveSet;
 pub use node_source::NodeSource;
 pub use segment_format::SEGMENT_FORMAT_VERSION;
 pub use segment_reader::SegmentReader;

@@ -3,7 +3,7 @@
 .claude/memory/
 .claude/scheduled_tasks.lock
 .claude/worktrees/
-.worktrees/
+/.worktrees/
 
 # superpowers subagent-driven-development scratch state
 .superpowers/

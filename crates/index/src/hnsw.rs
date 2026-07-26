@@ -4,6 +4,7 @@
 
 use crate::distance::L2;
 use crate::graph::Graph;
+use crate::live_set::LiveSet;
 
 /// One search result: which row-id, and its squared L2 distance to the
 /// query vector. `row_id` is the persistent, global identity from
@@ -192,7 +193,11 @@ impl HnswIndex {
         // hnsw_rs's own unseeded RNG). If a real `rand`-crate dependency
         // is preferred instead, swap this for one — flagged here as an
         // explicit, deliberate choice for the implementer/reviewer to
-        // confirm, not a silent placeholder.
+        // confirm, not a silent placeholder. Safe to call concurrently:
+        // `fetch_add` guarantees each call sees a distinct `n`, so
+        // concurrent callers inserting into distinct `HnswIndex` instances
+        // (e.g. concurrent commits each building their own per-commit
+        // segment) never need any extra synchronization here.
         let n = self
             .row_counter
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -314,6 +319,24 @@ impl HnswIndex {
             .collect())
     }
 
+    /// Builds a [`LiveSet`] from `live_ids` and delegates to
+    /// [`Self::search_filtered_live`]. Sizing note: the bitset is
+    /// `max_row_id / 8` bytes — proportional to the largest live row-id,
+    /// *not* to `live_ids.len()`. For a dense low-selectivity filter that is
+    /// a large win over the ~24-bytes/entry `HashSet` it replaced (~12KB vs
+    /// ~1MB at 100k live ids). For a *highly selective* predicate over a very
+    /// large dataset it can be the other way round — a handful of matches
+    /// with a max row-id near 1e8 still allocates ~12MB here where a
+    /// `HashSet` would have been tiny. Both are dwarfed by the in-memory
+    /// graph and by the whole-file re-read `crates/txn`'s `row_ids_matching`
+    /// pays to resolve `live_ids` in the first place, so this is not the term
+    /// that matters — but it is not unconditionally smaller.
+    ///
+    /// Callers that resolve the same live set across many queries (e.g. a
+    /// per-snapshot cache keyed by predicate) should build a [`LiveSet`] once
+    /// with [`LiveSet::from_row_ids`] and call [`Self::search_filtered_live`]
+    /// directly instead, to avoid rebuilding the bitset on every call.
+    ///
     /// # Errors
     ///
     /// Same as [`Self::search`].
@@ -325,7 +348,38 @@ impl HnswIndex {
         live_ids: &[usize],
         is_visible: impl Fn(u64) -> bool,
     ) -> Result<Vec<VectorMatch>, IndexError> {
-        let filter = build_live_filter(live_ids, is_visible);
+        self.search_filtered_live(
+            query,
+            k,
+            ef_search,
+            &LiveSet::from_row_ids(live_ids),
+            is_visible,
+        )
+    }
+
+    /// Like [`Self::search_filtered`], but takes an already-built
+    /// [`LiveSet`] rather than rebuilding one from a raw `&[usize]`.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::search`].
+    pub fn search_filtered_live(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+        live: &LiveSet,
+        is_visible: impl Fn(u64) -> bool,
+    ) -> Result<Vec<VectorMatch>, IndexError> {
+        // live-set membership and is_visible are composed into ONE
+        // predicate passed straight into k_nn_search -> search_layer,
+        // applied during traversal-time result-set construction — not a
+        // post-filter over an already-capped top-k. This matches
+        // hnsw_rs's original FilterT-based behavior exactly: a live row
+        // deep in the graph is never missed just because it fell outside
+        // some pre-guessed widened candidate window, since the predicate is
+        // evaluated as part of the same search, not after it.
+        let filter = move |id: u64| live.contains(id) && is_visible(id);
         let raw = self.graph.k_nn_search(query, k, ef_search, filter)?;
         Ok(raw
             .into_iter()
@@ -372,11 +426,12 @@ impl HnswIndex {
 }
 
 /// Builds the combined live-ids/visibility predicate used by
-/// [`HnswIndex::search_filtered`] and by `segment_set::SegmentSet::search_filtered`
-/// (the sibling module), which calls `k_nn_search_generic` directly rather
-/// than through this type's methods — see that module's doc comments for
-/// why. Factored out here (rather than duplicated) so both call sites build
-/// the exact same predicate from the exact same code.
+/// `segment_set::SegmentSet::search_filtered_pruned` (the sibling module),
+/// which calls `k_nn_search_generic` directly rather than through
+/// [`HnswIndex`]'s methods — see that module's doc comments for why.
+/// Delegates to [`LiveSet`] (the same bitset [`HnswIndex::search_filtered`]
+/// builds) rather than duplicating it, so there is exactly one
+/// live-row-id-membership implementation in this crate.
 ///
 /// `live_ids` membership and `is_visible` are composed into ONE predicate
 /// passed straight into `k_nn_search` -> `search_layer`, applied during
@@ -385,38 +440,26 @@ impl HnswIndex {
 /// behavior exactly: a `live_ids` row deep in the graph is never missed just
 /// because it fell outside some pre-guessed widened candidate window, since
 /// the predicate is evaluated as part of the same search, not after it.
-/// A dense bitset rather than a `HashSet`. Row-ids are dense and monotonic
-/// (see `NodeTable`'s own contract), so membership is one indexed load plus
-/// a shift instead of a `SipHash` probe, and no hashing or rehash growth is
-/// paid while building it.
-///
-/// Sizing note: the bitset is `max_row_id / 8` bytes — proportional to the
-/// largest live row-id, *not* to `live_ids.len()`. For a dense
-/// low-selectivity filter that is a large win over the ~24-bytes/entry
-/// `HashSet` (~12KB vs ~1MB at 100k live ids). For a *highly selective*
-/// predicate over a very large dataset it can be the other way round — a
-/// handful of matches with a max row-id near 1e8 still allocates ~12MB here
-/// where the `HashSet` would have been tiny. Both are dwarfed by the
-/// in-memory graph and by the whole-file re-read `row_ids_matching` already
-/// pays per query, so this is not the term that matters — but it is not
-/// unconditionally smaller.
 ///
 /// `live_ids` need not be sorted: the bitset is order-insensitive.
 pub(crate) fn build_live_filter(
     live_ids: &[usize],
     is_visible: impl Fn(u64) -> bool,
 ) -> impl Fn(u64) -> bool {
-    let max_id = live_ids.iter().copied().max().unwrap_or(0);
-    let mut live = vec![0_u64; max_id / 64 + 1];
-    for &id in live_ids {
-        live[id / 64] |= 1_u64 << (id % 64);
-    }
-    move |id: u64| {
-        // An id past the end of the bitset simply isn't live, which is
-        // also what makes the empty-`live_ids` case behave correctly.
-        let word = usize::try_from(id / 64).unwrap_or(usize::MAX);
-        word < live.len() && (live[word] >> (id % 64)) & 1 == 1 && is_visible(id)
-    }
+    let live = LiveSet::from_row_ids(live_ids);
+    move |id: u64| live.contains(id) && is_visible(id)
+}
+
+/// As [`build_live_filter`], but for a caller that already has a built
+/// [`LiveSet`] in hand (e.g. `crates/txn`'s per-`(Snapshot, Predicate)`
+/// cache) and wants to avoid rebuilding the bitset from a raw `&[usize]` on
+/// every call — see `HnswIndex::search_filtered_live`'s doc comment for the
+/// same tradeoff on the `HnswIndex`-method side.
+pub(crate) fn build_live_filter_from_live_set<'a>(
+    live: &'a LiveSet,
+    is_visible: impl Fn(u64) -> bool + 'a,
+) -> impl Fn(u64) -> bool + 'a {
+    move |id: u64| live.contains(id) && is_visible(id)
 }
 
 #[cfg(all(test, not(loom)))]
@@ -688,6 +731,33 @@ mod tests {
             results.iter().all(|r| r.row_id >= 15),
             "search_filtered must only return ids from the live set, even when \
              closer points exist outside it: {results:?}"
+        );
+    }
+
+    #[test]
+    fn search_filtered_live_with_a_prebuilt_live_set_matches_search_filtered() {
+        let index = HnswIndex::new(
+            MaxConnections(TEST_MAX_NB_CONNECTION),
+            MaxElements(100),
+            MaxLayers(TEST_MAX_LAYER),
+            EfConstruction(TEST_EF_CONSTRUCTION),
+        )
+        .unwrap();
+        insert_cluster(&index, 0, 15, [0.0, 0.0, 0.0], 0.01);
+        insert_cluster(&index, 15, 15, [1000.0, 0.0, 0.0], 0.01);
+
+        let live_ids: Vec<usize> = (15..30).collect();
+        let via_ids = index
+            .search_filtered(&[0.0, 0.0, 0.0], 3, TEST_EF_SEARCH, &live_ids, |_| true)
+            .unwrap();
+        let live_set = crate::live_set::LiveSet::from_row_ids(&live_ids);
+        let via_live_set = index
+            .search_filtered_live(&[0.0, 0.0, 0.0], 3, TEST_EF_SEARCH, &live_set, |_| true)
+            .unwrap();
+        assert_eq!(
+            via_ids, via_live_set,
+            "search_filtered and search_filtered_live must agree given an \
+             equivalent live set"
         );
     }
 

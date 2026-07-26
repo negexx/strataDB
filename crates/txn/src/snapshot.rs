@@ -1,8 +1,13 @@
 //! A point-in-time, immutable view of a [`Dataset`](crate::Dataset) — see
 //! `docs/superpowers/specs/2026-07-17-phase-5-mvcc-snapshot-isolation-design.md`.
-//! Every field is `Copy`, `Arc`-wrapped, or (for `index: SegmentSet`) itself
-//! just an `Arc<[_]>` internally, so cloning a `Snapshot` is cheap and never
-//! touches the data it points to.
+//! `Snapshot` itself is never cloned — callers hold it behind
+//! [`Dataset::snapshot`](crate::dataset::Dataset::snapshot)'s `Arc<Snapshot>`,
+//! and cloning *that* `Arc` is cheap and never touches the data it points to.
+//! Every field except `live_set_cache` is `Copy` or `Arc`-wrapped (`index:
+//! SegmentSet` is itself just an `Arc<[_]>` internally); `live_set_cache` is
+//! neither (it owns a `Mutex`-guarded cache — see `crate::live_set_cache`'s
+//! module doc), which is fine precisely because nothing clones a `Snapshot`
+//! by value, only the surrounding `Arc`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -10,11 +15,14 @@ use std::sync::Arc;
 use arrow::array::{Array, BooleanArray, RecordBatch, UInt64Array};
 use arrow::compute::{concat_batches, filter_record_batch};
 use arrow::datatypes::SchemaRef;
-use strata_query::{Predicate, filter, mask, should_scan_file};
+use strata_index::LiveSet;
+use strata_query::{Predicate, PredicateKey, filter, mask, should_scan_file};
 use strata_storage::{DataFileEntry, Manifest, read_batch, read_batch_columns};
 
 use crate::dataset::{ROW_ID_COLUMN, cast_batch_to_schema, data_subdir, safe_join};
 use crate::error::{Result, TxnError};
+
+use crate::live_set_cache::LiveSetCache;
 
 /// Downcasts a `SegmentSet` part's opaque zone-map payload back to the
 /// concrete type `crates/txn` is the only crate that knows it really is
@@ -46,7 +54,20 @@ pub struct Snapshot {
     pub(crate) manifest: Arc<Manifest>,
     pub(crate) index: strata_index::SegmentSet,
     pub(crate) tombstones: Arc<imbl::HashSet<u64>>,
+    /// Per-predicate resolved-row-id cache — see
+    /// `.claude/docs/analysis/2026-07-25-filtered-vector-search-memory-audit.md`
+    /// and `crate::live_set_cache`'s module doc for why this is sound (this
+    /// `Snapshot` is immutable) and how it's bounded (a byte budget, not an
+    /// entry count).
+    pub(crate) live_set_cache: LiveSetCache,
 }
+
+/// Soft cap on a single `Snapshot`'s resolved-live-set cache — see
+/// `crate::live_set_cache`'s module doc for why a byte budget rather than an
+/// entry-count LRU. 64 MiB is a few thousand 25k-row-scale bitsets or a
+/// handful of very large ones; revisit with real workload data, not a guess,
+/// if it ever needs tuning.
+pub(crate) const LIVE_SET_CACHE_BYTE_BUDGET: usize = 64 * 1024 * 1024;
 
 /// The outcome of [`Snapshot::explain`] — which files and segments a
 /// predicate would require scanning, without actually reading any file
@@ -287,8 +308,9 @@ impl Snapshot {
     /// this snapshot's version, optionally narrowed to rows matching
     /// `predicate`. Visibility (the tombstone set) is enforced by passing
     /// `Self::is_visible` into
-    /// [`HnswIndex::search`]/[`HnswIndex::search_filtered`] — see
-    /// `.claude/docs/design/phase-4-vector-index-spec.md` §3-4 and the
+    /// [`SegmentSet::search`](strata_index::SegmentSet::search)/
+    /// [`SegmentSet::search_filtered_pruned_live`](strata_index::SegmentSet::search_filtered_pruned_live)
+    /// — see `.claude/docs/design/phase-4-vector-index-spec.md` §3-4 and the
     /// Phase 5 design doc.
     ///
     /// # Examples
@@ -348,34 +370,50 @@ impl Snapshot {
                 .search(query, k, EF_SEARCH_DEFAULT, |id| self.is_visible(id))?);
         };
 
-        // Not sorted: `search_filtered` builds an order-insensitive bitset
-        // from these, so sorting them was pure work with no consumer.
+        // `row_ids_matching` re-reads the whole surviving data file per
+        // call (see its own doc comment) — ~51 MB/query at 25k rows x
+        // 512-dim, the single largest allocation source in the lifecycle
+        // benchmark. `resolve_live_set` (below) resolves it through a
+        // per-snapshot cache keyed by predicate identity instead of calling
+        // it directly, so a live `Snapshot` queried with the same predicate
+        // more than once pays that cost at most once. See
+        // `.claude/docs/analysis/2026-07-25-filtered-vector-search-memory-audit.md`.
         //
-        // Measured phase split on a 100k-row, 512-dim dataset with a 1-in-10
-        // predicate: `row_ids_matching` 133-157ms, `widen_ef` 9us,
-        // `search_filtered` 1.3-1.8ms. This path is ~99% the cost of
-        // resolving `live_ids`, and that cost is dominated by re-reading the
-        // whole data file per query — see `row_ids_matching`'s own comment.
         // Zone-map pruning (S1 W4b) shrinks the fan-out/search side of that
-        // split only — it does nothing for `row_ids_matching` — so it is not
-        // expected to move this end-to-end split; its proof of "working" is
-        // `Snapshot::explain` reporting fewer segments scanned, not a
-        // wall-clock win (design amendment §6).
-        let live_ids = self.row_ids_matching(predicate)?;
+        // cost only — it does nothing for `row_ids_matching`/
+        // `resolve_live_set` — so it is not expected to move this
+        // end-to-end split; its proof of "working" is `Snapshot::explain`
+        // reporting fewer segments scanned, not a wall-clock win (design
+        // amendment §6).
+        let live_set = self.resolve_live_set(predicate)?;
         let ef = widen_ef(EF_SEARCH_DEFAULT, self, predicate);
-        Ok(self.index.search_filtered_pruned(
+        Ok(self.index.search_filtered_pruned_live(
             query,
             k,
             ef,
-            &live_ids,
+            &live_set,
             |id| self.is_visible(id),
             |zone_map| zone_map_permits_scan(zone_map, predicate),
         )?)
     }
 
+    /// Resolves `predicate`'s live set via `self.live_set_cache`, computing
+    /// it with [`Snapshot::row_ids_matching`] on a miss. See
+    /// `crate::live_set_cache`'s module doc for the caching/locking policy.
+    fn resolve_live_set(&self, predicate: &Predicate) -> Result<Arc<LiveSet>> {
+        let key = PredicateKey::from(predicate);
+        self.live_set_cache.get_or_try_compute(key, || {
+            let ids = self.row_ids_matching(predicate)?;
+            Ok(LiveSet::from_row_ids(&ids))
+        })
+    }
+
     /// Resolves the row-ids of every row matching `predicate`, reading each
     /// surviving (per `should_scan_file`) file's raw on-disk batch
-    /// directly — not through the public `scan_with_predicate`.
+    /// directly — not through the public `scan_with_predicate`. Called at
+    /// most once per `(Snapshot, Predicate)` pair via
+    /// [`Snapshot::resolve_live_set`]'s cache; call this directly only if a
+    /// caller genuinely needs an uncached read.
     fn row_ids_matching(&self, predicate: &Predicate) -> Result<Vec<usize>> {
         // Decode only the predicate's own columns and the row-id column, so
         // the embedding column is never turned into an Arrow array.
@@ -386,14 +424,15 @@ impl Snapshot {
         // skips array *construction*, not the read. Measured, this was worth
         // only ~2ms of a ~109ms call — the remaining ~105ms is re-reading
         // ~205MB (100k rows x 512-dim f32) from the page cache on *every*
-        // query, at ~1.5GB/s.
+        // uncached call, at ~1.5GB/s. `resolve_live_set`'s cache is what
+        // amortizes this now for a snapshot queried with the same predicate
+        // more than once — see
+        // `.claude/docs/analysis/2026-07-25-filtered-vector-search-memory-audit.md`.
         //
-        // Eliminating that needs one of: a per-snapshot cache of the
-        // resolved row-ids (snapshots are immutable, so this is sound but is
-        // a memory/latency tradeoff worth deciding deliberately), or a
-        // genuinely column-chunked file format so a single column can be
-        // read without its neighbours — the format change `datafile.rs`'s
-        // module doc already defers. Neither is a drive-by change.
+        // Eliminating the underlying per-call cost needs a genuinely
+        // column-chunked file format so a single column can be read without
+        // its neighbours — the format change `datafile.rs`'s module doc
+        // already defers. Not a drive-by change.
         let mut projection: Vec<&str> = predicate.columns();
         projection.push(ROW_ID_COLUMN);
         projection.sort_unstable();
@@ -443,6 +482,7 @@ mod tests {
             // avoids building an index nothing queries.
             index: strata_index::SegmentSet::empty(),
             tombstones: Arc::new(tombstoned.iter().copied().collect()),
+            live_set_cache: LiveSetCache::new(LIVE_SET_CACHE_BYTE_BUDGET),
         }
     }
 

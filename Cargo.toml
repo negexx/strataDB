@@ -21,6 +21,7 @@ rust-version = "1.90"
 arrow = "58"
 criterion = "0.8"
 hnsw_rs = "0.3"
+proptest = "1"
 pyo3 = { version = "0.29", features = ["extension-module"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -41,3 +42,13 @@ expect_used = "warn"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
+
+# Cargo's own defaults (codegen-units = 16, no LTO) favor compile speed over
+# runtime speed; this is a production database engine, not a fast-iterating
+# app, so trade a slower release build for cross-crate inlining -- this
+# matters concretely for `crates/index`'s hot loops (distance evaluation,
+# neighbor-slot scans), which call across the `strata-index`/`anndists`
+# crate boundary constantly.
+[profile.release]
+lto = "thin"
+codegen-units = 1
