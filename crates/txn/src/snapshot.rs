@@ -17,6 +17,30 @@ use crate::dataset::{ROW_ID_COLUMN, cast_batch_to_schema, data_subdir, safe_join
 use crate::error::{Result, TxnError};
 use crate::row_id::RowIdRange;
 
+/// Downcasts a `SegmentSet` part's opaque zone-map payload back to the
+/// concrete type `crates/txn` is the only crate that knows it really is
+/// (`HashMap<String, ColumnStats>`), and applies the existing
+/// `should_scan_file` evaluator — S1 W4b. `crates/index` never sees a
+/// `Predicate` or a `ColumnStats`; see
+/// `docs/superpowers/specs/2026-07-26-s1-w4-zone-map-design-amendment.md` §2.
+///
+/// The `None` arm (a payload that isn't a `HashMap<String, ColumnStats>`)
+/// is unreachable in practice — `crates/txn` is the only code that ever
+/// constructs one of these payloads (`Transaction::commit`, `load_segments`)
+/// and it always constructs exactly this type — but fails open (must scan)
+/// rather than panicking, matching `should_scan_file`'s own "absent means
+/// must scan" contract for a payload it cannot interpret.
+fn zone_map_permits_scan(
+    zone_map: &(dyn std::any::Any + Send + Sync),
+    predicate: &Predicate,
+) -> bool {
+    match zone_map.downcast_ref::<std::collections::HashMap<String, strata_storage::ColumnStats>>()
+    {
+        Some(map) => should_scan_file(map, predicate),
+        None => true,
+    }
+}
+
 pub struct Snapshot {
     pub(crate) dir: PathBuf,
     pub(crate) version: u64,
@@ -31,13 +55,33 @@ pub struct Snapshot {
     pub(crate) tombstones: Arc<imbl::HashSet<u64>>,
 }
 
-/// The outcome of [`Snapshot::explain`] — which files a predicate would
-/// touch, without actually reading any of their bodies.
+/// The outcome of [`Snapshot::explain`] — which files and segments a
+/// predicate would require scanning, without actually reading any file
+/// bodies or evaluating a single vector distance.
+///
+/// The `segments_*` fields were added in S1 W4b, additively: they never
+/// changed the meaning of `total_files`/`scanned`/`skipped`, which describe
+/// row data files only and are read directly by `widen_ef` — merging
+/// segment counts into them would silently change `ef_search` width across
+/// every filtered vector search in the system (see the S1 W4 design
+/// amendment §4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExplainResult {
     pub total_files: usize,
     pub scanned: Vec<String>,
     pub skipped: Vec<String>,
+    /// How many index segments this snapshot's manifest lists, regardless
+    /// of whether any of them carries a vector-search-relevant predicate
+    /// column in its zone map.
+    pub segments_total: usize,
+    /// Names of segments `should_scan_file` says could match the
+    /// predicate, evaluated against each segment's own
+    /// `SegmentEntry.zone_map` (S1 W4a).
+    pub segments_scanned: Vec<String>,
+    /// Names of segments `should_scan_file` proves cannot match — these
+    /// are the segments `Snapshot::vector_search`'s predicate path skips
+    /// entirely via `SegmentSet::search_filtered_pruned`.
+    pub segments_skipped: Vec<String>,
 }
 
 // HNSW search-widening parameters — see `widen_ef`'s doc comment.
@@ -166,10 +210,22 @@ impl Snapshot {
                 skipped.push(entry.name.clone());
             }
         }
+        let mut segments_scanned = Vec::new();
+        let mut segments_skipped = Vec::new();
+        for entry in &self.manifest.segments {
+            if should_scan_file(&entry.zone_map, predicate) {
+                segments_scanned.push(entry.name.clone());
+            } else {
+                segments_skipped.push(entry.name.clone());
+            }
+        }
         ExplainResult {
             total_files: self.manifest.data_files.len(),
             scanned,
             skipped,
+            segments_total: self.manifest.segments.len(),
+            segments_scanned,
+            segments_skipped,
         }
     }
 
@@ -267,11 +323,21 @@ impl Snapshot {
         // `search_filtered` 1.3-1.8ms. This path is ~99% the cost of
         // resolving `live_ids`, and that cost is dominated by re-reading the
         // whole data file per query — see `row_ids_matching`'s own comment.
+        // Zone-map pruning (S1 W4b) shrinks the fan-out/search side of that
+        // split only — it does nothing for `row_ids_matching` — so it is not
+        // expected to move this end-to-end split; its proof of "working" is
+        // `Snapshot::explain` reporting fewer segments scanned, not a
+        // wall-clock win (design amendment §6).
         let live_ids = self.row_ids_matching(predicate)?;
         let ef = widen_ef(EF_SEARCH_DEFAULT, self, predicate);
-        Ok(self
-            .index
-            .search_filtered(query, k, ef, &live_ids, |id| self.is_visible(id))?)
+        Ok(self.index.search_filtered_pruned(
+            query,
+            k,
+            ef,
+            &live_ids,
+            |id| self.is_visible(id),
+            |zone_map| zone_map_permits_scan(zone_map, predicate),
+        )?)
     }
 
     /// Resolves the row-ids of every row matching `predicate`, reading each
@@ -411,5 +477,195 @@ mod tests {
         assert!(!snapshot.is_visible(6));
         assert!(snapshot.is_visible(7));
         assert!(!snapshot.is_visible(8), "tombstones still apply");
+    }
+
+    #[test]
+    fn explain_gains_segment_fields_without_changing_the_existing_file_fields() {
+        use crate::dataset::Dataset;
+        use arrow::array::{Float32Array, Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc as StdArc;
+        use strata_query::Predicate;
+        use strata_storage::Value;
+
+        let dir =
+            std::env::temp_dir().join(format!("strata-w4b-explain-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dataset = Dataset::create(&dir).unwrap();
+
+        let schema = StdArc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("category", DataType::Utf8, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    StdArc::new(Field::new("item", DataType::Float32, false)),
+                    3,
+                ),
+                false,
+            ),
+        ]));
+
+        // Segment 0: every row tagged "a", clustered near the origin.
+        let mut txn = dataset.begin();
+        txn.insert(
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    StdArc::new(Int64Array::from(vec![1, 2])),
+                    StdArc::new(StringArray::from(vec!["a", "a"])),
+                    StdArc::new(arrow::array::FixedSizeListArray::new(
+                        StdArc::new(Field::new("item", DataType::Float32, false)),
+                        3,
+                        StdArc::new(Float32Array::from(vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0])),
+                        None,
+                    )),
+                ],
+            )
+            .unwrap(),
+        );
+        txn.commit().unwrap();
+
+        // Segment 1: every row tagged "b", clustered far away.
+        let mut txn = dataset.begin();
+        txn.insert(
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    StdArc::new(Int64Array::from(vec![3, 4])),
+                    StdArc::new(StringArray::from(vec!["b", "b"])),
+                    StdArc::new(arrow::array::FixedSizeListArray::new(
+                        StdArc::new(Field::new("item", DataType::Float32, false)),
+                        3,
+                        StdArc::new(Float32Array::from(vec![
+                            9_000.0, 9_000.0, 9_000.0, 9_001.0, 9_001.0, 9_001.0,
+                        ])),
+                        None,
+                    )),
+                ],
+            )
+            .unwrap(),
+        );
+        txn.commit().unwrap();
+
+        let snapshot = dataset.snapshot();
+        assert_eq!(snapshot.manifest.segments.len(), 2, "sanity: two segments");
+
+        let predicate = Predicate::Eq("category".to_string(), Value::Utf8("b".to_string()));
+        let explain = snapshot.explain(&predicate);
+
+        // New fields: segment 0's zone map is category == "a" (min==max),
+        // which cannot satisfy category == "b" -- it must be skipped.
+        // Segment 1's zone map is category == "b" -- it must be scanned.
+        assert_eq!(explain.segments_total, 2);
+        assert_eq!(explain.segments_scanned.len(), 1, "{explain:?}");
+        assert_eq!(explain.segments_skipped.len(), 1, "{explain:?}");
+        assert_ne!(
+            explain.segments_scanned[0], explain.segments_skipped[0],
+            "the scanned and skipped segment must not be the same one"
+        );
+
+        // Existing fields must be completely unaffected by the new ones --
+        // both data files must still be considered scan-worthy, since
+        // `category` also appears in the row files' own per-file stats and
+        // segment 0's row file also only ever holds "a".
+        assert_eq!(explain.total_files, 2);
+        assert_eq!(explain.scanned.len() + explain.skipped.len(), 2);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn vector_search_with_a_selective_predicate_returns_correct_results_when_a_segment_is_pruned() {
+        use crate::dataset::Dataset;
+        use arrow::array::{Float32Array, Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc as StdArc;
+        use strata_query::Predicate;
+        use strata_storage::Value;
+
+        let dir = std::env::temp_dir().join(format!(
+            "strata-w4b-vector-search-pruning-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dataset = Dataset::create(&dir).unwrap();
+
+        let schema = StdArc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("category", DataType::Utf8, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    StdArc::new(Field::new("item", DataType::Float32, false)),
+                    3,
+                ),
+                false,
+            ),
+        ]));
+
+        // Segment 0 ("a"): clustered at the origin -- nearest to the query
+        // below, but must never be returned once filtered to category "b".
+        let mut txn = dataset.begin();
+        txn.insert(
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    StdArc::new(Int64Array::from(vec![1])),
+                    StdArc::new(StringArray::from(vec!["a"])),
+                    StdArc::new(arrow::array::FixedSizeListArray::new(
+                        StdArc::new(Field::new("item", DataType::Float32, false)),
+                        3,
+                        StdArc::new(Float32Array::from(vec![0.0, 0.0, 0.0])),
+                        None,
+                    )),
+                ],
+            )
+            .unwrap(),
+        );
+        txn.commit().unwrap();
+
+        // Segment 1 ("b"): far from the query, but the only segment that
+        // can satisfy `category == "b"`.
+        let mut txn = dataset.begin();
+        txn.insert(
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    StdArc::new(Int64Array::from(vec![2])),
+                    StdArc::new(StringArray::from(vec!["b"])),
+                    StdArc::new(arrow::array::FixedSizeListArray::new(
+                        StdArc::new(Field::new("item", DataType::Float32, false)),
+                        3,
+                        StdArc::new(Float32Array::from(vec![9_000.0, 9_000.0, 9_000.0])),
+                        None,
+                    )),
+                ],
+            )
+            .unwrap(),
+        );
+        txn.commit().unwrap();
+
+        let snapshot = dataset.snapshot();
+        let predicate = Predicate::Eq("category".to_string(), Value::Utf8("b".to_string()));
+
+        // Confirm pruning actually has something to prune here, exactly
+        // like the `explain`-shaped assertion the design amendment
+        // requires as W4b's proof of "working" (amendment §6).
+        let explain = snapshot.explain(&predicate);
+        assert_eq!(explain.segments_skipped.len(), 1);
+
+        let results = snapshot
+            .vector_search(&[0.0, 0.0, 0.0], 5, Some(&predicate))
+            .unwrap();
+        assert_eq!(results.len(), 1, "{results:?}");
+        assert_eq!(
+            results[0].row_id, 1,
+            "row-id 1 is category \"b\"'s only row, even though it is far \
+             from the query and row-id 0 (category \"a\", pruned) is much \
+             nearer: {results:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

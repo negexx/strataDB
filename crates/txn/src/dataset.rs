@@ -1159,7 +1159,13 @@ impl Transaction {
         // The new snapshot's segment set is the previous snapshot's parts
         // plus a reader over the very bytes just fsynced — no read-back.
         let index = match new_segment {
-            Some(published) => latest_snapshot.index.with_appended(published.reader),
+            Some(published) => {
+                let zone_map: Arc<dyn std::any::Any + Send + Sync> =
+                    Arc::new(published.entry.zone_map);
+                latest_snapshot
+                    .index
+                    .with_appended(published.reader, zone_map)
+            }
             None => latest_snapshot.index.clone(),
         };
         debug_assert_eq!(
@@ -1755,7 +1761,8 @@ fn load_segments(dir: &Path, manifest: &Manifest) -> Result<strata_index::Segmen
             Some(_) => {}
             None => established_dimension = Some(entry.dimension),
         }
-        parts.push(Arc::new(reader));
+        let zone_map: Arc<dyn std::any::Any + Send + Sync> = Arc::new(entry.zone_map.clone());
+        parts.push((Arc::new(reader), zone_map));
     }
     Ok(strata_index::SegmentSet::from_segments(parts))
 }
