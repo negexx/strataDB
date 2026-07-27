@@ -125,7 +125,7 @@ Invoke the skill BEFORE acting. A ≥1% chance it applies means you MUST invoke 
 
 | Situation | Skill |
 |---|---|
-| Writing code against arrow-rs, hnsw_rs, PyO3, loom, or madsim APIs | `context7-mcp` |
+| Writing code against arrow-rs, anndists, PyO3, or loom APIs | `context7-mcp` |
 | Hard architectural or tradeoff decision (isolation level, conflict granularity, index format) | `llm-council` |
 | Prior-art research before a design decision — this project's Design Principle #7 | `deep-research` |
 | Confirm a change works end-to-end, not just under `cargo test` | `run` |
@@ -145,7 +145,7 @@ Invoke the skill BEFORE acting. A ≥1% chance it applies means you MUST invoke 
 Reading list from the project spec — study before Phase 0 (design) and Phase 7 (correctness harness) especially:
 
 - Jepsen (Kyle Kingsbury) — methodology for testing distributed/concurrent correctness claims
-- FoundationDB engineering blog — deterministic simulation testing approach (`madsim`/`turmoil` are the reusable Rust equivalent)
+- FoundationDB engineering blog — deterministic simulation testing approach (Phase 7's harness follows Jepsen's methodology instead — real process spawn and real crashes, not `madsim`/`turmoil` — see this file's Phase 7 bullet above for why)
 - CockroachDB / TiDB public design docs — MVCC and transaction internals
 - *Designing Data-Intensive Applications* (Kleppmann) — transactions/consistency chapters
 - Lance format — storage/versioning reference

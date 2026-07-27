@@ -3,6 +3,8 @@
 **Date:** 2026-07-21
 **Status:** Approved for implementation planning
 
+> **Note (2026-07-26):** written against the pre-S1 shared-mutable-HNSW-graph design. §2's framing (the graph-mutation-ordering hazard, `Arc<HnswIndex>` mutated before `commit_manifest`) and §5 step 6 ("apply deltas to the graph") describe a mechanism S1 (`.claude/docs/design/phase-s1-segmented-index-spec.md`) replaced with immutable per-commit segments. The *guarantees* this doc specifies (row-id-keyed conflict detection, atomic row+index commit, zero-buffering durability) still hold and are still enforced — only the mechanism the doc names for the index side is gone. Do not use §2/§5's mechanism-level description as current when implementing against `crates/txn` today; the rest of this doc (conflict semantics, `CommitLog`, row-id allocation) is still accurate.
+
 ## 1. Goal and scope
 
 Phase 6 is Strata's flagship subsystem (`.claude/docs/architecture.md`'s roadmap):

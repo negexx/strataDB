@@ -3,6 +3,8 @@
 **Date:** 2026-07-22
 **Status:** Approved for implementation planning
 
+> **Note (2026-07-26):** §4's workload spec (insert/update/delete agents with seed-derived conflict density) and §6's invariants were written against the pre-S1 design and have NOT been fully implemented against the current segmented-index code — `crates/chaos-worker` today is insert-only (see its own `src/main.rs`), so §4's conflict-density and delete/update coverage, and any zone-map/pruning-specific invariant beyond §6's original four, remain open work. §6 invariant 4 specifically still names `replay_index` ("rebuilds the graph from...") as the recovery mechanism it checks — that function no longer exists; recovery today is `load_segments`'s direct segment deserialization (no replay), per `.claude/docs/design/phase-0-transaction-and-format-spec.md` §8. This doc's harness *mechanism* (real process spawn, real `std::process::abort()`, `tests/sim/tests/chaos.rs`) is current and correct; its workload/invariant *coverage* is the documented starting scope for the Phase 6/7 hardening pass — see `.claude/docs/design/phase-s1-segmented-index-spec.md` §9's closure note.
+
 ## 1. Goal and scope
 
 Phase 7 is the proof phase for everything Phases 0-6 built. Per

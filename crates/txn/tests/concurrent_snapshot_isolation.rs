@@ -5,12 +5,13 @@
 //! after their snapshot was taken. The tombstone half of the isolation
 //! guarantee (a reader never loses a row tombstoned after their snapshot
 //! was taken) needs a specific before/after ordering rather than a race,
-//! so it's covered by a single-threaded test below instead --
-//! `an_old_snapshots_vector_search_still_sees_a_row_a_later_commit_tombstones`.
-//! `scan`'s tombstone half is currently untestable: `Snapshot::scan` doesn't
-//! consult tombstones at all yet (see the note in
-//! `an_old_snapshots_scan_never_gains_a_later_commits_rows` below, and the
-//! tracked follow-up task to fix it).
+//! so it's covered by single-threaded tests below instead:
+//! `an_old_snapshots_vector_search_still_sees_a_row_a_later_commit_tombstones`
+//! for `vector_search`, and `crates/txn/src/snapshot.rs`'s own
+//! `scan_never_returns_a_tombstoned_row` /
+//! `an_old_snapshot_still_sees_a_row_a_later_delete_tombstones_via_scan` for
+//! `scan`/`scan_with_predicate` (`Snapshot::scan` now consults tombstones —
+//! see `Snapshot::filter_tombstoned_rows`).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

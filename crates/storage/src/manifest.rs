@@ -151,7 +151,7 @@ pub struct Manifest {
     pub commit_time_high_water: i64,
     /// Immutable index segments as of this version — see
     /// `docs/superpowers/specs/2026-07-24-s1-segment-format-w3-migration-design.md`
-    /// §3. Always empty until S1 W3.2 starts writing segments.
+    /// §3. Empty only for a dataset that has never committed a vector.
     /// `#[serde(default)]` so manifests written before this field existed
     /// still deserialize, same reasoning as `tombstones`/`next_attempt_id`.
     #[serde(default)]

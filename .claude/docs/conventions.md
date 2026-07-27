@@ -23,7 +23,7 @@
 - `unwrap()`/`expect()` are `clippy::warn`, not banned outright — fine in tests and genuinely-infallible paths (with a comment saying why it's infallible), not fine on a path that can receive untrusted input or fail at runtime.
 - Prefer borrowing (`&T`/`&mut T`) over cloning; when you do clone, that's a signal to double-check whether ownership could be restructured instead.
 - `#[must_use]` on any function whose return value must be checked (especially anything in `crates/txn/` returning a commit/conflict result) — Rust's own unused-`Result`-must-use lint already covers `Result`-returning functions, so this is mainly for non-`Result` return types where a caller could plausibly ignore something they shouldn't.
-- Don't wrap `hnsw_rs`'s (or whatever HNSW crate is in use) serialization APIs behind an abstraction that hides them from the segment/commit code — see `docs/decisions/0005-rust-over-cpp-reversal.md`.
+- Don't wrap `crates/index`'s segment serialization (`crates/index/src/segment_{format,writer,reader}.rs`) behind an abstraction that hides it from the segment/commit code — see `docs/decisions/0005-rust-over-cpp-reversal.md`.
 
 ## Imports
 

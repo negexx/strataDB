@@ -581,8 +581,8 @@ pub struct Transaction {
     last_issued_timestamp: Arc<AtomicI64>,
     /// Test-only fault injection: makes [`Transaction::commit`]'s durability
     /// step fail, modelling a recoverable I/O error (e.g. ENOSPC) *after*
-    /// this commit's deltas have already reached the shared graph. See
-    /// [`Transaction::inject_manifest_commit_failure`].
+    /// this commit's segment (if any) has already been built and fsynced in
+    /// `write_phase`. See [`Transaction::inject_manifest_commit_failure`].
     ///
     /// Scoped to one `Transaction` rather than a thread-local because
     /// `loom` multiplexes its model threads, which would let a thread-local
@@ -1296,10 +1296,11 @@ impl Transaction {
     ///
     /// `zone_map` is this commit's already-merged per-column stats (see
     /// [`merge_zone_map_stats`]), attached to the produced `SegmentEntry`
-    /// unchanged (S1 W4a — compute and store only; nothing reads it yet,
-    /// see the design amendment). If this commit carries no vectors, the
-    /// map is simply discarded along with everything else here — there is
-    /// no segment to attach it to.
+    /// unchanged. Consumed for pruning since S1 W4b by
+    /// `strata_txn::snapshot::zone_map_permits_scan` — see the design
+    /// amendment. If this commit carries no vectors, the map is simply
+    /// discarded along with everything else here — there is no segment to
+    /// attach it to.
     ///
     /// # Errors
     ///
@@ -5112,7 +5113,7 @@ mod tests {
         // indexing bug (e.g. an off-by-one in row * value_length, or
         // accidentally reading a neighboring row's slice) would surface as
         // a row getting the wrong vector, which a row_id-only assertion
-        // (as the other build_delta_entries tests use) would never catch.
+        // (as the other build_vector_inserts tests use) would never catch.
         let ids = Arc::new(Int64Array::from(vec![10, 11, 12]));
         let item_field = Arc::new(Field::new("item", DataType::Float32, false));
         let values = Arc::new(arrow::array::Float32Array::from(vec![
@@ -5141,7 +5142,7 @@ mod tests {
 
     #[test]
     fn build_vector_inserts_reads_the_correct_vector_from_a_sliced_batch() {
-        // Pins the assumption build_delta_entries's downcast-hoist rewrite
+        // Pins the assumption build_vector_inserts's downcast-hoist rewrite
         // rests on: FixedSizeListArray::offset()/Float32Array::offset() are
         // both always 0 in the installed arrow-array version, because
         // slicing bakes the offset into a new `values` buffer rather than
@@ -5652,7 +5653,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::cast_precision_loss)]
-    fn commit_applies_only_its_own_new_deltas_not_the_full_history() {
+    fn a_fourth_commit_adds_exactly_one_row_to_three_commits_of_history() {
         let dir = tempfile::Builder::new()
             .prefix("strata-replay-cost-regression-")
             .tempdir()
@@ -5672,13 +5673,14 @@ mod tests {
         }
 
         // The 4th commit's own pending batch has exactly 1 row (1 new
-        // segment, keyed 0..1). Publishing it must not require touching the
-        // 3 earlier commits' segment files at all — confirmed indirectly
-        // here by checking the resulting snapshot's row count matches
-        // "3 history rows + 1 new row", which would only be wrong if
-        // either too few (this commit's row lost) or suspiciously
-        // history-dependent logic silently reprocessed old entries into a
-        // wrong count.
+        // segment, keyed 0..1). This only checks the resulting row count —
+        // NOT that publishing it left the 3 earlier commits' segment files
+        // untouched (this test's name previously overclaimed that; it
+        // asserts nothing about segment files at all). A count of exactly
+        // "3 history rows + 1 new row" would still be wrong if either this
+        // commit's row were lost, or history-dependent logic silently
+        // reprocessed old entries into a wrong count — that's the actual
+        // discriminating power this assertion has.
         let mut txn = dataset.begin();
         txn.insert(crate::mvp_fixtures::mvp_row(3, "row", [3.0, 0.0, 0.0]).unwrap());
         txn.commit().unwrap();
@@ -6027,7 +6029,8 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_commits_vector_is_never_searchable_after_a_later_commit_advances_the_watermark() {
+    fn a_failed_commits_vector_is_never_searchable_after_a_later_commit_advances_the_row_id_counter()
+     {
         // Regression test for the dangling-search-hit hazard. Before S1
         // W3.2a, `commit` applied this transaction's HNSW `Insert` deltas to
         // a shared `Arc<HnswIndex>` *before* `commit_manifest` made the
@@ -6067,9 +6070,9 @@ mod tests {
         seed.commit().unwrap();
 
         // T1: insert a vector at distinctive, never-reused coordinates, then
-        // fail at the manifest-commit step (after the delta has already
-        // reached the shared graph). Its row-id (1) is allocated but never
-        // committed.
+        // fail at the manifest-commit step (after its segment has already
+        // been built and fsynced in write_phase). Its row-id (1) is
+        // allocated but never committed.
         let mut failing = ds.begin();
         failing.insert(vector_batch(
             vec![2i64],
@@ -6438,10 +6441,10 @@ mod tests {
         // I/O failure (e.g. ENOSPC) at `commit_manifest`, injected at
         // exactly that step -- after this commit's .seg file is already
         // fsynced. Distinct from
-        // `a_failed_commits_vector_is_never_searchable_after_a_later_commit_advances_the_watermark`
+        // `a_failed_commits_vector_is_never_searchable_after_a_later_commit_advances_the_row_id_counter`
         // above, which uses the same injector to regression-test one
         // specific hazard (a dangling search hit surfacing only after a
-        // *later* commit advances the watermark); this test asserts the
+        // *later* commit advances the row-id counter); this test asserts the
         // full six-point list -- including that the orphan `.seg` file
         // exists on disk and that a reopen reproduces everything -- against
         // the very next observation, with no later commit involved.
@@ -6775,7 +6778,7 @@ mod tests {
 /// in one run.
 ///
 /// **Model 3**, below
-/// (`a_reader_never_sees_one_in_flight_commits_row_while_observing_an_unrelated_commits_watermark`),
+/// (`a_reader_never_sees_one_in_flight_commits_row_while_observing_an_unrelated_commits_row_id_counter`),
 /// is the regression gate for deleting `RowIdAllocator.active` / `in_flight`
 /// / collapsing `Snapshot::is_visible` to the tombstone check — see
 /// `.claude/docs/design/phase-s1-segmented-index-spec.md` §6. It was added
@@ -6826,7 +6829,7 @@ mod loom_tests {
     /// crate-wide total), but every commit-running model here still has to
     /// budget against it independently: the two `two_threads_deleting_*`
     /// models sit at 4 of 5 (root + setup + 2 racing threads);
-    /// `a_failed_commits_graph_residue_is_never_searchable_under_concurrent_commits`
+    /// `a_failed_commits_segment_is_never_searchable_under_concurrent_commits`
     /// sits at the cap itself, 5 of 5 (root + seed + failing + succeeding +
     /// final);
     /// `concurrent_first_vector_commits_at_different_dimensions_are_not_both_accepted`
@@ -6837,7 +6840,7 @@ mod loom_tests {
     /// search assertion non-vacuous, see that test's own doc comment);
     /// `a_commits_row_and_its_segment_become_visible_as_one_atomic_step` sits
     /// at 3 of 5 (root + a committer + a reader racing it directly);
-    /// `a_reader_never_sees_one_in_flight_commits_row_while_observing_an_unrelated_commits_watermark`
+    /// `a_reader_never_sees_one_in_flight_commits_row_while_observing_an_unrelated_commits_row_id_counter`
     /// ("Model 3") sits at 4 of 5 (root + committer_a + committer_b + reader).
     /// One more `spawn_committer` in any model already at the cap trips an
     /// assert inside loom, so a commit that only needs the stack — not the
@@ -7065,10 +7068,10 @@ mod loom_tests {
         arrow::array::RecordBatch::try_new(schema, vec![ids, vectors]).unwrap()
     }
 
-    /// One row, no `"vector"` column — so `build_delta_entries` yields no
+    /// One row, no `"vector"` column — so `build_vector_inserts` yields no
     /// entries and the commit does zero HNSW work while still claiming a
-    /// row-id and advancing the watermark. Used for the committers whose
-    /// only job here is to move the watermark, keeping the loom model
+    /// row-id and advancing the row-id counter. Used for the committers
+    /// whose only job here is to move the counter, keeping the loom model
     /// small enough to explore.
     fn loom_plain_batch(id: i64) -> arrow::array::RecordBatch {
         let schema = StdArc::new(arrow::datatypes::Schema::new(vec![
@@ -7082,9 +7085,9 @@ mod loom_tests {
     }
 
     #[test]
-    fn a_failed_commits_graph_residue_is_never_searchable_under_concurrent_commits() {
+    fn a_failed_commits_segment_is_never_searchable_under_concurrent_commits() {
         // The interleaving counterpart to
-        // `dataset::tests::a_failed_commits_vector_is_never_searchable_after_a_later_commit_advances_the_watermark`.
+        // `dataset::tests::a_failed_commits_vector_is_never_searchable_after_a_later_commit_advances_the_row_id_counter`.
         // That test fixes the order (fail, then commit); this one lets loom
         // explore every order in which a *failing* committer and a
         // *succeeding* committer reach and release the commit lock.
@@ -7125,9 +7128,9 @@ mod loom_tests {
         // eventually does — is now structural (a snapshot's `SegmentSet` is
         // exactly its own manifest's segment list, so an uncommitted
         // transaction's row/segment can never appear in an already-published
-        // snapshot regardless of what its watermark numerically covers), and
+        // snapshot regardless of what its row-id counter numerically covers), and
         // is covered by
-        // `a_reader_never_sees_one_in_flight_commits_row_while_observing_an_unrelated_commits_watermark`
+        // `a_reader_never_sees_one_in_flight_commits_row_while_observing_an_unrelated_commits_row_id_counter`
         // below (interleavings) and
         // `dataset::tests::a_concurrent_reader_never_sees_an_in_flight_commits_vector`
         // (a real reader thread racing the slow commit's still-open critical
@@ -7191,10 +7194,15 @@ mod loom_tests {
                 "an insert-only transaction has an empty write-set and cannot conflict"
             );
 
-            // Guarantees the watermark covers whatever row-id the failed
-            // commit claimed, in *every* interleaving — without this, the
-            // schedules where it claimed a row-id above the watermark would
-            // satisfy the assertion below vacuously.
+            // Exercises the row-id allocator's continued progress after a
+            // failed commit, under every interleaving -- the failed
+            // commit's claimed row-id is never recycled (spec §8), so this
+            // commit must still succeed and claim the next one. Unlike the
+            // pre-S1 watermark design, the vector_search assertion below no
+            // longer depends on this: non-vacuousness now comes structurally
+            // from the segment-list invariant (see this test's doc comment
+            // above), not from a watermark numerically advancing past the
+            // failed commit's row-id.
             //
             // Spawned rather than run inline for the stack, not the
             // concurrency: the root thread's 32 KiB cannot hold a `commit`
@@ -7432,7 +7440,7 @@ mod loom_tests {
         // discriminate -- "only the seed's vector is ever findable" versus
         // "search finds nothing because there is nothing to search" --
         // exactly mirroring the seed
-        // `a_failed_commits_graph_residue_is_never_searchable_under_concurrent_commits`
+        // `a_failed_commits_segment_is_never_searchable_under_concurrent_commits`
         // above already uses for the same reason.
         //
         // **What this model proves, and what it can't.** The property here
@@ -7452,7 +7460,7 @@ mod loom_tests {
         // schedule the pre-fix version was actually running.
         //
         // This is the genuinely new interleaving space relative to
-        // `a_failed_commits_graph_residue_is_never_searchable_under_concurrent_commits`
+        // `a_failed_commits_segment_is_never_searchable_under_concurrent_commits`
         // above: that model races two *committers* against each other and
         // only reads afterward (sequentially, once both have joined). This
         // one races a *reader* directly against the failing committer's own
@@ -7614,7 +7622,7 @@ mod loom_tests {
         // above, this races a reader directly against a committer's own
         // execution rather than against another committer -- the
         // interleaving space neither
-        // `a_failed_commits_graph_residue_is_never_searchable_under_concurrent_commits`
+        // `a_failed_commits_segment_is_never_searchable_under_concurrent_commits`
         // nor
         // `concurrent_first_vector_commits_at_different_dimensions_are_not_both_accepted`
         // covers.
@@ -7723,7 +7731,7 @@ mod loom_tests {
     }
 
     #[test]
-    fn a_reader_never_sees_one_in_flight_commits_row_while_observing_an_unrelated_commits_watermark()
+    fn a_reader_never_sees_one_in_flight_commits_row_while_observing_an_unrelated_commits_row_id_counter()
      {
         // Base design §6 ("The snapshot-isolation simplification (benefit +
         // hazard)") / this file's own note above `mod loom_tests` --
@@ -7731,27 +7739,31 @@ mod loom_tests {
         // `RowIdAllocator.active`/`in_flight` and collapsing
         // `Snapshot::is_visible` to the tombstone check.
         //
-        // The specific hazard `crate::row_id`'s module doc names: row-ids
-        // are claimed *before* `commit_lock`, from a single *global*
-        // counter. Two concurrent, non-conflicting (disjoint-row,
-        // insert-only) commits can therefore claim in either order but
-        // publish (commit) in either order too. If transaction A claims a
-        // row-id and is still inside `commit()` when unrelated transaction
-        // B claims a later row-id and fully commits, B's published
-        // watermark is read from the SAME global counter A already
-        // advanced by claiming -- so B's watermark numerically covers A's
-        // row-id, even though A has not committed.
+        // The specific hazard `crate::row_id`'s module doc names, now
+        // closed: row-ids are claimed *before* `commit_lock`, from a
+        // single *global* counter. Two concurrent, non-conflicting
+        // (disjoint-row, insert-only) commits can therefore claim in
+        // either order but publish (commit) in either order too. Under
+        // the OLD shared-mutable-HNSW-graph design, if transaction A
+        // claimed a row-id and was still inside `commit()` when unrelated
+        // transaction B claimed a later row-id and fully committed, B's
+        // published watermark was read from the SAME global counter A had
+        // already advanced by claiming -- so B's watermark numerically
+        // covered A's row-id, even though A had not committed, which is
+        // exactly why that design needed the in-flight exclusion set this
+        // model regression-gates the removal of.
         //
         // What actually prevents a reader from finding A's row in that
-        // situation (proven here, not assumed): B's published snapshot's
-        // `SegmentSet`/`manifest.data_files` are built from B's OWN commit
-        // only. A's segment/data file are never added to them, regardless
-        // of what B's watermark numerically covers -- there is no shared,
-        // eagerly-mutated structure for A's in-flight write to leak into.
-        // So a reader's `vector_search` hit for a vector and that same
-        // row's presence in the SAME snapshot's `scan()` must always
-        // agree, for every writer, independent of which watermark happens
-        // to be published at the moment the reader's snapshot was taken.
+        // situation today (proven here, not assumed): B's published
+        // snapshot's `SegmentSet`/`manifest.data_files` are built from B's
+        // OWN commit only. A's segment/data file are never added to them,
+        // regardless of what B's row-id counter numerically covers --
+        // there is no shared, eagerly-mutated structure for A's in-flight
+        // write to leak into. So a reader's `vector_search` hit for a
+        // vector and that same row's presence in the SAME snapshot's
+        // `scan()` must always agree, for every writer, independent of
+        // which row-id-counter value happens to be current at the moment
+        // the reader's snapshot was taken.
         //
         // A commits id=1 at [900,900,900]; B commits id=2 at [100,100,100]
         // -- disjoint rows, so both always succeed regardless of

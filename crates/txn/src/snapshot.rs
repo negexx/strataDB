@@ -139,7 +139,7 @@ impl Snapshot {
     /// construction can never include a row-id this snapshot's own commit
     /// didn't allocate, and can never include an in-flight (not-yet-durable)
     /// transaction's row at all. Proven, not assumed:
-    /// `dataset::loom_tests::a_reader_never_sees_one_in_flight_commits_row_while_observing_an_unrelated_commits_watermark`.
+    /// `dataset::loom_tests::a_reader_never_sees_one_in_flight_commits_row_while_observing_an_unrelated_commits_row_id_counter`.
     ///
     /// This runs once per candidate during HNSW graph traversal.
     pub(crate) fn is_visible(&self, row_id: u64) -> bool {
