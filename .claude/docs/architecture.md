@@ -66,6 +66,7 @@ The transaction/conflict layer is an explicit, load-bearing architectural compon
 | `anndists` (`simdeez_f` feature) | SIMD-accelerated distance kernels only — `crates/index`'s HNSW graph structure, traversal, and on-disk segment format are this project's own from-scratch code, not `hnsw_rs` (fully replaced; see `docs/superpowers/specs/2026-07-18-hnsw-rs-wrap-vs-replace-decision.md`) | N/A — narrow-purpose SIMD kernel dependency only |
 | `loom` | Exhaustive interleaving testing of locks/atomics/CAS loops in `crates/txn`/`crates/index` | N/A — dev/test-only, not shipped |
 | `pyo3` / `maturin` | Python binding generation | ABI mismatch across Python versions — pin the target Python version per release build |
+| `hnsw_rs` | Retained deliberately as `bench/`'s comparison baseline (`bench/benches/lockfree_vs_hnsw_rs_bench.rs`) — NOT used by `crates/index`'s production HNSW implementation, which fully replaced it (see the `anndists` row above) | N/A — bench-only dependency; do not "clean up" as apparently-unused |
 
 ## Cross-cutting concerns
 

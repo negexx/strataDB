@@ -5653,7 +5653,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::cast_precision_loss)]
-    fn commit_publishes_only_its_own_new_data_not_the_full_history() {
+    fn a_fourth_commit_adds_exactly_one_row_to_three_commits_of_history() {
         let dir = tempfile::Builder::new()
             .prefix("strata-replay-cost-regression-")
             .tempdir()
@@ -5673,13 +5673,14 @@ mod tests {
         }
 
         // The 4th commit's own pending batch has exactly 1 row (1 new
-        // segment, keyed 0..1). Publishing it must not require touching the
-        // 3 earlier commits' segment files at all — confirmed indirectly
-        // here by checking the resulting snapshot's row count matches
-        // "3 history rows + 1 new row", which would only be wrong if
-        // either too few (this commit's row lost) or suspiciously
-        // history-dependent logic silently reprocessed old entries into a
-        // wrong count.
+        // segment, keyed 0..1). This only checks the resulting row count —
+        // NOT that publishing it left the 3 earlier commits' segment files
+        // untouched (this test's name previously overclaimed that; it
+        // asserts nothing about segment files at all). A count of exactly
+        // "3 history rows + 1 new row" would still be wrong if either this
+        // commit's row were lost, or history-dependent logic silently
+        // reprocessed old entries into a wrong count — that's the actual
+        // discriminating power this assertion has.
         let mut txn = dataset.begin();
         txn.insert(crate::mvp_fixtures::mvp_row(3, "row", [3.0, 0.0, 0.0]).unwrap());
         txn.commit().unwrap();
@@ -6069,9 +6070,9 @@ mod tests {
         seed.commit().unwrap();
 
         // T1: insert a vector at distinctive, never-reused coordinates, then
-        // fail at the manifest-commit step (after the delta has already
-        // reached the shared graph). Its row-id (1) is allocated but never
-        // committed.
+        // fail at the manifest-commit step (after its segment has already
+        // been built and fsynced in write_phase). Its row-id (1) is
+        // allocated but never committed.
         let mut failing = ds.begin();
         failing.insert(vector_batch(
             vec![2i64],
@@ -7193,10 +7194,15 @@ mod loom_tests {
                 "an insert-only transaction has an empty write-set and cannot conflict"
             );
 
-            // Guarantees the watermark covers whatever row-id the failed
-            // commit claimed, in *every* interleaving — without this, the
-            // schedules where it claimed a row-id above the watermark would
-            // satisfy the assertion below vacuously.
+            // Exercises the row-id allocator's continued progress after a
+            // failed commit, under every interleaving -- the failed
+            // commit's claimed row-id is never recycled (spec §8), so this
+            // commit must still succeed and claim the next one. Unlike the
+            // pre-S1 watermark design, the vector_search assertion below no
+            // longer depends on this: non-vacuousness now comes structurally
+            // from the segment-list invariant (see this test's doc comment
+            // above), not from a watermark numerically advancing past the
+            // failed commit's row-id.
             //
             // Spawned rather than run inline for the stack, not the
             // concurrency: the root thread's 32 KiB cannot hold a `commit`
@@ -7733,27 +7739,31 @@ mod loom_tests {
         // `RowIdAllocator.active`/`in_flight` and collapsing
         // `Snapshot::is_visible` to the tombstone check.
         //
-        // The specific hazard `crate::row_id`'s module doc names: row-ids
-        // are claimed *before* `commit_lock`, from a single *global*
-        // counter. Two concurrent, non-conflicting (disjoint-row,
-        // insert-only) commits can therefore claim in either order but
-        // publish (commit) in either order too. If transaction A claims a
-        // row-id and is still inside `commit()` when unrelated transaction
-        // B claims a later row-id and fully commits, B's published
-        // watermark is read from the SAME global counter A already
-        // advanced by claiming -- so B's watermark numerically covers A's
-        // row-id, even though A has not committed.
+        // The specific hazard `crate::row_id`'s module doc names, now
+        // closed: row-ids are claimed *before* `commit_lock`, from a
+        // single *global* counter. Two concurrent, non-conflicting
+        // (disjoint-row, insert-only) commits can therefore claim in
+        // either order but publish (commit) in either order too. Under
+        // the OLD shared-mutable-HNSW-graph design, if transaction A
+        // claimed a row-id and was still inside `commit()` when unrelated
+        // transaction B claimed a later row-id and fully committed, B's
+        // published watermark was read from the SAME global counter A had
+        // already advanced by claiming -- so B's watermark numerically
+        // covered A's row-id, even though A had not committed, which is
+        // exactly why that design needed the in-flight exclusion set this
+        // model regression-gates the removal of.
         //
         // What actually prevents a reader from finding A's row in that
-        // situation (proven here, not assumed): B's published snapshot's
-        // `SegmentSet`/`manifest.data_files` are built from B's OWN commit
-        // only. A's segment/data file are never added to them, regardless
-        // of what B's watermark numerically covers -- there is no shared,
-        // eagerly-mutated structure for A's in-flight write to leak into.
-        // So a reader's `vector_search` hit for a vector and that same
-        // row's presence in the SAME snapshot's `scan()` must always
-        // agree, for every writer, independent of which watermark happens
-        // to be published at the moment the reader's snapshot was taken.
+        // situation today (proven here, not assumed): B's published
+        // snapshot's `SegmentSet`/`manifest.data_files` are built from B's
+        // OWN commit only. A's segment/data file are never added to them,
+        // regardless of what B's row-id counter numerically covers --
+        // there is no shared, eagerly-mutated structure for A's in-flight
+        // write to leak into. So a reader's `vector_search` hit for a
+        // vector and that same row's presence in the SAME snapshot's
+        // `scan()` must always agree, for every writer, independent of
+        // which row-id-counter value happens to be current at the moment
+        // the reader's snapshot was taken.
         //
         // A commits id=1 at [900,900,900]; B commits id=2 at [100,100,100]
         // -- disjoint rows, so both always succeed regardless of
