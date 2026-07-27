@@ -166,7 +166,7 @@ fn check_invariants(dir: &std::path::Path, acknowledged: &HashSet<u64>, crashed:
     // the storage engine. `VectorMatch::row_id` is a completely different,
     // internal identifier: the dataset's own monotonic row-id counter,
     // assigned by *commit order* (`row_id_base` in
-    // `crates/txn/src/dataset.rs`'s `build_delta_entries`), which is
+    // `crates/txn/src/dataset.rs`'s `build_vector_inserts`), which is
     // scrambled relative to the "id" column's values by chaos-worker's
     // whole point — randomized agent interleaving. Confirmed empirically
     // with a standalone probe: inserting id=999 then id=5 as two separate

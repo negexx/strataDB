@@ -581,8 +581,8 @@ pub struct Transaction {
     last_issued_timestamp: Arc<AtomicI64>,
     /// Test-only fault injection: makes [`Transaction::commit`]'s durability
     /// step fail, modelling a recoverable I/O error (e.g. ENOSPC) *after*
-    /// this commit's deltas have already reached the shared graph. See
-    /// [`Transaction::inject_manifest_commit_failure`].
+    /// this commit's segment (if any) has already been built and fsynced in
+    /// `write_phase`. See [`Transaction::inject_manifest_commit_failure`].
     ///
     /// Scoped to one `Transaction` rather than a thread-local because
     /// `loom` multiplexes its model threads, which would let a thread-local
@@ -1296,10 +1296,11 @@ impl Transaction {
     ///
     /// `zone_map` is this commit's already-merged per-column stats (see
     /// [`merge_zone_map_stats`]), attached to the produced `SegmentEntry`
-    /// unchanged (S1 W4a — compute and store only; nothing reads it yet,
-    /// see the design amendment). If this commit carries no vectors, the
-    /// map is simply discarded along with everything else here — there is
-    /// no segment to attach it to.
+    /// unchanged. Consumed for pruning since S1 W4b by
+    /// `strata_txn::snapshot::zone_map_permits_scan` — see the design
+    /// amendment. If this commit carries no vectors, the map is simply
+    /// discarded along with everything else here — there is no segment to
+    /// attach it to.
     ///
     /// # Errors
     ///
@@ -5112,7 +5113,7 @@ mod tests {
         // indexing bug (e.g. an off-by-one in row * value_length, or
         // accidentally reading a neighboring row's slice) would surface as
         // a row getting the wrong vector, which a row_id-only assertion
-        // (as the other build_delta_entries tests use) would never catch.
+        // (as the other build_vector_inserts tests use) would never catch.
         let ids = Arc::new(Int64Array::from(vec![10, 11, 12]));
         let item_field = Arc::new(Field::new("item", DataType::Float32, false));
         let values = Arc::new(arrow::array::Float32Array::from(vec![
@@ -5141,7 +5142,7 @@ mod tests {
 
     #[test]
     fn build_vector_inserts_reads_the_correct_vector_from_a_sliced_batch() {
-        // Pins the assumption build_delta_entries's downcast-hoist rewrite
+        // Pins the assumption build_vector_inserts's downcast-hoist rewrite
         // rests on: FixedSizeListArray::offset()/Float32Array::offset() are
         // both always 0 in the installed arrow-array version, because
         // slicing bakes the offset into a new `values` buffer rather than
@@ -5652,7 +5653,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::cast_precision_loss)]
-    fn commit_applies_only_its_own_new_deltas_not_the_full_history() {
+    fn commit_publishes_only_its_own_new_data_not_the_full_history() {
         let dir = tempfile::Builder::new()
             .prefix("strata-replay-cost-regression-")
             .tempdir()
@@ -6027,7 +6028,8 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_commits_vector_is_never_searchable_after_a_later_commit_advances_the_watermark() {
+    fn a_failed_commits_vector_is_never_searchable_after_a_later_commit_advances_the_row_id_counter()
+     {
         // Regression test for the dangling-search-hit hazard. Before S1
         // W3.2a, `commit` applied this transaction's HNSW `Insert` deltas to
         // a shared `Arc<HnswIndex>` *before* `commit_manifest` made the
@@ -6438,10 +6440,10 @@ mod tests {
         // I/O failure (e.g. ENOSPC) at `commit_manifest`, injected at
         // exactly that step -- after this commit's .seg file is already
         // fsynced. Distinct from
-        // `a_failed_commits_vector_is_never_searchable_after_a_later_commit_advances_the_watermark`
+        // `a_failed_commits_vector_is_never_searchable_after_a_later_commit_advances_the_row_id_counter`
         // above, which uses the same injector to regression-test one
         // specific hazard (a dangling search hit surfacing only after a
-        // *later* commit advances the watermark); this test asserts the
+        // *later* commit advances the row-id counter); this test asserts the
         // full six-point list -- including that the orphan `.seg` file
         // exists on disk and that a reopen reproduces everything -- against
         // the very next observation, with no later commit involved.
@@ -7065,10 +7067,10 @@ mod loom_tests {
         arrow::array::RecordBatch::try_new(schema, vec![ids, vectors]).unwrap()
     }
 
-    /// One row, no `"vector"` column — so `build_delta_entries` yields no
+    /// One row, no `"vector"` column — so `build_vector_inserts` yields no
     /// entries and the commit does zero HNSW work while still claiming a
-    /// row-id and advancing the watermark. Used for the committers whose
-    /// only job here is to move the watermark, keeping the loom model
+    /// row-id and advancing the row-id counter. Used for the committers
+    /// whose only job here is to move the counter, keeping the loom model
     /// small enough to explore.
     fn loom_plain_batch(id: i64) -> arrow::array::RecordBatch {
         let schema = StdArc::new(arrow::datatypes::Schema::new(vec![
@@ -7084,7 +7086,7 @@ mod loom_tests {
     #[test]
     fn a_failed_commits_graph_residue_is_never_searchable_under_concurrent_commits() {
         // The interleaving counterpart to
-        // `dataset::tests::a_failed_commits_vector_is_never_searchable_after_a_later_commit_advances_the_watermark`.
+        // `dataset::tests::a_failed_commits_vector_is_never_searchable_after_a_later_commit_advances_the_row_id_counter`.
         // That test fixes the order (fail, then commit); this one lets loom
         // explore every order in which a *failing* committer and a
         // *succeeding* committer reach and release the commit lock.
