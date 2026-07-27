@@ -7128,7 +7128,7 @@ mod loom_tests {
         // eventually does — is now structural (a snapshot's `SegmentSet` is
         // exactly its own manifest's segment list, so an uncommitted
         // transaction's row/segment can never appear in an already-published
-        // snapshot regardless of what its watermark numerically covers), and
+        // snapshot regardless of what its row-id counter numerically covers), and
         // is covered by
         // `a_reader_never_sees_one_in_flight_commits_row_while_observing_an_unrelated_commits_row_id_counter`
         // below (interleavings) and

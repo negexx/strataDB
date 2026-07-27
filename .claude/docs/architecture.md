@@ -48,7 +48,7 @@ The transaction/conflict layer is an explicit, load-bearing architectural compon
 | Transaction & conflict layer | `crates/txn/` | OCC, snapshot isolation, row/key-range conflict detection, atomic row+index commits — the flagship subsystem |
 | Client bindings | `crates/bindings/` | PyO3 Python bindings (builds `strata_ext`), including an explicit transaction API (`begin`/`commit`/retry-on-conflict) |
 | CLI | `crates/cli/` | Dataset/manifest inspection (`strata` binary) |
-| Correctness harness | `tests/sim/` | Jepsen-style real-process-kill fault injection, randomized fault injection (Phase 7) — not `madsim`-based, see the Cross-cutting concerns section below |
+| Correctness harness | `tests/sim/` | Jepsen-style real-process-abort fault injection, seed-reproducible (Phase 7) — not `madsim`-based, see the Cross-cutting concerns section below |
 
 ## Data flow
 
