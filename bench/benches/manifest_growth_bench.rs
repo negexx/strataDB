@@ -22,7 +22,7 @@
 //! corrected. This runs one long monotonic sequence and prints the curve.
 //!
 //! Batches carry an `id` column only — no `"vector"` column — so
-//! `build_delta_entries` produces nothing and no HNSW insert runs. That
+//! `build_vector_inserts` produces nothing and no HNSW insert runs. That
 //! isolates the manifest cost from the index's own, separately growing,
 //! insert cost.
 //!

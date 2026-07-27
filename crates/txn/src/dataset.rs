@@ -6777,7 +6777,7 @@ mod tests {
 /// in one run.
 ///
 /// **Model 3**, below
-/// (`a_reader_never_sees_one_in_flight_commits_row_while_observing_an_unrelated_commits_watermark`),
+/// (`a_reader_never_sees_one_in_flight_commits_row_while_observing_an_unrelated_commits_row_id_counter`),
 /// is the regression gate for deleting `RowIdAllocator.active` / `in_flight`
 /// / collapsing `Snapshot::is_visible` to the tombstone check — see
 /// `.claude/docs/design/phase-s1-segmented-index-spec.md` §6. It was added
@@ -6828,7 +6828,7 @@ mod loom_tests {
     /// crate-wide total), but every commit-running model here still has to
     /// budget against it independently: the two `two_threads_deleting_*`
     /// models sit at 4 of 5 (root + setup + 2 racing threads);
-    /// `a_failed_commits_graph_residue_is_never_searchable_under_concurrent_commits`
+    /// `a_failed_commits_segment_is_never_searchable_under_concurrent_commits`
     /// sits at the cap itself, 5 of 5 (root + seed + failing + succeeding +
     /// final);
     /// `concurrent_first_vector_commits_at_different_dimensions_are_not_both_accepted`
@@ -6839,7 +6839,7 @@ mod loom_tests {
     /// search assertion non-vacuous, see that test's own doc comment);
     /// `a_commits_row_and_its_segment_become_visible_as_one_atomic_step` sits
     /// at 3 of 5 (root + a committer + a reader racing it directly);
-    /// `a_reader_never_sees_one_in_flight_commits_row_while_observing_an_unrelated_commits_watermark`
+    /// `a_reader_never_sees_one_in_flight_commits_row_while_observing_an_unrelated_commits_row_id_counter`
     /// ("Model 3") sits at 4 of 5 (root + committer_a + committer_b + reader).
     /// One more `spawn_committer` in any model already at the cap trips an
     /// assert inside loom, so a commit that only needs the stack — not the
@@ -7084,7 +7084,7 @@ mod loom_tests {
     }
 
     #[test]
-    fn a_failed_commits_graph_residue_is_never_searchable_under_concurrent_commits() {
+    fn a_failed_commits_segment_is_never_searchable_under_concurrent_commits() {
         // The interleaving counterpart to
         // `dataset::tests::a_failed_commits_vector_is_never_searchable_after_a_later_commit_advances_the_row_id_counter`.
         // That test fixes the order (fail, then commit); this one lets loom
@@ -7129,7 +7129,7 @@ mod loom_tests {
         // transaction's row/segment can never appear in an already-published
         // snapshot regardless of what its watermark numerically covers), and
         // is covered by
-        // `a_reader_never_sees_one_in_flight_commits_row_while_observing_an_unrelated_commits_watermark`
+        // `a_reader_never_sees_one_in_flight_commits_row_while_observing_an_unrelated_commits_row_id_counter`
         // below (interleavings) and
         // `dataset::tests::a_concurrent_reader_never_sees_an_in_flight_commits_vector`
         // (a real reader thread racing the slow commit's still-open critical
@@ -7434,7 +7434,7 @@ mod loom_tests {
         // discriminate -- "only the seed's vector is ever findable" versus
         // "search finds nothing because there is nothing to search" --
         // exactly mirroring the seed
-        // `a_failed_commits_graph_residue_is_never_searchable_under_concurrent_commits`
+        // `a_failed_commits_segment_is_never_searchable_under_concurrent_commits`
         // above already uses for the same reason.
         //
         // **What this model proves, and what it can't.** The property here
@@ -7454,7 +7454,7 @@ mod loom_tests {
         // schedule the pre-fix version was actually running.
         //
         // This is the genuinely new interleaving space relative to
-        // `a_failed_commits_graph_residue_is_never_searchable_under_concurrent_commits`
+        // `a_failed_commits_segment_is_never_searchable_under_concurrent_commits`
         // above: that model races two *committers* against each other and
         // only reads afterward (sequentially, once both have joined). This
         // one races a *reader* directly against the failing committer's own
@@ -7616,7 +7616,7 @@ mod loom_tests {
         // above, this races a reader directly against a committer's own
         // execution rather than against another committer -- the
         // interleaving space neither
-        // `a_failed_commits_graph_residue_is_never_searchable_under_concurrent_commits`
+        // `a_failed_commits_segment_is_never_searchable_under_concurrent_commits`
         // nor
         // `concurrent_first_vector_commits_at_different_dimensions_are_not_both_accepted`
         // covers.
@@ -7725,7 +7725,7 @@ mod loom_tests {
     }
 
     #[test]
-    fn a_reader_never_sees_one_in_flight_commits_row_while_observing_an_unrelated_commits_watermark()
+    fn a_reader_never_sees_one_in_flight_commits_row_while_observing_an_unrelated_commits_row_id_counter()
      {
         // Base design §6 ("The snapshot-isolation simplification (benefit +
         // hazard)") / this file's own note above `mod loom_tests` --
