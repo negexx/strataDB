@@ -11,6 +11,8 @@ use std::io::Write as _;
 use rand::{Rng as _, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
+// Not yet called from main() -- wired in by Task 6 of the workload-extension
+// plan, which removes this attribute once it is.
 #[allow(dead_code)]
 mod ops;
 
