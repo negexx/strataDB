@@ -204,7 +204,23 @@ Replace the `todo!()` body in `crates/storage/src/backend/local.rs`'s `impl Back
         }
         crate::chaos::chaos_checkpoint(); // tmp object is durable, about to rename into place
         fs::rename(&tmp_path, &final_path)?;
-        crate::chaos::chaos_checkpoint(); // renamed into place; now discoverable
+        crate::chaos::chaos_checkpoint(); // renamed into place; now discoverable by content
+        // Fsync the containing directory so the rename itself survives a
+        // crash, not just the file content -- matching `commit_manifest`'s
+        // existing `sync_dir` step today. Folded in here (rather than left
+        // as a separate caller-side step, as `commit_manifest` used to do)
+        // so `Backend::put`'s durability contract is self-contained and
+        // uniform across backends: S3 has no analogous directory-entry
+        // step, so a caller shouldn't need backend-specific knowledge to
+        // get full durability out of `put` alone. `sync_dir` performs its
+        // own chaos checkpoint internally (see `datafile.rs`), so this
+        // contributes the 3rd checkpoint here, matching the 3 checkpoints
+        // `commit_manifest` + its old explicit `sync_dir` call produced
+        // together today -- see Task 6, which removes that now-redundant
+        // explicit call.
+        if let Some(parent) = final_path.parent() {
+            crate::datafile::sync_dir(parent)?;
+        }
         Ok(())
     }
 ```
@@ -424,6 +440,13 @@ In `crates/storage/src/backend/local.rs`, add to `impl Backend for LocalFs` (aft
         match link_result {
             Ok(()) => {
                 crate::chaos::chaos_checkpoint(); // linked into place; now discoverable
+                // See `put`'s matching comment: fsync the containing
+                // directory so the new hard link survives a crash, not
+                // just the file content. `sync_dir` performs its own
+                // chaos checkpoint internally.
+                if let Some(parent) = final_path.parent() {
+                    crate::datafile::sync_dir(parent)?;
+                }
                 Ok(())
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -756,16 +779,16 @@ pub fn commit_manifest(dataset_dir: &Path, manifest: &Manifest) -> Result<()> {
     let backend = LocalFs::new(dataset_dir);
     let key = format!("_versions/{:020}.manifest", manifest.version);
     let json = serde_json::to_vec(manifest)?;
+    // `LocalFs::put` fsyncs the containing directory internally (see Task
+    // 1), so there is no separate `sync_dir` call here the way the
+    // pre-Backend code had one -- folding that step into `put` itself
+    // (rather than leaving it a caller-remembered step) is what makes
+    // `Backend::put`'s durability contract self-contained. Do not add a
+    // second explicit `sync_dir` call here: `versions_dir(dataset_dir)` is
+    // exactly the directory `put` already fsyncs for this key, so a second
+    // call would double a chaos checkpoint and break the "checkpoint count
+    // unchanged" global constraint below.
     backend.put(&key, &json)?;
-
-    // fsync the containing directory so the rename itself survives a crash,
-    // not just the file content -- see `crate::datafile::sync_dir`. Not
-    // fatal if unsupported on this platform, since `rename()` on both
-    // POSIX and NTFS is itself atomic; the worst case without this is a
-    // rename that completed but whose *durability* is unconfirmed on an
-    // immediate power loss, not a torn or partially-visible write.
-    crate::datafile::sync_dir(&versions_dir(dataset_dir))?;
-
     Ok(())
 }
 ```
@@ -844,7 +867,31 @@ Then, inside `#[cfg(test)] mod tests` (which currently starts with `use super::*
 
 (insert directly after the existing `use super::*;` line in `mod tests`)
 
-- [ ] **Step 5: Run the full manifest test suite to verify no regression**
+- [ ] **Step 5: Mark `versions_dir`/`manifest_path` test-only**
+
+Neither `versions_dir` nor `manifest_path` (both existing helper functions,
+unchanged in body) is called by the new `commit_manifest`/`read_current`
+implementations above — `commit_manifest` now inlines its key as a format
+string, and `read_current` lists by a literal prefix. Both helpers are
+still used, but only by `mod tests`'s direct-filesystem assertions (e.g.
+`manifest_path(&dir, 0)` to read back raw bytes). Left as plain functions,
+a non-test `cargo build` would flag both as unused (`mod tests` doesn't
+exist in that compilation). Mark them `#[cfg(test)]` so they're compiled
+exactly when something uses them:
+
+```rust
+#[cfg(test)]
+fn versions_dir(dataset_dir: &Path) -> PathBuf {
+    dataset_dir.join("_versions")
+}
+
+#[cfg(test)]
+fn manifest_path(dataset_dir: &Path, version: u64) -> PathBuf {
+    versions_dir(dataset_dir).join(format!("{version:020}.manifest"))
+}
+```
+
+- [ ] **Step 6: Run the full manifest test suite to verify no regression**
 
 Run: `cargo test -p strata-storage manifest:: -- --nocapture`
 Expected: PASS — all 13 tests green, unmodified, including
@@ -855,12 +902,12 @@ Expected: PASS — all 13 tests green, unmodified, including
 specifically exercise the tmp-file/rename/listing behavior this task
 relocated into `LocalFs`, so they're the real regression check.
 
-- [ ] **Step 6: Run the full storage crate's test suite**
+- [ ] **Step 7: Run the full storage crate's test suite**
 
 Run: `cargo test -p strata-storage -- --nocapture`
 Expected: PASS — every test in `strata-storage` (datafile, manifest, backend, encoding, stats) green.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add crates/storage/src/manifest.rs
