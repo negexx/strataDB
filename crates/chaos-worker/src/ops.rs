@@ -76,11 +76,17 @@ pub(crate) fn resolve_target(
 }
 
 /// Given the verb drawn for this agent's current op slot and how many
-/// slots remain (including the current one), decides how many slots this
-/// op actually consumes and what verb to execute. `MultiBatchInsert`
+/// slots remain (including the current one — so `slots_remaining >= 1` is
+/// always expected; the caller only ever invokes this for an agent it has
+/// already filtered to have at least one op left), decides how many slots
+/// this op actually consumes and what verb to execute. `MultiBatchInsert`
 /// needs 2 slots; if only 1 remains, it downgrades to a plain `Insert`
 /// consuming just that 1 slot.
 pub(crate) fn resolve_slot_consumption(verb: OpVerb, slots_remaining: u64) -> (OpVerb, u64) {
+    debug_assert!(
+        slots_remaining >= 1,
+        "caller must never invoke this for an exhausted agent"
+    );
     match verb {
         OpVerb::MultiBatchInsert if slots_remaining < 2 => (OpVerb::Insert, 1),
         OpVerb::MultiBatchInsert => (OpVerb::MultiBatchInsert, 2),
@@ -93,7 +99,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn draw_verb_respects_the_documented_boundaries() {
+    fn verb_for_fraction_respects_the_documented_boundaries() {
         assert_eq!(verb_for_fraction(0.0), OpVerb::Insert);
         assert_eq!(verb_for_fraction(0.399), OpVerb::Insert);
         assert_eq!(verb_for_fraction(0.4), OpVerb::Delete);
@@ -105,10 +111,76 @@ mod tests {
     }
 
     #[test]
+    fn generate_verb_sequence_matches_the_documented_distribution_over_many_draws() {
+        // Exercises draw_verb/generate_verb_sequence end-to-end through the
+        // real RNG, not just the pure verb_for_fraction boundary function
+        // above -- if draw_verb's rng.random() call ever changed range (a
+        // silent drift verb_for_fraction's own test cannot catch), this is
+        // what would notice. Design doc §6 names precisely this failure
+        // mode: "a distribution that's too insert-heavy would silently
+        // under-exercise the very thing this design exists to add."
+        let sequence = generate_verb_sequence(42, 1, 10_000);
+        assert_eq!(sequence.len(), 10_000);
+        let count = |verb: OpVerb| sequence.iter().filter(|&&v| v == verb).count();
+        let insert = count(OpVerb::Insert);
+        let delete = count(OpVerb::Delete);
+        let update = count(OpVerb::Update);
+        let multi = count(OpVerb::MultiBatchInsert);
+        assert_eq!(insert + delete + update + multi, 10_000);
+        // Generous tolerance (+/- 300 of the expected count, ~7.5% relative)
+        // so this isn't flaky, while still catching a distribution that
+        // silently drifted to e.g. 50/50.
+        assert!(
+            (3700..=4300).contains(&insert),
+            "insert count {insert} outside expected range"
+        );
+        assert!(
+            (1700..=2300).contains(&delete),
+            "delete count {delete} outside expected range"
+        );
+        assert!(
+            (1700..=2300).contains(&update),
+            "update count {update} outside expected range"
+        );
+        assert!(
+            (1700..=2300).contains(&multi),
+            "multibatch count {multi} outside expected range"
+        );
+    }
+
+    #[test]
     fn the_same_seed_and_agent_always_produce_the_same_sequence() {
         let a = generate_verb_sequence(42, 1, 20);
         let b = generate_verb_sequence(42, 1, 20);
         assert_eq!(a, b);
+        assert_eq!(a.len(), 20, "must produce exactly ops_per_agent verbs");
+    }
+
+    #[test]
+    fn generate_verb_sequence_has_a_pinned_golden_output_for_seed_42_agent_1() {
+        // Pins the actual seeding discipline (seed ^ agent ^ VERB_STREAM,
+        // ChaCha8Rng, draw order), not just "calling it twice gives the
+        // same answer" (true of any pure function, including a badly
+        // seeded one) -- the chaos harness depends on cross-run,
+        // cross-version reproducibility (CLAUDE.md's Phase 7 bullet:
+        // "seed-reproducible scenarios"), which only a literal golden
+        // vector actually tests. Captured by running this exact call once
+        // and pasting its real output -- do not hand-derive or guess this
+        // value.
+        let sequence = generate_verb_sequence(42, 1, 8);
+        assert_eq!(
+            sequence,
+            vec![
+                OpVerb::Insert,
+                OpVerb::Insert,
+                OpVerb::Delete,
+                OpVerb::Delete,
+                OpVerb::Insert,
+                OpVerb::Update,
+                OpVerb::Insert,
+                OpVerb::Insert,
+            ]
+        );
     }
 
     #[test]
@@ -148,22 +220,44 @@ mod tests {
     }
 
     #[test]
-    fn resolve_target_draws_from_both_sources_over_many_draws() {
+    fn resolve_target_draws_from_both_sources_in_roughly_equal_proportion() {
         let mut rng = ChaCha8Rng::seed_from_u64(7);
-        let mut saw_pool = false;
-        let mut saw_own = false;
+        let mut pool_count = 0;
+        let mut own_count = 0;
         for _ in 0..200 {
             match resolve_target(&mut rng, &[100], &[200]) {
-                Some(100) => saw_pool = true,
-                Some(200) => saw_own = true,
+                Some(100) => pool_count += 1,
+                Some(200) => own_count += 1,
                 other => panic!("unexpected target: {other:?}"),
             }
         }
+        assert_eq!(pool_count + own_count, 200);
+        // A real balance check on the stated 50/50 policy, not just "both
+        // were reachable" -- a 199/1 split would satisfy reachability
+        // alone but clearly isn't 50/50. Generous bound (60..140 of 200,
+        // i.e. 30%-70%) so this isn't flaky.
         assert!(
-            saw_pool && saw_own,
-            "200 draws from a 50/50 choice between two singleton pools must hit both \
-             at least once (probability of missing either is 2^-200)"
+            (60..=140).contains(&pool_count),
+            "pool_count {pool_count}/200 outside the expected ~50/50 balance"
         );
+        assert!(
+            (60..=140).contains(&own_count),
+            "own_count {own_count}/200 outside the expected ~50/50 balance"
+        );
+    }
+
+    #[test]
+    fn resolve_target_is_deterministic_for_identically_seeded_rngs() {
+        let mut rng_a = ChaCha8Rng::seed_from_u64(99);
+        let mut rng_b = ChaCha8Rng::seed_from_u64(99);
+        for _ in 0..20 {
+            let a = resolve_target(&mut rng_a, &[1, 2, 3], &[4, 5, 6]);
+            let b = resolve_target(&mut rng_b, &[1, 2, 3], &[4, 5, 6]);
+            assert_eq!(
+                a, b,
+                "identically-seeded RNGs must draw the identical target sequence"
+            );
+        }
     }
 
     #[test]
