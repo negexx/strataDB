@@ -1819,6 +1819,23 @@ fn run_worker(dir: &std::path::Path, seed: u64, abort_at: Option<u64>) -> RunRes
     }
 }
 
+/// Builds the same schema shape as `crates/chaos-worker/src/schema.rs`'s
+/// `schema_with_row_id` (that function is `pub(crate)` to chaos-worker,
+/// not reachable from here, so this is a small intentional duplicate) --
+/// `mvp_schema()`'s fields plus the hidden internal row-id column,
+/// appended last.
+fn schema_with_row_id() -> arrow::datatypes::SchemaRef {
+    let mvp = strata_txn::mvp_fixtures::mvp_schema();
+    let mut fields: Vec<arrow::datatypes::Field> =
+        mvp.fields().iter().map(|f| f.as_ref().clone()).collect();
+    fields.push(arrow::datatypes::Field::new(
+        strata_txn::ROW_ID_COLUMN,
+        arrow::datatypes::DataType::UInt64,
+        false,
+    ));
+    std::sync::Arc::new(arrow::datatypes::Schema::new(fields))
+}
+
 fn check_invariants(dir: &std::path::Path, result: &RunResult) {
     let acknowledged = &result.acknowledged_inserts;
     let crashed = result.crashed;
@@ -1832,16 +1849,29 @@ fn check_invariants(dir: &std::path::Path, result: &RunResult) {
         Err(e) => panic!("dataset failed to reopen after crash — corruption: {e}"),
     };
 
-    let schema = strata_txn::mvp_fixtures::mvp_schema();
+    // Reads the internal system row-id, NOT the business `id` column.
+    // print_outcome's ack lines (Task 3) print the internal row-id
+    // returned by lookup_row_id -- e.g. an insert's ack line is
+    // `row_id 6`, not the business id used to construct that row. The
+    // business `id` column is also unusable directly here regardless:
+    // setup_contested_pool (Task 6) commits pool rows with NEGATIVE
+    // business ids, so casting that column to u64 (as an earlier version
+    // of this function did) panics with a TryFromIntError on every run
+    // that includes the pool -- i.e. every run, since pool setup is
+    // unconditional.
+    let schema = schema_with_row_id();
     let batch = dataset.snapshot().scan(&schema).expect("scan failed after reopen");
-    let id_col = batch
-        .column(0)
+    let row_id_col = batch
+        .column(
+            batch
+                .schema_ref()
+                .index_of(strata_txn::ROW_ID_COLUMN)
+                .unwrap(),
+        )
         .as_any()
-        .downcast_ref::<arrow::array::Int64Array>()
+        .downcast_ref::<arrow::array::UInt64Array>()
         .unwrap();
-    let visible_row_ids: HashSet<u64> = (0..batch.num_rows())
-        .map(|i| u64::try_from(id_col.value(i)).unwrap())
-        .collect();
+    let visible_row_ids: HashSet<u64> = (0..batch.num_rows()).map(|i| row_id_col.value(i)).collect();
 
     // Invariant 2: no lost commits.
     let lost: Vec<&u64> = acknowledged.difference(&visible_row_ids).collect();
@@ -1872,14 +1902,16 @@ fn check_invariants(dir: &std::path::Path, result: &RunResult) {
         "resurrected tombstones: acknowledged as deleted but visible after reopen: {resurrected:?}"
     );
 
-    // Invariant 4: row + index consistency (unchanged from the
-    // insert-only version; still iterates every currently-visible row).
+    // Invariant 4: row + index consistency (still iterates every
+    // currently-visible row; row_idx lookup and the vector column index
+    // both updated for the row-id-column schema above).
+    let vector_col_idx = batch.schema_ref().index_of("vector").unwrap();
     for &row_id in &visible_row_ids {
         let row_idx = (0..batch.num_rows())
-            .find(|&i| u64::try_from(id_col.value(i)).unwrap() == row_id)
+            .find(|&i| row_id_col.value(i) == row_id)
             .expect("visible row must be in the scanned batch (it was just derived from it)");
         let vector_col = batch
-            .column(2)
+            .column(vector_col_idx)
             .as_any()
             .downcast_ref::<arrow::array::FixedSizeListArray>()
             .unwrap();
@@ -1897,7 +1929,7 @@ fn check_invariants(dir: &std::path::Path, result: &RunResult) {
 }
 ```
 
-Note: the reference row-ids in the ack-line parser (e.g. `row_id.parse()`) parse as `u64`, matching the `id_col.value(i)` cast used in `check_invariants` — both namespaces are still the "business id" values chaos-worker prints, consistent with the pre-existing design (see the untouched invariant-4 comment in the original file about `VectorMatch::row_id` being a different, internal identifier — that distinction is unaffected by this rewrite).
+**Correction (caught before implementation, not a review finding on committed code):** an earlier version of this step read the business `id` column directly (`batch.column(0)` cast to `Int64Array`, then `u64::try_from(...).unwrap()`), on the claim that the ack-line row-ids and the `id` column were "the same namespace." That claim was wrong on two independent counts, either of which alone would have broken this task: (1) `setup_contested_pool` (Task 6) commits pool rows with negative business ids, so the `u64::try_from` cast panics on every single run, pool or no pool, crash or no crash; (2) even with negative ids fixed some other way, Task 3's `print_outcome` prints the *internal system row-id* (via `lookup_row_id`), never the business `id` column value — so `acknowledged`/`visible_row_ids` would be built from two entirely different id spaces and invariants 2/3 would fail near-constantly, not just on the pool rows. The fix above reads `ROW_ID_COLUMN` instead, matching what the ack lines actually report, via a small locally-duplicated `schema_with_row_id` (chaos-worker's own version is `pub(crate)`, not reachable from `tests/sim`).
 
 - [ ] **Step 2: Update both call sites of `check_invariants`**
 
