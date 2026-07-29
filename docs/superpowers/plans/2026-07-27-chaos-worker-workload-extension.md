@@ -416,10 +416,10 @@ mod tests {
 Create `crates/chaos-worker/src/commit_ops.rs` (this task only adds the pieces below; op execution is added in Task 3):
 
 ```rust
-//! Commit execution, conflict retry, and the contested-row-id registry
-//! for the chaos workload. See
+//! Commit execution, conflict retry, the contested-row-id registry, and
+//! acknowledgment-line printing for the chaos workload. See
 //! `docs/superpowers/specs/2026-07-27-chaos-worker-workload-extension-design.md`
-//! §3.1-§3.2.
+//! §3.1, §3.2, and §3.5.
 
 use arrow::array::UInt64Array;
 use strata_query::Predicate;
@@ -631,6 +631,44 @@ pub(crate) enum ExecOutcome {
     Dropped,
 }
 
+/// Whether [`commit_with_retry_once`]'s two-attempt policy ended in a
+/// commit or a drop. Deliberately not `Result` -- neither outcome is an
+/// error at this layer, and folding "dropped" into an `Err` variant would
+/// invite a stray `?` to silently propagate it as one.
+enum RetryOutcome {
+    Committed,
+    Dropped,
+}
+
+/// The retry-once-then-drop policy shared by [`execute_delete`] and
+/// [`execute_update`] — see design doc §3.2. `attempt` must build and
+/// commit a FRESH transaction on every call (never reuse transaction
+/// state across calls), since a retry needs a `dataset.begin()` at the
+/// post-winner version to have any chance of succeeding. `context` names
+/// the operation for the panic message on an unexpected (non-`Conflict`)
+/// error.
+///
+/// Extracted as its own function, rather than duplicated inline in both
+/// callers, specifically so this policy is unit-testable in isolation
+/// with a mock closure — real concurrent conflicts need `crates/txn`'s
+/// `#[cfg(test)]`-private rendezvous hooks, which aren't reachable from
+/// this crate, so a mock is the only way to exercise the `Dropped` path
+/// at all outside a real multi-agent chaos run (see Task 8).
+fn commit_with_retry_once(
+    mut attempt: impl FnMut() -> Result<(), TxnError>,
+    context: &str,
+) -> RetryOutcome {
+    match attempt() {
+        Ok(()) => RetryOutcome::Committed,
+        Err(TxnError::Conflict { .. }) => match attempt() {
+            Ok(()) => RetryOutcome::Committed,
+            Err(TxnError::Conflict { .. }) => RetryOutcome::Dropped,
+            Err(e) => panic!("unexpected commit error on {context} retry: {e}"),
+        },
+        Err(e) => panic!("unexpected commit error on {context}: {e}"),
+    }
+}
+
 /// A pure insert has an empty write-set (`Transaction::insert` never
 /// touches it), so it structurally cannot conflict — any error here is a
 /// genuine, unexpected bug, exactly like today's insert-only worker.
@@ -648,26 +686,22 @@ pub(crate) fn execute_insert(dataset: &Dataset, business_id: i64, name: &str, ve
     }
 }
 
-/// See design doc §3.2: retry the identical op once on `TxnError::Conflict`,
-/// drop if the retry also conflicts, panic on any other error.
+/// See design doc §3.2 and [`commit_with_retry_once`] for the retry
+/// policy.
 pub(crate) fn execute_delete(dataset: &Dataset, target_row_id: u64) -> ExecOutcome {
     let attempt = || {
         let mut txn = dataset.begin();
         txn.delete(target_row_id);
         txn.commit()
     };
-    match attempt() {
-        Ok(()) => ExecOutcome::CommittedDelete { target_row_id },
-        Err(TxnError::Conflict { .. }) => match attempt() {
-            Ok(()) => ExecOutcome::CommittedDelete { target_row_id },
-            Err(TxnError::Conflict { .. }) => ExecOutcome::Dropped,
-            Err(e) => panic!("unexpected commit error on delete retry: {e}"),
-        },
-        Err(e) => panic!("unexpected commit error on delete: {e}"),
+    match commit_with_retry_once(attempt, "delete") {
+        RetryOutcome::Committed => ExecOutcome::CommittedDelete { target_row_id },
+        RetryOutcome::Dropped => ExecOutcome::Dropped,
     }
 }
 
-/// See design doc §3.2. Same retry policy as [`execute_delete`].
+/// See design doc §3.2 and [`commit_with_retry_once`] for the retry
+/// policy.
 pub(crate) fn execute_update(
     dataset: &Dataset,
     target_row_id: u64,
@@ -682,20 +716,12 @@ pub(crate) fn execute_update(
         txn.update(target_row_id, batch);
         txn.commit()
     };
-    match attempt() {
-        Ok(()) => ExecOutcome::CommittedUpdate {
+    match commit_with_retry_once(attempt, "update") {
+        RetryOutcome::Committed => ExecOutcome::CommittedUpdate {
             target_row_id,
             row_id: lookup_row_id(dataset, business_id),
         },
-        Err(TxnError::Conflict { .. }) => match attempt() {
-            Ok(()) => ExecOutcome::CommittedUpdate {
-                target_row_id,
-                row_id: lookup_row_id(dataset, business_id),
-            },
-            Err(TxnError::Conflict { .. }) => ExecOutcome::Dropped,
-            Err(e) => panic!("unexpected commit error on update retry: {e}"),
-        },
-        Err(e) => panic!("unexpected commit error on update: {e}"),
+        RetryOutcome::Dropped => ExecOutcome::Dropped,
     }
 }
 
@@ -768,6 +794,101 @@ pub(crate) fn print_outcome(out: &mut impl Write, agent: u64, op: u64, outcome: 
 Add these new tests inside the existing `mod tests` block (alongside `lookup_row_id_finds_the_row_just_inserted` and the registry tests from Task 2):
 
 ```rust
+    #[test]
+    fn commit_with_retry_once_commits_on_first_success() {
+        let outcome = commit_with_retry_once(|| Ok(()), "test");
+        assert!(matches!(outcome, RetryOutcome::Committed));
+    }
+
+    #[test]
+    fn commit_with_retry_once_retries_and_commits_after_one_conflict() {
+        let mut calls = 0;
+        let outcome = commit_with_retry_once(
+            || {
+                calls += 1;
+                if calls == 1 {
+                    Err(TxnError::Conflict {
+                        contested_row_ids: vec![1],
+                    })
+                } else {
+                    Ok(())
+                }
+            },
+            "test",
+        );
+        assert!(matches!(outcome, RetryOutcome::Committed));
+        assert_eq!(calls, 2, "must retry exactly once, not more");
+    }
+
+    #[test]
+    fn commit_with_retry_once_drops_after_a_second_conflict() {
+        let mut calls = 0;
+        let outcome = commit_with_retry_once(
+            || {
+                calls += 1;
+                Err(TxnError::Conflict {
+                    contested_row_ids: vec![1],
+                })
+            },
+            "test",
+        );
+        assert!(matches!(outcome, RetryOutcome::Dropped));
+        assert_eq!(calls, 2, "must attempt exactly twice, never a third time");
+    }
+
+    #[test]
+    #[should_panic(expected = "unexpected commit error on test")]
+    fn commit_with_retry_once_panics_on_a_non_conflict_error() {
+        commit_with_retry_once(|| Err(TxnError::NotFound(std::path::PathBuf::from("x"))), "test");
+    }
+
+    #[test]
+    fn print_outcome_matches_the_documented_ack_line_format_for_every_variant() {
+        // Task 7's orchestrator parses these lines by exact format -- a
+        // typo here (a missing token, "multi_batch" instead of
+        // "multibatch", a space instead of a comma) would compile and
+        // pass every execute_* test while silently breaking Task 7's
+        // parser. Round-trips through a Vec<u8> writer rather than
+        // spawning the real worker binary, so this stays a fast unit test.
+        let mut out: Vec<u8> = Vec::new();
+        print_outcome(
+            &mut out,
+            1,
+            2,
+            &ExecOutcome::CommittedInsert {
+                business_id: 99,
+                row_id: 5,
+            },
+        );
+        print_outcome(&mut out, 1, 3, &ExecOutcome::CommittedDelete { target_row_id: 5 });
+        print_outcome(
+            &mut out,
+            1,
+            4,
+            &ExecOutcome::CommittedUpdate {
+                target_row_id: 5,
+                row_id: 6,
+            },
+        );
+        print_outcome(
+            &mut out,
+            1,
+            5,
+            &ExecOutcome::CommittedMultiBatch { row_ids: [7, 8] },
+        );
+        print_outcome(&mut out, 1, 6, &ExecOutcome::Dropped);
+
+        let printed = String::from_utf8(out).unwrap();
+        let expected = "\
+agent 1 committed insert op 2 row_id 5
+agent 1 committed delete op 3 target_row_id 5
+agent 1 committed update op 4 target_row_id 5 row_id 6
+agent 1 committed multibatch op 5 row_ids 7,8
+agent 1 dropped op 6 (conflict)
+";
+        assert_eq!(printed, expected);
+    }
+
     #[test]
     fn execute_insert_returns_the_looked_up_row_id() {
         let dir = temp_dir("execute-insert");
