@@ -40,6 +40,18 @@ pub trait Backend: Send + Sync {
     /// # Errors
     /// Returns an error if the write can't complete durably.
     fn put(&self, key: &str, bytes: &[u8]) -> Result<()>;
+
+    /// Writes `bytes` to `key` only if `key` does not already exist —
+    /// atomic create-if-absent, the primitive Strata's manifest commit path
+    /// uses in place of the `rename`-based CAS local disk doesn't need but
+    /// object storage does. See
+    /// `docs/superpowers/specs/2026-07-30-phase9-object-storage-backend-design.md`
+    /// §3.3.
+    ///
+    /// # Errors
+    /// Returns [`crate::error::StorageError::AlreadyExists`] if `key`
+    /// already exists; any other error if the write can't complete.
+    fn put_if_absent(&self, key: &str, bytes: &[u8]) -> Result<()>;
 }
 
 pub use local::LocalFs;

@@ -113,12 +113,54 @@ impl Backend for LocalFs {
         }
         Ok(())
     }
+
+    fn put_if_absent(&self, key: &str, bytes: &[u8]) -> Result<()> {
+        let final_path = self.resolve(key);
+        if let Some(parent) = final_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let tmp_path = Self::tmp_path_for(&final_path);
+        {
+            let mut tmp_file = File::create(&tmp_path)?;
+            tmp_file.write_all(bytes)?;
+            tmp_file.sync_all()?;
+        }
+        crate::chaos::chaos_checkpoint(); // tmp object is durable, about to link into place
+
+        // `hard_link` is atomic w.r.t. the existence check on both POSIX
+        // (link(2)) and Windows (CreateHardLinkW): it never exposes
+        // partial content at `final_path`, and fails with `AlreadyExists`
+        // rather than silently overwriting -- unlike `rename`, which
+        // always overwrites unconditionally. The tmp file is removed
+        // either way; on success it was only ever a second name for the
+        // same durable content, never the only copy.
+        let link_result = fs::hard_link(&tmp_path, &final_path);
+        let _ = fs::remove_file(&tmp_path);
+        match link_result {
+            Ok(()) => {
+                crate::chaos::chaos_checkpoint(); // linked into place; now discoverable
+                // See `put`'s matching comment: fsync the containing
+                // directory so the new hard link survives a crash, not
+                // just the file content. `sync_dir` performs its own
+                // chaos checkpoint internally.
+                if let Some(parent) = final_path.parent() {
+                    crate::datafile::sync_dir(parent)?;
+                }
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(crate::error::StorageError::AlreadyExists(key.to_string()))
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::error::StorageError;
 
     fn temp_root(label: &str) -> PathBuf {
         tempfile::Builder::new()
@@ -202,6 +244,34 @@ mod tests {
         let result = backend.get_range("a.bin", 5..15);
 
         assert!(result.is_err());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn put_if_absent_succeeds_on_a_fresh_key() {
+        let root = temp_root("if-absent-fresh");
+        let backend = LocalFs::new(&root);
+
+        backend.put_if_absent("a.bin", b"first").unwrap();
+
+        assert_eq!(backend.get("a.bin").unwrap(), b"first");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn put_if_absent_errors_on_a_key_that_already_exists() {
+        let root = temp_root("if-absent-collision");
+        let backend = LocalFs::new(&root);
+        backend.put_if_absent("a.bin", b"first").unwrap();
+
+        let result = backend.put_if_absent("a.bin", b"second");
+
+        assert!(
+            matches!(result, Err(StorageError::AlreadyExists(ref k)) if k == "a.bin"),
+            "expected AlreadyExists(\"a.bin\"), got {result:?}"
+        );
+        // The original content must be untouched by the failed attempt.
+        assert_eq!(backend.get("a.bin").unwrap(), b"first");
         fs::remove_dir_all(&root).ok();
     }
 }
