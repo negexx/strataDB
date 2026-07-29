@@ -39,3 +39,16 @@ tempfile = { workspace = true }
 
 [features]
 chaos-injection = ["strata-storage/chaos-injection"]
+# Off by default, matching `chaos-injection`'s own precedent for a
+# risk-bearing, opt-in code path -- see `build_and_write_segment` in
+# `src/dataset.rs` and `.claude/rules/vector-index.md` for what this
+# switches between. Unlike `chaos-injection` (always compiled, inert
+# unless an env var is set), this is a genuine compile-time branch: the
+# commit path calls `HnswIndex::insert_batch_parallel` only when this
+# feature is enabled, and falls back to a plain sequential per-row loop
+# otherwise. With it on, worker-thread scheduling makes graph shape (and
+# so the exact bytes of a committed `.seg` file) non-deterministic across
+# runs of an otherwise-identical commit -- harmless today since nothing
+# depends on byte-identical replays, but don't enable this for a chaos-
+# harness workload that ever grows one.
+parallel-insert = []

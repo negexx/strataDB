@@ -26,8 +26,40 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      - name: Test (parallel-insert feature)
+        # `insert_batch_parallel`'s clustered-data recall hazard fix (see
+        # `.claude/rules/vector-index.md`) is only exercised end-to-end
+        # through `crates/txn`'s commit path when this feature is on --
+        # `cargo test --workspace` above never enables it, since it's off
+        # by default (`crates/txn/Cargo.toml`).
+        run: cargo test -p strata-txn --features parallel-insert
+
+      - name: Loom tests (strata-index)
+        # Scoped to this one crate rather than a workspace-wide
+        # `RUSTFLAGS=--cfg loom cargo test` -- see
+        # `.claude/rules/concurrency-txn-layer.md` for why that would break
+        # other crates in the dependency graph. This is the only CI-visible
+        # regression gate for the empty-graph race and the publication-
+        # barrier fix (`EntryPoint::claim_if_empty`,
+        # `Node::is_published`/`mark_published`) -- both are proven solely
+        # by the exhaustive loom models in `crates/index/src/graph.rs`'s
+        # `loom_tests`, which nothing else in this workflow runs.
+        run: |
+          set -euo pipefail
+          cargo rustc -p strata-index --lib --profile test --message-format=json -- --cfg loom \
+            | tee /tmp/loom-index-build.json
+          bin=$(jq -r 'select(.reason == "compiler-artifact" and .executable != null) | .executable' /tmp/loom-index-build.json | tail -1)
+          if [ -z "$bin" ]; then
+            echo "::error::no test binary produced by the --cfg loom build"
+            exit 1
+          fi
+          "$bin" --test-threads=1
+
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Clippy (parallel-insert feature)
+        run: cargo clippy -p strata-txn --all-targets --features parallel-insert -- -D warnings
 
       - name: Format check
         run: cargo fmt --check
