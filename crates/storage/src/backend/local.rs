@@ -48,10 +48,34 @@ impl Backend for LocalFs {
     }
 
     fn get_range(&self, key: &str, range: std::ops::Range<u64>) -> Result<Vec<u8>> {
-        let mut file = File::open(self.resolve(key))?;
-        file.seek(SeekFrom::Start(range.start))?;
-        let len = usize::try_from(range.end - range.start)
+        let resolved = self.resolve(key);
+        let mut file = File::open(&resolved)?;
+
+        // Validate before allocating: `range` may come from on-disk data
+        // (a footer/manifest offset) rather than a trusted caller, so a
+        // reversed or past-EOF range must become a typed error here, not
+        // a raw `u64` subtraction underflow (panics in debug, wraps in
+        // release) or an allocation sized from that wrapped value.
+        let file_len = file.metadata()?.len();
+        let span_len = range
+            .end
+            .checked_sub(range.start)
+            .filter(|_| range.end <= file_len)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "range {}..{} is invalid or extends past {}'s length ({file_len})",
+                        range.start,
+                        range.end,
+                        resolved.display()
+                    ),
+                )
+            })?;
+        let len = usize::try_from(span_len)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
+        file.seek(SeekFrom::Start(range.start))?;
         let mut buf = vec![0u8; len];
         file.read_exact(&mut buf)?;
         Ok(buf)
@@ -153,6 +177,31 @@ mod tests {
         let slice = backend.get_range("a.bin", 3..6).unwrap();
 
         assert_eq!(slice, b"345");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    #[allow(clippy::reversed_empty_ranges)]
+    fn get_range_errors_on_reversed_range() {
+        let root = temp_root("range-reversed");
+        let backend = LocalFs::new(&root);
+        backend.put("a.bin", b"0123456789").unwrap();
+
+        let result = backend.get_range("a.bin", 6..3);
+
+        assert!(result.is_err());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn get_range_errors_on_range_extending_past_eof() {
+        let root = temp_root("range-eof");
+        let backend = LocalFs::new(&root);
+        backend.put("a.bin", b"0123456789").unwrap();
+
+        let result = backend.get_range("a.bin", 5..15);
+
+        assert!(result.is_err());
         fs::remove_dir_all(&root).ok();
     }
 }
