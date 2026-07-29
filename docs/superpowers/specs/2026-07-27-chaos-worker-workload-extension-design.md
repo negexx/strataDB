@@ -7,6 +7,8 @@
 
 Close the gap the S1 spec's own closure note names explicitly (`.claude/docs/design/phase-s1-segmented-index-spec.md` §9): the Phase 7 chaos harness is insert-only, single-row-per-commit, and constructed so every commit succeeds cleanly. It never exercises a delete, an update, a genuine write-write conflict, a predicate-filtered `scan_with_predicate`/`vector_search` under zone-map pruning, or a multi-batch commit's zone-map merge — all under a real crash. This design extends `crates/chaos-worker` and `tests/sim/tests/chaos.rs` to cover all five, in one pass.
 
+**Post-implementation correction (final whole-branch review, before merge):** as implemented, this closes 3 of the 5 gaps (delete, update, predicate-filtered search under pruning) rather than all 5. The scheduler that landed simulates `NUM_AGENTS` agents sequentially on one thread, not concurrently on separate threads — every commit's `base_version` equals `latest_version` at commit time, so `TxnError::Conflict` is structurally unreachable, and the "genuine write-write conflict" gap remains open (§3.2's retry/drop logic is real code but dead at runtime in this harness). The multi-batch zone-map-merge gap also remains open, for reasons detailed in §3.3's own post-implementation correction. Both are recorded here rather than silently treated as closed; see `.superpowers/sdd/progress.md`'s Task-8/final-review ledger entries for the full reasoning and what closing them for real would require (real concurrent agent threads, for the conflict gap).
+
 ## 2. Current state (baseline)
 
 `crates/chaos-worker/src/main.rs`: a single binary, given `(dir, seed, num_agents, ops_per_agent)`. Each agent's full op sequence (a vector per op) is generated entirely up front from `(seed, agent_index)`, independent of scheduling. A single seeded scheduler RNG picks which not-yet-finished agent commits next, one op = one single-row insert per commit. The worker panics on any commit error, since fresh monotonic row-ids structurally cannot conflict under an insert-only workload. Each successful commit prints `agent {A} committed op {O} row_id {G}` to stdout and flushes.
@@ -63,6 +65,8 @@ A reader thread spawns once at worker startup, running for the whole process lif
 
 This closes two of the five original gaps (predicate-pruning correctness, and multi-batch zone-map-merge correctness) through one mechanism, rather than needing two bespoke checks.
 
+**Post-implementation correction (final whole-branch review, before merge):** step 4's second direction ("every reference row with a genuinely nearest vector must be findable through the pruned path too") was never implemented — only the pruned-subset-of-reference direction shipped. This matters: `vector_search`'s pruned path applies `live_set` as an *exact* per-row membership filter after pruning (`build_live_filter_from_live_set`), so `pruned ⊆ reference` holds **by construction**, independent of whether the zone map itself is correct. The realistic zone-map-merge bug is a merged range that's too *narrow*, wrongly pruning a segment **out** — producing *missing* rows, which only the unimplemented reverse direction could detect. Separately, `execute_multi_batch_insert` gives both rows in one commit the *same* `name` value, so even the reverse direction would exercise a degenerate merge (identical on the one column this predicate covers) — the two batches differ only in `id` and `vector`, neither of which this reader's predicate touches. Net effect: this mechanism verifies gaps 2 and 4 (delete/update and predicate-filtered search are genuinely exercised under pruning) but does **not** verify gap 5 (multi-batch zone-map-merge correctness) as originally claimed. Left as a known, documented gap rather than fixed in this pass — see the design's own §1 for the five-gap list this affects.
+
 ### 3.4 Failure signaling
 
 Install one global panic hook (`std::panic::set_hook`) at the very start of `main()`, before spawning the reader thread or starting the scheduler loop. On any panic — from the main commit-loop thread or the reader thread — the hook prints `GENUINE_FAILURE: <panic message>` to stdout, flushes, and calls `std::process::exit(2)` immediately, before unwinding proceeds any further. This makes a genuine bug (an unexpected commit error, a reader-detected disagreement, anything else that would `panic!`) produce a distinct, reserved exit code — deliberately *not* relying on OS-specific signal decoding (`std::process::abort()`'s exact termination signature differs between the Linux CI environment and local Windows dev machines; exit code 2 does not).
@@ -84,7 +88,10 @@ agent {A} committed delete op {O} target_row_id {T}
 agent {A} committed update op {O} target_row_id {T} row_id {G}
 agent {A} committed multibatch op {O} row_ids {G1},{G2}
 agent {A} dropped op {O} (conflict)
+pool committed insert row_id {G}
 ```
+
+The pool-setup line has no `agent`/`op` fields (it's printed once per pool row before the interleaved phase, not from within the scheduler loop) but is otherwise an ordinary insert acknowledgment and is added to `acknowledged_inserts` the same way.
 
 The orchestrator's stdout parser is rewritten to a small line-oriented match on the third word (`insert`/`delete`/`update`/`multibatch`) rather than a blind last-token split, producing two sets instead of one:
 

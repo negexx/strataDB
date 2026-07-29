@@ -4,10 +4,25 @@
 //! predicate query against an unpruned reference on the SAME snapshot.
 //!
 //! Only checks pruned-result-is-a-subset-of-reference (§3.3's first
-//! direction). The reverse direction ("every reference row with a
+//! direction) — this does NOT verify zone-map-merge correctness (design
+//! doc §1's gap 5), despite §3.3's original claim that it would.
+//! `Snapshot::vector_search`'s pruned path applies `live_set` as an exact
+//! per-row membership filter after pruning, so pruned ⊆ reference holds
+//! BY CONSTRUCTION regardless of whether the zone map itself is correct.
+//! The realistic zone-map-merge bug is a merged range too narrow, wrongly
+//! pruning a segment OUT — producing missing rows, which only the
+//! unimplemented reverse direction ("every reference row with a
 //! genuinely nearest vector must be findable through the pruned path
-//! too") is not implemented here — it needs real multi-segment zone-map
-//! coverage to be meaningful, which only Task 8's chaos runs produce.
+//! too") could detect. Even that reverse direction would additionally
+//! need `execute_multi_batch_insert` to give its two rows DISTINCT `name`
+//! values (today both rows in one multi-batch commit share the same
+//! `name`, so the merged zone map is identical to either batch's alone —
+//! a degenerate merge for exactly the column this reader predicates on).
+//! Neither gap is closed by real chaos-run volume alone; see the design
+//! doc's own post-implementation correction in §3.3 for the full
+//! reasoning. What this module DOES genuinely verify: gap 2 (delete/
+//! update visibility) and gap 4 (predicate-filtered search is actually
+//! exercised under pruning, not just present).
 
 use std::collections::HashSet;
 use std::sync::Arc;

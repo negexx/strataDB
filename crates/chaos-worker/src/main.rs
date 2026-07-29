@@ -141,14 +141,13 @@ fn main() {
 
     let num_agents_usize = usize::try_from(num_agents).unwrap();
     let mut registry = Registry::new(num_agents_usize);
-    {
-        // Locked only for pool setup, not held across reader::spawn/join
-        // below -- see the comment on that join() for why holding a
-        // StdoutLock across it would deadlock a reader-thread panic.
-        let stdout = std::io::stdout();
-        let mut out = stdout.lock();
-        setup_contested_pool(&dataset, seed, &mut registry, &mut out);
-    }
+    // Deliberately `std::io::stdout()`, NOT `.lock()`'d: `Stdout` itself
+    // implements `Write` by locking/unlocking internally on every single
+    // call, rather than holding the lock across this whole function --
+    // see the comment on the scheduler loop's `out` below for why holding
+    // it for any extended span is unsafe here.
+    let mut out = std::io::stdout();
+    setup_contested_pool(&dataset, seed, &mut registry, &mut out);
 
     let (reader_handle, reader_done) = reader::spawn(Arc::clone(&dataset));
 
@@ -184,18 +183,6 @@ fn main() {
     let mut remaining: Vec<u64> = vec![ops_per_agent; num_agents_usize];
     let mut scheduler_rng = ChaCha8Rng::seed_from_u64(seed ^ 0xA9E1_C0DE_u64);
 
-    // Locked only for the duration of this loop, not held across the
-    // reader_handle.join() below: Stdout's lock is reentrant per-thread
-    // but blocks a DIFFERENT thread's lock() call, so if this scope
-    // extended past join(), a reader-thread panic would deadlock --
-    // its own install_failure_hook's stdout().lock() call would block
-    // forever on the lock this thread is still holding while blocked
-    // in join(), and join() can never return since the reader thread
-    // can never finish exiting. Ending this block first (this loop is
-    // guaranteed to terminate in bounded time on its own, independent
-    // of the reader thread) breaks that cycle.
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
     loop {
         let live_agents: Vec<usize> = (0..num_agents_usize)
             .filter(|&a| remaining[a] > 0)
@@ -303,10 +290,6 @@ fn main() {
         next_op[pick] += slots_consumed;
         remaining[pick] -= slots_consumed;
     }
-    // Release the stdout lock before joining the reader thread below --
-    // see the comment where it was acquired for why holding it across
-    // join() would deadlock a reader-thread panic.
-    drop(out);
 
     reader_done.store(true, Ordering::SeqCst);
     reader_handle.join().expect("reader thread panicked without going through the failure hook -- this should be unreachable");
@@ -365,20 +348,28 @@ mod failure_hook_tests {
 
 #[cfg(test)]
 mod stdout_lock_discipline_tests {
-    // A characterization test of the ReentrantLock cross-thread-blocking
-    // property main()'s drop(out)-before-join() fix relies on -- NOT a
-    // test of main() itself (it never calls main() or anything in it, so
-    // it cannot detect a regression there; only a real subprocess run
-    // with an injected reader-thread panic could). What it DOES pin down
-    // is the mechanism: Stdout's lock is reentrant PER THREAD ONLY, so a
-    // second thread's lock() call blocks while a first thread still holds
-    // it, and unblocks once that first thread drops its guard. If that
-    // property ever changed (or this test's own setup regressed), this
-    // fails. main() depends on exactly this property to avoid deadlocking
-    // install_failure_hook's stdout().lock() call from a reader-thread
-    // panic against a StdoutLock held on the main thread across
-    // reader_handle.join() -- see the comments at that drop(out) and its
-    // acquisition sites for the actual production-code reasoning.
+    // A characterization test of a ReentrantLock cross-thread-blocking
+    // property this crate deliberately never triggers, not a test of
+    // main() itself (it never calls main() or anything in it, so it
+    // cannot detect a regression there). The property: Stdout's lock is
+    // reentrant PER THREAD ONLY, so a second thread's lock() call blocks
+    // while a first thread still holds it, and unblocks once that first
+    // thread drops its guard.
+    //
+    // main() and setup_contested_pool print through a plain
+    // `std::io::Stdout` handle, never a `StdoutLock` -- `Stdout` itself
+    // implements `Write` by locking and unlocking internally on every
+    // single call, so no thread here ever holds the lock across a
+    // blocking operation (the scheduler loop, reader_handle.join(), etc).
+    // That matters because install_failure_hook's hook calls
+    // stdout().lock() from whichever thread panics: if the main thread
+    // instead held a `StdoutLock` across `reader_handle.join()` (an
+    // earlier version of this file did exactly that), a reader-thread
+    // panic's own lock() call would block forever on it, and join() could
+    // never return since the reader thread could never finish exiting
+    // through its own blocked hook. This test exists to document that
+    // hazard precisely, so nobody "optimizes" the printing here back into
+    // a held `StdoutLock` without understanding what it would reintroduce.
     #[test]
     fn a_thread_holding_the_stdout_lock_blocks_another_threads_lock_until_it_is_dropped() {
         let stdout = std::io::stdout();
