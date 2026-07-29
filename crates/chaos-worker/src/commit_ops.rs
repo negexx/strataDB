@@ -81,7 +81,7 @@ impl Registry {
     }
 }
 
-#[cfg(all(test, not(loom)))]
+#[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;

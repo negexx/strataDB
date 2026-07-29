@@ -9,25 +9,8 @@ publish = false
 name = "chaos-worker"
 path = "src/main.rs"
 
-[lints.clippy]
-all = { level = "warn", priority = -1 }
-pedantic = { level = "warn", priority = -1 }
-unwrap_used = "warn"
-expect_used = "warn"
-
-[lints.rust]
-unsafe_op_in_unsafe_fn = "deny"
-# `loom` is consumed via a `#[cfg(all(test, not(loom)))]` shim in
-# commit_ops.rs -- without this, rustc's `unexpected_cfgs` lint
-# (warn-by-default since 1.80) flags `loom` as an unrecognized cfg name,
-# since nothing else declares it. This can't instead be expressed via
-# `[lints] workspace = true` (as this crate did before) because Cargo
-# forbids combining workspace-inherited lints with any additional local
-# keys in the same [lints] table -- so the workspace's clippy/rust lints
-# are duplicated here rather than inherited, matching
-# `crates/txn/Cargo.toml` and `crates/index/Cargo.toml`'s identical
-# workaround for the same reason.
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
+[lints]
+workspace = true
 
 [dependencies]
 arrow.workspace = true
