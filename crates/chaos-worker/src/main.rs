@@ -21,6 +21,10 @@ mod ops;
 mod commit_ops;
 #[allow(dead_code)]
 mod schema;
+// Not yet called from main() -- wired in by Task 6, which removes this
+// attribute once it is.
+#[allow(dead_code)]
+mod reader;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
