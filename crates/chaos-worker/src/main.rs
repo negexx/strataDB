@@ -365,43 +365,47 @@ mod failure_hook_tests {
 
 #[cfg(test)]
 mod stdout_lock_discipline_tests {
-    // Regression test for a real deadlock this task's structure fixes:
-    // main() used to hold a StdoutLock for its whole run, including
-    // while blocked in reader_handle.join(). install_failure_hook's own
-    // hook calls std::io::stdout().lock() from whichever thread panics
-    // -- Stdout's lock is reentrant PER THREAD ONLY, so a reader-thread
-    // panic's hook call would block forever on the lock main was still
-    // holding, and main's join() would never return since the reader
-    // thread could never finish exiting. Fixed by releasing the lock
-    // (via an explicit drop(out)) before joining.
-    //
-    // Asserts BOTH directions, not just "release then lock succeeds" --
-    // that alone is a tautology about std (true regardless of any change
-    // to main(), since it never exercises a still-held lock at all). The
-    // held-lock-blocks assertion below is what actually pins down the
-    // mechanism the fix depends on; reverting the fix (holding the lock
-    // across a join-like wait) would still pass a release-then-lock-only
-    // test, but fails this one via the first recv_timeout.
+    // A characterization test of the ReentrantLock cross-thread-blocking
+    // property main()'s drop(out)-before-join() fix relies on -- NOT a
+    // test of main() itself (it never calls main() or anything in it, so
+    // it cannot detect a regression there; only a real subprocess run
+    // with an injected reader-thread panic could). What it DOES pin down
+    // is the mechanism: Stdout's lock is reentrant PER THREAD ONLY, so a
+    // second thread's lock() call blocks while a first thread still holds
+    // it, and unblocks once that first thread drops its guard. If that
+    // property ever changed (or this test's own setup regressed), this
+    // fails. main() depends on exactly this property to avoid deadlocking
+    // install_failure_hook's stdout().lock() call from a reader-thread
+    // panic against a StdoutLock held on the main thread across
+    // reader_handle.join() -- see the comments at that drop(out) and its
+    // acquisition sites for the actual production-code reasoning.
     #[test]
     fn a_thread_holding_the_stdout_lock_blocks_another_threads_lock_until_it_is_dropped() {
         let stdout = std::io::stdout();
         let out = stdout.lock(); // Simulates main() still holding its lock.
 
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (tx, rx) = std::sync::mpsc::channel();
         let handle = std::thread::spawn(move || {
             // Simulates the panic hook's own stdout().lock() call from a
-            // different thread while main's lock is still held.
+            // different thread while main's lock is still held. Signals
+            // "about to call lock()" first so the parent's 200ms window
+            // below measures actual blocking, not thread-spawn latency.
+            let _ = started_tx.send(());
             let stdout = std::io::stdout();
             let _out = stdout.lock();
             let _ = tx.send(());
         });
 
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("spawned thread should signal it's about to call lock() promptly");
         assert_eq!(
             rx.recv_timeout(std::time::Duration::from_millis(200)),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout),
             "a second thread's stdout lock() must block while the first thread still holds \
-             it -- if this doesn't block, the test below (lock released -> unblocks) can't \
-             prove anything, since there'd be no contention to release in the first place"
+             it -- if this doesn't block, the assertion below (lock released -> unblocks) \
+             can't prove anything, since there'd be no contention to release in the first place"
         );
 
         drop(out); // Mirrors main()'s drop(out) before reader_handle.join().
