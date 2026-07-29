@@ -1746,7 +1746,7 @@ git commit -m "feat(chaos-worker): wire pool setup, scheduler, reader thread, an
 
 - [ ] **Step 1: Replace `RunResult`, `run_worker`, and `check_invariants`**
 
-In `tests/sim/tests/chaos.rs`, replace the `RunResult` struct, `run_worker`, and `check_invariants` (everything between `worker_bin_path` and the `#[test] fn fast_tier_random_seeds_survive_random_crash_points`) with:
+In `tests/sim/tests/chaos.rs`, replace the `RunResult` struct, `run_worker`, and `check_invariants`. **Note the current file's actual ordering, which does not match a naive reading of "everything between":** `struct RunResult` currently appears BEFORE `worker_bin_path` (not between it and `fast_tier_random_seeds_survive_random_crash_points`), and `worker_bin_path` itself is NOT being replaced — it stays exactly as-is, unchanged, in its current position. The scope is: delete the current `struct RunResult` definition, keep `worker_bin_path` untouched, then replace `run_worker` and `check_invariants` (which together span from right after `worker_bin_path` down to `fast_tier_random_seeds_survive_random_crash_points`) — then insert the new code below, which begins with a NEW `struct RunResult` definition, in `run_worker`'s old position (i.e., after `worker_bin_path`, not before it). Do not end up with two `struct RunResult` definitions (a leftover old one at the top plus a new one from this block) — that's the exact way this instruction's own parenthetical wording could be misread.
 
 ```rust
 struct RunResult {
