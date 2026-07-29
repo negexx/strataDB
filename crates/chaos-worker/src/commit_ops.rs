@@ -3,10 +3,12 @@
 //! `docs/superpowers/specs/2026-07-27-chaos-worker-workload-extension-design.md`
 //! §3.1-§3.2.
 
+use std::io::Write;
+
 use arrow::array::UInt64Array;
 use strata_query::Predicate;
 use strata_storage::Value;
-use strata_txn::{Dataset, ROW_ID_COLUMN};
+use strata_txn::{Dataset, ROW_ID_COLUMN, TxnError};
 
 use crate::schema::schema_with_row_id;
 
@@ -86,6 +88,165 @@ impl Registry {
     }
 }
 
+/// The result of attempting one op. `Dropped` means a conflict occurred
+/// twice in a row (the original attempt and one retry) — see the module
+/// doc comment and design doc §3.2.
+#[derive(Debug)]
+pub(crate) enum ExecOutcome {
+    CommittedInsert { business_id: i64, row_id: u64 },
+    CommittedDelete { target_row_id: u64 },
+    CommittedUpdate { target_row_id: u64, row_id: u64 },
+    CommittedMultiBatch { row_ids: [u64; 2] },
+    Dropped,
+}
+
+/// A pure insert has an empty write-set (`Transaction::insert` never
+/// touches it), so it structurally cannot conflict — any error here is a
+/// genuine, unexpected bug, exactly like today's insert-only worker.
+pub(crate) fn execute_insert(
+    dataset: &Dataset,
+    business_id: i64,
+    name: &str,
+    vector: [f32; 3],
+) -> ExecOutcome {
+    let batch = strata_txn::mvp_fixtures::mvp_row(business_id, name, vector)
+        .expect("mvp_row must succeed for a well-formed insert");
+    let mut txn = dataset.begin();
+    txn.insert(batch);
+    match txn.commit() {
+        Ok(()) => ExecOutcome::CommittedInsert {
+            business_id,
+            row_id: lookup_row_id(dataset, business_id),
+        },
+        Err(e) => panic!("unexpected commit error on a pure insert (inserts cannot conflict): {e}"),
+    }
+}
+
+/// See design doc §3.2: retry the identical op once on `TxnError::Conflict`,
+/// drop if the retry also conflicts, panic on any other error.
+pub(crate) fn execute_delete(dataset: &Dataset, target_row_id: u64) -> ExecOutcome {
+    let attempt = || {
+        let mut txn = dataset.begin();
+        txn.delete(target_row_id);
+        txn.commit()
+    };
+    match attempt() {
+        Ok(()) => ExecOutcome::CommittedDelete { target_row_id },
+        Err(TxnError::Conflict { .. }) => match attempt() {
+            Ok(()) => ExecOutcome::CommittedDelete { target_row_id },
+            Err(TxnError::Conflict { .. }) => ExecOutcome::Dropped,
+            Err(e) => panic!("unexpected commit error on delete retry: {e}"),
+        },
+        Err(e) => panic!("unexpected commit error on delete: {e}"),
+    }
+}
+
+/// See design doc §3.2. Same retry policy as [`execute_delete`].
+pub(crate) fn execute_update(
+    dataset: &Dataset,
+    target_row_id: u64,
+    business_id: i64,
+    name: &str,
+    vector: [f32; 3],
+) -> ExecOutcome {
+    let attempt = || {
+        let batch = strata_txn::mvp_fixtures::mvp_row(business_id, name, vector)
+            .expect("mvp_row must succeed for a well-formed update");
+        let mut txn = dataset.begin();
+        txn.update(target_row_id, batch);
+        txn.commit()
+    };
+    match attempt() {
+        Ok(()) => ExecOutcome::CommittedUpdate {
+            target_row_id,
+            row_id: lookup_row_id(dataset, business_id),
+        },
+        Err(TxnError::Conflict { .. }) => match attempt() {
+            Ok(()) => ExecOutcome::CommittedUpdate {
+                target_row_id,
+                row_id: lookup_row_id(dataset, business_id),
+            },
+            Err(TxnError::Conflict { .. }) => ExecOutcome::Dropped,
+            Err(e) => panic!("unexpected commit error on update retry: {e}"),
+        },
+        Err(e) => panic!("unexpected commit error on update: {e}"),
+    }
+}
+
+/// Bundles 2 separate `Transaction::insert()` calls into one `commit()` —
+/// the multi-batch shape that exercises `merge_zone_map_stats` across
+/// batches. Like [`execute_insert`], a pure insert cannot conflict.
+pub(crate) fn execute_multi_batch_insert(
+    dataset: &Dataset,
+    business_ids: [i64; 2],
+    name: &str,
+    vectors: [[f32; 3]; 2],
+) -> ExecOutcome {
+    let batch0 = strata_txn::mvp_fixtures::mvp_row(business_ids[0], name, vectors[0])
+        .expect("mvp_row must succeed for a well-formed multi-batch insert");
+    let batch1 = strata_txn::mvp_fixtures::mvp_row(business_ids[1], name, vectors[1])
+        .expect("mvp_row must succeed for a well-formed multi-batch insert");
+    let mut txn = dataset.begin();
+    txn.insert(batch0);
+    txn.insert(batch1);
+    match txn.commit() {
+        Ok(()) => ExecOutcome::CommittedMultiBatch {
+            row_ids: [
+                lookup_row_id(dataset, business_ids[0]),
+                lookup_row_id(dataset, business_ids[1]),
+            ],
+        },
+        Err(e) => {
+            panic!("unexpected commit error on multi-batch insert (inserts cannot conflict): {e}")
+        }
+    }
+}
+
+/// Prints one acknowledgment line matching the design doc §3.5 protocol,
+/// and flushes immediately (`tests/sim`'s orchestrator reads this over a
+/// pipe and needs each line as soon as it's written, same as the
+/// pre-existing insert-only worker's own behavior).
+pub(crate) fn print_outcome(out: &mut impl Write, agent: u64, op: u64, outcome: &ExecOutcome) {
+    match outcome {
+        ExecOutcome::CommittedInsert { row_id, .. } => {
+            writeln!(
+                out,
+                "agent {agent} committed insert op {op} row_id {row_id}"
+            )
+            .unwrap();
+        }
+        ExecOutcome::CommittedDelete { target_row_id } => {
+            writeln!(
+                out,
+                "agent {agent} committed delete op {op} target_row_id {target_row_id}"
+            )
+            .unwrap();
+        }
+        ExecOutcome::CommittedUpdate {
+            target_row_id,
+            row_id,
+        } => {
+            writeln!(
+                out,
+                "agent {agent} committed update op {op} target_row_id {target_row_id} row_id {row_id}"
+            )
+            .unwrap();
+        }
+        ExecOutcome::CommittedMultiBatch { row_ids } => {
+            writeln!(
+                out,
+                "agent {agent} committed multibatch op {op} row_ids {},{}",
+                row_ids[0], row_ids[1]
+            )
+            .unwrap();
+        }
+        ExecOutcome::Dropped => {
+            writeln!(out, "agent {agent} dropped op {op} (conflict)").unwrap();
+        }
+    }
+    out.flush().unwrap();
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -152,5 +313,146 @@ mod tests {
         registry.record_own_row(0, 1);
         registry.remove(0, 999);
         assert_eq!(registry.own_rows(0), &[1]);
+    }
+
+    #[test]
+    fn execute_insert_returns_the_looked_up_row_id() {
+        let dir = temp_dir("execute-insert");
+        let dataset = Dataset::create(&dir).unwrap();
+        let outcome = execute_insert(&dataset, 1, "agent0", [1.0, 2.0, 3.0]);
+        assert!(matches!(
+            outcome,
+            ExecOutcome::CommittedInsert {
+                business_id: 1,
+                row_id: 0
+            }
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn execute_delete_tombstones_the_target_row() {
+        let dir = temp_dir("execute-delete");
+        let dataset = Dataset::create(&dir).unwrap();
+        let insert_outcome = execute_insert(&dataset, 1, "agent0", [1.0, 2.0, 3.0]);
+        let ExecOutcome::CommittedInsert { row_id, .. } = insert_outcome else {
+            panic!("expected CommittedInsert");
+        };
+
+        let delete_outcome = execute_delete(&dataset, row_id);
+        assert!(matches!(
+            delete_outcome,
+            ExecOutcome::CommittedDelete { target_row_id } if target_row_id == row_id
+        ));
+
+        let schema = strata_txn::mvp_fixtures::mvp_schema();
+        let visible = dataset.snapshot().scan(&schema).unwrap();
+        assert_eq!(
+            visible.num_rows(),
+            0,
+            "the deleted row must no longer be visible"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn execute_update_tombstones_the_old_row_and_makes_the_new_one_visible() {
+        let dir = temp_dir("execute-update");
+        let dataset = Dataset::create(&dir).unwrap();
+        let insert_outcome = execute_insert(&dataset, 1, "agent0", [1.0, 2.0, 3.0]);
+        let ExecOutcome::CommittedInsert {
+            row_id: old_row_id, ..
+        } = insert_outcome
+        else {
+            panic!("expected CommittedInsert");
+        };
+
+        let update_outcome = execute_update(&dataset, old_row_id, 2, "agent0", [9.0, 9.0, 9.0]);
+        let ExecOutcome::CommittedUpdate {
+            target_row_id,
+            row_id: new_row_id,
+        } = update_outcome
+        else {
+            panic!("expected CommittedUpdate, got {update_outcome:?}");
+        };
+        assert_eq!(target_row_id, old_row_id);
+        assert_ne!(
+            new_row_id, old_row_id,
+            "the replacement insert must get a fresh row-id"
+        );
+
+        let schema = strata_txn::mvp_fixtures::mvp_schema();
+        let visible = dataset.snapshot().scan(&schema).unwrap();
+        assert_eq!(visible.num_rows(), 1, "exactly the new row must be visible");
+        let id_col = visible
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        assert_eq!(
+            id_col.value(0),
+            2,
+            "the new row's business id must be the update's, not the old one's"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn execute_multi_batch_insert_commits_both_rows_in_one_transaction() {
+        let dir = temp_dir("execute-multibatch");
+        let dataset = Dataset::create(&dir).unwrap();
+        let outcome = execute_multi_batch_insert(
+            &dataset,
+            [1, 2],
+            "agent0",
+            [[1.0, 1.0, 1.0], [2.0, 2.0, 2.0]],
+        );
+        let ExecOutcome::CommittedMultiBatch { row_ids } = outcome else {
+            panic!("expected CommittedMultiBatch, got {outcome:?}");
+        };
+        assert_ne!(row_ids[0], row_ids[1]);
+
+        let schema = strata_txn::mvp_fixtures::mvp_schema();
+        let visible = dataset.snapshot().scan(&schema).unwrap();
+        assert_eq!(
+            visible.num_rows(),
+            2,
+            "both rows from the one multi-batch commit must be visible"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn deleting_an_already_tombstoned_row_is_a_harmless_idempotent_commit() {
+        // NOT a test of the retry-then-drop path: this single-threaded
+        // scenario has no second concurrent transaction, so
+        // execute_delete's second call here cannot produce an actual
+        // TxnError::Conflict -- it just re-tombstones an already-dead
+        // row-id, which the design doc's own note says is harmless. This
+        // pins that specific claim down. Genuine conflict-drop coverage
+        // (a real TxnError::Conflict, retried once, then dropped) can
+        // only come from real concurrent interleaving -- that's exercised
+        // by Task 8's chaos-tier runs (many agents, real scheduling, a
+        // shared contested pool), not by a unit test here.
+        let dir = temp_dir("execute-delete-idempotent-retombstone");
+        let dataset = Dataset::create(&dir).unwrap();
+        let insert_outcome = execute_insert(&dataset, 1, "agent0", [1.0, 2.0, 3.0]);
+        let ExecOutcome::CommittedInsert { row_id, .. } = insert_outcome else {
+            panic!("expected CommittedInsert");
+        };
+
+        let first = execute_delete(&dataset, row_id);
+        assert!(matches!(first, ExecOutcome::CommittedDelete { .. }));
+
+        let second = execute_delete(&dataset, row_id);
+        assert!(
+            matches!(second, ExecOutcome::CommittedDelete { .. }),
+            "re-deleting an already-tombstoned row-id must commit cleanly, not error or drop: {second:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
