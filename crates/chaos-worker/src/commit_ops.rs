@@ -122,17 +122,23 @@ pub(crate) fn execute_insert(
     }
 }
 
-/// The result of [`commit_with_retry_once`]'s retry-once-then-drop policy.
+/// Whether [`commit_with_retry_once`]'s two-attempt policy ended in a
+/// commit or a drop. Deliberately not `Result` -- neither outcome is an
+/// error at this layer, and folding "dropped" into an `Err` variant would
+/// invite a stray `?` to silently propagate it as one.
 #[derive(Debug, PartialEq, Eq)]
 enum RetryOutcome {
     Committed,
     Dropped,
 }
 
-/// See design doc §3.2: retry the identical op once on `TxnError::Conflict`,
-/// drop if the retry also conflicts, panic on any other error. Shared by
-/// [`execute_delete`] and [`execute_update`], which differ only in what
-/// `ExecOutcome` they build from the result.
+/// The retry-once-then-drop policy shared by [`execute_delete`] and
+/// [`execute_update`] -- see design doc §3.2. `attempt` must build and
+/// commit a FRESH transaction on every call (never reuse transaction
+/// state across calls), since a retry needs a `dataset.begin()` at the
+/// post-winner version to have any chance of succeeding. `context` names
+/// the operation for the panic message on an unexpected (non-`Conflict`)
+/// error.
 fn commit_with_retry_once(
     mut attempt: impl FnMut() -> Result<(), TxnError>,
     context: &str,
@@ -148,6 +154,8 @@ fn commit_with_retry_once(
     }
 }
 
+/// See design doc §3.2 and [`commit_with_retry_once`] for the retry
+/// policy.
 pub(crate) fn execute_delete(dataset: &Dataset, target_row_id: u64) -> ExecOutcome {
     let attempt = || {
         let mut txn = dataset.begin();
@@ -160,6 +168,8 @@ pub(crate) fn execute_delete(dataset: &Dataset, target_row_id: u64) -> ExecOutco
     }
 }
 
+/// See design doc §3.2 and [`commit_with_retry_once`] for the retry
+/// policy.
 pub(crate) fn execute_update(
     dataset: &Dataset,
     target_row_id: u64,
@@ -368,10 +378,34 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "unexpected commit error on test")]
-    fn commit_with_retry_once_panics_on_a_non_conflict_error() {
+    #[should_panic(expected = "unexpected commit error on test:")]
+    fn commit_with_retry_once_panics_on_a_non_conflict_error_on_the_first_attempt() {
         commit_with_retry_once(
             || Err(TxnError::NotFound(std::path::PathBuf::from("x"))),
+            "test",
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "unexpected commit error on test retry:")]
+    fn commit_with_retry_once_panics_on_a_non_conflict_error_on_the_retry() {
+        // Distinct from the first-attempt panic test above: the message
+        // prefix "unexpected commit error on test" is a substring of both
+        // panic sites, so without asserting the ":" vs " retry:" suffix
+        // (and without a first attempt that actually conflicts) this
+        // would pass even if the retry arm's panic message were wrong.
+        let mut calls = 0;
+        commit_with_retry_once(
+            || {
+                calls += 1;
+                if calls == 1 {
+                    Err(TxnError::Conflict {
+                        contested_row_ids: vec![1],
+                    })
+                } else {
+                    Err(TxnError::NotFound(std::path::PathBuf::from("x")))
+                }
+            },
             "test",
         );
     }

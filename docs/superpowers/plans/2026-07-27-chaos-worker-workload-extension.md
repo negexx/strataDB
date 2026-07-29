@@ -837,9 +837,33 @@ Add these new tests inside the existing `mod tests` block (alongside `lookup_row
     }
 
     #[test]
-    #[should_panic(expected = "unexpected commit error on test")]
-    fn commit_with_retry_once_panics_on_a_non_conflict_error() {
+    #[should_panic(expected = "unexpected commit error on test:")]
+    fn commit_with_retry_once_panics_on_a_non_conflict_error_on_the_first_attempt() {
         commit_with_retry_once(|| Err(TxnError::NotFound(std::path::PathBuf::from("x"))), "test");
+    }
+
+    #[test]
+    #[should_panic(expected = "unexpected commit error on test retry:")]
+    fn commit_with_retry_once_panics_on_a_non_conflict_error_on_the_retry() {
+        // Distinct from the first-attempt panic test above: the message
+        // prefix "unexpected commit error on test" is a substring of both
+        // panic sites, so without asserting the ":" vs " retry:" suffix
+        // (and without a first attempt that actually conflicts) this
+        // would pass even if the retry arm's panic message were wrong.
+        let mut calls = 0;
+        commit_with_retry_once(
+            || {
+                calls += 1;
+                if calls == 1 {
+                    Err(TxnError::Conflict {
+                        contested_row_ids: vec![1],
+                    })
+                } else {
+                    Err(TxnError::NotFound(std::path::PathBuf::from("x")))
+                }
+            },
+            "test",
+        );
     }
 
     #[test]
