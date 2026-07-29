@@ -744,39 +744,32 @@ Add these new tests inside the existing `mod tests` block (alongside `lookup_row
     }
 
     #[test]
-    fn a_second_conflicting_delete_drops_instead_of_erroring() {
-        // Two transactions targeting the SAME row-id, with the second
-        // one's begin() happening before the first commits, so the
-        // second genuinely conflicts and (after its own single retry,
-        // which will ALSO conflict here since we deliberately keep the
-        // first transaction's conflict alive) gets dropped. Modeled
-        // directly against the write-set rather than real threads: begin
-        // two transactions, commit one, then commit the other, and
-        // confirm delete of an already-conflicting write-set entry drops
-        // rather than panicking. This exercises the drop path
-        // deterministically without needing real concurrency.
-        let dir = temp_dir("execute-delete-conflict");
+    fn deleting_an_already_tombstoned_row_is_a_harmless_idempotent_commit() {
+        // NOT a test of the retry-then-drop path: this single-threaded
+        // scenario has no second concurrent transaction, so
+        // execute_delete's second call here cannot produce an actual
+        // TxnError::Conflict -- it just re-tombstones an already-dead
+        // row-id, which the design doc's own note says is harmless. This
+        // pins that specific claim down. Genuine conflict-drop coverage
+        // (a real TxnError::Conflict, retried once, then dropped) can
+        // only come from real concurrent interleaving -- that's exercised
+        // by Task 8's chaos-tier runs (many agents, real scheduling, a
+        // shared contested pool), not by a unit test here.
+        let dir = temp_dir("execute-delete-idempotent-retombstone");
         let dataset = Dataset::create(&dir).unwrap();
         let insert_outcome = execute_insert(&dataset, 1, "agent0", [1.0, 2.0, 3.0]);
         let ExecOutcome::CommittedInsert { row_id, .. } = insert_outcome else {
             panic!("expected CommittedInsert");
         };
 
-        // First delete succeeds outright.
         let first = execute_delete(&dataset, row_id);
         assert!(matches!(first, ExecOutcome::CommittedDelete { .. }));
 
-        // A second delete of the SAME already-tombstoned row-id is not a
-        // conflict at all (no other transaction is racing it) -- it just
-        // re-tombstones an already-dead row-id, which is a harmless
-        // idempotent commit per the design doc's own note. This test
-        // instead confirms that path stays Committed, not Dropped --
-        // Dropped is reserved for an ACTUAL TxnError::Conflict, which
-        // this single-threaded scenario cannot produce without a second
-        // concurrent transaction. Genuine conflict-drop coverage lives in
-        // Task 7's chaos-tier runs, where real interleaving produces it.
         let second = execute_delete(&dataset, row_id);
-        assert!(matches!(second, ExecOutcome::CommittedDelete { .. }));
+        assert!(
+            matches!(second, ExecOutcome::CommittedDelete { .. }),
+            "re-deleting an already-tombstoned row-id must commit cleanly, not error or drop: {second:?}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
