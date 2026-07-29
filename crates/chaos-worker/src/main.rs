@@ -11,6 +11,9 @@ use std::io::Write as _;
 use rand::{Rng as _, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
+#[allow(dead_code)]
+mod ops;
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let dir = args
