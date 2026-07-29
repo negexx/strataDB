@@ -312,11 +312,6 @@ fn main() {
     reader_handle.join().expect("reader thread panicked without going through the failure hook -- this should be unreachable");
 }
 
-// Carried over verbatim from Task 5 -- this full-file replacement does not
-// touch failure_hook_tests, it only removes the #[allow(dead_code)]
-// attributes that guarded the mod declarations above while they were
-// unused. See Task 5's Step 2 for why this needs current_exe() + an
-// env-var-gated inner test rather than a fn main() CLI-flag check.
 #[cfg(test)]
 mod failure_hook_tests {
     use super::install_failure_hook;
@@ -378,40 +373,44 @@ mod stdout_lock_discipline_tests {
     // panic's hook call would block forever on the lock main was still
     // holding, and main's join() would never return since the reader
     // thread could never finish exiting. Fixed by releasing the lock
-    // (via an explicit drop(out)) before joining. This test reproduces
-    // the underlying lock-contention mechanism directly -- a thread
-    // taking the stdout lock while main's own lock is still held would
-    // hang without the fix -- without needing a real reader-thread bug
-    // or the real panic hook (Task 5's failure_hook_tests already covers
-    // the hook itself, on the main thread, via a subprocess).
+    // (via an explicit drop(out)) before joining.
+    //
+    // Asserts BOTH directions, not just "release then lock succeeds" --
+    // that alone is a tautology about std (true regardless of any change
+    // to main(), since it never exercises a still-held lock at all). The
+    // held-lock-blocks assertion below is what actually pins down the
+    // mechanism the fix depends on; reverting the fix (holding the lock
+    // across a join-like wait) would still pass a release-then-lock-only
+    // test, but fails this one via the first recv_timeout.
     #[test]
-    fn stdout_lock_from_one_thread_does_not_block_a_release_then_lock_from_another() {
+    fn a_thread_holding_the_stdout_lock_blocks_another_threads_lock_until_it_is_dropped() {
         let stdout = std::io::stdout();
-        {
-            let mut out = stdout.lock();
-            std::io::Write::write_all(&mut out, b"simulated main-loop output\n").unwrap();
-        } // Lock released here -- mirrors main()'s drop(out) before join().
+        let out = stdout.lock(); // Simulates main() still holding its lock.
 
-        let handle = std::thread::spawn(|| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
             // Simulates the panic hook's own stdout().lock() call from a
-            // different thread, after the first thread's lock is gone.
+            // different thread while main's lock is still held.
             let stdout = std::io::stdout();
             let _out = stdout.lock();
-        });
-
-        // A bounded wait, not a bare join(): if the lock above were still
-        // held (the bug this test guards against), join() would hang
-        // forever and this test would hang the whole suite instead of
-        // failing it.
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            handle.join().unwrap();
             let _ = tx.send(());
         });
-        rx.recv_timeout(std::time::Duration::from_secs(5)).expect(
-            "the spawned thread's stdout lock acquisition should complete promptly -- a \
-             timeout here means something is holding the stdout lock across a join(), \
-             reintroducing the deadlock this test guards against",
+
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_millis(200)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+            "a second thread's stdout lock() must block while the first thread still holds \
+             it -- if this doesn't block, the test below (lock released -> unblocks) can't \
+             prove anything, since there'd be no contention to release in the first place"
         );
+
+        drop(out); // Mirrors main()'s drop(out) before reader_handle.join().
+
+        rx.recv_timeout(std::time::Duration::from_secs(5)).expect(
+            "the spawned thread's stdout lock acquisition should complete promptly once the \
+             holding thread's lock is dropped -- a timeout here means something is still \
+             holding the stdout lock, reintroducing the deadlock this test guards against",
+        );
+        handle.join().unwrap();
     }
 }
