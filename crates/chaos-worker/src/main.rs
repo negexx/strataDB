@@ -67,6 +67,9 @@ fn install_failure_hook() {
             .unwrap_or_default();
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
+        // Best-effort: if even this write fails, still exit with the
+        // reserved code below so the orchestrator's exit-code check still
+        // fires (it does not require the message line to be present).
         let _ = writeln!(out, "GENUINE_FAILURE: {message}{location}");
         let _ = out.flush();
         std::process::exit(GENUINE_FAILURE_EXIT_CODE);
@@ -136,12 +139,16 @@ fn main() {
             .expect("failed to open or create dataset"),
     );
 
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-
     let num_agents_usize = usize::try_from(num_agents).unwrap();
     let mut registry = Registry::new(num_agents_usize);
-    setup_contested_pool(&dataset, seed, &mut registry, &mut out);
+    {
+        // Locked only for pool setup, not held across reader::spawn/join
+        // below -- see the comment on that join() for why holding a
+        // StdoutLock across it would deadlock a reader-thread panic.
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        setup_contested_pool(&dataset, seed, &mut registry, &mut out);
+    }
 
     let (reader_handle, reader_done) = reader::spawn(Arc::clone(&dataset));
 
@@ -177,6 +184,18 @@ fn main() {
     let mut remaining: Vec<u64> = vec![ops_per_agent; num_agents_usize];
     let mut scheduler_rng = ChaCha8Rng::seed_from_u64(seed ^ 0xA9E1_C0DE_u64);
 
+    // Locked only for the duration of this loop, not held across the
+    // reader_handle.join() below: Stdout's lock is reentrant per-thread
+    // but blocks a DIFFERENT thread's lock() call, so if this scope
+    // extended past join(), a reader-thread panic would deadlock --
+    // its own install_failure_hook's stdout().lock() call would block
+    // forever on the lock this thread is still holding while blocked
+    // in join(), and join() can never return since the reader thread
+    // can never finish exiting. Ending this block first (this loop is
+    // guaranteed to terminate in bounded time on its own, independent
+    // of the reader thread) breaks that cycle.
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
     loop {
         let live_agents: Vec<usize> = (0..num_agents_usize)
             .filter(|&a| remaining[a] > 0)
@@ -284,6 +303,10 @@ fn main() {
         next_op[pick] += slots_consumed;
         remaining[pick] -= slots_consumed;
     }
+    // Release the stdout lock before joining the reader thread below --
+    // see the comment where it was acquired for why holding it across
+    // join() would deadlock a reader-thread panic.
+    drop(out);
 
     reader_done.store(true, Ordering::SeqCst);
     reader_handle.join().expect("reader thread panicked without going through the failure hook -- this should be unreachable");
@@ -298,6 +321,13 @@ fn main() {
 mod failure_hook_tests {
     use super::install_failure_hook;
 
+    /// Env var gating this test's actual body -- unset (the normal case,
+    /// when this test runs as part of the full suite) it's a no-op, so it
+    /// never installs the global panic hook and never disturbs any other
+    /// test sharing this process. Only the subprocess spawned by
+    /// `a_panic_after_the_hook_is_installed_exits_with_the_reserved_code`,
+    /// which sets this var and filters to run ONLY this one test, ever
+    /// exercises the real body.
     const TRIGGER_ENV_VAR: &str = "CHAOS_WORKER_TEST_TRIGGER_GENUINE_FAILURE";
 
     #[test]
@@ -309,6 +339,14 @@ mod failure_hook_tests {
         panic!("deliberate test panic");
     }
 
+    // Spawns THIS SAME test binary (via current_exe()), filtered with
+    // libtest's own --exact to run ONLY inner_trigger_genuine_failure,
+    // with the trigger env var set -- the only way to observe a global
+    // panic hook's effect without corrupting other tests sharing this
+    // process. A bare CLI flag checked in fn main() does NOT work here:
+    // current_exe() under `cargo test` is the libtest-harness binary,
+    // not this crate's real fn main() entry point, so an arbitrary flag
+    // reaches libtest's own parser (which rejects it), not fn main().
     #[test]
     fn a_panic_after_the_hook_is_installed_exits_with_the_reserved_code() {
         let exe = std::env::current_exe().unwrap();
@@ -326,6 +364,54 @@ mod failure_hook_tests {
         assert!(
             stdout.contains("GENUINE_FAILURE: deliberate test panic"),
             "expected the marker line in stdout, got: {stdout}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod stdout_lock_discipline_tests {
+    // Regression test for a real deadlock this task's structure fixes:
+    // main() used to hold a StdoutLock for its whole run, including
+    // while blocked in reader_handle.join(). install_failure_hook's own
+    // hook calls std::io::stdout().lock() from whichever thread panics
+    // -- Stdout's lock is reentrant PER THREAD ONLY, so a reader-thread
+    // panic's hook call would block forever on the lock main was still
+    // holding, and main's join() would never return since the reader
+    // thread could never finish exiting. Fixed by releasing the lock
+    // (via an explicit drop(out)) before joining. This test reproduces
+    // the underlying lock-contention mechanism directly -- a thread
+    // taking the stdout lock while main's own lock is still held would
+    // hang without the fix -- without needing a real reader-thread bug
+    // or the real panic hook (Task 5's failure_hook_tests already covers
+    // the hook itself, on the main thread, via a subprocess).
+    #[test]
+    fn stdout_lock_from_one_thread_does_not_block_a_release_then_lock_from_another() {
+        let stdout = std::io::stdout();
+        {
+            let mut out = stdout.lock();
+            std::io::Write::write_all(&mut out, b"simulated main-loop output\n").unwrap();
+        } // Lock released here -- mirrors main()'s drop(out) before join().
+
+        let handle = std::thread::spawn(|| {
+            // Simulates the panic hook's own stdout().lock() call from a
+            // different thread, after the first thread's lock is gone.
+            let stdout = std::io::stdout();
+            let _out = stdout.lock();
+        });
+
+        // A bounded wait, not a bare join(): if the lock above were still
+        // held (the bug this test guards against), join() would hang
+        // forever and this test would hang the whole suite instead of
+        // failing it.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            handle.join().unwrap();
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5)).expect(
+            "the spawned thread's stdout lock acquisition should complete promptly -- a \
+             timeout here means something is holding the stdout lock across a join(), \
+             reintroducing the deadlock this test guards against",
         );
     }
 }
