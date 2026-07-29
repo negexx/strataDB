@@ -21,9 +21,8 @@ const POOL_SIZE: u64 = 6;
 /// Comfortably above the total number of checkpoints one full run
 /// produces -- an ESTIMATE with real margin built in, not an exact count
 /// (the true total is workload-mix-dependent, since Insert/Update/Delete/
-/// `MultiBatchInsert` each touch a different number of checkpoint sites; see
-/// Task 8's thorough tier for empirical validation of actual coverage). A
-/// vector-carrying single-row commit (a plain Insert, or Update's insert
+/// `MultiBatchInsert` each touch a different number of checkpoint sites).
+/// A vector-carrying single-row commit (a plain Insert, or Update's insert
 /// half) passes through six: `write_batch`'s data-file fsync,
 /// `write_bytes`'s segment fsync (added by S1 W3.2a), `sync_dir`'s
 /// data-dir fsync, `commit_manifest`'s tmp-sync, its rename, and
@@ -39,15 +38,24 @@ const POOL_SIZE: u64 = 6;
 /// per-slot cost -- `MultiBatchInsert`'s 7 checkpoints buys 2 slots, or
 /// 3.5/slot): `OPS_PER_AGENT` * 6 * `NUM_AGENTS` = 90. `setup_contested_pool`
 /// (Task 6) adds `POOL_SIZE` more single-row inserts, UNCONDITIONALLY, on
-/// every run, before any agent op: `POOL_SIZE` * 6 = 36 more. Conservative
-/// total estimate: 90 + 36 = 126 -- this constant is set well above that
-/// with real margin, not tuned to the exact figure.
+/// every run, before any agent op: `POOL_SIZE` * 6 = 36 more. Plus
+/// `Dataset::create`'s own initial `commit_manifest` call (3 more, for a
+/// freshly-created dataset). Conservative total estimate: 90 + 36 + 3 =
+/// 129. Empirically confirmed by binary-searching the true checkpoint
+/// total on 12 real seeds: 95-119, comfortably under this estimate. A
+/// higher threshold than needed isn't free: `abort_at` is drawn uniformly
+/// from `1..MAX_ABORT_THRESHOLD`, so a threshold much above the true
+/// total wastes iterations on clean (non-crashing) runs instead of
+/// exercising a crash -- Task 8's thorough tier is the actual Phase 7
+/// exit criterion, and every non-crashing iteration there is one fewer
+/// crash-path check out of its fixed seed budget. Kept at 200, not
+/// pushed up to a larger "safe" round number, for exactly that reason.
 ///
 /// `STRATA_CHAOS_ABORT_AT` counts checkpoints since **process start** off
 /// one process-global counter, so this constant must be re-checked
 /// whenever a checkpoint site is added or removed anywhere in
 /// `strata-storage`.
-const MAX_ABORT_THRESHOLD: u64 = 300;
+const MAX_ABORT_THRESHOLD: u64 = 200;
 
 /// Builds (once, lazily — `OnceLock` caches the result across every
 /// `run_worker` call in this test binary rather than re-invoking `cargo
@@ -170,6 +178,19 @@ fn run_worker(dir: &std::path::Path, seed: u64, abort_at: Option<u64>) -> RunRes
                 total_op_slots += 2;
             }
             [.., "dropped", "op", _, "(conflict)"] => {
+                // The dropped line carries no verb, so this hardcodes 1
+                // slot -- correct only because a droppable op always costs
+                // exactly 1 slot today: execute_delete/execute_update are
+                // the only ops that can return Dropped (commit_ops.rs's
+                // commit_with_retry_once), and both are 1-slot ops.
+                // execute_insert/execute_multi_batch_insert panic on any
+                // commit error instead of returning Dropped, so a 2-slot
+                // MultiBatchInsert can never reach this arm. If that ever
+                // changes, this hardcoded 1 would silently desync
+                // total_op_slots from the real slot count on a clean run,
+                // and the exact-count assertion below would start failing
+                // with a misleading "didn't account for every op slot"
+                // message instead of pointing at this arm.
                 total_op_slots += 1;
             }
             _ => panic!("unrecognized chaos-worker stdout line: {line:?}"),
