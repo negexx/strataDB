@@ -93,10 +93,25 @@ impl Registry {
 /// doc comment and design doc §3.2.
 #[derive(Debug)]
 pub(crate) enum ExecOutcome {
-    CommittedInsert { business_id: i64, row_id: u64 },
-    CommittedDelete { target_row_id: u64 },
-    CommittedUpdate { target_row_id: u64, row_id: u64 },
-    CommittedMultiBatch { row_ids: [u64; 2] },
+    CommittedInsert {
+        // Retained for the `Debug` impl and test assertions (e.g.
+        // commit_ops::tests' `matches!` patterns) -- `main`'s scheduler
+        // loop and `print_outcome` only ever need `row_id`, so this field
+        // is otherwise unread in a non-test build.
+        #[allow(dead_code)]
+        business_id: i64,
+        row_id: u64,
+    },
+    CommittedDelete {
+        target_row_id: u64,
+    },
+    CommittedUpdate {
+        target_row_id: u64,
+        row_id: u64,
+    },
+    CommittedMultiBatch {
+        row_ids: [u64; 2],
+    },
     Dropped,
 }
 

@@ -3,28 +3,26 @@
 //! acknowledgment after every successful commit. Meant to be spawned as a
 //! child process by `tests/sim`'s orchestrator with `STRATA_CHAOS_ABORT_AT`
 //! set, so it may be aborted mid-run by `strata_storage::chaos`. See
-//! `docs/superpowers/specs/2026-07-22-phase-7-correctness-harness-design.md`.
+//! `docs/superpowers/specs/2026-07-27-chaos-worker-workload-extension-design.md`.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::io::Write as _;
+mod commit_ops;
+mod ops;
+mod reader;
+mod schema;
 
-use rand::{Rng as _, SeedableRng};
+use std::io::Write as _;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+
+use rand::{Rng as _, SeedableRng as _};
 use rand_chacha::ChaCha8Rng;
 
-// Not yet called from main() -- wired in by Task 6 of the workload-extension
-// plan, which removes this attribute once it is.
-#[allow(dead_code)]
-mod ops;
-// Not yet called from main() -- wired in by Task 6, which removes these
-// attributes once they are.
-#[allow(dead_code)]
-mod commit_ops;
-#[allow(dead_code)]
-mod schema;
-// Not yet called from main() -- wired in by Task 6, which removes this
-// attribute once it is.
-#[allow(dead_code)]
-mod reader;
+use commit_ops::{
+    ExecOutcome, Registry, execute_delete, execute_insert, execute_multi_batch_insert,
+    execute_update,
+};
+use ops::{OpVerb, generate_verb_sequence, resolve_slot_consumption, resolve_target};
 
 /// Reserved exit code [`install_failure_hook`]'s hook uses for a genuine
 /// panic, distinct from `chaos_checkpoint`'s `std::process::abort()` (an
@@ -32,13 +30,10 @@ mod reader;
 /// `tests/sim`'s orchestrator can tell a genuine bug apart from an
 /// expected chaos-induced crash without decoding OS-specific exit
 /// signals. See design doc §3.4.
-// Not yet called from main() -- wired in by Task 6, which removes this
-// attribute once it is. (dead_code on this const is redundant once
-// install_failure_hook is allow'd too, since rustc's dead-code pass seeds
-// liveness from that function -- kept anyway for clarity at the
-// definition site, and both are removed together in Task 6.)
-#[allow(dead_code)]
 const GENUINE_FAILURE_EXIT_CODE: i32 = 2;
+const POOL_SIZE: u64 = 6;
+const POOL_STREAM: u64 = 0x9001_5EED_0000_0001;
+const TARGET_STREAM: u64 = 0x7A46_E7D0_0000_0002;
 
 /// Installs a global panic hook: any panic, on the main thread or the
 /// reader thread, prints a `GENUINE_FAILURE: <message>` line and exits
@@ -57,9 +52,6 @@ const GENUINE_FAILURE_EXIT_CODE: i32 = 2;
 /// untrusted/externally-corrupted input, not this worker's own writes) —
 /// so the recovery path this preempts should not be reachable from a
 /// chaos run in practice, and would be a design bug if it ever were.
-// Not yet called from main() -- wired in by Task 6, which removes this
-// attribute once it is.
-#[allow(dead_code)]
 fn install_failure_hook() {
     std::panic::set_hook(Box::new(|info| {
         let message = if let Some(s) = info.payload().downcast_ref::<&str>() {
@@ -75,16 +67,49 @@ fn install_failure_hook() {
             .unwrap_or_default();
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
-        // Best-effort: if even this write fails, still exit with the
-        // reserved code below so the orchestrator's exit-code check still
-        // fires (it does not require the message line to be present).
         let _ = writeln!(out, "GENUINE_FAILURE: {message}{location}");
         let _ = out.flush();
         std::process::exit(GENUINE_FAILURE_EXIT_CODE);
     }));
 }
 
+/// Commits `POOL_SIZE` individual single-row inserts before the
+/// interleaved phase starts, establishing the shared contested row-id
+/// pool — see design doc §3.1. Business ids are negative (`-1..-POOL_SIZE`)
+/// so they can never collide with an agent's own `global_id` business ids
+/// (always >= 0).
+fn setup_contested_pool(
+    dataset: &strata_txn::Dataset,
+    seed: u64,
+    registry: &mut Registry,
+    out: &mut impl std::io::Write,
+) {
+    let mut rng = ChaCha8Rng::seed_from_u64(seed ^ POOL_STREAM);
+    for i in 0..POOL_SIZE {
+        let business_id = -1 - i64::try_from(i).unwrap();
+        let vector = [
+            rng.random::<f32>(),
+            rng.random::<f32>(),
+            rng.random::<f32>(),
+        ];
+        let outcome = execute_insert(dataset, business_id, "pool", vector);
+        let ExecOutcome::CommittedInsert { row_id, .. } = outcome else {
+            panic!("pool setup insert must always commit cleanly: {outcome:?}");
+        };
+        registry.record_pool_row(row_id);
+        writeln!(out, "pool committed insert row_id {row_id}").unwrap();
+        out.flush().unwrap();
+    }
+}
+
+// One linear scheduler loop wiring together pool setup, the reader thread,
+// and every op verb's commit path -- splitting it into smaller functions
+// would scatter the ordering this task's brief specifies as one coherent
+// unit, not make it clearer.
+#[allow(clippy::too_many_lines)]
 fn main() {
+    install_failure_hook();
+
     let args: Vec<String> = std::env::args().collect();
     let dir = args
         .get(1)
@@ -105,18 +130,26 @@ fn main() {
         .parse()
         .expect("ops_per_agent must be a u64");
 
-    let dataset = strata_txn::Dataset::open(dir)
-        .or_else(|_| strata_txn::Dataset::create(dir))
-        .expect("failed to open or create dataset");
+    let dataset = Arc::new(
+        strata_txn::Dataset::open(dir)
+            .or_else(|_| strata_txn::Dataset::create(dir))
+            .expect("failed to open or create dataset"),
+    );
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
 
-    // Each agent's full operation sequence (what vector/name it will use
-    // for each of its ops) is generated up front from (seed, agent index)
-    // — unchanged from Task 3 — so interleaving order below only changes
-    // *when* an already-fully-determined op happens, never *what* it is.
-    let agent_ops: Vec<Vec<[f32; 3]>> = (0..num_agents)
+    let num_agents_usize = usize::try_from(num_agents).unwrap();
+    let mut registry = Registry::new(num_agents_usize);
+    setup_contested_pool(&dataset, seed, &mut registry, &mut out);
+
+    let (reader_handle, reader_done) = reader::spawn(Arc::clone(&dataset));
+
+    // Per-agent vector generation (unchanged from the original insert-only
+    // worker) and verb generation (new — see ops.rs), both pre-generated
+    // up front. Target resolution for Delete/Update stays just-in-time
+    // (see resolve_target's own doc comment for why).
+    let agent_vectors: Vec<Vec<[f32; 3]>> = (0..num_agents)
         .map(|agent| {
             let mut agent_rng = ChaCha8Rng::seed_from_u64(seed ^ agent);
             (0..ops_per_agent)
@@ -133,15 +166,15 @@ fn main() {
                 .collect()
         })
         .collect();
+    let agent_verbs: Vec<Vec<OpVerb>> = (0..num_agents)
+        .map(|agent| generate_verb_sequence(seed, agent, ops_per_agent))
+        .collect();
+    let mut agent_target_rngs: Vec<ChaCha8Rng> = (0..num_agents)
+        .map(|agent| ChaCha8Rng::seed_from_u64(seed ^ agent ^ TARGET_STREAM))
+        .collect();
 
-    let num_agents_usize = usize::try_from(num_agents).unwrap();
     let mut next_op: Vec<u64> = vec![0; num_agents_usize];
     let mut remaining: Vec<u64> = vec![ops_per_agent; num_agents_usize];
-
-    // A single scheduler RNG, seeded from the same top-level seed but a
-    // distinct stream (via a fixed XOR constant) from any individual
-    // agent's RNG, picks which not-yet-finished agent goes next at each
-    // step — this is the actual interleaving driver.
     let mut scheduler_rng = ChaCha8Rng::seed_from_u64(seed ^ 0xA9E1_C0DE_u64);
 
     loop {
@@ -154,49 +187,117 @@ fn main() {
         let pick = live_agents[scheduler_rng.random_range(0..live_agents.len())];
         let agent = pick as u64;
         let op = next_op[pick];
-        let global_id = agent * ops_per_agent + op;
-        let vector = agent_ops[pick][usize::try_from(op).unwrap()];
+        let drawn_verb = agent_verbs[pick][usize::try_from(op).unwrap()];
+        let (verb, slots_consumed) = resolve_slot_consumption(drawn_verb, remaining[pick]);
 
-        let batch = strata_txn::mvp_fixtures::mvp_row(
-            i64::try_from(global_id).unwrap(),
-            &format!("agent{agent}"),
-            vector,
-        )
-        .unwrap();
+        let outcome = match verb {
+            OpVerb::Insert => {
+                let global_id = agent * ops_per_agent + op;
+                let vector = agent_vectors[pick][usize::try_from(op).unwrap()];
+                execute_insert(
+                    &dataset,
+                    i64::try_from(global_id).unwrap(),
+                    &format!("agent{agent}"),
+                    vector,
+                )
+            }
+            OpVerb::MultiBatchInsert => {
+                let global_id_0 = agent * ops_per_agent + op;
+                let global_id_1 = agent * ops_per_agent + op + 1;
+                let vector_0 = agent_vectors[pick][usize::try_from(op).unwrap()];
+                let vector_1 = agent_vectors[pick][usize::try_from(op + 1).unwrap()];
+                execute_multi_batch_insert(
+                    &dataset,
+                    [
+                        i64::try_from(global_id_0).unwrap(),
+                        i64::try_from(global_id_1).unwrap(),
+                    ],
+                    &format!("agent{agent}"),
+                    [vector_0, vector_1],
+                )
+            }
+            OpVerb::Delete => {
+                if let Some(target_row_id) = resolve_target(
+                    &mut agent_target_rngs[pick],
+                    registry.pool_rows(),
+                    registry.own_rows(pick),
+                ) {
+                    execute_delete(&dataset, target_row_id)
+                } else {
+                    // No eligible target yet -- downgrade to Insert per design doc §3.1.
+                    let global_id = agent * ops_per_agent + op;
+                    let vector = agent_vectors[pick][usize::try_from(op).unwrap()];
+                    execute_insert(
+                        &dataset,
+                        i64::try_from(global_id).unwrap(),
+                        &format!("agent{agent}"),
+                        vector,
+                    )
+                }
+            }
+            OpVerb::Update => {
+                if let Some(target_row_id) = resolve_target(
+                    &mut agent_target_rngs[pick],
+                    registry.pool_rows(),
+                    registry.own_rows(pick),
+                ) {
+                    let global_id = agent * ops_per_agent + op;
+                    let vector = agent_vectors[pick][usize::try_from(op).unwrap()];
+                    execute_update(
+                        &dataset,
+                        target_row_id,
+                        i64::try_from(global_id).unwrap(),
+                        &format!("agent{agent}"),
+                        vector,
+                    )
+                } else {
+                    let global_id = agent * ops_per_agent + op;
+                    let vector = agent_vectors[pick][usize::try_from(op).unwrap()];
+                    execute_insert(
+                        &dataset,
+                        i64::try_from(global_id).unwrap(),
+                        &format!("agent{agent}"),
+                        vector,
+                    )
+                }
+            }
+        };
 
-        let mut txn = dataset.begin();
-        txn.insert(batch);
-        match txn.commit() {
-            Ok(()) => {
-                writeln!(out, "agent {agent} committed op {op} row_id {global_id}").unwrap();
-                out.flush().unwrap();
+        match &outcome {
+            ExecOutcome::CommittedInsert { row_id, .. } => registry.record_own_row(pick, *row_id),
+            ExecOutcome::CommittedUpdate {
+                target_row_id,
+                row_id,
+            } => {
+                registry.remove(pick, *target_row_id);
+                registry.record_own_row(pick, *row_id);
             }
-            Err(e) => {
-                // A pure-insert-only worker (this task) can only ever
-                // get Clean commits — fresh monotonic row-ids never
-                // conflict (design doc §1's "appends never conflict").
-                // A real error here means something is genuinely
-                // broken, not a chaos scenario to tolerate silently.
-                panic!("unexpected commit error: {e}");
+            ExecOutcome::CommittedDelete { target_row_id } => registry.remove(pick, *target_row_id),
+            ExecOutcome::CommittedMultiBatch { row_ids } => {
+                registry.record_own_row(pick, row_ids[0]);
+                registry.record_own_row(pick, row_ids[1]);
             }
+            ExecOutcome::Dropped => {}
         }
+        commit_ops::print_outcome(&mut out, agent, op, &outcome);
 
-        next_op[pick] += 1;
-        remaining[pick] -= 1;
+        next_op[pick] += slots_consumed;
+        remaining[pick] -= slots_consumed;
     }
+
+    reader_done.store(true, Ordering::SeqCst);
+    reader_handle.join().expect("reader thread panicked without going through the failure hook -- this should be unreachable");
 }
 
+// Carried over verbatim from Task 5 -- this full-file replacement does not
+// touch failure_hook_tests, it only removes the #[allow(dead_code)]
+// attributes that guarded the mod declarations above while they were
+// unused. See Task 5's Step 2 for why this needs current_exe() + an
+// env-var-gated inner test rather than a fn main() CLI-flag check.
 #[cfg(test)]
 mod failure_hook_tests {
     use super::install_failure_hook;
 
-    /// Env var gating this test's actual body -- unset (the normal case,
-    /// when this test runs as part of the full suite) it's a no-op, so it
-    /// never installs the global panic hook and never disturbs any other
-    /// test sharing this process. Only the subprocess spawned by
-    /// `a_panic_after_the_hook_is_installed_exits_with_the_reserved_code`,
-    /// which sets this var and filters to run ONLY this one test, ever
-    /// exercises the real body.
     const TRIGGER_ENV_VAR: &str = "CHAOS_WORKER_TEST_TRIGGER_GENUINE_FAILURE";
 
     #[test]
@@ -208,14 +309,6 @@ mod failure_hook_tests {
         panic!("deliberate test panic");
     }
 
-    // Spawns THIS SAME test binary (via current_exe()), filtered with
-    // libtest's own --exact to run ONLY inner_trigger_genuine_failure,
-    // with the trigger env var set -- the only way to observe a global
-    // panic hook's effect without corrupting other tests sharing this
-    // process. A bare CLI flag checked in fn main() does NOT work here:
-    // current_exe() under `cargo test` is the libtest-harness binary,
-    // not this crate's real fn main() entry point, so an arbitrary flag
-    // reaches libtest's own parser (which rejects it), not fn main().
     #[test]
     fn a_panic_after_the_hook_is_installed_exits_with_the_reserved_code() {
         let exe = std::env::current_exe().unwrap();
