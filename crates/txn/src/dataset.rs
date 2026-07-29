@@ -1320,9 +1320,33 @@ impl Transaction {
         let node_count = inserts.len();
         let index = new_hnsw_index(node_count)?;
         let mut row_ids = Vec::with_capacity(node_count);
+        let mut rows = Vec::with_capacity(node_count);
         for (local, insert) in inserts.into_iter().enumerate() {
             row_ids.push(insert.row_id);
-            index.insert_owned(u64::try_from(local)?, insert.vector)?;
+            rows.push((u64::try_from(local)?, insert.vector));
+        }
+        // Gated behind the `parallel-insert` feature (off by default --
+        // see that feature's own doc comment in Cargo.toml and
+        // `.claude/rules/vector-index.md`). When enabled, parallelizes
+        // across up to `PARALLEL_INSERT_THREADS` worker threads once
+        // `rows` is large enough to be worth it (see
+        // `insert_batch_parallel`'s own doc comment for the chunking
+        // threshold and the mandatory-first-sequential-insert invariant
+        // that makes this sound on a brand-new, empty per-commit index).
+        // `row_ids` was already fully built above from the original order,
+        // so the row-id/ordinal association survives regardless of which
+        // thread inserts which ordinal.
+        #[cfg(feature = "parallel-insert")]
+        index.insert_batch_parallel(rows, PARALLEL_INSERT_THREADS)?;
+        // Default path: a plain sequential per-row loop, identical in
+        // effect to what `insert_batch_parallel` itself falls back to
+        // below its own small-batch threshold -- no worker threads, no
+        // chunking, nothing for hazard #4's mechanism (see `Graph::
+        // insert`'s doc comment in `crates/index/src/graph.rs`) to exploit
+        // even in principle, regardless of how well-verified the fix is.
+        #[cfg(not(feature = "parallel-insert"))]
+        for (row_id, vector) in rows {
+            index.insert_owned(row_id, vector)?;
         }
         let bytes = index.to_segment_bytes(&row_ids)?;
 
@@ -1596,6 +1620,43 @@ fn new_hnsw_index(capacity: usize) -> Result<HnswIndex> {
         EfConstruction(HNSW_EF_CONSTRUCTION),
     )?)
 }
+
+// Worker-thread count for `HnswIndex::insert_batch_parallel` at the commit
+// site above -- only meaningful, and only compiled, when the
+// `parallel-insert` feature is enabled (see that call site's own comment
+// and the feature's doc comment in Cargo.toml). Ported from this crate's
+// pre-S1 parallel-insert design
+// (deferred, not carried over, when Phase S1 merged -- see git history on
+// `build_and_write_segment`), which measured (lifecycle_bench, 25k rows,
+// 512-dim, 12-core dev machine): threads=1 25.09s (baseline), threads=4
+// 9.77s (2.57x), threads=8 10.00s (2.51x -- statistically indistinguishable
+// from threads=4).
+//
+// That measurement's own default was 8, not 4, reasoned as "no real
+// downside to leaving headroom" -- but that reasoning assumed `commit_lock`
+// serialized every commit, so at most one `insert_batch_parallel` call was
+// ever in flight at a time. Post-S1, segment building happens OUTSIDE
+// `commit_lock` (the entire point of the S1 W3.2 migration), so N
+// concurrently-committing transactions can now each spawn
+// `PARALLEL_INSERT_THREADS` workers simultaneously -- the old "no downside"
+// argument no longer holds, since 8 threads x N concurrent commits can
+// oversubscribe a machine's cores in a way a single in-flight call never
+// could. Set to 4 here instead of re-adopting 8: the historical measurement
+// above already showed 4 and 8 performing identically for one build, so
+// this loses ~nothing in the single-committer case while meaningfully
+// bounding worst-case thread count under genuine multi-committer
+// contention. Not independently re-validated under real concurrent-commit
+// load with this specific value -- a follow-up re-tuning pass under actual
+// multi-writer contention (rather than reasoning from a single-committer
+// number) would be worth doing before treating 4 as final.
+//
+// Post-S1 re-measurement after this port landed (`lifecycle_bench`, 25k
+// rows, 512-dim, threads=4, single committer): ingest+commit wall time
+// dropped from 11.53s (sequential insert, S1-merged baseline) to 3.51s
+// (3.28x), confirming the parallel path is doing real work end-to-end
+// through the new segment-per-commit build path, not just in isolation.
+#[cfg(feature = "parallel-insert")]
+const PARALLEL_INSERT_THREADS: usize = 4;
 
 /// Sane ceiling for a manifest's `next_row_id`, enforced at open before any
 /// row-id from that manifest can reach the index.
@@ -3190,6 +3251,87 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].row_id, 0); // row-id 0 is the first committed row (id=1)
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// End-to-end coverage for `insert_batch_parallel`'s port onto
+    /// `build_and_write_segment` (see that function and
+    /// `PARALLEL_INSERT_THREADS` above), gated behind this crate's
+    /// `parallel-insert` feature the same way the call site itself is
+    /// (`cargo test -p strata-txn --features parallel-insert`) -- without
+    /// that feature the parallel path doesn't exist to test. Every other
+    /// vector test in this module commits too few rows to ever leave
+    /// `HnswIndex::insert_batch_parallel`'s sequential fallback (it only
+    /// fans out to real OS threads once the post-first-row remainder
+    /// exceeds `MIN_ROWS_PER_CHUNK` (64) in `crates/index/src/hnsw.rs`), so
+    /// none of them exercise the parallel path through the REAL
+    /// `Dataset::create` -> `insert` -> `commit` -> `vector_search` flow --
+    /// only direct `HnswIndex` calls in `crates/index`'s own tests do.
+    /// 301 rows in one commit (300 after the mandatory sequential first
+    /// insert, chunked into exactly 4 x 75 -- on a host with at least 4
+    /// available cores) clears that threshold and spawns all
+    /// `PARALLEL_INSERT_THREADS = 4` worker threads -- a smaller N (e.g.
+    /// 100) still exercises the parallel path but, because
+    /// `insert_batch_parallel`'s chunk size is
+    /// `max(ceil(rest/threads), MIN_ROWS_PER_CHUNK)`, would only produce 2
+    /// chunks, not 4. `insert_batch_parallel` also clamps `threads` to
+    /// `std::thread::available_parallelism()`, so on a <4-core host (e.g.
+    /// some CI runners) this still exercises the real parallel path with
+    /// real chunking, just with fewer than 4 actual chunks/threads -- the
+    /// point of this test (proving the path is wired end-to-end) still
+    /// holds either way, but "exactly 4 x 75" is a ≥4-core claim, not a
+    /// universal one.
+    ///
+    /// Uses `widely_separated_rows`-style far-apart points (mirroring
+    /// `crates/index/src/hnsw.rs`'s own choice for its analogous
+    /// findability test). This asserts EXACT recall (0 misses), not a
+    /// bounded miss rate: the clustered-data recall hazard this batch of
+    /// work found and fixed (`Graph::insert`'s own doc comment in
+    /// `crates/index/src/graph.rs` -- hazard #4, the dominant mechanism)
+    /// is now verified closed end to end (0/800 real commits of a
+    /// 200-row/20-cluster fixture under heavy concurrent load), and
+    /// widely-separated points don't even exercise that hazard's
+    /// clustered-topology precondition -- any miss here would be a real
+    /// regression, not an expected residual.
+    #[test]
+    #[cfg(feature = "parallel-insert")]
+    #[allow(clippy::cast_precision_loss)] // row indices here are always < 301, far under f32/f64's exact-integer ceiling
+    fn a_large_single_commit_is_built_via_the_parallel_insert_path_and_stays_searchable() {
+        const N: i64 = 301;
+
+        let dir = temp_dir("large-commit-parallel-insert");
+        let ds = Dataset::create(&dir).unwrap();
+
+        let ids: Vec<i64> = (0..N).collect();
+        let vectors: Vec<[f32; 3]> = (0..N).map(|i| [i as f32 * 1000.0, 0.0, 0.0]).collect();
+
+        let mut txn = ds.begin();
+        txn.insert(vector_batch(ids, vectors));
+        txn.commit().unwrap();
+
+        assert_eq!(
+            ds.snapshot().manifest.segments.len(),
+            1,
+            "one commit must produce exactly one segment regardless of how many \
+             worker threads built it"
+        );
+
+        let mut misses = 0u64;
+        for i in 0..N {
+            let query = [i as f32 * 1000.0, 0.0, 0.0];
+            let hits = ds.snapshot().vector_search(&query, 1, None).unwrap();
+            if hits.first().map(|m| m.row_id) != u64::try_from(i).ok() {
+                misses += 1;
+            }
+        }
+        assert_eq!(
+            misses, 0,
+            "{misses}/{N} rows were not their own nearest neighbor after a large \
+             parallel-insert commit -- the clustered-data recall hazard this fixture \
+             predates is now fixed and verified closed, so any miss here is a real \
+             regression"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

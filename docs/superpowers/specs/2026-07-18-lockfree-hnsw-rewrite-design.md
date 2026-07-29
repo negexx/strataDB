@@ -120,6 +120,124 @@ newer information than what this thread planned to remove. A failed slot
 CAS is a self-resolving no-op, not an error condition requiring a retry
 loop the way `Transaction::commit()`'s whole-snapshot CAS does.
 
+**Amendment (S1 parallel-insert port, 2026-07-27): the shrink DECISION
+itself does now retry, though no individual slot CAS gained a retry.** The
+per-slot compare-and-clear above is still exactly as described — never
+retried, self-resolving. What changed is the layer above it: the decision
+of WHICH neighbors to keep is computed from a read of the neighbor's
+occupied set, and on clustered data under concurrent commit-time inserts,
+two threads could each compute that decision from a snapshot that omitted
+the other's not-yet-landed claim, then both apply their own (individually
+reasonable) `clear_matching` call — the union of which could remove a
+bridging edge that a decision informed by the full, actually-simultaneous
+set of claimants would have kept. Because HNSW's level assignment is
+exponentially sparse (`m_l = 1/ln(M)`, roughly 1-in-M nodes ever reach
+level >= 1), that bridging edge can be a whole cluster's only path from
+the entry point — so this isn't the "which near-equidistant candidate
+survives" cosmetic case the original design accepted, it's a correctness
+gap in the flagship "no silently stale vector search results" claim.
+`Graph::insert`'s shrink step now re-reads the occupied set after
+`clear_matching` and recomputes the decision if it's changed, terminating
+once a read confirms the neighbor is at or under capacity. This is the
+SAME ordinary lock-free CAS idiom this section already describes for
+`EntryPoint::advance_if_higher` (re-check a fresh value, terminate once
+satisfied), applied one layer up — a decision-level retry around an
+otherwise-unretried per-slot CAS, not a whole-method OCC retry.
+
+A second hypothesis was investigated and rejected: that the inserting
+side's own `neighbor_node.layer(lc).claim(row_id)` call discarding its
+return value mattered (a claim onto a physically-full neighbor would
+silently fail with no chance for that candidate to be judged by the
+heuristic). A fix was implemented, then measurement showed `claim` fails
+zero times across 180 real instrumented commits at production
+parameters (`PARALLEL_INSERT_THREADS = 4` is far below the `capacity + 1`
+physical headroom, and rows within one parallel-insert chunk are inserted
+sequentially by that chunk's own thread, not concurrently with each
+other) — the fix was removed as dead code rather than shipped unexercised
+in a lock-free primitive this sensitive.
+
+**Be honest about what the retry-loop fix establishes**: unlike the
+claim-failure hypothesis above, it is not structurally unreachable (a
+synthetic high-contention fixture does reach it), but at TODAY's
+production parameters it is, in practice, also currently unexercised --
+instrumented over 1120 real commits, the retry path (the loop's second
+iteration) fires ZERO times, and the shrink body itself only runs ~0.17
+times per commit against ~440 over-capacity checks per commit. It's kept
+as a correctness guard for a proven-real hazard that becomes reachable at
+smaller `M` or higher thread counts, not because it's shown to help at
+today's defaults.
+
+**Bounded, later (code review follow-up): the retry loop above had no
+iteration cap.** Termination held even unbounded (each `insert` makes
+finitely many claims, and `clear_matching` makes progress absent
+concurrent modification), but an unbounded `loop` on the commit path,
+where "no write acknowledged until durable" means a pathological
+interleaving would stall the caller with no detectable symptom, is a
+theoretical risk not worth carrying once named. `run_shrink_retry_loop`
+(`crates/index/src/graph.rs`) caps it at `MAX_SHRINK_RETRIES = 64` --
+generous headroom over both the zero retries measured at production
+parameters and the 5 retries the synthetic high-contention fixture above
+reached -- and reports `IndexError::NeighborShrinkDidNotConverge` instead
+of silently leaving the neighbor over capacity if the bound is ever hit.
+Deliberately extracted as a function generic over one "attempt a shrink,
+report the outcome" closure, so the bound/retry bookkeeping itself is
+unit-testable without needing real concurrency to exercise the
+essentially-unreachable stuck/exceeded-bound paths.
+
+**The dominant mechanism, found after the above two were ruled out: a
+node becomes visible in `NodeTable` (and so findable as a search
+candidate) well before its own edges at every layer are built.** A
+concurrent insert's own descent (the ef=1 phase, or the real
+connection-building phase's per-layer descent) can pick that not-yet-
+finished node as its nearest candidate and carry it down as the ENTRY
+into the next-lower layer — `search_layer` seeded there returns nothing
+but that node itself, collapsing the concurrent insert's own candidate
+set to 1. This is the actual cause of the clustered-data stranding rate;
+the shrink step was never it. Fixed by `Node::is_published`/
+`mark_published` (`crates/index/src/node.rs`) plus a publication guard on
+both descent loops in `Graph::insert` (`crates/index/src/graph.rs`): a
+node is marked published only once its own connection-building finishes,
+and descent now picks the nearest PUBLISHED candidate, keeping the
+current entry if none qualify. Deliberately NOT applied to ordinary
+candidate/connection selection — a not-yet-published node is still a
+perfectly good neighbor to connect TO, and excluding it from that path
+was measured to make the hazard WORSE. Proven by a dedicated, exhaustive
+`loom` model (`concurrent_insert_never_uses_an_unpublished_node_as_a_
+descent_entry_loom` in `graph.rs`'s `loom_tests`) that deterministically
+reproduces the candidate-set collapse when the guard is ablated and
+passes cleanly with it restored.
+
+**Verified end to end: 0/800 real commits of the 200-row/20-cluster
+fixture, through the actual `Dataset::create` -> `insert` -> `commit` ->
+`vector_search` path, under the same heavy concurrent load that produced
+the original 10-21% failure rate, lost a single row.** Full parity with
+sequential insert's own 0.00% — this closes the hazard, it does not just
+reduce it. See `Graph::insert`'s own doc comment in
+`crates/index/src/graph.rs` for the complete mechanism writeup and every
+measured number.
+
+A separate, more severe, and structurally distinct bug was also found and
+fixed independently: two threads racing to insert into a genuinely empty
+graph could both take the zero-connections fast path and only one would
+win the entry-point race, permanently stranding the other (not clustered-
+data-specific — any two concurrent `Graph::insert` calls on a fresh graph
+could hit it). Fixed by `EntryPoint::claim_if_empty` (makes "am I first" a
+single atomic claim instead of a check-then-branch) and proven by a small
+exhaustive `loom` model that deterministically reproduces the strand
+pre-fix and passes cleanly post-fix.
+
+Two more measures landed alongside the fixes above, both defense-in-depth
+rather than replacements for them: `insert_batch_parallel`'s chunking
+(`crates/index/src/hnsw.rs`) is now round-robin (row `i` to
+`chunks[i % num_chunks]`) instead of contiguous, so a commit whose rows
+arrive already grouped by cluster doesn't hand one whole cluster to one
+worker; and `crates/txn`'s call into `insert_batch_parallel`
+(`build_and_write_segment` in `crates/txn/src/dataset.rs`) is gated behind
+a `parallel-insert` Cargo feature, off by default — every commit's segment
+build uses a plain sequential per-row loop unless that feature is
+explicitly enabled. See `.claude/rules/vector-index.md` for the full
+writeup of both.
+
 ## 4. Performance-critical design choices
 
 **SIMD distance computation via a proven crate, not hand-rolled

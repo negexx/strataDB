@@ -18,6 +18,21 @@ use crate::node_table::NodeTable;
 /// Sentinel for "the graph has no nodes yet" — see `EntryPoint::new`.
 const NO_ENTRY: u64 = u64::MAX;
 
+/// Ceiling on `run_shrink_retry_loop`'s retry count (see that function's
+/// own doc comment) before it gives up and reports
+/// `IndexError::NeighborShrinkDidNotConverge` instead of looping again.
+/// Deliberately generous, not tuned to any observed number: instrumented
+/// over 1120 real production-parameter commits, the retry path fires
+/// ZERO times; a deliberately adversarial synthetic fixture (8 threads,
+/// `mmax0 = mmax = 2`) reached at most 5 retries across 1569 shrink
+/// attempts. 64 is far beyond either, chosen purely as a paranoia bound
+/// that converts a theoretical, believed-unreachable livelock into a
+/// detectable, typed error rather than an indefinite stall on the commit
+/// path — see `.claude/rules/concurrency-txn-layer.md`'s "no write
+/// acknowledged until durable" invariant for why an unbounded stall here
+/// would be worse than a loud failure.
+const MAX_SHRINK_RETRIES: u32 = 64;
+
 /// `(row_id, level)` are packed into the low/high bits of a single
 /// `AtomicU64` and updated with ONE compare-exchange, not two separate
 /// atomics. This is not stylistic: an earlier version of this design used
@@ -84,6 +99,33 @@ impl EntryPoint {
             return None;
         }
         Some(unpack(packed))
+    }
+
+    /// Attempts to claim the entry point as `(row_id, level)` if the graph
+    /// is currently empty. `Ok(())` means this call's row genuinely became
+    /// the graph's first (and therefore only) node — no connections need
+    /// building. `Err((actual_row_id, actual_level))` means the graph was
+    /// no longer empty by the time of this call (another thread's insert
+    /// claimed it, or has since advanced further) — the caller must fall
+    /// through to normal connection-building using the returned entry
+    /// point, exactly as if `get()` had returned `Some` from the start.
+    ///
+    /// This closes a race a plain "if `get()` is `None`, take the empty-
+    /// graph fast path" check cannot: two threads racing to insert into a
+    /// genuinely empty graph could both observe `None`, both take a
+    /// zero-connections fast path, and only one would win a subsequent
+    /// `advance_if_higher` — permanently stranding the other's node (no
+    /// in-edges, no out-edges, not the entry point, unreachable from
+    /// anywhere). Making "am I first" itself a single atomic claim closes
+    /// that window: at most one caller can ever observe `Ok(())` for a
+    /// given graph, and every other caller is guaranteed to see a real,
+    /// already-connected-or-connecting entry point to build against.
+    pub(crate) fn claim_if_empty(&self, row_id: u64, level: usize) -> Result<(), (u64, usize)> {
+        let new_packed = pack(row_id, level);
+        self.packed
+            .compare_exchange(NO_ENTRY, new_packed, Ordering::SeqCst, Ordering::SeqCst)
+            .map(|_| ())
+            .map_err(unpack)
     }
 
     /// Advances the entry point to `(row_id, level)` if the graph is
@@ -244,23 +286,249 @@ impl<D: Distance> Graph<D> {
             .map_or(f32::INFINITY, |n| self.distance.eval(query, n.vector()))
     }
 
+    /// `false` for a row that doesn't (yet) exist at all, same as an
+    /// unpublished one -- both are equally unsafe to descend through, and
+    /// `Graph::insert`'s two descent loops only ever call this with a
+    /// `row_id` `search_layer` just returned, which the `NodeTable` lookup
+    /// below will always resolve.
+    fn is_published(&self, row_id: u64) -> bool {
+        self.nodes.get(row_id).is_some_and(|n| n.is_published())
+    }
+
+    /// Core of `run_shrink_retry_loop`'s per-attempt step (see that
+    /// function's own doc comment, and `Graph::insert`'s for the full
+    /// writeup): decides which of `scratch.occupied_buf`'s members survive
+    /// a shrink to `capacity` under this graph's distance/diversity
+    /// heuristic, then clears whichever occupied members don't survive.
+    /// Returns whether anything was actually targeted for removal --
+    /// `false` is unreachable today (`NodeTable::insert`'s
+    /// one-insert-per-row-id contract and `search_layer`'s own dedup via
+    /// its `visited` set mean `occupied_buf` can't hold a duplicate
+    /// row-id, so an over-capacity read always has at least one candidate
+    /// outside `keep`), but the caller checks it anyway rather than
+    /// assuming: a `false` here with no defensive check would turn a
+    /// violated invariant into a silent, capacity-violating `break`
+    /// instead of the typed `IndexError::NeighborShrinkDidNotConverge`
+    /// `run_shrink_retry_loop` now surfaces for exactly this case.
+    #[allow(clippy::trivially_copy_pass_by_ref)] // deliberately `&Node`, not `Node`, despite `Node: Copy` -- `node_table.rs`'s own doc comment warns that a duplicated `Node` handle inserted twice causes a double-free on drop; taking a reference here, even though this function only reads through it, keeps that invariant visibly enforced at every call site rather than relying on callers to copy carefully
+    fn shrink_and_check(
+        &self,
+        neighbor_node: &Node,
+        lc: usize,
+        capacity: usize,
+        alpha: f64,
+        scratch: &mut SearchScratch,
+    ) -> bool {
+        let with_dists: Vec<(u64, f32)> = scratch
+            .occupied_buf
+            .iter()
+            .map(|&id| (id, self.distance_to(neighbor_node.vector(), id)))
+            .collect();
+        let mut keep = Vec::new();
+        select_neighbors_heuristic_into(
+            &with_dists,
+            capacity,
+            alpha,
+            |a, b| self.pairwise_distance(a, b),
+            &mut scratch.heuristic_working,
+            &mut keep,
+        );
+        let to_remove: Vec<u64> = scratch
+            .occupied_buf
+            .iter()
+            .copied()
+            .filter(|id| !keep.contains(id))
+            .collect();
+        if to_remove.is_empty() {
+            return false;
+        }
+        neighbor_node.layer(lc).clear_matching(&to_remove);
+        true
+    }
+
     /// Algorithm 1, `INSERT`. `unif` is a caller-supplied draw from
     /// `(0, 1)` (exclusive of 0) used for this node's random level
-    /// assignment — see `crate::node::assign_level`. No OCC-retry-loop
-    /// (the `Transaction::commit()` pattern of retrying a whole operation
-    /// after a conflict) exists anywhere in this method: a failed
-    /// slot-claim or slot-clear CAS is simply abandoned, never retried —
-    /// self-resolving, per design doc §3. `EntryPoint::advance_if_higher`
-    /// (called at the end of this method) does loop on CAS failure, but
-    /// that's the ordinary lock-free CAS idiom (re-check a fresh value,
-    /// terminate once it already satisfies the postcondition), not an
-    /// OCC retry — it never re-attempts this method's own work.
+    /// assignment — see `crate::node::assign_level`. No OCC-retry-loop in
+    /// the `Transaction::commit()` sense (retrying this method's WHOLE
+    /// operation after a conflict) exists anywhere in this method. One
+    /// narrower thing DOES loop on CAS/decision failure, and it's the
+    /// ordinary lock-free CAS idiom instead (re-check a fresh value,
+    /// terminate once it already satisfies the postcondition, never
+    /// re-attempt the surrounding method's own work) -- the same idiom
+    /// `EntryPoint::advance_if_higher` (called at the end of this method)
+    /// already uses: the neighbor-shrink step's retry loop (inside the
+    /// connection-building phase below), described in full here. Every
+    /// OTHER slot-claim or slot-clear CAS in this method is still simply
+    /// abandoned on failure, never retried — self-resolving, per design
+    /// doc §3, which now additionally documents this one narrower
+    /// exception (see that doc's own amendment).
+    ///
+    /// ## The clustered-data recall hazard: mechanisms found, and the fix
+    ///
+    /// Losing an edge to a concurrency race doesn't just cost one row's
+    /// optimal neighbor choice: `assign_level`'s exponential falloff (`m_l
+    /// = 1/ln(M)`) means only roughly 1-in-M nodes ever reach level >= 1,
+    /// so a node with very few higher-layer neighbors can be the ONLY path
+    /// from the global entry point into an entire local cluster of
+    /// otherwise-disjoint layer-0 neighbors. Found and reproduced through
+    /// the real `crates/txn` commit path
+    /// (`a_large_single_commit_builds_a_correct_segment_and_every_row_is_visible`'s
+    /// 200-row/20-cluster fixture, stress-tested under heavy concurrent
+    /// CPU load): sequential insert consistently measures 0.00% failures
+    /// across every sample tried; the ORIGINAL parallel path showed a
+    /// real, reproducible, non-zero failure rate in every variant tried --
+    /// roughly 10-21% of commits losing at least one row (a distinct
+    /// measurement from the worst single-run SEVERITY, which reached
+    /// 21-24% of one commit's 200 rows in the worst observed run -- keep
+    /// these two numbers straight, they are different units). This
+    /// established it as a genuine concurrency bug, not fixture noise.
+    ///
+    /// Four hazards were investigated under the configuration these
+    /// hazards were originally found and measured at (`HnswIndex::new`:
+    /// `mmax0 = 2*M`, `mmax = M`, `PARALLEL_INSERT_THREADS = 4`) -- not
+    /// necessarily today's shipping default, since `insert_batch_parallel`
+    /// is now gated behind `crates/txn`'s `parallel-insert` Cargo feature,
+    /// off by default (see `.claude/rules/vector-index.md`). Two turned out not to explain the
+    /// measured failure rate; one is a distinct, separately-fixed bug; the
+    /// fourth is the actual dominant mechanism, and fixing it closes the
+    /// clustered-data hazard completely (verified below).
+    ///
+    /// 1. **Physical claim-slot exhaustion — investigated, then reverted
+    ///    as dead code.** `SlotArray::layer_slot_count` gives layer 0
+    ///    `mmax0 + 1` physical slots (33, since `mmax0 = 2*M`) and every
+    ///    layer above `mmax + 1` (17). A first hypothesis was that
+    ///    `neighbor_node.layer(lc).claim(row_id)` discarding its return
+    ///    value mattered in production: if a neighbor's physical array
+    ///    were ever full, a claim would silently fail with no chance to
+    ///    compete via the heuristic. Measurement disproved the premise:
+    ///    instrumented over 180 real commits of the fixture above, `claim`
+    ///    failed **zero** times (`PARALLEL_INSERT_THREADS = 4` concurrent
+    ///    claimants per neighbor never gets close to either headroom
+    ///    figure, and rows within one parallel-insert chunk are inserted
+    ///    SEQUENTIALLY by that chunk's own single thread, so a large chunk
+    ///    does not mean many concurrent claimants on one neighbor). A fix
+    ///    for this path was implemented, then removed once the
+    ///    measurement above showed it never executes in this
+    ///    configuration -- keeping unreachable, unexercised code in a
+    ///    lock-free primitive this sensitive is a worse trade than not
+    ///    having it. Left here as a documented dead end: if
+    ///    `PARALLEL_INSERT_THREADS` or `M` ever change enough to make
+    ///    claim failure reachable, this mechanism needs to be revisited,
+    ///    not assumed still irrelevant.
+    /// 2. **Stale-decision compounding in the capacity-based shrink --
+    ///    investigated, kept as a guard, NOT the dominant mechanism.**
+    ///    Once a claim succeeds and pushes the neighbor over LOGICAL
+    ///    capacity, a single-shot shrink applying a keep/remove decision
+    ///    computed from whatever was occupied at READ time, with no check
+    ///    that the same set was still current at CLEAR time, is a real
+    ///    hazard in principle: two threads racing to shrink the same
+    ///    neighbor could each read a different, incomplete snapshot and
+    ///    independently apply decisions whose UNION removes a candidate
+    ///    neither decision alone would have. Fixed by re-reading after
+    ///    every `clear_matching` and recomputing from a fresh snapshot if
+    ///    the neighbor's occupied count is still over capacity -- safe
+    ///    because `clear_matching` is already a compare-and-clear no-op
+    ///    for any slot that changed underneath it, and terminates because
+    ///    every claim onto one neighbor's slot array is a single,
+    ///    globally-finite event (`Graph`/`insert` are both `pub`, so this
+    ///    doesn't lean on any particular caller's chunk size or thread
+    ///    count to hold). But instrumented over 1120 real commits of the
+    ///    fixture above, the shrink body executes only 192 times total
+    ///    (0.171/commit) against 493,031 over-capacity checks
+    ///    (440.2/commit) -- and the loop's retry iteration fires ZERO
+    ///    times. Kept as a correctness guard (a synthetic high-contention
+    ///    fixture -- 8 threads, `m = mmax0 = mmax = 2` -- does reach it:
+    ///    `shrink_calls=1569, shrink_retries=5`, so it's reachable at
+    ///    smaller `M` or higher thread counts, just not today's), but it
+    ///    is NOT what was causing the measured failure rate -- the shrink
+    ///    path barely runs at all while failures were common, which is
+    ///    what motivated hazard #4 below.
+    /// 3. **The empty-graph race -- a separate, more severe bug, fixed
+    ///    independently.** Two threads racing to insert into a genuinely
+    ///    empty graph could both observe no entry point, both take the
+    ///    zero-connections fast path, and only one would win the
+    ///    subsequent entry-point CAS -- permanently stranding the other
+    ///    (no in-edges, no out-edges, not the entry point). Unlike hazards
+    ///    1/2, this ISN'T clustered-data-specific and doesn't depend on
+    ///    `PARALLEL_INSERT_THREADS`; any two concurrent `Graph::insert`
+    ///    calls on a fresh graph can hit it. Fixed by `EntryPoint::
+    ///    claim_if_empty` (see its own doc comment): "am I the first node"
+    ///    is now a single atomic claim, not a check-then-branch. Proven
+    ///    both by a real-thread stress test and, decisively, by a small
+    ///    exhaustive `loom` model (`concurrent_inserts_into_a_genuinely_
+    ///    empty_graph_never_strand_a_node_loom` in this file's
+    ///    `loom_tests`) that deterministically reproduces the strand on
+    ///    the pre-fix code and passes cleanly on the fix.
+    /// 4. **A node published to `NodeTable` before its own edges exist,
+    ///    then used as a concurrent insert's DESCENT ENTRY into a lower
+    ///    layer -- the actual dominant mechanism, now fixed.** A node
+    ///    becomes visible in `NodeTable` (and so findable as a search
+    ///    candidate) the moment its slot is claimed, well before its
+    ///    connections at every layer are built. That visibility is fine
+    ///    for ordinary candidate/connection selection -- a not-yet-fully-
+    ///    connected node can still be a perfectly good neighbor to connect
+    ///    to. It is NOT fine when a concurrent insert's own descent (Phase
+    ///    1's ef=1 descent, or Phase 2's per-layer descent below) picks
+    ///    that node as its nearest candidate and carries it down as the
+    ///    ENTRY for the next-lower layer: `search_layer` seeded at a node
+    ///    whose edges at that layer are still empty returns nothing but
+    ///    that node itself, so the concurrent insert's own candidate set
+    ///    collapses to 1, and it ends up with a handful of edges instead
+    ///    of the dozens a sequential insert would give it -- exactly the
+    ///    mechanism behind the clustered-data failures measured above.
+    ///    Fixed by `Node::is_published`/`mark_published` (see that doc
+    ///    comment): a node is marked published only once its own `insert`
+    ///    call finishes, and BOTH descent loops below now pick the
+    ///    nearest PUBLISHED candidate as their next entry (keeping the
+    ///    current entry, never falling back to an unpublished one, if none
+    ///    qualify) -- deliberately NOT applied to ordinary candidate/
+    ///    connection selection, since excluding unpublished nodes there
+    ///    was measured to make the hazard WORSE, not better.
+    ///
+    /// **Verified end to end, not just in isolation: 0/800 real commits of
+    /// the 200-row/20-cluster fixture through the actual `Dataset::create`
+    /// -> `insert` -> `commit` -> `vector_search` path, under the same
+    /// heavy concurrent CPU load that produced the original 10-21%
+    /// failure rate, lost a single row (0 total misses across 160,000
+    /// row-lookups) -- full parity with sequential insert's own 0.00%.**
+    /// This is not a bounded-but-nonzero mitigation like hazards 1-2 above
+    /// turned out to be; it closes the measured hazard completely. See
+    /// `concurrent_inserts_into_a_genuinely_empty_graph_never_strand_a_node_loom`
+    /// for hazard 3's exhaustive proof, and `concurrent_insert_never_uses_
+    /// an_unpublished_node_as_a_descent_entry_loom` (both in this file's
+    /// `loom_tests`) for hazard 4's -- a dedicated small-scale loom model
+    /// that deterministically reproduces the candidate-set collapse
+    /// pre-fix and passes cleanly post-fix (verified by ablating the
+    /// publication guard and confirming the test fails, then restoring
+    /// it).
     ///
     /// # Errors
     ///
     /// Returns `IndexError::DimensionMismatch` if `vector`'s length
     /// doesn't match the dimension established by this graph's first-ever
-    /// insert.
+    /// insert, or `IndexError::RowIdOutOfRange` if `row_id` is beyond this
+    /// graph's addressable capacity -- both fail before any graph
+    /// structure is mutated (see the `RowIdOutOfRange` check's own comment
+    /// below), so the graph is left exactly as it was before this call.
+    ///
+    /// Returns `IndexError::NeighborShrinkDidNotConverge` if the bounded
+    /// shrink-retry loop (`run_shrink_retry_loop`, guarding a hazard
+    /// believed structurally unreachable at any real parameter scale --
+    /// see that function's own doc comment) ever actually gives up.
+    /// Unlike the two errors above, this one is NOT a clean, no-mutation
+    /// failure: `row_id`'s node already exists in `NodeTable` and may
+    /// already have real connections at some layers, but this call returns
+    /// before `mark_published()` or `entry_point.advance_if_higher()` run,
+    /// so the node stays permanently unpublished and never becomes the
+    /// entry point. It is not corrupted (every connection actually built
+    /// before the error is a real, valid edge), just incomplete -- the
+    /// same "degrades, does not corrupt" character `Node::is_published`'s
+    /// own doc comment describes for an unmarked first node. Since this
+    /// error is believed unreachable at any parameter scale this project
+    /// ships, no repair/retry path is provided for it; a caller
+    /// encountering it in practice should treat it as the "please file a
+    /// bug" condition its own error message says it is, not as a normal,
+    /// expected `Result` branch to handle.
     // Algorithm 1's own parameter list (row-id, vector, M, Mmax0, Mmax,
     // efConstruction, mL, plus the caller-supplied `unif` draw this design
     // injects instead of an internal RNG) is inherently 9 conceptual
@@ -314,18 +582,35 @@ impl<D: Distance> Graph<D> {
                 capacity: e.capacity,
             })?;
 
-        let Some((mut entry, mut entry_level)) = self.entry_point.get() else {
-            // First node in the graph: it IS the entry point, no
-            // connections to build.
-            self.entry_point.advance_if_higher(row_id, level);
-            return Ok(());
+        // `claim_if_empty` (not a plain `get()`-then-branch) closes the
+        // empty-graph race: see its own doc comment for the two-threads-
+        // both-see-`None` hazard this replaces. `Ok(())` means this row
+        // genuinely became the graph's sole node -- since that's a single
+        // atomic claim, `row_id` can never come back as the `entry` in the
+        // `Err` branch below (this row hasn't been visible to any other
+        // caller as a candidate entry point before this line runs), so
+        // there is no longer an `entry == row_id` case to guard against.
+        let (mut entry, mut entry_level) = match self.entry_point.claim_if_empty(row_id, level) {
+            Ok(()) => {
+                // The first node has no edges to build, but it still must
+                // be marked published: `claim_if_empty`'s `Ok(())` above
+                // already made it the graph's entry point (one line
+                // earlier, not "about to" -- the CAS itself is the
+                // publication of `entry_point`), and every later insert's
+                // descent logic (see the publication guard on both
+                // `entry = ...` sites below) treats "is the entry point"
+                // and "is published" as the same fact for a fresh graph's
+                // very first node -- if this row were never marked, no
+                // subsequent insert could ever advance `entry` away from
+                // it, degrading (not corrupting) every later insert's
+                // connection quality for the graph's whole lifetime.
+                if let Some(first) = self.nodes.get(row_id) {
+                    first.mark_published();
+                }
+                return Ok(());
+            }
+            Err(existing) => existing,
         };
-        if entry == row_id {
-            // We only just inserted; re-fetch below already accounts for
-            // the entry point possibly having been this exact call in a
-            // single-node graph — nothing further to connect.
-            return Ok(());
-        }
 
         // The node table now owns the vector (moved into the `Node` above,
         // never cloned) — borrow it back for the rest of this call rather
@@ -348,8 +633,19 @@ impl<D: Distance> Graph<D> {
             // concept — always-true filter, deleted-flag exclusion still
             // applies via search_layer's own unconditional check.
             let found = self.search_layer(query, entry, 1, entry_level, &|_| true, false);
-            if let Some((nearest, _)) = found.first() {
-                entry = *nearest;
+            // Only descend to a PUBLISHED candidate -- see `Node::
+            // is_published`'s doc comment for why using a not-yet-
+            // published node as the entry into the next-lower layer is
+            // the actual dominant mechanism behind the clustered-data
+            // stranding this method's own doc comment measures. `found`
+            // is already sorted nearest-first (`search_layer`'s own
+            // contract), so this picks the nearest PUBLISHED candidate,
+            // not simply the nearest. If none are published, keep the
+            // current `entry` unchanged -- structurally still valid at
+            // any lower layer, since its own level was already `>=`
+            // whatever `entry_level` we're about to descend to.
+            if let Some(&(nearest, _)) = found.iter().find(|&&(id, _)| self.is_published(id)) {
+                entry = nearest;
             }
             entry_level -= 1;
         }
@@ -359,8 +655,20 @@ impl<D: Distance> Graph<D> {
         let start_layer = entry_level.min(level);
         for lc in (0..=start_layer).rev() {
             let candidates = self.search_layer(query, entry, ef_construction, lc, &|_| true, false);
-            if let Some((nearest, _)) = candidates.first() {
-                entry = *nearest;
+            // Same publication guard as Phase 1's descent above, and for
+            // the identical reason -- this loop ALSO carries `entry` down
+            // one layer per iteration, so it's exposed to the same
+            // not-yet-published-node-as-entry hazard. Note this is
+            // deliberately NOT applied to `chosen` (the actual connection
+            // targets selected a few lines below): excluding unpublished
+            // nodes from ordinary candidate/connection selection was
+            // measured to make the underlying hazard WORSE, not better --
+            // a not-yet-published node can still be a perfectly good
+            // neighbor to connect to, it just can't safely serve as a
+            // traversal entry into a layer its own edges don't exist at
+            // yet.
+            if let Some(&(nearest, _)) = candidates.iter().find(|&&(id, _)| self.is_published(id)) {
+                entry = nearest;
             }
             let capacity = if lc == 0 { mmax0 } else { mmax };
             let chosen = SEARCH_SCRATCH.with(|scratch_cell| {
@@ -386,52 +694,63 @@ impl<D: Distance> Graph<D> {
                     && lc <= neighbor_node.level()
                 {
                     neighbor_node.layer(lc).claim(row_id);
-                    // Shrink the neighbor's list if it now exceeds capacity.
+                    // Shrink the neighbor's list if it now exceeds
+                    // capacity. See this method's own doc comment above
+                    // for the full writeup, the measured numbers, and the
+                    // residual risk this doesn't close -- this site only
+                    // sketches the mechanism. `run_shrink_retry_loop`
+                    // itself doesn't know about `Graph`/`Node` at all --
+                    // this closure supplies one attempt's worth of real
+                    // work (read occupancy, shrink if still over
+                    // capacity), so the retry/bound bookkeeping stays
+                    // unit-testable in isolation (see that function's own
+                    // doc comment and this module's tests).
+                    //
                     // occupied_buf/heuristic_working are distinct scratch
                     // fields accessed sequentially within this one borrow —
                     // never simultaneously live borrows of the same field.
-                    SEARCH_SCRATCH.with(|scratch_cell| {
-                        let mut scratch = scratch_cell.borrow_mut();
-                        neighbor_node
-                            .layer(lc)
-                            .occupied_into(&mut scratch.occupied_buf);
-                        if scratch.occupied_buf.len() > capacity {
-                            // `neighbor_node` (and so its vector) is already
-                            // in scope from the lookup a few lines up and is
-                            // the same node for every element of
-                            // `occupied_buf` here — `distance_to` takes the
-                            // vector directly and looks up only the varying
-                            // `id` side, instead of
-                            // `pairwise_distance(neighbor_id, id)` re-fetching
-                            // `neighbor_id`'s node on every iteration of a
-                            // loop where it never changes.
-                            let with_dists: Vec<(u64, f32)> = scratch
-                                .occupied_buf
-                                .iter()
-                                .map(|&id| (id, self.distance_to(neighbor_node.vector(), id)))
-                                .collect();
-                            let mut keep = Vec::new();
-                            select_neighbors_heuristic_into(
-                                &with_dists,
+                    SEARCH_SCRATCH
+                        .with(|scratch_cell| {
+                            let mut scratch = scratch_cell.borrow_mut();
+                            run_shrink_retry_loop(|| {
+                                neighbor_node
+                                    .layer(lc)
+                                    .occupied_into(&mut scratch.occupied_buf);
+                                if scratch.occupied_buf.len() <= capacity {
+                                    return ShrinkStep::Converged;
+                                }
+                                if self.shrink_and_check(
+                                    neighbor_node,
+                                    lc,
+                                    capacity,
+                                    alpha,
+                                    &mut scratch,
+                                ) {
+                                    ShrinkStep::Progressed
+                                } else {
+                                    ShrinkStep::Stuck
+                                }
+                            })
+                        })
+                        .map_err(|attempts| {
+                            crate::hnsw::IndexError::NeighborShrinkDidNotConverge {
+                                row_id,
+                                neighbor_id,
+                                layer: lc,
                                 capacity,
-                                alpha,
-                                |a, b| self.pairwise_distance(a, b),
-                                &mut scratch.heuristic_working,
-                                &mut keep,
-                            );
-                            let to_remove: Vec<u64> = scratch
-                                .occupied_buf
-                                .iter()
-                                .copied()
-                                .filter(|id| !keep.contains(id))
-                                .collect();
-                            neighbor_node.layer(lc).clear_matching(&to_remove);
-                        }
-                    });
+                                attempts,
+                            }
+                        })?;
                 }
             }
         }
 
+        // Publish AFTER every layer's connections above are built, and
+        // BEFORE this row can become visible as the graph's entry point
+        // (the only way another thread's insert ever picks up a `row_id`
+        // it didn't just search for as an ordinary candidate) -- see
+        // `Node::is_published`'s doc comment for the race this closes.
+        inserted.mark_published();
         self.entry_point.advance_if_higher(row_id, level);
         Ok(())
     }
@@ -452,7 +771,13 @@ impl<D: Distance> Graph<D> {
     /// Returns `IndexError::DimensionMismatch` on the first row whose
     /// vector length disagrees with the graph's established dimension (or
     /// an earlier row in this same batch) — matches `insert`'s own
-    /// per-call validation, just applied row-by-row within the batch.
+    /// per-call validation, just applied row-by-row within the batch. Also
+    /// propagates `IndexError::RowIdOutOfRange` and (believed unreachable
+    /// in practice) `IndexError::NeighborShrinkDidNotConverge` straight
+    /// from whichever row's own `insert` call hits them — see that
+    /// method's own `# Errors` section for what each one means and, for
+    /// the latter, its partial-mutation semantics (which apply to that one
+    /// row, not the rows already committed earlier in this same batch).
     // Mirrors `insert`'s own 9-parameter signature by design (this is a
     // thin forwarding wrapper over it) — same too-many-arguments rationale
     // as `insert` above, not something to restructure into a struct here
@@ -775,6 +1100,27 @@ fn search_layer_generic<S: NodeSource, D: Distance>(
 /// Generic over `NodeSource` — see `search_layer_generic`'s doc comment for
 /// the local-id-vs-row-id note, which applies identically here.
 ///
+/// **Deliberately has no publication guard on its own layer-descent loop
+/// below** (`found.first()`, not "nearest PUBLISHED candidate" the way
+/// `Graph::insert`'s two descent loops now work -- see hazard #4 in that
+/// method's own doc comment). That is a scope cut, not an oversight: this
+/// function is reachable from `HnswIndex::search`, which is `pub` and
+/// therefore *could* be called concurrently with `HnswIndex::insert`/
+/// `insert_batch_parallel` on the same instance by some caller outside
+/// this crate, but Strata's own production caller never does that --
+/// `crates/txn`'s per-commit `Graph`/`HnswIndex` is exclusively under
+/// construction until it's fully built and sealed into an immutable
+/// segment, and is never handed to a reader before then (see
+/// `.claude/rules/vector-index.md`'s first bullet). Hazard #4's
+/// consequence for a WRITER racing an unpublished node is a permanent,
+/// baked-into-the-graph connectivity loss; the same race for a READER here
+/// would only be a transient, self-healing recall dip during the window a
+/// concurrent insert is still running -- not worth this loop's extra
+/// per-candidate check on every search, given production never exercises
+/// the concurrent-caller precondition in the first place. If a future
+/// caller ever does run `search` concurrently with `insert` on a live,
+/// still-mutating `Graph`, revisit this.
+///
 /// # Errors
 ///
 /// Returns `IndexError::DimensionMismatch` if `query`'s length doesn't
@@ -899,6 +1245,69 @@ fn select_neighbors_heuristic(
     result
 }
 
+/// Outcome of one `run_shrink_retry_loop` attempt (see that function's own
+/// doc comment).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShrinkStep {
+    /// The neighbor is back within capacity -- nothing more to do.
+    Converged,
+    /// Still over capacity, but the shrink attempt targeted at least one
+    /// occupant for removal, so another attempt might converge. NOT a
+    /// guarantee anything was actually removed -- `shrink_and_check`'s own
+    /// doc comment notes the underlying `clear_matching` call is a
+    /// compare-and-clear that can no-op if the slot changed underneath it,
+    /// which is exactly why this can't just be a single retry and why
+    /// `MAX_SHRINK_RETRIES` exists at all.
+    Progressed,
+    /// Still over capacity, and the shrink attempt found nothing removable
+    /// -- an already-violated invariant (see `Graph::shrink_and_check`'s
+    /// own doc comment), not a race outcome to keep retrying against.
+    Stuck,
+}
+
+/// Drives `Graph::insert`'s neighbor-shrink step to convergence, bounded by
+/// [`MAX_SHRINK_RETRIES`] (see that constant's own doc comment for why this
+/// bound exists and why 64 was chosen). `step` is called once per attempt
+/// and must itself read the neighbor's current occupancy and, if still
+/// over capacity, attempt one shrink -- see `Graph::insert`'s call site for
+/// what that looks like against a real graph. Kept generic over `step`
+/// (rather than taking `&Graph`/`&Node` directly) specifically so this
+/// function's own retry/bound bookkeeping is unit-testable in isolation,
+/// without needing a real concurrent race to actually happen -- see this
+/// module's own tests for coverage of the converge/stuck/exceeds-bound
+/// paths that a real race essentially never reaches (instrumented at
+/// production parameters: zero retries across 1120 real commits).
+///
+/// Returns `Ok(())` once `step` reports [`ShrinkStep::Converged`], or
+/// `Err(attempts)` (the number of times `step` was actually called, `>= 1`,
+/// before giving up) if `step` reports [`ShrinkStep::Stuck`] on any
+/// attempt, or the attempt count reaches [`MAX_SHRINK_RETRIES`] without
+/// converging. `attempts` counts every call to `step`, including the one
+/// that reported `Stuck` -- unlike an earlier version of this function,
+/// which counted only `Progressed` calls and so reported `Err(0)` for a
+/// `Stuck` result on the very first attempt, self-contradicting the "0
+/// shrink attempts" that value would render into
+/// [`crate::hnsw::IndexError::NeighborShrinkDidNotConverge`]'s error
+/// message on exactly the path that message exists to make debuggable.
+/// The caller maps `Err` to that error rather than silently leaving the
+/// neighbor over capacity -- silently `break`ing here would violate the
+/// exact connectivity invariant this whole module is about.
+fn run_shrink_retry_loop(mut step: impl FnMut() -> ShrinkStep) -> Result<(), u32> {
+    let mut attempts: u32 = 0;
+    loop {
+        attempts += 1;
+        match step() {
+            ShrinkStep::Converged => return Ok(()),
+            ShrinkStep::Stuck => return Err(attempts),
+            ShrinkStep::Progressed => {
+                if attempts >= MAX_SHRINK_RETRIES {
+                    return Err(attempts);
+                }
+            }
+        }
+    }
+}
+
 /// Same algorithm as [`select_neighbors_heuristic`], writing into
 /// caller-supplied scratch buffers instead of allocating fresh `Vec`s each
 /// call — `Graph::insert` calls this twice per layer (the main connection
@@ -950,6 +1359,87 @@ fn select_neighbors_heuristic_into(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::cast_precision_loss)]
 mod tests {
     use super::*;
+
+    /// `run_shrink_retry_loop` is deliberately generic over `step` so its
+    /// own retry/bound bookkeeping can be proven correct in isolation,
+    /// without needing a real `Graph`/`Node` or any actual concurrency --
+    /// see that function's own doc comment. These four tests cover its
+    /// three possible outcomes directly (two for `Converged`: immediately,
+    /// and after some `Progressed` attempts).
+    #[test]
+    fn run_shrink_retry_loop_converges_as_soon_as_step_reports_converged() {
+        let mut calls = 0;
+        let result = run_shrink_retry_loop(|| {
+            calls += 1;
+            ShrinkStep::Converged
+        });
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            calls, 1,
+            "must not call `step` again once it reports Converged"
+        );
+    }
+
+    #[test]
+    fn run_shrink_retry_loop_converges_after_some_progress() {
+        let mut remaining_progress_steps = 3;
+        let mut calls = 0;
+        let result = run_shrink_retry_loop(|| {
+            calls += 1;
+            if remaining_progress_steps == 0 {
+                ShrinkStep::Converged
+            } else {
+                remaining_progress_steps -= 1;
+                ShrinkStep::Progressed
+            }
+        });
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            calls, 4,
+            "3 Progressed steps, then the Converged step that stops the loop"
+        );
+    }
+
+    #[test]
+    fn run_shrink_retry_loop_gives_up_immediately_when_step_reports_stuck() {
+        // `Stuck` on the very first attempt is exactly `shrink_and_check`'s
+        // documented "should be unreachable" case -- nothing removable
+        // despite still being over capacity. Verifies this is treated as
+        // an immediate failure, not silently retried -- and that the
+        // reported count is 1 (one real attempt was made), not 0, which an
+        // earlier version of this function got wrong (see
+        // `run_shrink_retry_loop`'s own doc comment).
+        let mut calls = 0;
+        let result = run_shrink_retry_loop(|| {
+            calls += 1;
+            ShrinkStep::Stuck
+        });
+        assert_eq!(
+            result,
+            Err(1),
+            "Stuck must fail immediately, reporting exactly the 1 attempt that was made"
+        );
+        assert_eq!(calls, 1, "must not call `step` again once it reports Stuck");
+    }
+
+    #[test]
+    fn run_shrink_retry_loop_gives_up_after_max_shrink_retries_if_never_converging() {
+        // Never reports Converged or Stuck -- always claims progress, so
+        // the ONLY way this loop can ever terminate is the retry bound
+        // itself. This is the test that actually proves
+        // `MAX_SHRINK_RETRIES` is enforced, not just documented.
+        let mut calls: u32 = 0;
+        let result = run_shrink_retry_loop(|| {
+            calls += 1;
+            ShrinkStep::Progressed
+        });
+        assert_eq!(
+            result,
+            Err(MAX_SHRINK_RETRIES),
+            "must give up at exactly MAX_SHRINK_RETRIES, not loop forever"
+        );
+        assert_eq!(calls, MAX_SHRINK_RETRIES);
+    }
 
     #[test]
     fn new_entry_point_is_empty() {
@@ -1670,6 +2160,110 @@ mod tests {
         }
     }
 
+    /// Targets the empty-graph race `EntryPoint::claim_if_empty` exists to
+    /// close: with the OLD "if `get()` is `None`, take the zero-
+    /// connections fast path" check, several threads could all observe a
+    /// genuinely empty graph at the same instant, all take that fast path
+    /// (building no edges), and only one would win the entry-point race --
+    /// permanently stranding the rest (no in-edges, no out-edges, not the
+    /// entry point). `concurrent_inserts_are_all_findable_afterward` above
+    /// already races many threads from an empty graph, but with no forced
+    /// simultaneity: `std::thread::spawn` gives the OS wide latitude to
+    /// serialize most of that race away, so it exercised this hazard only
+    /// by luck. This test forces the actual race window with an explicit
+    /// `Barrier`, on a FRESH empty graph per trial, many trials, and checks
+    /// the specific invariant the fast path could violate: every inserted
+    /// row must end up EITHER the entry point OR holding at least one real
+    /// edge at some layer -- never structurally isolated.
+    ///
+    /// Falsifiability checked directly, not assumed: reverting to the OLD
+    /// `get()`-then-branch check reproduces the strand, but only
+    /// probabilistically and at a rate too low to trust a small trial
+    /// count -- 8 threads/200 trials didn't catch it at all; 4 threads/2000
+    /// caught it in only 1 of 3 runs; 4 threads/8000 caught it in 2 of 3
+    /// runs (one first failure at trial 402: "row 0 is not the entry point
+    /// (3) and has zero edges at every layer"). Real-thread stress testing
+    /// of a rare race is inherently probabilistic like this -- see
+    /// `concurrent_inserts_into_a_genuinely_empty_graph_never_strand_a_node_loom`
+    /// below for the actual authoritative proof (loom's exhaustive
+    /// interleaving search, not sampling). This test is `#[ignore]`d by
+    /// default because 8000 trials costs ~40s even with the fix applied
+    /// (every trial spawns real OS threads) -- run it explicitly
+    /// (`--ignored`) as an additional real-concurrency sanity check, not as
+    /// part of the routine suite; the loom test is what actually gates CI.
+    #[test]
+    #[ignore = "8000 real-thread trials costs ~40s even with the fix applied; the loom test below is what gates CI"]
+    fn concurrent_inserts_into_a_genuinely_empty_graph_never_strand_a_node() {
+        use std::sync::{Arc, Barrier};
+
+        const THREADS: usize = 4;
+        const TRIALS: usize = 8000;
+        let m_l = 1.0 / (16f64).ln();
+
+        for trial in 0..TRIALS {
+            let graph = Arc::new(Graph::new(crate::distance::L2, THREADS));
+            let barrier = Arc::new(Barrier::new(THREADS));
+
+            let handles: Vec<_> = (0..THREADS)
+                .map(|i| {
+                    let row_id = i as u64;
+                    let graph = Arc::clone(&graph);
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait(); // force every thread to race the empty-graph check together
+                        #[allow(clippy::cast_precision_loss)]
+                        // row_id here is always < THREADS (4), far under f32's exact-integer ceiling
+                        graph
+                            .insert(
+                                row_id,
+                                vec![row_id as f32, 0.0, 0.0],
+                                1,
+                                1,
+                                1,
+                                1,
+                                m_l,
+                                1.0,
+                                test_unif(row_id.wrapping_add(trial as u64)),
+                            )
+                            .unwrap();
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().unwrap();
+            }
+
+            let (entry_row, _) = graph
+                .entry_point
+                .get()
+                .expect("at least one of the concurrent inserts must have become the entry point");
+            for i in 0..THREADS {
+                let row_id = i as u64;
+                if row_id == entry_row {
+                    continue; // the entry point itself needs no edges
+                }
+                let node = graph.nodes.get(row_id).unwrap_or_else(|| {
+                    panic!("trial {trial}: row {row_id} must exist in the node table")
+                });
+                let mut occupied = Vec::new();
+                let mut has_any_edge = false;
+                for lc in 0..=node.level() {
+                    node.layer(lc).occupied_into(&mut occupied);
+                    if !occupied.is_empty() {
+                        has_any_edge = true;
+                        break;
+                    }
+                }
+                assert!(
+                    has_any_edge,
+                    "trial {trial}: row {row_id} is not the entry point ({entry_row}) and has \
+                     zero edges at every layer -- it is structurally stranded, exactly the \
+                     empty-graph race `claim_if_empty` exists to prevent"
+                );
+            }
+        }
+    }
+
     #[test]
     fn concurrent_inserts_after_dimension_established_are_findable_and_vector_readable() {
         use std::sync::Arc;
@@ -2090,6 +2684,54 @@ mod tests {
 mod loom_tests {
     use super::*;
 
+    /// See `.claude/rules/concurrency-txn-layer.md`'s note on loom's tiny
+    /// default coroutine stack (32 KiB on a 64-bit target -- `generator`'s
+    /// own default, not the megabytes a real OS thread gets): a coroutine
+    /// stack overflow surfaces as silent memory corruption sensitive to
+    /// unrelated code-shape changes elsewhere in the binary, NOT a clean
+    /// crash or an honest "stack overflow" message -- discovered here the
+    /// hard way, when adding `run_shrink_retry_loop`'s extra call frame to
+    /// `Graph::insert` (see that function's own doc comment) made
+    /// `concurrent_insert_never_uses_an_unpublished_node_as_a_descent_
+    /// entry_loom` below fail in ~0.02s with the exact hazard-#4 symptom,
+    /// on every run, with NO actual regression in the publication guard
+    /// (confirmed: reverting just the shrink-loop refactor, or adding
+    /// ANY unrelated code such as a diagnostic `eprintln!` or extra
+    /// post-join reads, made the same "failure" disappear -- a hallmark of
+    /// undefined behavior, not a real, reproducible bug in the code under
+    /// test). Every loom thread below that calls `Graph::insert` (which
+    /// now does substantially more work per call than a bare `EntryPoint`
+    /// or `SlotArray` primitive) uses this helper instead of
+    /// `loom::thread::spawn` directly, matching the pattern
+    /// `crates/txn/src/dataset.rs`'s own `loom_tests::spawn_committer`
+    /// already established for `Transaction::commit` -- with ONE
+    /// deliberate exception,
+    /// `concurrent_inserts_racing_on_one_shared_neighbor_always_keep_the_nearest`,
+    /// which still uses plain `loom::thread::spawn`; see that test's own
+    /// doc comment for why, and read it skeptically -- "passes reliably on
+    /// the default stack" is weaker evidence than it sounds, since a
+    /// coroutine stack overflow is undefined behavior and can just as
+    /// easily corrupt state in a way that lets an assertion pass having
+    /// proven nothing, not only in a way that makes it fail loudly.
+    ///
+    /// `1 MiB`, matching `crates/txn`'s own `COMMIT_STACK_SIZE` precedent
+    /// exactly (`crates/txn/src/dataset.rs`) rather than a smaller,
+    /// separately-chosen value: the 3-thread test's own doc comment found
+    /// the `stack_size` slowdown to be roughly independent of the actual
+    /// size requested, which means a smaller size buys strictly less
+    /// headroom against a silent-memory-corruption hazard for essentially
+    /// the same cost -- there's no reason to pick smaller here.
+    fn spawn_insert<F, T>(f: F) -> loom::thread::JoinHandle<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        loom::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(f)
+            .expect("spawning a loom model thread never fails")
+    }
+
     /// Mirrors the shape of `crates/txn/src/dataset.rs`'s
     /// `one_writer_store_races_safely_with_many_readers_load` loom test:
     /// multiple threads racing to advance the entry point to different
@@ -2152,14 +2794,12 @@ mod loom_tests {
                 .unwrap();
 
             let g1 = loom::sync::Arc::clone(&graph);
-            let t1 = loom::thread::spawn(move || {
-                g1.insert(1, vec![1.0, 0.0, 0.0], 1, 1, 1, 1, 1.0, 1.0, 0.5)
-            });
+            let t1 =
+                spawn_insert(move || g1.insert(1, vec![1.0, 0.0, 0.0], 1, 1, 1, 1, 1.0, 1.0, 0.5));
 
             let g2 = loom::sync::Arc::clone(&graph);
-            let t2 = loom::thread::spawn(move || {
-                g2.insert(2, vec![2.0, 0.0, 0.0], 1, 1, 1, 1, 1.0, 1.0, 0.5)
-            });
+            let t2 =
+                spawn_insert(move || g2.insert(2, vec![2.0, 0.0, 0.0], 1, 1, 1, 1, 1.0, 1.0, 0.5));
 
             t1.join().unwrap().unwrap();
             t2.join().unwrap().unwrap();
@@ -2201,6 +2841,366 @@ mod loom_tests {
             assert!(
                 [0, 1, 2].contains(&entry_row),
                 "entry point must be one of the rows actually inserted, not a corrupted value"
+            );
+        });
+    }
+
+    /// An earlier version of this test asserted row 0's neighbor slot is
+    /// never left completely empty after three concurrent claimants race
+    /// onto it. Review caught that this is unfalsifiable by construction,
+    /// not just true in practice: `select_neighbors_heuristic_into`
+    /// (`select_neighbors_heuristic_into`'s own body) sorts by distance and
+    /// unconditionally pushes the first (nearest) candidate before running
+    /// its diversity filter, so `keep` always contains the nearest row in
+    /// whatever `occupied_into` snapshot a thread reads; `clear_matching`
+    /// only clears a slot if its *current* value (re-read at clear time) is
+    /// in `to_remove`, and `to_remove` is always `snapshot \ keep`. So the
+    /// globally-nearest row among everything ever actually recorded in the
+    /// slot array can never appear in any `to_remove` -- it is either in a
+    /// given snapshot (making it that snapshot's own nearest, hence kept)
+    /// or not yet recorded (hence not removable from it). "Zero survivors"
+    /// cannot happen regardless of scheduling, so a test asserting that
+    /// proves nothing about the shrink step's concurrency safety.
+    ///
+    /// What review also found empirically: at the original M=1/Mmax0=1
+    /// parameters, the *specific* row that ends up nearest-and-kept is not
+    /// guaranteed to be globally-nearest-of-the-three, because a claim can
+    /// fail outright before ever reaching the heuristic. `layer_slot_count`
+    /// (`node_layout.rs`) gives layer 0 exactly `mmax0 + 1` physical slots
+    /// -- one slot of headroom over the logical capacity, not one per
+    /// extra concurrent claimant. With `mmax0 = 1` that is 2 physical
+    /// slots for 3 concurrent `claim()` calls: by the CAS-loop in
+    /// `SlotArray::claim` (each thread tries slot 0, then slot 1, in
+    /// order), at most 2 of the 3 threads can ever win a slot, full stop,
+    /// regardless of interleaving -- the third's `claim()` call returns
+    /// `false`, which `Graph::insert` (deliberately, per its own comment on
+    /// self-resolving CAS failures) never checks or retries. That row is
+    /// simply never in any snapshot, so the heuristic never gets a chance
+    /// to judge it against the other two -- it can be the globally-nearest
+    /// row and still lose, purely on claim timing. That is a real,
+    /// previously-uncharacterized mechanism, but it needs *more concurrent
+    /// claimants than one neighbor's physical headroom* to trigger, and in
+    /// production (`HNSW_MAX_NB_CONNECTION` gives `mmax0 = 16`, headroom
+    /// 17) that would need 18+ threads converging on one neighbor at once
+    /// -- far beyond `PARALLEL_INSERT_THREADS = 4`. It is not what this
+    /// test is meant to isolate.
+    ///
+    /// This version raises `mmax0`/`mmax` to 2 (physical headroom 3),
+    /// removing the claim-capacity confound: if all 3 threads' `Graph::
+    /// insert` calls do end up choosing row 0 as their connection target,
+    /// every claim physically succeeds, so only the shrink heuristic's
+    /// choice of which to keep down to logical capacity 2 is under test.
+    ///
+    /// "If" matters here, and an earlier version of this doc comment
+    /// overclaimed it: row 0 being the sole pre-existing node only
+    /// guarantees it's the FIRST thread's only candidate. Once that first
+    /// thread's row is inserted and visible in the node table, a
+    /// LATER-scheduled thread's own `search_layer` call can find that
+    /// row (not row 0) nearer and connect there instead -- row 0's
+    /// shrink step only actually runs in the subset of interleavings
+    /// where enough threads still pick row 0 while it's the best (or
+    /// only) candidate they see. Loom's exhaustive-within-bound search
+    /// does explore that subset (this test would be pointless otherwise),
+    /// but not every explored execution reaches it, so this test's
+    /// coverage of the shrink step is real but partial, not universal --
+    /// judge it by what it can and can't prove, not by an assumed 100%
+    /// hit rate.
+    ///
+    /// The invariant asserted below (row 1 always among the survivors) is
+    /// real, non-vacuous, and passes across every execution loom explores
+    /// at this bound -- but be precise about what it does and doesn't
+    /// protect against: in every schedule where row 0's shrink step
+    /// actually fires in THIS fixture, row 1 has already been claimed
+    /// before that shrink check runs (it's `dist=1`, always the fastest
+    /// to be picked as a candidate), so the shrink heuristic never
+    /// actually has to choose row 1 over a not-yet-present alternative --
+    /// row 1 simply never appears in anyone's `to_remove`. That means
+    /// this specific test does NOT catch every regression to the
+    /// heuristic-ordering or `clear_matching`'s compare-and-clear
+    /// semantics on its own (verified: reversing `select_neighbors_
+    /// heuristic_into`'s sort order, or replacing `clear_matching`'s CAS
+    /// with a blind `store`, both still pass this test, because row 1's
+    /// presence is never actually contested by the time either mutation's
+    /// effect could matter in this fixture). What it DOES prove: under
+    /// adversarial concurrent scheduling of `Graph::insert`'s shrink step
+    /// on a genuinely shared, physically-at-capacity neighbor, the
+    /// already-established nearest candidate is never silently evicted --
+    /// a real, useful, but narrower guarantee than "this test enforces
+    /// the shrink heuristic's correctness in general."
+    ///
+    /// Bounded to `preemption_bound = Some(3)`, following the pattern this
+    /// project already established in `crates/txn/src/dataset.rs`'s own
+    /// "Model 3" loom test for an expensive model: an unbounded run of an
+    /// earlier version of this test (three full `Graph::insert` calls is a
+    /// lot more per-thread atomic surface than the existing 2-thread
+    /// `Graph::insert` model) was killed after 1.5+ hours with no sign of
+    /// finishing. `Builder::new()` seeds `preemption_bound` from
+    /// `LOOM_MAX_PREEMPTIONS`; assigning it after overrides that, so this
+    /// gate explores the same space regardless of the environment.
+    ///
+    /// **Deliberately uses plain `loom::thread::spawn`, NOT `spawn_insert`,
+    /// unlike every other test in this module.** This is a real, measured
+    /// tradeoff, not an oversight: giving these 3 threads `spawn_insert`'s
+    /// larger stack (see that function's own doc comment on the loom
+    /// coroutine-stack-overflow hazard it exists to close) was tried and
+    /// measured at ~430-570s depending on stack size, a 4-5x slowdown over
+    /// this test's own ~110s baseline -- `stack_size` appears to route
+    /// loom's generator machinery through a substantially more expensive
+    /// path per thread, independent of the actual size requested. Since
+    /// this specific test, at these parameters, was independently verified
+    /// passing reliably (multiple full runs) on the plain default stack
+    /// even with the exact `Graph::insert` change (`run_shrink_retry_loop`)
+    /// that pushed the smaller 2-thread hazard-4 model over loom's default
+    /// stack limit, there is no CURRENT evidence this specific model needs
+    /// the fix.
+    ///
+    /// That is a real, accepted residual risk, NOT a proof of safety --
+    /// and "passes reliably" is weaker evidence of safety than it sounds,
+    /// in both directions. If this test ever starts failing in a way that
+    /// disappears when unrelated code changes (the exact signature that
+    /// exposed the hazard-4 case), a stack-size-related coroutine overflow
+    /// -- not a logic regression -- should be the first hypothesis tried,
+    /// before trusting the failure at face value. But the more insidious
+    /// direction is the one repeated passing runs can NEVER rule out: a
+    /// coroutine stack overflow is undefined behavior, and UB can just as
+    /// easily corrupt memory in a way that happens to leave every
+    /// assertion below satisfied, proving nothing, as in a way that trips
+    /// one. Every green run recorded for this test is real evidence this
+    /// exact fixture's schedules don't currently need more stack -- it is
+    /// not, and cannot be, evidence that they structurally never will.
+    #[test]
+    fn concurrent_inserts_racing_on_one_shared_neighbor_always_keep_the_nearest() {
+        let mut model = loom::model::Builder::new();
+        model.preemption_bound = Some(3);
+        model.check(move || {
+            let graph = loom::sync::Arc::new(Graph::new(crate::distance::L2, 4));
+            // Seeded sequentially, before any thread spawns: row 0 is the
+            // sole existing node and entry point, so it's the FIRST
+            // connecting thread's only possible candidate -- but not
+            // necessarily every thread's (see this test's own doc comment
+            // for why a later thread can find an already-inserted row
+            // nearer instead). mmax0/mmax = 2 gives row 0's layer-0 slot
+            // array 3 physical slots (layer_slot_count = mmax0 + 1) --
+            // exactly enough for all 3 concurrent claims to succeed in the
+            // schedules where all 3 do target row 0, so in THOSE
+            // schedules only the shrink heuristic's choice of which one to
+            // keep down to logical capacity 2 is under test, not physical
+            // claim-slot exhaustion.
+            graph
+                .insert(0, vec![0.0, 0.0, 0.0], 1, 2, 2, 1, 1.0, 1.0, 0.5)
+                .unwrap();
+
+            let g1 = loom::sync::Arc::clone(&graph);
+            let t1 = loom::thread::spawn(move || {
+                g1.insert(1, vec![1.0, 0.0, 0.0], 1, 2, 2, 1, 1.0, 1.0, 0.5)
+            });
+            let g2 = loom::sync::Arc::clone(&graph);
+            let t2 = loom::thread::spawn(move || {
+                g2.insert(2, vec![2.0, 0.0, 0.0], 1, 2, 2, 1, 1.0, 1.0, 0.5)
+            });
+            let g3 = loom::sync::Arc::clone(&graph);
+            let t3 = loom::thread::spawn(move || {
+                g3.insert(3, vec![3.0, 0.0, 0.0], 1, 2, 2, 1, 1.0, 1.0, 0.5)
+            });
+
+            t1.join().unwrap().unwrap();
+            t2.join().unwrap().unwrap();
+            t3.join().unwrap().unwrap();
+
+            // Every one of the three new rows must exist, uncorrupted,
+            // regardless of which one(s) survived row 0's shrink step.
+            for (row_id, vector) in [
+                (1u64, vec![1.0f32, 0.0, 0.0]),
+                (2, vec![2.0, 0.0, 0.0]),
+                (3, vec![3.0, 0.0, 0.0]),
+            ] {
+                let node = graph
+                    .nodes
+                    .get(row_id)
+                    .unwrap_or_else(|| panic!("row {row_id} must exist in the node table"));
+                assert_eq!(
+                    node.vector(),
+                    vector.as_slice(),
+                    "row {row_id}'s vector must be exactly what was inserted, not corrupted"
+                );
+            }
+
+            // The actual invariant under test (see this test's own doc
+            // comment for the proof): row 1 is strictly nearer to row 0
+            // than row 2 or row 3, and with headroom covering all 3
+            // physical claims, it must always be among the survivors --
+            // regardless of which thread's shrink check ran when or which
+            // `occupied_into` snapshot it observed.
+            let seed_node = graph
+                .nodes
+                .get(0)
+                .expect("row 0 must still exist -- it was never removed, only its neighbors");
+            let mut occupied = Vec::new();
+            seed_node.layer(0).occupied_into(&mut occupied);
+            assert!(
+                occupied.contains(&1),
+                "row 1 (strictly nearest to row 0) did not survive row 0's shrink step \
+                 (occupied = {occupied:?}) -- the nearest-candidate-always-kept invariant \
+                 was violated by this concurrent schedule"
+            );
+        });
+    }
+
+    /// Exhaustive, deterministic proof for the empty-graph race
+    /// `EntryPoint::claim_if_empty` closes (see that method's own doc
+    /// comment, and `concurrent_inserts_into_a_genuinely_empty_graph_
+    /// never_strand_a_node` in the non-loom `tests` module above for the
+    /// real-thread stress-test version of this same property, which could
+    /// only catch the pre-fix bug probabilistically). With the OLD "if
+    /// `get()` is `None`, take the zero-connections fast path" check, two
+    /// threads racing to insert into a genuinely empty graph could both
+    /// observe `None`, both build zero edges, and only one would win a
+    /// subsequent `advance_if_higher` -- permanently stranding the other.
+    /// `claim_if_empty` makes "am I first" itself a single atomic claim,
+    /// so at most one of the two threads below can ever take the zero-
+    /// edges path; the other is guaranteed to observe a real (already-
+    /// claimed-or-claiming) entry point and build a real connection to it.
+    ///
+    /// No pre-seeding here (unlike this file's other 2-3-thread `Graph::
+    /// insert` loom models): a genuinely empty starting graph, with BOTH
+    /// threads racing the empty-graph check itself, is the exact
+    /// precondition this race needs. Two threads (not three) because this
+    /// specific race is already fully exposed by the minimum concurrency
+    /// that can violate it -- adding a third thread here would only grow
+    /// loom's exploration cost without covering a hazard two threads
+    /// don't already reach.
+    #[test]
+    fn concurrent_inserts_into_a_genuinely_empty_graph_never_strand_a_node_loom() {
+        loom::model(|| {
+            let graph = loom::sync::Arc::new(Graph::new(crate::distance::L2, 2));
+
+            let g1 = loom::sync::Arc::clone(&graph);
+            let t1 =
+                spawn_insert(move || g1.insert(0, vec![0.0, 0.0, 0.0], 1, 1, 1, 1, 1.0, 1.0, 0.5));
+            let g2 = loom::sync::Arc::clone(&graph);
+            let t2 =
+                spawn_insert(move || g2.insert(1, vec![1.0, 0.0, 0.0], 1, 1, 1, 1, 1.0, 1.0, 0.5));
+
+            t1.join().unwrap().unwrap();
+            t2.join().unwrap().unwrap();
+
+            let (entry_row, _) = graph
+                .entry_point
+                .get()
+                .expect("one of the two concurrent inserts must have become the entry point");
+            for row_id in [0u64, 1u64] {
+                if row_id == entry_row {
+                    continue; // the entry point itself needs no edges
+                }
+                let node = graph
+                    .nodes
+                    .get(row_id)
+                    .unwrap_or_else(|| panic!("row {row_id} must exist in the node table"));
+                let mut occupied = Vec::new();
+                node.layer(0).occupied_into(&mut occupied);
+                assert!(
+                    !occupied.is_empty(),
+                    "row {row_id} is not the entry point ({entry_row}) and has zero edges -- \
+                     it is structurally stranded, exactly the empty-graph race \
+                     `claim_if_empty` exists to prevent"
+                );
+            }
+        });
+    }
+
+    /// Exhaustive, deterministic proof for hazard #4 in `Graph::insert`'s
+    /// own doc comment: a node published to `NodeTable` before its own
+    /// edges exist, picked as a CONCURRENT insert's descent entry into a
+    /// lower layer, collapsing that insert's candidate set at the lower
+    /// layer to just that one edge-less node.
+    ///
+    /// Setup: row 0 is seeded sequentially (before either thread spawns)
+    /// at level 1, so it's the sole pre-existing node and entry point.
+    /// Thread A inserts row 1, ALSO at level 1, at distance 10 from row 0.
+    /// Thread B inserts row 2, at level 0 only, at distance 9 from row 0
+    /// but distance 1 from row 1 -- closer to row 1 than to row 0, so if
+    /// row 1 is ever visible as a candidate to thread B's own search, it
+    /// is always the nearer (and thus preferred) one. (See the fourth
+    /// paragraph below for why these specific numbers, not smaller ones,
+    /// were chosen.)
+    ///
+    /// The race this isolates: row 1 only becomes reachable from row 0's
+    /// own edges once thread A's Phase 2 `lc == 1` iteration runs (the
+    /// mutual claim that links row 0 <-> row 1 at layer 1) -- before that,
+    /// no traversal from row 0 can ever discover row 1, regardless of
+    /// `NodeTable` visibility, since `search_layer` only follows edges, it
+    /// doesn't scan the table. That gives a real, structurally-reachable
+    /// window: after row 0 <-> row 1 are linked at layer 1, but before
+    /// thread A's `lc == 0` iteration links them at layer 0 (or marks row
+    /// 1 published) -- if thread B's Phase 1 descent runs its layer-1
+    /// search in that exact window, it can find row 1 (nearer, and now
+    /// reachable) and carry it down as entry into layer 0. Row 1 has no
+    /// layer-0 edges yet in that window, so a search seeded there returns
+    /// nothing but row 1 itself, and thread B's own layer-0 connections
+    /// would collapse to {row 1} alone, permanently missing row 0 --
+    /// exactly the mechanism the publication guard on both descent loops
+    /// closes, by refusing to descend into an unpublished candidate and
+    /// keeping the already-established (and therefore edge-complete) row 0
+    /// as entry instead.
+    ///
+    /// `mmax0 = mmax = 2` (physical headroom 3) and `ef_construction = 4`
+    /// are wide enough that BOTH row 0 and row 1 would land in thread B's
+    /// final candidate set whenever both are actually reachable -- but
+    /// only if the vector geometry doesn't hand the diversity heuristic
+    /// (`select_neighbors_heuristic_into`'s Algorithm-4 dominance check,
+    /// `alpha = 1.0`) an excuse to prune row 0 on its own. That check
+    /// drops a farther candidate whenever it's closer to an
+    /// already-picked nearer one than to the query itself -- i.e. row 0
+    /// survives only if `dist(row0, row1) >= dist(row0, row2)`. Distances
+    /// below (10 and 9) satisfy that deliberately, so the ONLY way row 2
+    /// ends up missing row 0 is the race this test isolates, not an
+    /// unrelated pruning artifact of the vectors chosen (an earlier
+    /// version of this test used distances 1 and 3, which violated this
+    /// and produced a false failure even on the fixed code -- the
+    /// diversity heuristic pruned row 0 in the ordinary, race-free path
+    /// too).
+    #[test]
+    fn concurrent_insert_never_uses_an_unpublished_node_as_a_descent_entry_loom() {
+        loom::model(|| {
+            let graph = loom::sync::Arc::new(Graph::new(crate::distance::L2, 3));
+            // Seeded sequentially, before any thread spawns: row 0 is the
+            // sole existing node, at level 1, so it's both the entry
+            // point and the only node either thread's search can ever
+            // start from.
+            graph
+                .insert(0, vec![0.0, 0.0, 0.0], 2, 2, 2, 4, 1.0, 1.0, 0.3)
+                .unwrap();
+
+            let g1 = loom::sync::Arc::clone(&graph);
+            let t1 = spawn_insert(move || {
+                // Also level 1 (unif = 0.3, same as row 0's own draw).
+                g1.insert(1, vec![10.0, 0.0, 0.0], 2, 2, 2, 4, 1.0, 1.0, 0.3)
+            });
+            let g2 = loom::sync::Arc::clone(&graph);
+            let t2 = spawn_insert(move || {
+                // Level 0 only (unif = 0.5) -- distance 9 from row 0,
+                // distance 1 from row 1, so row 1 is strictly nearer
+                // whenever it's visible to this thread's own search, but
+                // (see this test's own doc comment) not so much nearer
+                // that the diversity heuristic would prune row 0 on its
+                // own merits once both are reachable.
+                g2.insert(2, vec![9.0, 0.0, 0.0], 2, 2, 2, 4, 1.0, 1.0, 0.5)
+            });
+
+            t1.join().unwrap().unwrap();
+            t2.join().unwrap().unwrap();
+
+            let row2 = graph
+                .nodes
+                .get(2)
+                .expect("row 2 must exist in the node table");
+            let mut occupied = Vec::new();
+            row2.layer(0).occupied_into(&mut occupied);
+            assert!(
+                occupied.contains(&0),
+                "row 2 has no layer-0 edge to row 0 (occupied = {occupied:?}) -- its \
+                 candidate set collapsed to row 1 alone, exactly the hazard-#4 race \
+                 the publication guard on both descent loops exists to prevent"
             );
         });
     }

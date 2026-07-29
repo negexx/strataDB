@@ -22,6 +22,18 @@ pub(crate) struct NodeHeader {
     pub(crate) mmax0: u16,
     pub(crate) mmax: u16,
     pub(crate) deleted: AtomicU8,
+    /// `0` from construction until `Graph::insert`'s connection-building
+    /// for this row completes, then `1` forever after (never reset --
+    /// there's no "un-publish"). See `Node::is_published`'s doc comment
+    /// for the race this closes: a node visible in `NodeTable` but not
+    /// yet published can still be *discovered* as a search candidate (that
+    /// path is untouched and must stay untouched, per the investigation
+    /// that led to this field -- excluding unpublished nodes from
+    /// candidate selection made the underlying hazard measurably WORSE),
+    /// it just can't be used as the ENTRY a concurrent insert descends
+    /// through to the next-lower layer, since its own edges at that lower
+    /// layer may not exist yet.
+    pub(crate) published: AtomicU8,
 }
 
 pub(crate) struct NodeLayoutOffsets {
@@ -195,6 +207,7 @@ pub(crate) unsafe fn alloc_node(
                 mmax0: u16::try_from(mmax0).expect("mmax0 must fit in u16"),
                 mmax: u16::try_from(mmax).expect("mmax must fit in u16"),
                 deleted: AtomicU8::new(0),
+                published: AtomicU8::new(0),
             },
         );
     }
