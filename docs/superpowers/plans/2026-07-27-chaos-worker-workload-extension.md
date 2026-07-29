@@ -22,6 +22,8 @@
 8. **Failure signal** (spec §3.4): a global panic hook prints `GENUINE_FAILURE: <message>` and calls `std::process::exit(2)` on any panic, main thread or reader thread. `tests/sim/tests/chaos.rs` checks exit code 2 first, before anything else.
 9. Every task's code must pass `cargo build --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo fmt --check` clean, in addition to its own tests — per `.claude/CLAUDE.md`'s "What done means."
 10. `crates/chaos-worker` and `tests/sim` are not `crates/txn`/`crates/index`, so no `loom` test is required by `.claude/rules/concurrency-txn-layer.md` — this plan adds no new lock/atomic/CAS logic of its own (the reader thread only ever calls already-thread-safe `Dataset`/`Snapshot` methods).
+11. **`crates/chaos-worker` stays a bin-only crate — no `src/lib.rs`.** It has one `[[bin]]` target (`chaos-worker`) and no `[lib]` target (confirmed against its `Cargo.toml`); this matches `crates/cli`'s existing precedent (`strata-cli` is bin-only with inline `#[cfg(test)] mod tests` in `main.rs`, tested via `cargo test -p strata-cli --bin strata`, NOT `--lib` — `--lib` errors with "no library targets found" against a bin-only package, confirmed empirically). Every task below tests its new module the same way: `cargo test -p strata-chaos-worker --bin chaos-worker`. Do not add a `src/lib.rs` to route around a test-command issue — if a test command in this plan doesn't work as written, the command is wrong, not the crate's structure; flag it rather than restructuring the crate.
+12. **Dead-code warnings between tasks are expected and handled uniformly.** Tasks 1-4 each add a module whose functions aren't called from `main()` yet — that wiring only happens in Task 6 — so `cargo clippy --workspace --all-targets -- -D warnings` would otherwise fail on a real `dead_code` lint in the non-test build profile (the test profile doesn't trip it, since each module's own `#[cfg(test)] mod tests` calls everything). Each of Tasks 1-4 places a single `#[allow(dead_code)]` directly on that task's `mod` declaration in `main.rs` (attributes on a `mod` item apply recursively to everything inside it), with a comment explaining it's temporary. Task 6 removes every one of these `#[allow(dead_code)]` lines as part of its full-file rewrite of `main.rs`, since by then every module is genuinely called — leaving one in past Task 6 would silently suppress real future dead-code detection in that module.
 
 ---
 
@@ -240,12 +242,15 @@ mod tests {
 In `crates/chaos-worker/src/main.rs`, add near the top (after the existing `use` block):
 
 ```rust
+// Not yet called from main() -- wired in by Task 6 of the workload-extension
+// plan, which removes this attribute once it is.
+#[allow(dead_code)]
 mod ops;
 ```
 
 - [ ] **Step 2: Run tests to verify they pass**
 
-Run: `cargo test -p strata-chaos-worker --lib`
+Run: `cargo test -p strata-chaos-worker --bin chaos-worker`
 Expected: all `ops::tests::*` tests pass (this module has no prior implementation to be "failing against" — it's new, so write-then-run is the TDD cycle here rather than red-then-green against pre-existing code).
 
 - [ ] **Step 3: Commit**
@@ -471,13 +476,17 @@ mod tests {
 In `crates/chaos-worker/src/main.rs`, add:
 
 ```rust
+// Not yet called from main() -- wired in by Task 6, which removes these
+// attributes once they are.
+#[allow(dead_code)]
 mod commit_ops;
+#[allow(dead_code)]
 mod schema;
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p strata-chaos-worker --lib`
+Run: `cargo test -p strata-chaos-worker --bin chaos-worker`
 Expected: all `schema::tests::*` and `commit_ops::tests::*` tests pass.
 
 - [ ] **Step 5: Commit**
@@ -777,7 +786,7 @@ Add these new tests inside the existing `mod tests` block (alongside `lookup_row
 
 - [ ] **Step 2: Run tests to verify they pass**
 
-Run: `cargo test -p strata-chaos-worker --lib`
+Run: `cargo test -p strata-chaos-worker --bin chaos-worker`
 Expected: all `commit_ops::tests::*` tests pass.
 
 - [ ] **Step 3: Run the full verification gate**
@@ -945,12 +954,15 @@ mod tests {
 In `crates/chaos-worker/src/main.rs`, add:
 
 ```rust
+// Not yet called from main() -- wired in by Task 6, which removes this
+// attribute once it is.
+#[allow(dead_code)]
 mod reader;
 ```
 
 - [ ] **Step 2: Run tests to verify they pass**
 
-Run: `cargo test -p strata-chaos-worker --lib`
+Run: `cargo test -p strata-chaos-worker --bin chaos-worker`
 Expected: all `reader::tests::*` tests pass.
 
 - [ ] **Step 3: Commit**
@@ -1078,7 +1090,7 @@ git commit -m "feat(chaos-worker): add global panic hook with a reserved genuine
 
 - [ ] **Step 1: Replace the entire contents of `main.rs`**
 
-By this task, `crates/chaos-worker/src/main.rs` has accumulated, from Tasks 1/2/4/5: four separate `mod` declarations, `install_failure_hook`, and a two-line trigger check prepended to the original (still insert-only) `fn main()`. This step **replaces the ENTIRE FILE, from the first line to the last** — consolidating all of that into one coherent final version, superseding (not adding to) the smaller incremental edits those earlier tasks made. Do not end up with the `mod` declarations or `install_failure_hook` defined twice.
+By this task, `crates/chaos-worker/src/main.rs` has accumulated, from Tasks 1/2/4/5: four `mod` declarations (each with a temporary `#[allow(dead_code)]` per Global Constraint 12), `install_failure_hook`, and a two-line trigger check prepended to the original (still insert-only) `fn main()`. This step **replaces the ENTIRE FILE, from the first line to the last** — consolidating all of that into one coherent final version, superseding (not adding to) the smaller incremental edits those earlier tasks made. Do not end up with the `mod` declarations or `install_failure_hook` defined twice, and drop every `#[allow(dead_code)]` — by this task every module is genuinely called from `main()`, so none of them are needed anymore (the code below has none).
 
 Replace the entire contents of `crates/chaos-worker/src/main.rs` with:
 
@@ -1304,7 +1316,7 @@ fn main() {
 
 - [ ] **Step 2: Run the deterministic (non-chaos) tests to verify nothing regressed**
 
-Run: `cargo test -p strata-chaos-worker --lib`
+Run: `cargo test -p strata-chaos-worker --bin chaos-worker`
 Expected: all `ops::tests::*`, `commit_ops::tests::*`, `schema::tests::*`, `reader::tests::*` tests still pass (this task only touches `main()`, which none of them call).
 
 Run: `cargo test -p strata-chaos-worker --test '*' 2>&1 || true` — actually there is no separate integration test file for chaos-worker; skip this and instead do a manual smoke run:
