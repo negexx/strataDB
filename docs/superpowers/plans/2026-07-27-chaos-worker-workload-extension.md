@@ -387,6 +387,7 @@ pub(crate) fn schema_with_row_id() -> Arc<Schema> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
