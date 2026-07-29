@@ -1,7 +1,7 @@
 //! Commit execution, conflict retry, and the contested-row-id registry
 //! for the chaos workload. See
 //! `docs/superpowers/specs/2026-07-27-chaos-worker-workload-extension-design.md`
-//! §3.1-§3.2.
+//! §3.1, §3.2, and §3.5 (ack-line printing).
 
 use std::io::Write;
 
@@ -122,26 +122,44 @@ pub(crate) fn execute_insert(
     }
 }
 
+/// The result of [`commit_with_retry_once`]'s retry-once-then-drop policy.
+#[derive(Debug, PartialEq, Eq)]
+enum RetryOutcome {
+    Committed,
+    Dropped,
+}
+
 /// See design doc §3.2: retry the identical op once on `TxnError::Conflict`,
-/// drop if the retry also conflicts, panic on any other error.
+/// drop if the retry also conflicts, panic on any other error. Shared by
+/// [`execute_delete`] and [`execute_update`], which differ only in what
+/// `ExecOutcome` they build from the result.
+fn commit_with_retry_once(
+    mut attempt: impl FnMut() -> Result<(), TxnError>,
+    context: &str,
+) -> RetryOutcome {
+    match attempt() {
+        Ok(()) => RetryOutcome::Committed,
+        Err(TxnError::Conflict { .. }) => match attempt() {
+            Ok(()) => RetryOutcome::Committed,
+            Err(TxnError::Conflict { .. }) => RetryOutcome::Dropped,
+            Err(e) => panic!("unexpected commit error on {context} retry: {e}"),
+        },
+        Err(e) => panic!("unexpected commit error on {context}: {e}"),
+    }
+}
+
 pub(crate) fn execute_delete(dataset: &Dataset, target_row_id: u64) -> ExecOutcome {
     let attempt = || {
         let mut txn = dataset.begin();
         txn.delete(target_row_id);
         txn.commit()
     };
-    match attempt() {
-        Ok(()) => ExecOutcome::CommittedDelete { target_row_id },
-        Err(TxnError::Conflict { .. }) => match attempt() {
-            Ok(()) => ExecOutcome::CommittedDelete { target_row_id },
-            Err(TxnError::Conflict { .. }) => ExecOutcome::Dropped,
-            Err(e) => panic!("unexpected commit error on delete retry: {e}"),
-        },
-        Err(e) => panic!("unexpected commit error on delete: {e}"),
+    match commit_with_retry_once(attempt, "delete") {
+        RetryOutcome::Committed => ExecOutcome::CommittedDelete { target_row_id },
+        RetryOutcome::Dropped => ExecOutcome::Dropped,
     }
 }
 
-/// See design doc §3.2. Same retry policy as [`execute_delete`].
 pub(crate) fn execute_update(
     dataset: &Dataset,
     target_row_id: u64,
@@ -156,20 +174,12 @@ pub(crate) fn execute_update(
         txn.update(target_row_id, batch);
         txn.commit()
     };
-    match attempt() {
-        Ok(()) => ExecOutcome::CommittedUpdate {
+    match commit_with_retry_once(attempt, "update") {
+        RetryOutcome::Committed => ExecOutcome::CommittedUpdate {
             target_row_id,
             row_id: lookup_row_id(dataset, business_id),
         },
-        Err(TxnError::Conflict { .. }) => match attempt() {
-            Ok(()) => ExecOutcome::CommittedUpdate {
-                target_row_id,
-                row_id: lookup_row_id(dataset, business_id),
-            },
-            Err(TxnError::Conflict { .. }) => ExecOutcome::Dropped,
-            Err(e) => panic!("unexpected commit error on update retry: {e}"),
-        },
-        Err(e) => panic!("unexpected commit error on update: {e}"),
+        RetryOutcome::Dropped => ExecOutcome::Dropped,
     }
 }
 
@@ -313,6 +323,109 @@ mod tests {
         registry.record_own_row(0, 1);
         registry.remove(0, 999);
         assert_eq!(registry.own_rows(0), &[1]);
+    }
+
+    #[test]
+    fn commit_with_retry_once_commits_on_first_success() {
+        let outcome = commit_with_retry_once(|| Ok(()), "test");
+        assert_eq!(outcome, RetryOutcome::Committed);
+    }
+
+    #[test]
+    fn commit_with_retry_once_retries_and_commits_after_one_conflict() {
+        let mut calls = 0;
+        let outcome = commit_with_retry_once(
+            || {
+                calls += 1;
+                if calls == 1 {
+                    Err(TxnError::Conflict {
+                        contested_row_ids: vec![1],
+                    })
+                } else {
+                    Ok(())
+                }
+            },
+            "test",
+        );
+        assert_eq!(outcome, RetryOutcome::Committed);
+        assert_eq!(calls, 2, "must retry exactly once, not more");
+    }
+
+    #[test]
+    fn commit_with_retry_once_drops_after_a_second_conflict() {
+        let mut calls = 0;
+        let outcome = commit_with_retry_once(
+            || {
+                calls += 1;
+                Err(TxnError::Conflict {
+                    contested_row_ids: vec![1],
+                })
+            },
+            "test",
+        );
+        assert_eq!(outcome, RetryOutcome::Dropped);
+        assert_eq!(calls, 2, "must attempt exactly twice, never a third time");
+    }
+
+    #[test]
+    #[should_panic(expected = "unexpected commit error on test")]
+    fn commit_with_retry_once_panics_on_a_non_conflict_error() {
+        commit_with_retry_once(
+            || Err(TxnError::NotFound(std::path::PathBuf::from("x"))),
+            "test",
+        );
+    }
+
+    #[test]
+    fn print_outcome_matches_the_documented_ack_line_format_for_every_variant() {
+        // Task 7's orchestrator parses these lines by exact format -- a
+        // typo here (a missing token, "multi_batch" instead of
+        // "multibatch", a space instead of a comma) would compile and
+        // pass every execute_* test while silently breaking Task 7's
+        // parser. Round-trips through a Vec<u8> writer rather than
+        // spawning the real worker binary, so this stays a fast unit test.
+        let mut out: Vec<u8> = Vec::new();
+        print_outcome(
+            &mut out,
+            1,
+            2,
+            &ExecOutcome::CommittedInsert {
+                business_id: 99,
+                row_id: 5,
+            },
+        );
+        print_outcome(
+            &mut out,
+            1,
+            3,
+            &ExecOutcome::CommittedDelete { target_row_id: 5 },
+        );
+        print_outcome(
+            &mut out,
+            1,
+            4,
+            &ExecOutcome::CommittedUpdate {
+                target_row_id: 5,
+                row_id: 6,
+            },
+        );
+        print_outcome(
+            &mut out,
+            1,
+            5,
+            &ExecOutcome::CommittedMultiBatch { row_ids: [7, 8] },
+        );
+        print_outcome(&mut out, 1, 6, &ExecOutcome::Dropped);
+
+        let printed = String::from_utf8(out).unwrap();
+        let expected = "\
+agent 1 committed insert op 2 row_id 5
+agent 1 committed delete op 3 target_row_id 5
+agent 1 committed update op 4 target_row_id 5 row_id 6
+agent 1 committed multibatch op 5 row_ids 7,8
+agent 1 dropped op 6 (conflict)
+";
+        assert_eq!(printed, expected);
     }
 
     #[test]
