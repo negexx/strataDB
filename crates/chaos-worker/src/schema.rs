@@ -22,6 +22,7 @@ pub(crate) fn schema_with_row_id() -> Arc<Schema> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -32,6 +33,14 @@ mod tests {
         assert!(schema.field_with_name("id").is_ok());
         assert!(schema.field_with_name("name").is_ok());
         assert!(schema.field_with_name("vector").is_ok());
-        assert!(schema.field_with_name(strata_txn::ROW_ID_COLUMN).is_ok());
+        let row_id_field = schema.field_with_name(strata_txn::ROW_ID_COLUMN).unwrap();
+        assert_eq!(
+            *row_id_field.data_type(),
+            DataType::UInt64,
+            "must be UInt64 -- cast_batch_to_schema silently casts on a type \
+             mismatch instead of erroring, which would turn a wrong DataType \
+             here into a runtime downcast panic in commit_ops.rs instead of \
+             a caught-at-the-source bug"
+        );
     }
 }
