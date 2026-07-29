@@ -26,6 +26,37 @@ mod schema;
 #[allow(dead_code)]
 mod reader;
 
+/// Installs a global panic hook: any panic, on the main thread or the
+/// reader thread, prints a `GENUINE_FAILURE: <message>` line and exits
+/// with a reserved code — distinct from `chaos_checkpoint`'s
+/// `std::process::abort()` (an entirely different termination mechanism,
+/// not a panic) — so `tests/sim`'s orchestrator can tell a genuine bug
+/// apart from an expected chaos-induced crash without decoding
+/// OS-specific exit signals. See design doc §3.4.
+#[allow(dead_code)]
+const GENUINE_FAILURE_EXIT_CODE: i32 = 2;
+
+#[allow(dead_code)]
+fn install_failure_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let message = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "<non-string panic payload>".to_string()
+        };
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        // Best-effort: if even this write fails, still exit with the
+        // reserved code below so the orchestrator's exit-code check still
+        // fires (it does not require the message line to be present).
+        let _ = writeln!(out, "GENUINE_FAILURE: {message}");
+        let _ = out.flush();
+        std::process::exit(GENUINE_FAILURE_EXIT_CODE);
+    }));
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let dir = args
@@ -125,5 +156,56 @@ fn main() {
 
         next_op[pick] += 1;
         remaining[pick] -= 1;
+    }
+}
+
+#[cfg(test)]
+mod failure_hook_tests {
+    use super::install_failure_hook;
+
+    /// Env var gating this test's actual body -- unset (the normal case,
+    /// when this test runs as part of the full suite) it's a no-op, so it
+    /// never installs the global panic hook and never disturbs any other
+    /// test sharing this process. Only the subprocess spawned by
+    /// `a_panic_after_the_hook_is_installed_exits_with_the_reserved_code`,
+    /// which sets this var and filters to run ONLY this one test, ever
+    /// exercises the real body.
+    const TRIGGER_ENV_VAR: &str = "CHAOS_WORKER_TEST_TRIGGER_GENUINE_FAILURE";
+
+    #[test]
+    fn inner_trigger_genuine_failure() {
+        if std::env::var(TRIGGER_ENV_VAR).is_err() {
+            return;
+        }
+        install_failure_hook();
+        panic!("deliberate test panic");
+    }
+
+    // Spawns THIS SAME test binary (via current_exe()), filtered with
+    // libtest's own --exact to run ONLY inner_trigger_genuine_failure,
+    // with the trigger env var set -- the only way to observe a global
+    // panic hook's effect without corrupting other tests sharing this
+    // process. A bare CLI flag checked in fn main() does NOT work here:
+    // current_exe() under `cargo test` is the libtest-harness binary,
+    // not this crate's real fn main() entry point, so an arbitrary flag
+    // reaches libtest's own parser (which rejects it), not fn main().
+    #[test]
+    fn a_panic_after_the_hook_is_installed_exits_with_the_reserved_code() {
+        let exe = std::env::current_exe().unwrap();
+        let output = std::process::Command::new(exe)
+            .args([
+                "failure_hook_tests::inner_trigger_genuine_failure",
+                "--exact",
+                "--nocapture",
+            ])
+            .env(TRIGGER_ENV_VAR, "1")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("GENUINE_FAILURE: deliberate test panic"),
+            "expected the marker line in stdout, got: {stdout}"
+        );
     }
 }
