@@ -2,6 +2,12 @@
 //! Runs on its own thread for the whole worker process lifetime,
 //! concurrently with the main commit loop, comparing a zone-map-pruned
 //! predicate query against an unpruned reference on the SAME snapshot.
+//!
+//! Only checks pruned-result-is-a-subset-of-reference (§3.3's first
+//! direction). The reverse direction ("every reference row with a
+//! genuinely nearest vector must be findable through the pruned path
+//! too") is not implemented here — it needs real multi-segment zone-map
+//! coverage to be meaningful, which only Task 8's chaos runs produce.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -82,7 +88,12 @@ fn check_once(dataset: &Dataset, predicate: &Predicate) {
         .scan(&schema)
         .expect("scan must succeed against a live snapshot");
     let name_col = all_rows
-        .column(all_rows.schema().index_of("name").unwrap())
+        .column(
+            all_rows
+                .schema()
+                .index_of("name")
+                .expect("schema_with_row_id always includes a name column"),
+        )
         .as_any()
         .downcast_ref::<StringArray>()
         .expect("name column must be Utf8");
@@ -91,7 +102,7 @@ fn check_once(dataset: &Dataset, predicate: &Predicate) {
             all_rows
                 .schema()
                 .index_of(strata_txn::ROW_ID_COLUMN)
-                .unwrap(),
+                .expect("schema_with_row_id always includes the row-id column"),
         )
         .as_any()
         .downcast_ref::<UInt64Array>()
@@ -160,7 +171,11 @@ mod tests {
         // agents' worth of rows makes the "name" predicate load-bearing --
         // a check_once that ignored the predicate and returned every
         // row's id, or that matched the wrong column, would still pass a
-        // single-agent version of this test.
+        // single-agent version of this test. Both rows land in one commit
+        // (one segment, one merged zone map spanning both names), so this
+        // does NOT exercise segment-level zone-map pruning -- only the
+        // resolve_live_set filter path. Real pruning coverage needs
+        // multiple segments, which only Task 8's chaos runs produce.
         let dir = temp_dir("check-once-real-data");
         let dataset = Dataset::create(&dir).unwrap();
         let mut txn = dataset.begin();
