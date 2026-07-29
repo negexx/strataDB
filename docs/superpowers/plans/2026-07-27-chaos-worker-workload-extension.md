@@ -397,7 +397,15 @@ mod tests {
         assert!(schema.field_with_name("id").is_ok());
         assert!(schema.field_with_name("name").is_ok());
         assert!(schema.field_with_name("vector").is_ok());
-        assert!(schema.field_with_name(strata_txn::ROW_ID_COLUMN).is_ok());
+        let row_id_field = schema.field_with_name(strata_txn::ROW_ID_COLUMN).unwrap();
+        assert_eq!(
+            *row_id_field.data_type(),
+            DataType::UInt64,
+            "must be UInt64 -- cast_batch_to_schema silently casts on a type \
+             mismatch instead of erroring, which would turn a wrong DataType \
+             here into a runtime downcast panic in commit_ops.rs instead of \
+             a caught-at-the-source bug"
+        );
     }
 }
 ```
@@ -436,7 +444,7 @@ pub(crate) fn lookup_row_id(dataset: &Dataset, business_id: i64) -> u64 {
         "business id {business_id} must resolve to exactly one row right after its own insert"
     );
     let row_id_col = batch
-        .column(batch.schema().index_of(ROW_ID_COLUMN).unwrap())
+        .column(batch.schema_ref().index_of(ROW_ID_COLUMN).unwrap())
         .as_any()
         .downcast_ref::<UInt64Array>()
         .unwrap();
@@ -447,6 +455,11 @@ pub(crate) fn lookup_row_id(dataset: &Dataset, business_id: i64) -> u64 {
 /// contested pool, and each agent's own live (not-yet-tombstoned) rows.
 /// Updated only after a commit actually durably succeeds — never
 /// speculatively.
+///
+/// Every method taking an `agent` index requires `agent < num_agents` (the
+/// value passed to [`Registry::new`]) — callers are all in-crate and
+/// already have a valid agent index in hand from the scheduler loop, so
+/// this is an internal invariant, not a checked precondition.
 pub(crate) struct Registry {
     pool_live: Vec<u64>,
     own_live: Vec<Vec<u64>>,
@@ -506,15 +519,26 @@ mod tests {
 
     #[test]
     fn lookup_row_id_finds_the_row_just_inserted() {
+        // Two rows with distinct business ids, not one -- with only one
+        // row present, this test can't tell "matched business id 42" from
+        // "returned whatever row happened to be there," since both would
+        // return the dataset's only row-id. Two rows makes the predicate
+        // itself load-bearing: a lookup_row_id that filtered on the wrong
+        // column, the wrong Value variant, or ignored the predicate
+        // entirely would still pass a single-row version of this test.
         let dir = temp_dir("lookup-row-id");
         let dataset = Dataset::create(&dir).unwrap();
-        let mut txn = dataset.begin();
-        txn.insert(strata_txn::mvp_fixtures::mvp_row(42, "agent0", [1.0, 2.0, 3.0]).unwrap());
-        txn.commit().unwrap();
+        let mut first = dataset.begin();
+        first.insert(strata_txn::mvp_fixtures::mvp_row(42, "agent0", [1.0, 2.0, 3.0]).unwrap());
+        first.commit().unwrap();
+        let mut second = dataset.begin();
+        second.insert(strata_txn::mvp_fixtures::mvp_row(7, "agent0", [4.0, 5.0, 6.0]).unwrap());
+        second.commit().unwrap();
 
-        let row_id = lookup_row_id(&dataset, 42);
-        // First-ever commit in a fresh dataset always claims row-id 0.
-        assert_eq!(row_id, 0);
+        // First-ever commit in a fresh dataset always claims row-id 0; the
+        // second commit claims row-id 1.
+        assert_eq!(lookup_row_id(&dataset, 42), 0);
+        assert_eq!(lookup_row_id(&dataset, 7), 1);
 
         std::fs::remove_dir_all(&dir).ok();
     }
