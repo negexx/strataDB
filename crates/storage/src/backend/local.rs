@@ -4,7 +4,7 @@
 //! trait's `key: &str` / `bytes: &[u8]` interface.
 
 use std::fs::{self, File};
-use std::io::Write as _;
+use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -45,6 +45,16 @@ impl LocalFs {
 impl Backend for LocalFs {
     fn get(&self, key: &str) -> Result<Vec<u8>> {
         Ok(fs::read(self.resolve(key))?)
+    }
+
+    fn get_range(&self, key: &str, range: std::ops::Range<u64>) -> Result<Vec<u8>> {
+        let mut file = File::open(self.resolve(key))?;
+        file.seek(SeekFrom::Start(range.start))?;
+        let len = usize::try_from(range.end - range.start)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        let mut buf = vec![0u8; len];
+        file.read_exact(&mut buf)?;
+        Ok(buf)
     }
 
     fn put(&self, key: &str, bytes: &[u8]) -> Result<()> {
@@ -131,6 +141,18 @@ mod tests {
         backend.put("a.bin", b"second").unwrap();
 
         assert_eq!(backend.get("a.bin").unwrap(), b"second");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn get_range_reads_only_the_requested_byte_span() {
+        let root = temp_root("range");
+        let backend = LocalFs::new(&root);
+        backend.put("a.bin", b"0123456789").unwrap();
+
+        let slice = backend.get_range("a.bin", 3..6).unwrap();
+
+        assert_eq!(slice, b"345");
         fs::remove_dir_all(&root).ok();
     }
 }

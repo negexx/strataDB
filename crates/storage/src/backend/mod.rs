@@ -26,6 +26,13 @@ pub trait Backend: Send + Sync {
     /// Returns an error if `key` does not exist or can't be read.
     fn get(&self, key: &str) -> Result<Vec<u8>>;
 
+    /// Reads `range` (byte offsets, exclusive end) from `key`.
+    ///
+    /// # Errors
+    /// Returns an error if `key` does not exist, or `range` extends past
+    /// its length.
+    fn get_range(&self, key: &str, range: std::ops::Range<u64>) -> Result<Vec<u8>>;
+
     /// Writes `bytes` to `key`, durably, overwriting any existing content —
     /// truncate-and-replace semantics, matching today's `File::create`-based
     /// writers.
