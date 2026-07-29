@@ -60,7 +60,23 @@ impl Backend for LocalFs {
         }
         crate::chaos::chaos_checkpoint(); // tmp object is durable, about to rename into place
         fs::rename(&tmp_path, &final_path)?;
-        crate::chaos::chaos_checkpoint(); // renamed into place; now discoverable
+        crate::chaos::chaos_checkpoint(); // renamed into place; now discoverable by content
+        // Fsync the containing directory so the rename itself survives a
+        // crash, not just the file content -- matching `commit_manifest`'s
+        // existing `sync_dir` step today. Folded in here (rather than left
+        // as a separate caller-side step, as `commit_manifest` used to do)
+        // so `Backend::put`'s durability contract is self-contained and
+        // uniform across backends: S3 has no analogous directory-entry
+        // step, so a caller shouldn't need backend-specific knowledge to
+        // get full durability out of `put` alone. `sync_dir` performs its
+        // own chaos checkpoint internally (see `datafile.rs`), so this
+        // contributes the 3rd checkpoint here, matching the 3 checkpoints
+        // `commit_manifest` + its old explicit `sync_dir` call produced
+        // together today -- see Task 6, which removes that now-redundant
+        // explicit call.
+        if let Some(parent) = final_path.parent() {
+            crate::datafile::sync_dir(parent)?;
+        }
         Ok(())
     }
 }
