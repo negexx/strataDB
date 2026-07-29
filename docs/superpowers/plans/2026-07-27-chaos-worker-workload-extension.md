@@ -612,10 +612,10 @@ git commit -m "feat(chaos-worker): add row-id lookup and the contested-row regis
 
 Append to `crates/chaos-worker/src/commit_ops.rs` (before the closing `}` of the existing `mod tests` block — add these as new `#[test]` functions inside that same module, and add the new non-test code above the `#[cfg(test)]` line):
 
-Add above the `#[cfg(test)]` line:
+Add above the `#[cfg(test)]` line (`use std::io::Write;`, not `use std::io::Write as _;` — this file, unlike `main.rs`, names `Write` as a type in `print_outcome`'s `impl Write` parameter below, and an anonymous `as _` import only brings trait methods into scope, not the name itself):
 
 ```rust
-use std::io::Write as _;
+use std::io::Write;
 
 use strata_txn::TxnError;
 
