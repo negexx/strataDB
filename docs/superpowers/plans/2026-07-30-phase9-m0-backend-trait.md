@@ -479,10 +479,48 @@ In `crates/storage/src/backend/local.rs`, add to `impl Backend for LocalFs` (aft
     }
 ```
 
-- [ ] **Step 5: Run tests to verify they pass**
+- [ ] **Step 5: Write and run a concurrency test — this is the property that actually matters**
+
+`put_if_absent` exists specifically to be a race-safe create-if-absent
+primitive (the future manifest-commit CAS is built on it) — a
+sequential collision test alone doesn't exercise the property that
+justifies its existence: under two *simultaneous* callers, exactly one
+wins and the loser gets `AlreadyExists` with the winner's bytes intact.
+That property depends on `tmp_path_for`'s per-call uniqueness (Task 1)
+staying true under concurrent calls — worth asserting directly, not
+just trusting.
+
+Add to `crates/storage/src/backend/local.rs`'s test module:
+
+```rust
+    #[test]
+    fn put_if_absent_under_concurrent_racers_exactly_one_wins() {
+        let root = temp_root("if-absent-race");
+        let backend = LocalFs::new(&root);
+
+        let (ok_count, winner_bytes) = std::thread::scope(|scope| {
+            let backend_ref = &backend;
+            let h1 = scope.spawn(move || backend_ref.put_if_absent("a.bin", b"writer-one"));
+            let h2 = scope.spawn(move || backend_ref.put_if_absent("a.bin", b"writer-two"));
+            let r1 = h1.join().unwrap();
+            let r2 = h2.join().unwrap();
+
+            let ok_count = [&r1, &r2].iter().filter(|r| r.is_ok()).count();
+            let winner_bytes = backend_ref.get("a.bin").unwrap();
+            (ok_count, winner_bytes)
+        });
+
+        assert_eq!(ok_count, 1, "exactly one racer must succeed");
+        assert!(
+            winner_bytes == b"writer-one" || winner_bytes == b"writer-two",
+            "final content must be exactly one racer's payload, got {winner_bytes:?}"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+```
 
 Run: `cargo test -p strata-storage backend::local::tests -- --nocapture`
-Expected: PASS — all 6 tests green.
+Expected: PASS — all 7 tests green.
 
 - [ ] **Step 6: Commit**
 
