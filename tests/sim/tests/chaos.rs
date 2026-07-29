@@ -13,21 +13,41 @@ use rand::SeedableRng as _;
 
 const NUM_AGENTS: u64 = 3;
 const OPS_PER_AGENT: u64 = 5;
+/// Locally duplicated from `crates/chaos-worker/src/main.rs`'s private
+/// `POOL_SIZE` (design doc §3.1) -- that constant is not reachable from
+/// here, and this file needs its exact value for the clean-run slot-count
+/// assertion below and for this threshold's own upper-bound estimate.
+const POOL_SIZE: u64 = 6;
 /// Comfortably above the total number of checkpoints one full run
-/// produces. A vector-carrying commit passes through six: `write_batch`'s
-/// data-file fsync, `write_bytes`'s segment fsync (added by S1 W3.2a),
-/// `sync_dir`'s data-dir fsync, `commit_manifest`'s tmp-sync, its rename,
-/// and `sync_dir`'s versions-dir fsync. At 6 per commit and 15 ops max
-/// here that is 90 — so a threshold in this range can still land anywhere
-/// from "crash on the very first commit" to "never crashes, all ops
-/// complete". A delete-only commit produces fewer (no data file, no
-/// segment); this workload has none.
+/// produces -- an ESTIMATE with real margin built in, not an exact count
+/// (the true total is workload-mix-dependent, since Insert/Update/Delete/
+/// `MultiBatchInsert` each touch a different number of checkpoint sites; see
+/// Task 8's thorough tier for empirical validation of actual coverage). A
+/// vector-carrying single-row commit (a plain Insert, or Update's insert
+/// half) passes through six: `write_batch`'s data-file fsync,
+/// `write_bytes`'s segment fsync (added by S1 W3.2a), `sync_dir`'s
+/// data-dir fsync, `commit_manifest`'s tmp-sync, its rename, and
+/// `sync_dir`'s versions-dir fsync -- confirmed against the actual call
+/// sites in `crates/storage/src/{datafile,manifest}.rs`. A `MultiBatchInsert`
+/// commit calls `write_batch` once per pending row (2, not 1) but still
+/// only one `write_bytes`/`commit_manifest` (one segment, one manifest
+/// entry, built from both batches together) -- 7 checkpoints for that one
+/// op, not 6. A delete-only commit writes no new data file or segment at
+/// all, so it has fewer (this workload has had deletes since Task 6,
+/// unlike when this comment previously claimed otherwise). Per-AGENT
+/// worst case is still all-Insert (Insert's 6/slot is the single highest
+/// per-slot cost -- `MultiBatchInsert`'s 7 checkpoints buys 2 slots, or
+/// 3.5/slot): `OPS_PER_AGENT` * 6 * `NUM_AGENTS` = 90. `setup_contested_pool`
+/// (Task 6) adds `POOL_SIZE` more single-row inserts, UNCONDITIONALLY, on
+/// every run, before any agent op: `POOL_SIZE` * 6 = 36 more. Conservative
+/// total estimate: 90 + 36 = 126 -- this constant is set well above that
+/// with real margin, not tuned to the exact figure.
 ///
 /// `STRATA_CHAOS_ABORT_AT` counts checkpoints since **process start** off
 /// one process-global counter, so this constant must be re-checked
 /// whenever a checkpoint site is added or removed anywhere in
 /// `strata-storage`.
-const MAX_ABORT_THRESHOLD: u64 = 200;
+const MAX_ABORT_THRESHOLD: u64 = 300;
 
 /// Builds (once, lazily — `OnceLock` caches the result across every
 /// `run_worker` call in this test binary rather than re-invoking `cargo
@@ -54,6 +74,21 @@ fn worker_bin_path() -> &'static std::path::Path {
 struct RunResult {
     acknowledged_inserts: HashSet<u64>,
     acknowledged_tombstones: HashSet<u64>,
+    /// Sum of op-SLOTS acknowledged (pool lines excluded, tracked
+    /// separately by `pool_acks` below): insert/delete/update/dropped
+    /// each consume 1 slot, multibatch consumes 2 -- matches
+    /// `resolve_slot_consumption`'s own accounting in
+    /// `crates/chaos-worker/src/ops.rs`. Lets a clean run assert an EXACT
+    /// `NUM_AGENTS * OPS_PER_AGENT` total, restoring the coverage the
+    /// original insert-only exact-count check had, without assuming every
+    /// slot grows `acknowledged_inserts` by exactly one the way a pure
+    /// Insert workload did.
+    total_op_slots: u64,
+    /// Count of `pool committed insert` lines. Always exactly `POOL_SIZE`
+    /// on a clean run (`setup_contested_pool` is unconditional and
+    /// single-threaded, so either all `POOL_SIZE` lines print before the
+    /// scheduler loop starts, or the run crashed before finishing setup).
+    pool_acks: u64,
     crashed: bool,
 }
 
@@ -88,12 +123,18 @@ fn run_worker(dir: &std::path::Path, seed: u64, abort_at: Option<u64>) -> RunRes
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut acknowledged_inserts = HashSet::new();
     let mut acknowledged_tombstones = HashSet::new();
+    let mut total_op_slots: u64 = 0;
+    let mut pool_acks: u64 = 0;
     for line in stdout.lines() {
         let words: Vec<&str> = line.split(' ').collect();
         match words.as_slice() {
-            ["pool", "committed", "insert", "row_id", row_id]
-            | [.., "committed", "insert", "op", _, "row_id", row_id] => {
+            ["pool", "committed", "insert", "row_id", row_id] => {
                 acknowledged_inserts.insert(row_id.parse().unwrap());
+                pool_acks += 1;
+            }
+            [.., "committed", "insert", "op", _, "row_id", row_id] => {
+                acknowledged_inserts.insert(row_id.parse().unwrap());
+                total_op_slots += 1;
             }
             [
                 ..,
@@ -105,6 +146,7 @@ fn run_worker(dir: &std::path::Path, seed: u64, abort_at: Option<u64>) -> RunRes
                 target_row_id,
             ] => {
                 acknowledged_tombstones.insert(target_row_id.parse().unwrap());
+                total_op_slots += 1;
             }
             [
                 ..,
@@ -119,14 +161,16 @@ fn run_worker(dir: &std::path::Path, seed: u64, abort_at: Option<u64>) -> RunRes
             ] => {
                 acknowledged_tombstones.insert(target_row_id.parse().unwrap());
                 acknowledged_inserts.insert(row_id.parse().unwrap());
+                total_op_slots += 1;
             }
             [.., "committed", "multibatch", "op", _, "row_ids", row_ids] => {
                 for id in row_ids.split(',') {
                     acknowledged_inserts.insert(id.parse().unwrap());
                 }
+                total_op_slots += 2;
             }
             [.., "dropped", "op", _, "(conflict)"] => {
-                // Informational only -- not an acknowledgment either way.
+                total_op_slots += 1;
             }
             _ => panic!("unrecognized chaos-worker stdout line: {line:?}"),
         }
@@ -135,6 +179,8 @@ fn run_worker(dir: &std::path::Path, seed: u64, abort_at: Option<u64>) -> RunRes
     RunResult {
         acknowledged_inserts,
         acknowledged_tombstones,
+        total_op_slots,
+        pool_acks,
         crashed: !output.status.success(),
     }
 }
@@ -160,9 +206,21 @@ fn check_invariants(dir: &std::path::Path, result: &RunResult) {
     let acknowledged = &result.acknowledged_inserts;
     let crashed = result.crashed;
 
-    // Invariant 1: no corruption (see the original comment this
-    // preserves verbatim in spirit -- only the acknowledged-set field
-    // name changed).
+    // Invariant 1: no corruption. A crash mid-write must never leave an
+    // EXISTING dataset unable to open. One narrow, precisely-scoped
+    // exception: if the crash landed before the dataset's very first
+    // commit_manifest call ever completed its rename (e.g. abort_at=1,
+    // landing inside Dataset::create's own initial-manifest write), no
+    // manifest file -- not even the initial empty one -- was ever durably
+    // created, so NotFound is the correct, expected response to "nothing
+    // exists yet," not corruption. This can only be legitimate when
+    // nothing was ever acknowledged either (a non-empty acknowledged set
+    // would mean at least one commit fully landed, which requires a
+    // manifest to already exist) -- any other open failure, or a NotFound
+    // with a non-empty acknowledged set, is genuine corruption and must
+    // still fail loudly. All invariants below are trivially satisfied when
+    // nothing was ever created, so return early rather than trying to scan
+    // a dataset that doesn't exist.
     let dataset = match strata_txn::Dataset::open(dir) {
         Ok(ds) => ds,
         Err(strata_txn::TxnError::NotFound(_)) if acknowledged.is_empty() => return,
@@ -253,6 +311,27 @@ fn check_invariants(dir: &std::path::Path, result: &RunResult) {
         if crashed { "crashed" } else { "clean" }
     );
 
+    // Joint bound on invariants 2+3 together: the individual per-invariant
+    // tolerances above (lost <= 1, phantom <= 2) are each individually
+    // tight, but only ONE op is ever ambiguous at abort time (the scheduler
+    // is single-threaded and every chaos_checkpoint site lives inside the
+    // one commit() in flight), so the two bounds can never BOTH max out
+    // from the same run. Enumerating every op's ambiguous-outcome shape as
+    // (lost, phantom): Insert->(0,1), MultiBatchInsert->(0,2),
+    // Delete->(1,0), Update->(1,1) -- the worst combined total across all
+    // of them is 2, not 1+2=3. Without this check, a genuine lost commit
+    // occurring alongside an unrelated genuine 2-row phantom would pass
+    // silently, since each individually stays within its own bound.
+    let max_tolerated_combined = if crashed { 2 } else { 0 };
+    assert!(
+        lost.len() + phantom.len() <= max_tolerated_combined,
+        "combined lost+phantom count {} exceeds what any single ambiguous op can produce \
+         (tolerated at most {max_tolerated_combined} for this {} run) -- lost: {lost:?}, \
+         phantom: {phantom:?}",
+        lost.len() + phantom.len(),
+        if crashed { "crashed" } else { "clean" }
+    );
+
     // New invariant: no resurrected tombstones. Unlike an ambiguous
     // insert outcome, there is no legitimate scenario where a durably
     // tombstoned row should still be visible -- Snapshot::is_visible is a
@@ -321,18 +400,29 @@ fn fast_tier_random_seeds_survive_random_crash_points() {
         if !result.crashed {
             // The randomly-picked threshold happened to exceed the total
             // checkpoint count for this seed — the run completed cleanly.
-            // Still a valid, still-checked iteration; not a bug. Unlike
-            // the insert-only workload, a clean run's total acknowledged
-            // COUNT is no longer a fixed function of NUM_AGENTS *
-            // OPS_PER_AGENT alone (MultiBatchInsert consumes 2 slots per
-            // commit, Delete/Update don't grow acknowledged_inserts by
-            // one-per-slot the way Insert does, and a dropped conflict
-            // acknowledges nothing at all) -- so this checks only that
-            // SOMETHING was acknowledged, not an exact count.
-            assert!(
-                !result.acknowledged_inserts.is_empty()
-                    || !result.acknowledged_tombstones.is_empty(),
-                "worker exited successfully but acknowledged nothing at all"
+            // Still a valid, still-checked iteration; not a bug.
+            //
+            // Unlike the insert-only workload, a clean run's total
+            // acknowledged ROW-ID count is no longer a fixed function of
+            // NUM_AGENTS * OPS_PER_AGENT alone (MultiBatchInsert grows
+            // acknowledged_inserts by 2 per slot-pair, Delete/Update don't
+            // grow it at all, and a dropped conflict acknowledges nothing).
+            // But op-SLOT count IS still exact regardless of verb mix --
+            // every slot prints exactly one ack line, and total_op_slots
+            // counts insert/delete/update/dropped as 1 and multibatch as 2,
+            // mirroring resolve_slot_consumption's own accounting -- so
+            // this restores the precision the original insert-only exact
+            // count had (a merely-nonempty check would pass even if every
+            // single agent op silently vanished, since setup_contested_pool
+            // unconditionally acks POOL_SIZE rows before any agent op runs).
+            assert_eq!(
+                result.total_op_slots,
+                NUM_AGENTS * OPS_PER_AGENT,
+                "worker exited successfully but didn't account for every op slot"
+            );
+            assert_eq!(
+                result.pool_acks, POOL_SIZE,
+                "worker exited successfully but didn't acknowledge every pool row"
             );
         }
 
