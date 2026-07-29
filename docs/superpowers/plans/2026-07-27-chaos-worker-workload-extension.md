@@ -490,7 +490,7 @@ impl Registry {
     }
 }
 
-#[cfg(all(test, not(loom)))]
+#[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
@@ -585,9 +585,9 @@ git commit -m "feat(chaos-worker): add row-id lookup and the contested-row regis
 
 - [ ] **Step 1: Write the failing tests**
 
-Append to `crates/chaos-worker/src/commit_ops.rs` (before the closing `}` of the existing `mod tests` block — add these as new `#[test]` functions inside that same module, and add the new non-test code above the `#[cfg(all(test, not(loom)))]` line):
+Append to `crates/chaos-worker/src/commit_ops.rs` (before the closing `}` of the existing `mod tests` block — add these as new `#[test]` functions inside that same module, and add the new non-test code above the `#[cfg(test)]` line):
 
-Add above the `#[cfg(all(test, not(loom)))]` line:
+Add above the `#[cfg(test)]` line:
 
 ```rust
 use std::io::Write as _;
