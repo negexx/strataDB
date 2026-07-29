@@ -1272,7 +1272,7 @@ git commit -m "feat(chaos-worker): add the live predicate-pruning reader thread"
 
 **Interfaces:**
 - Consumes: nothing from earlier tasks.
-- Produces: `fn install_failure_hook()`, called once at the very start of `main()` in Task 6 — no other task depends on this beyond that call site.
+- Produces: `fn install_failure_hook()`, called once at the very start of `main()` in Task 6 — no other task depends on this beyond that call site. This task does not modify `fn main()` itself at all (see Step 2's note on why the original plan for that turned out to be broken).
 
 - [ ] **Step 1: Write the hook**
 
@@ -1313,21 +1313,53 @@ Note: `writeln!`/`Write` are already imported at the top of `main.rs` (`use std:
 
 - [ ] **Step 2: Add a direct test for the hook, via a subprocess**
 
-This needs its own process (a panic hook affects the whole process, and `std::panic::set_hook` is global mutable state unsafe to share across parallel `cargo test` threads within one process). Add a `#[cfg(test)]` block at the bottom of `main.rs`:
+**Correction (caught before implementation, not a review finding on committed code):** an earlier version of this step spawned `std::env::current_exe()` with a bare `--test-trigger-genuine-failure` CLI flag and had `fn main()` check for it as its first action. That does not work: under `cargo test`, `current_exe()` returns the *test-harness* binary (the one whose entry point is libtest's generated `main`, not this crate's `fn main()` — visible in every test run's own header line, `Running unittests src\main.rs (target\debug\deps\chaos_worker-<hash>.exe)`). Passing an arbitrary flag to that binary reaches libtest's own CLI parser, not `fn main()` — verified empirically with a throwaway scratch crate reproducing this exact shape: libtest rejects the unrecognized flag (`error: Unrecognized option: 'trigger'`, exit code 101), so `fn main()`'s check is never reached and the panic never fires. Two consequences: this task needs no `fn main()` modification at all (Task 6 is unaffected — its `main()` just calls `install_failure_hook()` as its first line, nothing else), and the test must trigger the panic from *inside* the test-harness process itself, not by handing it a flag it won't recognize.
+
+The corrected pattern: a second, normally-inert `#[test]` function that only does anything when an env var is set, invoked by the first test via `current_exe()` with libtest's own `--exact <test-path>` filter (so only that one test runs in the subprocess) plus the env var that makes it act. This was also verified empirically (same scratch crate): the subprocess exits with code 2, prints the `GENUINE_FAILURE:` line, and — critically — every *other* test in the suite is unaffected when the env var is unset, because the inner test is then a no-op. This is what makes it safe despite `install_failure_hook`'s global `std::panic::set_hook` call: without the env var, the inner test never calls it, so the shared test-runner process's default hook is never touched.
+
+Add a `#[cfg(test)]` block at the bottom of `main.rs`:
 
 ```rust
 #[cfg(test)]
 mod failure_hook_tests {
-    // Spawns this SAME binary with a hidden test-only argument that
-    // triggers a deliberate panic after installing the hook, and checks
-    // the resulting exit code and printed message — the only way to
-    // observe a global panic hook's effect without corrupting other
-    // tests running in the same process.
+    use super::install_failure_hook;
+
+    /// Env var gating this test's actual body -- unset (the normal case,
+    /// when this test runs as part of the full suite) it's a no-op, so it
+    /// never installs the global panic hook and never disturbs any other
+    /// test sharing this process. Only the subprocess spawned by
+    /// `a_panic_after_the_hook_is_installed_exits_with_the_reserved_code`,
+    /// which sets this var and filters to run ONLY this one test, ever
+    /// exercises the real body.
+    const TRIGGER_ENV_VAR: &str = "CHAOS_WORKER_TEST_TRIGGER_GENUINE_FAILURE";
+
+    #[test]
+    fn inner_trigger_genuine_failure() {
+        if std::env::var(TRIGGER_ENV_VAR).is_err() {
+            return;
+        }
+        install_failure_hook();
+        panic!("deliberate test panic");
+    }
+
+    // Spawns THIS SAME test binary (via current_exe()), filtered with
+    // libtest's own --exact to run ONLY inner_trigger_genuine_failure,
+    // with the trigger env var set -- the only way to observe a global
+    // panic hook's effect without corrupting other tests sharing this
+    // process. A bare CLI flag checked in fn main() does NOT work here:
+    // current_exe() under `cargo test` is the libtest-harness binary,
+    // not this crate's real fn main() entry point, so an arbitrary flag
+    // reaches libtest's own parser (which rejects it), not fn main().
     #[test]
     fn a_panic_after_the_hook_is_installed_exits_with_the_reserved_code() {
         let exe = std::env::current_exe().unwrap();
         let output = std::process::Command::new(exe)
-            .arg("--test-trigger-genuine-failure")
+            .args([
+                "failure_hook_tests::inner_trigger_genuine_failure",
+                "--exact",
+                "--nocapture",
+            ])
+            .env(TRIGGER_ENV_VAR, "1")
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(2));
@@ -1340,21 +1372,10 @@ mod failure_hook_tests {
 }
 ```
 
-This relies on `main()` itself checking for `--test-trigger-genuine-failure` as its very first action (before normal arg parsing) — add this at the very top of `fn main()` in Task 6's rewrite (Step 3 below shows the exact placement). For now, to make Task 5's own test compile and pass in isolation before Task 6 rewrites the rest of `main`, temporarily add just this check at the top of the existing `fn main()`:
-
-```rust
-fn main() {
-    install_failure_hook();
-    if std::env::args().any(|a| a == "--test-trigger-genuine-failure") {
-        panic!("deliberate test panic");
-    }
-    // ... existing body unchanged for now; Task 6 rewrites everything below this point.
-```
-
 - [ ] **Step 3: Run tests to verify they pass**
 
-Run: `cargo test -p strata-chaos-worker`
-Expected: `failure_hook_tests::a_panic_after_the_hook_is_installed_exits_with_the_reserved_code` passes. (This spawns the real compiled test binary as a subprocess — `cargo test` builds it first, same mechanism the existing `escargot`-based orchestrator test relies on for the release binary, just via `current_exe()` here instead.)
+Run: `cargo test -p strata-chaos-worker --bin chaos-worker`
+Expected: `failure_hook_tests::a_panic_after_the_hook_is_installed_exits_with_the_reserved_code` and `failure_hook_tests::inner_trigger_genuine_failure` both pass (the inner one passes trivially as a no-op in the normal run — it only does real work inside the subprocess the outer test spawns).
 
 - [ ] **Step 4: Run the full verification gate**
 
@@ -1381,7 +1402,7 @@ git commit -m "feat(chaos-worker): add global panic hook with a reserved genuine
 
 - [ ] **Step 1: Replace the entire contents of `main.rs`**
 
-By this task, `crates/chaos-worker/src/main.rs` has accumulated, from Tasks 1/2/4/5: four `mod` declarations (each with a temporary `#[allow(dead_code)]` per Global Constraint 12), `install_failure_hook`, and a two-line trigger check prepended to the original (still insert-only) `fn main()`. This step **replaces the ENTIRE FILE, from the first line to the last** — consolidating all of that into one coherent final version, superseding (not adding to) the smaller incremental edits those earlier tasks made. Do not end up with the `mod` declarations or `install_failure_hook` defined twice, and drop every `#[allow(dead_code)]` — by this task every module is genuinely called from `main()`, so none of them are needed anymore (the code below has none).
+By this task, `crates/chaos-worker/src/main.rs` has accumulated, from Tasks 1/2/4/5: four `mod` declarations (each with a temporary `#[allow(dead_code)]` per Global Constraint 12), `install_failure_hook`, and its `failure_hook_tests` module (which does NOT touch `fn main()` — see Task 5's Step 2 correction). This step **replaces the ENTIRE FILE, from the first line to the last** — consolidating all of that into one coherent final version, superseding (not adding to) the smaller incremental edits those earlier tasks made. Do not end up with the `mod` declarations, `install_failure_hook`, or `failure_hook_tests` defined twice, and drop every `#[allow(dead_code)]` — by this task every module is genuinely called from `main()`, so none of them are needed anymore (the code below has none).
 
 Replace the entire contents of `crates/chaos-worker/src/main.rs` with:
 
@@ -1458,9 +1479,6 @@ fn setup_contested_pool(
 
 fn main() {
     install_failure_hook();
-    if std::env::args().any(|a| a == "--test-trigger-genuine-failure") {
-        panic!("deliberate test panic");
-    }
 
     let args: Vec<String> = std::env::args().collect();
     let dir = args
@@ -1602,6 +1620,47 @@ fn main() {
 
     reader_done.store(true, Ordering::SeqCst);
     reader_handle.join().expect("reader thread panicked without going through the failure hook -- this should be unreachable");
+}
+
+// Carried over verbatim from Task 5 -- this full-file replacement does not
+// touch failure_hook_tests, it only removes the #[allow(dead_code)]
+// attributes that guarded the mod declarations above while they were
+// unused. See Task 5's Step 2 for why this needs current_exe() + an
+// env-var-gated inner test rather than a fn main() CLI-flag check.
+#[cfg(test)]
+mod failure_hook_tests {
+    use super::install_failure_hook;
+
+    const TRIGGER_ENV_VAR: &str = "CHAOS_WORKER_TEST_TRIGGER_GENUINE_FAILURE";
+
+    #[test]
+    fn inner_trigger_genuine_failure() {
+        if std::env::var(TRIGGER_ENV_VAR).is_err() {
+            return;
+        }
+        install_failure_hook();
+        panic!("deliberate test panic");
+    }
+
+    #[test]
+    fn a_panic_after_the_hook_is_installed_exits_with_the_reserved_code() {
+        let exe = std::env::current_exe().unwrap();
+        let output = std::process::Command::new(exe)
+            .args([
+                "failure_hook_tests::inner_trigger_genuine_failure",
+                "--exact",
+                "--nocapture",
+            ])
+            .env(TRIGGER_ENV_VAR, "1")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("GENUINE_FAILURE: deliberate test panic"),
+            "expected the marker line in stdout, got: {stdout}"
+        );
+    }
 }
 ```
 
