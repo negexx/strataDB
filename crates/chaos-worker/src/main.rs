@@ -15,6 +15,12 @@ use rand_chacha::ChaCha8Rng;
 // plan, which removes this attribute once it is.
 #[allow(dead_code)]
 mod ops;
+// Not yet called from main() -- wired in by Task 6, which removes these
+// attributes once they are.
+#[allow(dead_code)]
+mod commit_ops;
+#[allow(dead_code)]
+mod schema;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

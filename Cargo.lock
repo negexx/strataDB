@@ -1973,8 +1973,10 @@ dependencies = [
 name = "strata-chaos-worker"
 version = "0.1.0"
 dependencies = [
+ "arrow",
  "rand",
  "rand_chacha",
+ "strata-query",
  "strata-storage",
  "strata-txn",
 ]
