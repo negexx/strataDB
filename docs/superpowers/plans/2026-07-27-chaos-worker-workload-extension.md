@@ -1082,9 +1082,13 @@ use crate::schema::schema_with_row_id;
 
 const READER_PREDICATE_NAME: &str = "agent0";
 const READER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1);
-/// Generous upper bound on rows any single chaos run will ever produce —
-/// large enough that `vector_search` never truncates a genuine match, not
-/// a performance-sensitive value.
+/// Generous upper bound on rows any single chaos run will ever produce.
+/// This bounds only the post-merge truncation across parts
+/// (`SegmentSet::search_filtered_pruned_live`'s final `k`-truncation) --
+/// per-part recall is governed by `ef` (`EF_SEARCH_DEFAULT`, widened by
+/// `widen_ef`), not by this constant. Fine for this one-directional
+/// pruned-subset-of-reference check; a future reverse-direction check
+/// (reference implies prunable) would need to reason about `ef` instead.
 const READER_SEARCH_K: usize = 100_000;
 
 /// One iteration's check, as a pure function over already-fetched
@@ -1127,15 +1131,22 @@ fn check_once(dataset: &Dataset, predicate: &Predicate) {
     let snapshot = dataset.snapshot();
     let schema = schema_with_row_id();
 
-    let Ok(pruned) = snapshot.vector_search(&[0.0, 0.0, 0.0], READER_SEARCH_K, Some(predicate))
-    else {
-        return; // e.g. no vector committed yet — nothing to compare.
-    };
+    // Neither call legitimately errors here: an empty snapshot (zero
+    // committed files) resolves to Ok(vec![]) on both paths, and this
+    // codebase has no compaction/GC that could make a manifest-listed
+    // file vanish out from under a live snapshot. A real Err is therefore
+    // always a genuine bug (a dimension mismatch, a predicate/column type
+    // mismatch, a cast failure) — exactly the class of failure this
+    // reader thread exists to surface via the global panic hook (design
+    // doc §3.4), so it must panic here, not silently skip the check.
+    let pruned = snapshot
+        .vector_search(&[0.0, 0.0, 0.0], READER_SEARCH_K, Some(predicate))
+        .expect("vector_search must succeed against a live snapshot");
     let pruned_row_ids: Vec<u64> = pruned.into_iter().map(|m| m.row_id).collect();
 
-    let Ok(all_rows) = snapshot.scan(&schema) else {
-        return;
-    };
+    let all_rows = snapshot
+        .scan(&schema)
+        .expect("scan must succeed against a live snapshot");
     let name_col = all_rows
         .column(all_rows.schema().index_of("name").unwrap())
         .as_any()
@@ -1163,8 +1174,18 @@ fn check_once(dataset: &Dataset, predicate: &Predicate) {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "strata-chaos-worker-reader-test-{label}-{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        dir
+    }
 
     #[test]
     fn disagreement_is_empty_when_every_pruned_id_is_in_the_reference() {
@@ -1180,17 +1201,41 @@ mod tests {
 
     #[test]
     fn spawn_and_stop_against_a_real_but_empty_dataset_does_not_panic() {
-        let dir = std::env::temp_dir().join(format!(
-            "strata-chaos-worker-reader-test-{}",
-            std::process::id()
-        ));
-        std::fs::remove_dir_all(&dir).ok();
+        let dir = temp_dir("spawn-empty");
         let dataset = Arc::new(Dataset::create(&dir).unwrap());
 
         let (handle, done) = spawn(Arc::clone(&dataset));
         std::thread::sleep(std::time::Duration::from_millis(20));
         done.store(true, Ordering::SeqCst);
         handle.join().unwrap();
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn check_once_passes_against_real_committed_rows() {
+        // The empty-dataset spawn test above never exercises check_once's
+        // actual comparison logic: num_rows() == 0 means the reference-set
+        // construction, both `expect` downcasts, and the assertion never
+        // run against real data anywhere else in this module's tests. Two
+        // agents' worth of rows makes the "name" predicate load-bearing --
+        // a check_once that ignored the predicate and returned every
+        // row's id, or that matched the wrong column, would still pass a
+        // single-agent version of this test.
+        let dir = temp_dir("check-once-real-data");
+        let dataset = Dataset::create(&dir).unwrap();
+        let mut txn = dataset.begin();
+        txn.insert(strata_txn::mvp_fixtures::mvp_row(1, "agent0", [1.0, 0.0, 0.0]).unwrap());
+        txn.insert(strata_txn::mvp_fixtures::mvp_row(2, "agent1", [0.0, 1.0, 0.0]).unwrap());
+        txn.commit().unwrap();
+
+        let predicate = Predicate::Eq(
+            "name".to_string(),
+            Value::Utf8(READER_PREDICATE_NAME.to_string()),
+        );
+        // Must not panic: the pruned agent0-only search result must be a
+        // subset of the unpruned reference scan's agent0 rows.
+        check_once(&dataset, &predicate);
 
         std::fs::remove_dir_all(&dir).ok();
     }
