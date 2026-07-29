@@ -26,16 +26,39 @@ mod schema;
 #[allow(dead_code)]
 mod reader;
 
-/// Installs a global panic hook: any panic, on the main thread or the
-/// reader thread, prints a `GENUINE_FAILURE: <message>` line and exits
-/// with a reserved code — distinct from `chaos_checkpoint`'s
-/// `std::process::abort()` (an entirely different termination mechanism,
-/// not a panic) — so `tests/sim`'s orchestrator can tell a genuine bug
-/// apart from an expected chaos-induced crash without decoding
-/// OS-specific exit signals. See design doc §3.4.
+/// Reserved exit code [`install_failure_hook`]'s hook uses for a genuine
+/// panic, distinct from `chaos_checkpoint`'s `std::process::abort()` (an
+/// entirely different termination mechanism, not a panic) — so
+/// `tests/sim`'s orchestrator can tell a genuine bug apart from an
+/// expected chaos-induced crash without decoding OS-specific exit
+/// signals. See design doc §3.4.
+// Not yet called from main() -- wired in by Task 6, which removes this
+// attribute once it is. (dead_code on this const is redundant once
+// install_failure_hook is allow'd too, since rustc's dead-code pass seeds
+// liveness from that function -- kept anyway for clarity at the
+// definition site, and both are removed together in Task 6.)
 #[allow(dead_code)]
 const GENUINE_FAILURE_EXIT_CODE: i32 = 2;
 
+/// Installs a global panic hook: any panic, on the main thread or the
+/// reader thread, prints a `GENUINE_FAILURE: <message>` line and exits
+/// with [`GENUINE_FAILURE_EXIT_CODE`]. See design doc §3.4.
+///
+/// This unconditionally exits the process, which preempts
+/// `crates/storage`'s `catch_unwind`-based recovery for a corrupt data
+/// file (`crates/storage/src/datafile.rs`'s `read_batch`/
+/// `read_batch_columns`) — a panic hook runs at the panic site, before
+/// unwinding begins, so `catch_unwind` never gets a chance to observe and
+/// convert the payload. Accepted deliberately, not overlooked: design doc
+/// §3.4 mandates surfacing *any* panic as a genuine failure for this
+/// harness, and a data file this worker itself just wrote and fsynced
+/// before the manifest CAS that publishes it cannot be the truncated/
+/// corrupt file that recovery path exists for (that path is for
+/// untrusted/externally-corrupted input, not this worker's own writes) —
+/// so the recovery path this preempts should not be reachable from a
+/// chaos run in practice, and would be a design bug if it ever were.
+// Not yet called from main() -- wired in by Task 6, which removes this
+// attribute once it is.
 #[allow(dead_code)]
 fn install_failure_hook() {
     std::panic::set_hook(Box::new(|info| {
@@ -46,12 +69,16 @@ fn install_failure_hook() {
         } else {
             "<non-string panic payload>".to_string()
         };
+        let location = info
+            .location()
+            .map(|l| format!(" at {}:{}", l.file(), l.line()))
+            .unwrap_or_default();
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
         // Best-effort: if even this write fails, still exit with the
         // reserved code below so the orchestrator's exit-code check still
         // fires (it does not require the message line to be present).
-        let _ = writeln!(out, "GENUINE_FAILURE: {message}");
+        let _ = writeln!(out, "GENUINE_FAILURE: {message}{location}");
         let _ = out.flush();
         std::process::exit(GENUINE_FAILURE_EXIT_CODE);
     }));
