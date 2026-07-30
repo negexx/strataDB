@@ -3,12 +3,18 @@
 //!
 //! A manifest is one immutable file per version, named so lexicographic
 //! order equals numeric order (`{version:020}.manifest`, following Lance's
-//! own convention). Commit is: write to a temp name, fsync, atomically
-//! rename into place. A crash mid-write leaves only a `.tmp-*` file, which
-//! never matches the `*.manifest` glob `read_current` looks for — so a
-//! reader can never observe a partially-written version. This *is* the
-//! mechanism the Phase 1 "kill -9 mid-write, restart, recover last
-//! committed version" MVP checklist item tests.
+//! own convention). Commit is: write to a temp name (via
+//! [`crate::backend::LocalFs::put`]), fsync, atomically rename into place.
+//! A crash mid-write leaves only a `.tmp-*` file behind. Its stem (the
+//! part before `.manifest`) always starts with a `.` from the temp-name
+//! prefix, so it can never parse as a `u64` version — `read_current`
+//! excludes it on that basis. The leftover tmp file's name does still end
+//! in `.manifest` (it's derived from the target filename), so this is a
+//! single-guarded exclusion (numeric-parse failure), not a
+//! `*.manifest`-glob mismatch — but a reader still can never observe a
+//! partially-written version either way. This *is* the mechanism the
+//! Phase 1 "kill -9 mid-write, restart, recover last committed version"
+//! MVP checklist item tests.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -343,6 +349,47 @@ mod tests {
         assert_eq!(
             current, m0,
             "leftover .tmp file must not be treated as current"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn leftover_tmp_file_with_the_real_localfs_naming_shape_is_never_picked_up_as_current() {
+        // Unlike `leftover_tmp_file_is_never_picked_up_as_current` above
+        // (which uses the pre-Backend `.tmp-{version}` naming and so only
+        // exercises the suffix-mismatch path), this uses the actual shape
+        // `LocalFs::tmp_path_for` produces: `.tmp-{pid}-{n}-{file_name}`,
+        // where `file_name` is the target's own filename -- so this tmp
+        // file's name *does* end in `.manifest`. Exclusion here rests
+        // entirely on the stem (`.tmp-1234-0-...`) never parsing as a u64.
+        let dir = temp_dataset_dir("real-tmp-shape");
+        let m0 = Manifest {
+            version: 0,
+            data_files: vec![DataFileEntry {
+                name: "a.arrow".to_string(),
+                stats: HashMap::new(),
+            }],
+            next_row_id: 0,
+            tombstones: Vec::new(),
+            next_attempt_id: 0,
+            commit_time_high_water: 0,
+            segments: Vec::new(),
+        };
+        commit_manifest(&dir, &m0).unwrap();
+
+        let versions = versions_dir(&dir);
+        let mut tmp = File::create(versions.join(format!(
+            ".tmp-{}-0-{:020}.manifest",
+            std::process::id(),
+            1
+        )))
+        .unwrap();
+        tmp.write_all(b"{ incomplete json").unwrap();
+
+        let current = read_current(&dir).unwrap().unwrap();
+        assert_eq!(
+            current, m0,
+            "a leftover tmp file using LocalFs's real naming shape must not be treated as current"
         );
         fs::remove_dir_all(&dir).ok();
     }
