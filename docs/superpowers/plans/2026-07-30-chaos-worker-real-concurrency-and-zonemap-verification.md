@@ -828,13 +828,655 @@ Expected: builds clean, all unit tests pass. (`failure_hook_tests` and `stdout_l
 cargo test --workspace
 ```
 
-Expected: `fast_tier_random_seeds_survive_random_crash_points` passes. Op *content* per agent (which verbs, which vectors, which targets) is unchanged from before — only *which thread* runs each agent's sequence, and the exact interleaving of `chaos_checkpoint` counts across agents, is now nondeterministic. This is the reproducibility tradeoff the design doc states explicitly; it does not mean invariants can fail, since the invariants never depended on exact interleaving in the first place.
+Expected: `fast_tier_random_seeds_survive_random_crash_points` passes. Op *content* per agent (which verbs, which vectors, which targets) is unchanged from before — only *which thread* runs each agent's sequence, and the exact interleaving of `chaos_checkpoint` counts across agents, is now nondeterministic. **Correction (found during Task 3's review, see Task 3.5 below): this DOES affect the invariants** — `tests/sim/tests/chaos.rs`'s lost/phantom tolerances were derived from a "the scheduler is single-threaded, so at most one op is ever ambiguous at abort time" premise that this task's own change makes false. Task 3 is not complete until Task 3.5 closes that gap.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add crates/chaos-worker/src/main.rs
 git commit -m "feat(chaos-worker): replace the sequential scheduler with real per-agent threads"
+```
+
+---
+
+### Task 3.5: Precise in-flight-op tracking for `chaos.rs`'s invariant tolerances
+
+**Why this task exists (found during Task 3's review, not anticipated by the original design):** `tests/sim/tests/chaos.rs`'s lost/phantom/joint tolerances (`max_tolerated_lost`, `max_tolerated_phantoms`, `max_tolerated_combined`) were derived from and documented as depending on "the scheduler is single-threaded and every `chaos_checkpoint` site lives inside the one `commit()` in flight, so at most one op is ever ambiguous at abort time." Task 3 replaces the single-threaded scheduler with `NUM_AGENTS` real threads, so up to `NUM_AGENTS` ops (one per agent — each agent thread only ever has one op in flight at a time, since an agent's own ops run sequentially within its thread) can be genuinely ambiguous at the moment `chaos_checkpoint`'s process-global counter trips `std::process::abort()`. Left uncorrected, the harness could report a **false invariant violation on a correct database** — exactly the failure mode a Jepsen-style harness must not produce, and the class of bug that trains people to loosen tolerances until they stop meaning anything.
+
+**Approach (the human explicitly chose this over a cheaper "just scale the constants by `NUM_AGENTS`" alternative):** rather than widening the tolerance to a worst-case bound, make the harness know EXACTLY which ops were in flight at abort time, and derive the tolerance from their actual verb shapes. This keeps precision intact — a run only gets extra tolerance for ops that were provably in flight, not a blanket allowance.
+
+**Files:**
+- Modify: `crates/chaos-worker/src/main.rs` (`setup_contested_pool`, `run_agent`)
+- Modify: `tests/sim/tests/chaos.rs` (`RunResult`, `run_worker`, `check_invariants`)
+
+**Interfaces:**
+- New ack-line formats (in addition to the existing ones, which are all unchanged): `pool starting insert row {i}` (printed before each pool insert attempt) and `agent {agent} starting {verb} op {op}` (printed before each agent op's execute_* call, `verb` ∈ `{insert, delete, update, multibatch}` — the FINAL resolved verb, i.e. after any Delete/Update-to-Insert downgrade, not the originally-drawn verb).
+- `RunResult` gains two fields: `max_tolerated_lost: usize`, `max_tolerated_phantoms: usize`, computed during parsing from the actual set of started-but-never-completed ops in this specific run (not a flat constant).
+
+**Global constraint amendment:** this task supersedes this plan's original Global Constraint "No change to `tests/sim/tests/chaos.rs`'s invariants" — that constraint was written before this gap was discovered and is now known to be wrong. The invariant *definitions* (no corruption, no lost commits, no phantom commits, no resurrected tombstones, row+index consistency) do not change; only how their crash-tolerance *budgets* are computed changes, from a flat constant to a precise sum over actually-observed in-flight ops.
+
+- [ ] **Step 1: Write the failing test for the new ambiguity-shape helper**
+
+Add to `tests/sim/tests/chaos.rs`'s bottom (create a `#[cfg(test)] mod tests` block if one doesn't already exist in this file — it doesn't today, so add one):
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ambiguity_shape_matches_the_documented_per_verb_table() {
+        assert_eq!(ambiguity_shape("insert"), (0, 1));
+        assert_eq!(ambiguity_shape("delete"), (1, 0));
+        assert_eq!(ambiguity_shape("update"), (1, 1));
+        assert_eq!(ambiguity_shape("multibatch"), (0, 2));
+    }
+
+    #[test]
+    #[should_panic(expected = "unrecognized verb")]
+    fn ambiguity_shape_panics_on_an_unknown_verb() {
+        ambiguity_shape("bogus");
+    }
+}
+```
+
+- [ ] **Step 2: Run it to verify it fails**
+
+```bash
+cargo test -p strata-sim --test chaos ambiguity_shape
+```
+
+Expected: FAIL to compile — `ambiguity_shape` doesn't exist yet. (If the package name for `tests/sim` differs from `strata-sim`, use whatever `cargo test --workspace -- --list 2>&1 | grep ambiguity_shape` or the crate's `Cargo.toml` `[package] name` shows — check before running.)
+
+- [ ] **Step 3: Add `ambiguity_shape` to `chaos.rs`**
+
+Add near the top of the file, after the existing constants:
+
+```rust
+/// The (lost, phantom) tolerance a single op of this shape contributes if
+/// it was genuinely in flight — mid-commit, ack line not yet printed —
+/// when a chaos abort fired. Mirrors `crates/chaos-worker`'s own
+/// `resolve_slot_consumption`/`commit_ops.rs` op semantics: a pure insert
+/// (or a Delete/Update downgraded to one) can only ever produce a phantom
+/// (the row may have committed durably with no ack); a delete can only
+/// ever produce a lost commit (the tombstone may have committed durably
+/// with no ack, hiding a row `acknowledged_inserts` still expects to see);
+/// an update does both (it is a delete-of-old plus insert-of-new); a
+/// multi-batch insert can phantom BOTH of its rows behind the one ack line
+/// that never printed.
+fn ambiguity_shape(verb: &str) -> (usize, usize) {
+    match verb {
+        "insert" => (0, 1),
+        "delete" => (1, 0),
+        "update" => (1, 1),
+        "multibatch" => (0, 2),
+        other => panic!("unrecognized verb in a 'starting' ack line: {other:?}"),
+    }
+}
+```
+
+- [ ] **Step 4: Run the test to verify it passes**
+
+```bash
+cargo test -p strata-sim --test chaos ambiguity_shape
+```
+
+Expected: PASS.
+
+- [ ] **Step 5: Add the "starting" ack lines to `crates/chaos-worker/src/main.rs`**
+
+In `setup_contested_pool`, change:
+
+```rust
+fn setup_contested_pool(dataset: &strata_txn::Dataset, seed: u64, registry: &mut Registry) {
+    let mut rng = ChaCha8Rng::seed_from_u64(seed ^ POOL_STREAM);
+    for i in 0..POOL_SIZE {
+        let business_id = -1 - i64::try_from(i).unwrap();
+        let vector = [
+            rng.random::<f32>(),
+            rng.random::<f32>(),
+            rng.random::<f32>(),
+        ];
+        let outcome = execute_insert(dataset, business_id, "pool", vector);
+        let ExecOutcome::CommittedInsert { row_id, .. } = outcome else {
+            panic!("pool setup insert must always commit cleanly: {outcome:?}");
+        };
+        registry.record_pool_row(row_id);
+        print_line(&format!("pool committed insert row_id {row_id}"));
+    }
+}
+```
+
+to:
+
+```rust
+fn setup_contested_pool(dataset: &strata_txn::Dataset, seed: u64, registry: &mut Registry) {
+    let mut rng = ChaCha8Rng::seed_from_u64(seed ^ POOL_STREAM);
+    for i in 0..POOL_SIZE {
+        let business_id = -1 - i64::try_from(i).unwrap();
+        let vector = [
+            rng.random::<f32>(),
+            rng.random::<f32>(),
+            rng.random::<f32>(),
+        ];
+        print_line(&format!("pool starting insert row {i}"));
+        let outcome = execute_insert(dataset, business_id, "pool", vector);
+        let ExecOutcome::CommittedInsert { row_id, .. } = outcome else {
+            panic!("pool setup insert must always commit cleanly: {outcome:?}");
+        };
+        registry.record_pool_row(row_id);
+        print_line(&format!("pool committed insert row_id {row_id}"));
+    }
+}
+```
+
+(Use whatever qualification style — `print_line` or `commit_ops::print_line` — Task 2 actually landed with; both resolve to the same function.)
+
+In `run_agent`, add one `print_line` call immediately before each of the four `execute_*` call sites, using the FINAL resolved verb (post-downgrade for Delete/Update). Change:
+
+```rust
+        let outcome = match verb {
+            OpVerb::Insert => {
+                let global_id = agent * ops_per_agent + op;
+                let vector = vectors[usize::try_from(op).unwrap()];
+                execute_insert(
+                    dataset,
+                    i64::try_from(global_id).unwrap(),
+                    &format!("agent{agent}"),
+                    vector,
+                )
+            }
+            OpVerb::MultiBatchInsert => {
+                let global_id_0 = agent * ops_per_agent + op;
+                let global_id_1 = agent * ops_per_agent + op + 1;
+                let vector_0 = vectors[usize::try_from(op).unwrap()];
+                let vector_1 = vectors[usize::try_from(op + 1).unwrap()];
+                execute_multi_batch_insert(
+                    dataset,
+                    [
+                        i64::try_from(global_id_0).unwrap(),
+                        i64::try_from(global_id_1).unwrap(),
+                    ],
+                    &format!("agent{agent}"),
+                    [vector_0, vector_1],
+                )
+            }
+            OpVerb::Delete => {
+                let (pool_rows, own_rows) = {
+                    let guard = registry.lock().unwrap();
+                    (guard.pool_rows().to_vec(), guard.own_rows(pick).to_vec())
+                };
+                if let Some(target_row_id) = resolve_target(&mut target_rng, &pool_rows, &own_rows)
+                {
+                    execute_delete(dataset, target_row_id)
+                } else {
+                    // No eligible target yet -- downgrade to Insert per design doc §3.1.
+                    let global_id = agent * ops_per_agent + op;
+                    let vector = vectors[usize::try_from(op).unwrap()];
+                    execute_insert(
+                        dataset,
+                        i64::try_from(global_id).unwrap(),
+                        &format!("agent{agent}"),
+                        vector,
+                    )
+                }
+            }
+            OpVerb::Update => {
+                let (pool_rows, own_rows) = {
+                    let guard = registry.lock().unwrap();
+                    (guard.pool_rows().to_vec(), guard.own_rows(pick).to_vec())
+                };
+                if let Some(target_row_id) = resolve_target(&mut target_rng, &pool_rows, &own_rows)
+                {
+                    let global_id = agent * ops_per_agent + op;
+                    let vector = vectors[usize::try_from(op).unwrap()];
+                    execute_update(
+                        dataset,
+                        target_row_id,
+                        i64::try_from(global_id).unwrap(),
+                        &format!("agent{agent}"),
+                        vector,
+                    )
+                } else {
+                    let global_id = agent * ops_per_agent + op;
+                    let vector = vectors[usize::try_from(op).unwrap()];
+                    execute_insert(
+                        dataset,
+                        i64::try_from(global_id).unwrap(),
+                        &format!("agent{agent}"),
+                        vector,
+                    )
+                }
+            }
+        };
+```
+
+to:
+
+```rust
+        let outcome = match verb {
+            OpVerb::Insert => {
+                let global_id = agent * ops_per_agent + op;
+                let vector = vectors[usize::try_from(op).unwrap()];
+                print_line(&format!("agent {agent} starting insert op {op}"));
+                execute_insert(
+                    dataset,
+                    i64::try_from(global_id).unwrap(),
+                    &format!("agent{agent}"),
+                    vector,
+                )
+            }
+            OpVerb::MultiBatchInsert => {
+                let global_id_0 = agent * ops_per_agent + op;
+                let global_id_1 = agent * ops_per_agent + op + 1;
+                let vector_0 = vectors[usize::try_from(op).unwrap()];
+                let vector_1 = vectors[usize::try_from(op + 1).unwrap()];
+                print_line(&format!("agent {agent} starting multibatch op {op}"));
+                execute_multi_batch_insert(
+                    dataset,
+                    [
+                        i64::try_from(global_id_0).unwrap(),
+                        i64::try_from(global_id_1).unwrap(),
+                    ],
+                    &format!("agent{agent}"),
+                    [vector_0, vector_1],
+                )
+            }
+            OpVerb::Delete => {
+                let (pool_rows, own_rows) = {
+                    let guard = registry.lock().unwrap();
+                    (guard.pool_rows().to_vec(), guard.own_rows(pick).to_vec())
+                };
+                if let Some(target_row_id) = resolve_target(&mut target_rng, &pool_rows, &own_rows)
+                {
+                    print_line(&format!("agent {agent} starting delete op {op}"));
+                    execute_delete(dataset, target_row_id)
+                } else {
+                    // No eligible target yet -- downgrade to Insert per design doc §3.1.
+                    let global_id = agent * ops_per_agent + op;
+                    let vector = vectors[usize::try_from(op).unwrap()];
+                    print_line(&format!("agent {agent} starting insert op {op}"));
+                    execute_insert(
+                        dataset,
+                        i64::try_from(global_id).unwrap(),
+                        &format!("agent{agent}"),
+                        vector,
+                    )
+                }
+            }
+            OpVerb::Update => {
+                let (pool_rows, own_rows) = {
+                    let guard = registry.lock().unwrap();
+                    (guard.pool_rows().to_vec(), guard.own_rows(pick).to_vec())
+                };
+                if let Some(target_row_id) = resolve_target(&mut target_rng, &pool_rows, &own_rows)
+                {
+                    let global_id = agent * ops_per_agent + op;
+                    let vector = vectors[usize::try_from(op).unwrap()];
+                    print_line(&format!("agent {agent} starting update op {op}"));
+                    execute_update(
+                        dataset,
+                        target_row_id,
+                        i64::try_from(global_id).unwrap(),
+                        &format!("agent{agent}"),
+                        vector,
+                    )
+                } else {
+                    let global_id = agent * ops_per_agent + op;
+                    let vector = vectors[usize::try_from(op).unwrap()];
+                    print_line(&format!("agent {agent} starting insert op {op}"));
+                    execute_insert(
+                        dataset,
+                        i64::try_from(global_id).unwrap(),
+                        &format!("agent{agent}"),
+                        vector,
+                    )
+                }
+            }
+        };
+```
+
+Note: the "starting" line is printed exactly once per op-slot, before the FIRST attempt of a Delete/Update (which may retry once internally via `commit_with_retry_once`) — a crash during either attempt is covered by the same one line, since a retry always operates on the same target/verb.
+
+- [ ] **Step 6: Build and run chaos-worker's unit tests**
+
+```bash
+cargo build -p strata-chaos-worker
+cargo test -p strata-chaos-worker
+```
+
+Expected: all pass (no existing test asserts exact stdout content for a full run, so this addition doesn't break anything at this layer — the orchestrator-level tests in the next steps are what actually exercise the new lines).
+
+- [ ] **Step 7: Rewrite `tests/sim/tests/chaos.rs`'s parser to track in-flight ops precisely**
+
+Add `use std::collections::HashMap;` alongside the existing `use std::collections::HashSet;`.
+
+Replace `RunResult`'s definition:
+
+```rust
+struct RunResult {
+    acknowledged_inserts: HashSet<u64>,
+    acknowledged_tombstones: HashSet<u64>,
+    total_op_slots: u64,
+    pool_acks: u64,
+    crashed: bool,
+}
+```
+
+with:
+
+```rust
+struct RunResult {
+    acknowledged_inserts: HashSet<u64>,
+    acknowledged_tombstones: HashSet<u64>,
+    total_op_slots: u64,
+    pool_acks: u64,
+    crashed: bool,
+    /// Sum of `ambiguity_shape(verb).0` over every op that printed a
+    /// "starting" line but never printed its matching completion line in
+    /// this specific run -- computed from the ACTUAL observed in-flight
+    /// set, not a flat per-run constant. Zero on a run that exited
+    /// cleanly (every started op's thread runs its own commit loop to
+    /// completion before the process exits 0, so an unmatched start is
+    /// only possible when the process was aborted mid-commit).
+    max_tolerated_lost: usize,
+    /// Sum of `ambiguity_shape(verb).1` over the same in-flight set.
+    max_tolerated_phantoms: usize,
+}
+```
+
+Replace the entire body of `run_worker` from the `let stdout = String::from_utf8_lossy(&output.stdout);` line through the `RunResult { ... }` construction at the end with:
+
+```rust
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut acknowledged_inserts = HashSet::new();
+    let mut acknowledged_tombstones = HashSet::new();
+    let mut total_op_slots: u64 = 0;
+    let mut pool_acks: u64 = 0;
+    let mut pool_starts: u64 = 0;
+    // Keyed by (agent, op) -- an agent's own ops run sequentially within
+    // one thread, so at most one entry per agent can ever be present at
+    // the end of parsing (the one truly in flight when the process
+    // aborted, if it aborted mid-op).
+    let mut started_agent_ops: HashMap<(u64, u64), String> = HashMap::new();
+    for line in stdout.lines() {
+        let words: Vec<&str> = line.split(' ').collect();
+        match words.as_slice() {
+            ["pool", "starting", "insert", "row", _] => {
+                pool_starts += 1;
+            }
+            ["pool", "committed", "insert", "row_id", row_id] => {
+                acknowledged_inserts.insert(row_id.parse().unwrap());
+                pool_acks += 1;
+            }
+            ["agent", agent, "starting", verb, "op", op] => {
+                started_agent_ops.insert(
+                    (agent.parse().unwrap(), op.parse().unwrap()),
+                    (*verb).to_string(),
+                );
+            }
+            ["agent", agent, "committed", "insert", "op", op, "row_id", row_id] => {
+                acknowledged_inserts.insert(row_id.parse().unwrap());
+                total_op_slots += 1;
+                started_agent_ops.remove(&(agent.parse().unwrap(), op.parse().unwrap()));
+            }
+            [
+                "agent",
+                agent,
+                "committed",
+                "delete",
+                "op",
+                op,
+                "target_row_id",
+                target_row_id,
+            ] => {
+                acknowledged_tombstones.insert(target_row_id.parse().unwrap());
+                total_op_slots += 1;
+                started_agent_ops.remove(&(agent.parse().unwrap(), op.parse().unwrap()));
+            }
+            [
+                "agent",
+                agent,
+                "committed",
+                "update",
+                "op",
+                op,
+                "target_row_id",
+                target_row_id,
+                "row_id",
+                row_id,
+            ] => {
+                acknowledged_tombstones.insert(target_row_id.parse().unwrap());
+                acknowledged_inserts.insert(row_id.parse().unwrap());
+                total_op_slots += 1;
+                started_agent_ops.remove(&(agent.parse().unwrap(), op.parse().unwrap()));
+            }
+            [
+                "agent",
+                agent,
+                "committed",
+                "multibatch",
+                "op",
+                op,
+                "row_ids",
+                row_ids,
+            ] => {
+                for id in row_ids.split(',') {
+                    acknowledged_inserts.insert(id.parse().unwrap());
+                }
+                total_op_slots += 2;
+                started_agent_ops.remove(&(agent.parse().unwrap(), op.parse().unwrap()));
+            }
+            ["agent", agent, "dropped", "op", op, "(conflict)"] => {
+                // The dropped line carries no verb, so this hardcodes 1
+                // slot -- correct only because a droppable op always costs
+                // exactly 1 slot today: execute_delete/execute_update are
+                // the only ops that can return Dropped (commit_ops.rs's
+                // commit_with_retry_once), and both are 1-slot ops.
+                // execute_insert/execute_multi_batch_insert panic on any
+                // commit error instead of returning Dropped, so a 2-slot
+                // MultiBatchInsert can never reach this arm. If that ever
+                // changes, this hardcoded 1 would silently desync
+                // total_op_slots from the real slot count on a clean run,
+                // and the exact-count assertion below would start failing
+                // with a misleading "didn't account for every op slot"
+                // message instead of pointing at this arm.
+                total_op_slots += 1;
+                started_agent_ops.remove(&(agent.parse().unwrap(), op.parse().unwrap()));
+            }
+            _ => panic!("unrecognized chaos-worker stdout line: {line:?}"),
+        }
+    }
+
+    // Precise crash-tolerance budget: sum ambiguity_shape over exactly the
+    // ops that started but never completed in THIS run, not a flat
+    // per-run constant. At most one pool insert can be in flight (pool
+    // setup is strictly sequential, single-threaded, and runs to
+    // completion before any agent thread spawns) and at most one op per
+    // agent (each agent's own ops run sequentially within its thread) --
+    // see design doc Part 1 and this task's own rationale.
+    let mut max_tolerated_lost = 0usize;
+    let mut max_tolerated_phantoms = 0usize;
+    if pool_starts > pool_acks {
+        debug_assert_eq!(
+            pool_starts - pool_acks,
+            1,
+            "pool setup is strictly sequential; at most one pool insert can ever be in flight"
+        );
+        let (lost, phantom) = ambiguity_shape("insert");
+        max_tolerated_lost += lost;
+        max_tolerated_phantoms += phantom;
+    }
+    for verb in started_agent_ops.values() {
+        let (lost, phantom) = ambiguity_shape(verb);
+        max_tolerated_lost += lost;
+        max_tolerated_phantoms += phantom;
+    }
+
+    RunResult {
+        acknowledged_inserts,
+        acknowledged_tombstones,
+        total_op_slots,
+        pool_acks,
+        crashed: !output.status.success(),
+        max_tolerated_lost,
+        max_tolerated_phantoms,
+    }
+```
+
+- [ ] **Step 8: Rewrite `check_invariants`'s tolerance computation**
+
+Replace:
+
+```rust
+    let lost: Vec<&u64> = acknowledged
+        .difference(&visible_row_ids)
+        .filter(|id| !result.acknowledged_tombstones.contains(id))
+        .collect();
+    let max_tolerated_lost = usize::from(crashed);
+    assert!(
+        lost.len() <= max_tolerated_lost,
+        "lost commits: acknowledged but not visible after reopen: {lost:?} \
+         (tolerated at most {max_tolerated_lost} for this {} run)",
+        if crashed { "crashed" } else { "clean" }
+    );
+```
+
+to:
+
+```rust
+    let lost: Vec<&u64> = acknowledged
+        .difference(&visible_row_ids)
+        .filter(|id| !result.acknowledged_tombstones.contains(id))
+        .collect();
+    let max_tolerated_lost = result.max_tolerated_lost;
+    if !crashed {
+        assert_eq!(
+            max_tolerated_lost, 0,
+            "a clean (non-crashed) run must never have an op that started but never completed -- \
+             a nonzero budget here means the 'starting'/'committed'/'dropped' ack-line protocol \
+             itself is broken, not a legitimate ambiguity"
+        );
+    }
+    assert!(
+        lost.len() <= max_tolerated_lost,
+        "lost commits: acknowledged but not visible after reopen: {lost:?} \
+         (tolerated at most {max_tolerated_lost}, computed from the ops genuinely in flight \
+         at abort time in this {} run)",
+        if crashed { "crashed" } else { "clean" }
+    );
+```
+
+Replace:
+
+```rust
+    let phantom: Vec<&u64> = visible_row_ids.difference(acknowledged).collect();
+    let max_tolerated_phantoms = if crashed { 2 } else { 0 };
+    assert!(
+        phantom.len() <= max_tolerated_phantoms,
+        "phantom commits: visible after reopen but never acknowledged: {phantom:?} \
+         (tolerated at most {max_tolerated_phantoms} for this {} run)",
+        if crashed { "crashed" } else { "clean" }
+    );
+```
+
+to:
+
+```rust
+    let phantom: Vec<&u64> = visible_row_ids.difference(acknowledged).collect();
+    let max_tolerated_phantoms = result.max_tolerated_phantoms;
+    if !crashed {
+        assert_eq!(
+            max_tolerated_phantoms, 0,
+            "a clean (non-crashed) run must never have an op that started but never completed"
+        );
+    }
+    assert!(
+        phantom.len() <= max_tolerated_phantoms,
+        "phantom commits: visible after reopen but never acknowledged: {phantom:?} \
+         (tolerated at most {max_tolerated_phantoms}, computed from the ops genuinely in flight \
+         at abort time in this {} run)",
+        if crashed { "crashed" } else { "clean" }
+    );
+```
+
+Replace:
+
+```rust
+    let max_tolerated_combined = if crashed { 2 } else { 0 };
+    assert!(
+        lost.len() + phantom.len() <= max_tolerated_combined,
+        "combined lost+phantom count {} exceeds what any single ambiguous op can produce \
+         (tolerated at most {max_tolerated_combined} for this {} run) -- lost: {lost:?}, \
+         phantom: {phantom:?}",
+        lost.len() + phantom.len(),
+        if crashed { "crashed" } else { "clean" }
+    );
+```
+
+to:
+
+```rust
+    // The joint bound is exactly the sum of the two individual budgets --
+    // both are sums of ambiguity_shape(verb) over the SAME set of
+    // genuinely-in-flight ops, so no separate enumeration/reasoning is
+    // needed here (unlike the old flat-constant version, which had to
+    // reason about the worst case across UNKNOWN verbs; this version
+    // knows each in-flight op's actual verb from its "starting" line).
+    let max_tolerated_combined = max_tolerated_lost + max_tolerated_phantoms;
+    assert!(
+        lost.len() + phantom.len() <= max_tolerated_combined,
+        "combined lost+phantom count {} exceeds the budget computed from the ops genuinely in \
+         flight at abort time in this {} run (tolerated at most {max_tolerated_combined}) -- \
+         lost: {lost:?}, phantom: {phantom:?}",
+        lost.len() + phantom.len(),
+        if crashed { "crashed" } else { "clean" }
+    );
+```
+
+Also delete the large stale comment blocks immediately above invariants 2 and 3 (the ones beginning "Invariant 2: no lost commits. Two deliberate deviations..." and "Invariant 3: no phantom commits (up to two tolerated for a crashed run...") — they document the now-superseded single-ambiguous-op reasoning and the old flat constants' empirical justification. Replace both with a single comment above invariant 2 that covers both:
+
+```rust
+    // Invariants 2+3 (no lost commits, no phantom commits): crash-tolerance
+    // budgets are computed above from Task 3.5's precise in-flight-op
+    // tracking (see RunResult's own doc comments and this file's
+    // ambiguity_shape) -- NOT a flat per-run constant. A row also present
+    // in acknowledged_tombstones is correctly excluded from "lost" (that's
+    // Delete/Update doing its job, not ambiguity).
+```
+
+- [ ] **Step 9: Run the fast tier**
+
+```bash
+cargo test --workspace
+```
+
+Expected: `fast_tier_random_seeds_survive_random_crash_points` passes. This is the real test of this task — if the precise-tracking logic has a bug (e.g. a race between when `main.rs` prints "starting" vs when the orchestrator reads stdout — there isn't one, since `run_worker` reads the ENTIRE captured stdout only after the child process has fully exited via `cmd.output()`, so partial/racy reads are not possible), a wrong tolerance would show up here as either a spurious failure (tracking under-counts a real in-flight op) or a silently-passing bug (tracking over-counts, masking a real violation) — the latter is the harder one to catch by testing alone, which is exactly why this task's review should independently re-derive the tracking logic from source rather than trust a single green run.
+
+- [ ] **Step 10: Full workspace gate**
+
+```bash
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --check
+```
+
+- [ ] **Step 11: Commit**
+
+```bash
+git add crates/chaos-worker/src/main.rs tests/sim/tests/chaos.rs
+git commit -m "$(cat <<'EOF'
+fix(chaos-worker): track in-flight ops precisely instead of a flat tolerance constant
+
+Task 3's real concurrent agent threads invalidated tests/sim/tests/chaos.rs's
+"only one op is ever ambiguous at abort time" premise -- up to NUM_AGENTS ops
+can now be genuinely in flight when a chaos abort fires, one per agent.
+Rather than widening the flat lost/phantom tolerance constants (which would
+mask real bugs at the same scale), the worker now prints a "starting" ack
+line before each op's commit attempt; the orchestrator tracks exactly which
+ops started but never completed in a given run and sums their known
+ambiguity_shape to compute that run's actual tolerance budget.
+EOF
+)"
 ```
 
 ---
