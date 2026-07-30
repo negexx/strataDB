@@ -425,8 +425,17 @@ mod tests {
     fn local_fs_passes_the_backend_conformance_suite() {
         let root = temp_root("conformance");
         let root_for_closure = root.clone();
+        // `conformance::run` calls `make_backend` once per assertion group
+        // (5 times) and its own doc comment promises each group "starts
+        // from an empty backend" -- a counter-derived, per-call unique
+        // subdirectory is what actually makes that true, mirroring the
+        // `tmp_path_for` counter pattern already used in this file. Without
+        // it, every group would share one store (same directory), isolated
+        // only incidentally by using disjoint keys.
+        let call_counter = std::sync::atomic::AtomicU64::new(0);
         crate::backend::conformance::run(move || {
-            Box::new(LocalFs::new(root_for_closure.clone())) as Box<dyn Backend>
+            let n = call_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Box::new(LocalFs::new(root_for_closure.join(format!("group-{n}")))) as Box<dyn Backend>
         });
         fs::remove_dir_all(&root).ok();
     }
