@@ -85,6 +85,16 @@ per the redefinition in §4. `get_many` exists from day one, not added later
 — it's where prefetch and multi-segment hydration live, and retrofitting it
 after callers exist means touching every call site twice.
 
+**Deviation from the original trait sketch above:** `get_many` was deferred
+out of M0's six-method implementation (`get`/`put`/`get_range`/
+`put_if_absent`/`list`/`delete`) rather than included from day one as
+originally planned here. Nothing in M0 has a multi-object caller to
+exercise it against, and `LocalFs` has no meaningful concurrency story for
+it yet. It remains planned for M2, where `S3Backend`'s async bridge (§3.2)
+gives it a real implementation (`block_on(join_all(...))`) and a real
+caller (segment/manifest prefetch). Flagged here so this deviation is a
+recorded decision, not a silent drop.
+
 Two implementations: `LocalFs` (wraps today's `std::fs`-based code
 verbatim — no behavior change) and `S3Backend` (via `object_store`, S3
 feature only). Backend selection is runtime, by URI scheme (`file://` vs
@@ -236,6 +246,11 @@ Four CI tiers:
    `segment_reader.rs` finding).
 5. **M4 — Vacuum + chaos fault injection.** The `strata vacuum` orphan-object
    GC command; Tier 3's fault-injecting decorator wired into `tests/sim`.
+   The `strata vacuum` command's scope explicitly includes sweeping
+   `_versions/` for leftover `.tmp-*` files from crashed commits (a
+   permanent leak since M0's `LocalFs::tmp_path_for` naming, per pid+counter
+   uniqueness `put_if_absent` requires, doesn't self-recycle the way the
+   pre-Backend `.tmp-{version}` naming did).
 6. **M5 — Triage + close the exit criterion.** Classify every Phase 1-7 test
    per §4; land object-store analogues for anything POSIX-specific; write
    the dependency ADR for `object_store`/tokio (stating plainly that it is

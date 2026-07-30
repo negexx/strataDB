@@ -25,6 +25,33 @@ impl LocalFs {
         self.root.join(key)
     }
 
+    /// Validates that `key` matches the [`Backend`] trait's key contract:
+    /// relative, non-empty, no `.`/`..` component. Called as the first
+    /// step of every method taking a single `key: &str` (not `list`,
+    /// whose `prefix` may legitimately be empty or partial) so a key that
+    /// would otherwise be silently normalized or escape `root` via
+    /// `resolve`'s plain `Path::join` is rejected instead.
+    fn validate_key(key: &str) -> Result<()> {
+        if key.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "key must not be empty",
+            )
+            .into());
+        }
+        let has_invalid_component = Path::new(key)
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)));
+        if has_invalid_component {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("key {key:?} must be relative with no '.'/'..' components"),
+            )
+            .into());
+        }
+        Ok(())
+    }
+
     /// A unique, colocated temp filename for `final_path` — colocated so
     /// the eventual `rename` stays within one filesystem/volume. Uses a
     /// process-global counter plus the process id rather than a new
@@ -58,8 +85,27 @@ impl LocalFs {
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.is_dir() {
-                Self::walk(root, &path, prefix, out)?;
+            // `file_type()` reads the type from the readdir record itself
+            // on Windows/Linux (no extra syscall), unlike `path.is_dir()`
+            // which stats through symlinks -- this also stops an unbounded
+            // recursion if a symlink cycle ever exists under `root`.
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                let sub_key = Self::key_for(root, &path);
+                // Prune: only descend if this subtree could contain
+                // something matching `prefix` -- either the subtree is
+                // already inside the target scope (`sub_key` starts with
+                // `prefix`) or the target scope reaches further into this
+                // subtree (`prefix` starts with `sub_key`). A sibling
+                // directory that merely shares a textual prefix with
+                // `prefix` (e.g. `_versions_backup` vs `_versions/`)
+                // matches neither check and is skipped without a single
+                // stat inside it -- this is what turns `list("_versions/")`
+                // from O(every file in the dataset) into O(files actually
+                // under `_versions/`).
+                if sub_key.starts_with(prefix) || prefix.starts_with(&sub_key) {
+                    Self::walk(root, &path, prefix, out)?;
+                }
             } else {
                 let key = Self::key_for(root, &path);
                 if key.starts_with(prefix) {
@@ -85,10 +131,12 @@ impl LocalFs {
 
 impl Backend for LocalFs {
     fn get(&self, key: &str) -> Result<Vec<u8>> {
+        Self::validate_key(key)?;
         Ok(fs::read(self.resolve(key))?)
     }
 
     fn get_range(&self, key: &str, range: std::ops::Range<u64>) -> Result<Vec<u8>> {
+        Self::validate_key(key)?;
         let resolved = self.resolve(key);
         let mut file = File::open(&resolved)?;
 
@@ -123,6 +171,7 @@ impl Backend for LocalFs {
     }
 
     fn put(&self, key: &str, bytes: &[u8]) -> Result<()> {
+        Self::validate_key(key)?;
         let final_path = self.resolve(key);
         if let Some(parent) = final_path.parent() {
             fs::create_dir_all(parent)?;
@@ -155,7 +204,13 @@ impl Backend for LocalFs {
         Ok(())
     }
 
+    // Requires a filesystem that supports hard links (most POSIX
+    // filesystems, NTFS) -- fails on exFAT/FAT32 and some SMB mounts, not
+    // just on a genuine key collision. A future caller on such a
+    // filesystem should expect every `put_if_absent` call to fail, not
+    // just colliding ones.
     fn put_if_absent(&self, key: &str, bytes: &[u8]) -> Result<()> {
+        Self::validate_key(key)?;
         let final_path = self.resolve(key);
         if let Some(parent) = final_path.parent() {
             fs::create_dir_all(parent)?;
@@ -204,6 +259,7 @@ impl Backend for LocalFs {
     }
 
     fn delete(&self, key: &str) -> Result<()> {
+        Self::validate_key(key)?;
         fs::remove_file(self.resolve(key))?;
         Ok(())
     }
@@ -418,6 +474,20 @@ mod tests {
 
         assert!(backend.get("a.bin").is_err());
         assert!(backend.delete("a.bin").is_err());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn put_rejects_a_key_containing_a_parent_dir_component() {
+        let root = temp_root("key-validation");
+        let backend = LocalFs::new(&root);
+
+        let result = backend.put("../escape.bin", b"x");
+
+        assert!(
+            result.is_err(),
+            "a key with a '..' component must be rejected, not silently escape root"
+        );
         fs::remove_dir_all(&root).ok();
     }
 

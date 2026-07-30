@@ -22,6 +22,17 @@ pub struct ObjectMeta {
 /// the write is durable — no async buffering, ever, matching
 /// `.claude/rules/concurrency-txn-layer.md`'s durability invariant
 /// regardless of which `Backend` impl is in play.
+///
+/// # Key contract
+///
+/// A `key` is a relative, `/`-delimited, non-empty string. It must not
+/// contain a `.` or `..` path component. No normalization is performed —
+/// an implementation rejects a key that violates this rather than
+/// silently reinterpreting it (e.g. `LocalFs` must not silently collapse
+/// `"a/../b"` to `"b"`, or let an absolute-looking key escape its root).
+/// This keeps key identity consistent across backends: a real object
+/// store (e.g. S3) treats these as literal, distinct key strings with no
+/// path semantics at all.
 pub trait Backend: Send + Sync {
     /// Reads the full contents of `key`.
     ///
@@ -68,7 +79,11 @@ pub trait Backend: Send + Sync {
     /// Removes `key`.
     ///
     /// # Errors
-    /// Returns an error if `key` does not exist or can't be removed.
+    ///
+    /// Whether deleting an already-missing key errors is
+    /// implementation-defined: `LocalFs` errors (POSIX `unlink` semantics),
+    /// but an S3-compatible backend's `DeleteObject` is idempotent and
+    /// would return success. Callers must not depend on either behavior.
     fn delete(&self, key: &str) -> Result<()>;
 }
 
