@@ -28,6 +28,8 @@ pub enum StorageError {
     CorruptManifest(PathBuf, String),
     #[error("corrupt data file at {0}: {1}")]
     CorruptDataFile(PathBuf, String),
+    #[error("key already exists: {0}")]
+    AlreadyExists(String),
 }
 
 pub type Result<T> = std::result::Result<T, StorageError>;
