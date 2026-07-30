@@ -52,6 +52,21 @@ pub trait Backend: Send + Sync {
     /// Returns [`crate::error::StorageError::AlreadyExists`] if `key`
     /// already exists; any other error if the write can't complete.
     fn put_if_absent(&self, key: &str, bytes: &[u8]) -> Result<()>;
+
+    /// Lists every object whose key starts with `prefix`, sorted
+    /// lexicographically by key. Recurses into nested keys the way an
+    /// object store's flat, `/`-delimited namespace does — there is no
+    /// concept of "one directory level" here.
+    ///
+    /// # Errors
+    /// Returns an error if the underlying storage can't be listed.
+    fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>>;
+
+    /// Removes `key`.
+    ///
+    /// # Errors
+    /// Returns an error if `key` does not exist or can't be removed.
+    fn delete(&self, key: &str) -> Result<()>;
 }
 
 pub use local::LocalFs;

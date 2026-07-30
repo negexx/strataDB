@@ -40,6 +40,47 @@ impl LocalFs {
             .unwrap_or("tmp");
         final_path.with_file_name(format!(".tmp-{pid}-{n}-{file_name}"))
     }
+
+    /// Recursively walks `dir` (relative to `root`), collecting every file
+    /// whose `root`-relative, `/`-joined key starts with `prefix`. A
+    /// missing `dir` (e.g. `root` itself never created because nothing has
+    /// been `put` yet) is not an error — it just contributes no entries,
+    /// matching an object store's "empty prefix" behavior.
+    fn walk(
+        root: &Path,
+        dir: &Path,
+        prefix: &str,
+        out: &mut Vec<crate::backend::ObjectMeta>,
+    ) -> Result<()> {
+        if !dir.exists() {
+            return Ok(());
+        }
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                Self::walk(root, &path, prefix, out)?;
+            } else {
+                let key = Self::key_for(root, &path);
+                if key.starts_with(prefix) {
+                    let size = entry.metadata()?.len();
+                    out.push(crate::backend::ObjectMeta { key, size });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Converts an absolute path under `root` into a `/`-joined key,
+    /// regardless of platform path-separator conventions.
+    fn key_for(root: &Path, path: &Path) -> String {
+        path.strip_prefix(root)
+            .unwrap_or(path)
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/")
+    }
 }
 
 impl Backend for LocalFs {
@@ -154,12 +195,25 @@ impl Backend for LocalFs {
             Err(e) => Err(e.into()),
         }
     }
+
+    fn list(&self, prefix: &str) -> Result<Vec<crate::backend::ObjectMeta>> {
+        let mut results = Vec::new();
+        Self::walk(&self.root, &self.root, prefix, &mut results)?;
+        results.sort_by(|a, b| a.key.cmp(&b.key));
+        Ok(results)
+    }
+
+    fn delete(&self, key: &str) -> Result<()> {
+        fs::remove_file(self.resolve(key))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::backend::ObjectMeta;
     use crate::error::StorageError;
 
     fn temp_root(label: &str) -> PathBuf {
@@ -297,6 +351,73 @@ mod tests {
             winner_bytes == b"writer-one" || winner_bytes == b"writer-two",
             "final content must be exactly one racer's payload, got {winner_bytes:?}"
         );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn list_returns_only_keys_matching_the_prefix_sorted() {
+        let root = temp_root("list");
+        let backend = LocalFs::new(&root);
+        backend
+            .put("_versions/00000000000000000002.manifest", b"{}")
+            .unwrap();
+        backend
+            .put("_versions/00000000000000000001.manifest", b"{}")
+            .unwrap();
+        backend.put("data/a.arrow", b"irrelevant").unwrap();
+
+        let listed = backend.list("_versions/").unwrap();
+
+        let keys: Vec<&str> = listed.iter().map(|m| m.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "_versions/00000000000000000001.manifest",
+                "_versions/00000000000000000002.manifest",
+            ]
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn list_reports_the_correct_size_for_each_object() {
+        let root = temp_root("list-size");
+        let backend = LocalFs::new(&root);
+        backend.put("a.bin", b"12345").unwrap();
+
+        let listed = backend.list("a").unwrap();
+
+        assert_eq!(
+            listed,
+            vec![ObjectMeta {
+                key: "a.bin".to_string(),
+                size: 5
+            }]
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn list_on_a_prefix_with_no_matches_returns_empty() {
+        let root = temp_root("list-empty");
+        let backend = LocalFs::new(&root);
+
+        let listed = backend.list("_versions/").unwrap();
+
+        assert!(listed.is_empty());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn delete_removes_the_key_and_a_second_delete_errors() {
+        let root = temp_root("delete");
+        let backend = LocalFs::new(&root);
+        backend.put("a.bin", b"content").unwrap();
+
+        backend.delete("a.bin").unwrap();
+
+        assert!(backend.get("a.bin").is_err());
+        assert!(backend.delete("a.bin").is_err());
         fs::remove_dir_all(&root).ok();
     }
 }
