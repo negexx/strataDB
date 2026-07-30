@@ -351,6 +351,41 @@ mod tests {
     }
 
     #[test]
+    fn registry_survives_concurrent_record_and_remove_from_multiple_threads() {
+        use std::sync::{Arc, Mutex};
+        let registry = Arc::new(Mutex::new(Registry::new(4)));
+        let handles: Vec<_> = (0..4u64)
+            .map(|agent| {
+                let registry = Arc::clone(&registry);
+                std::thread::spawn(move || {
+                    let agent_idx = usize::try_from(agent).unwrap();
+                    for i in 0..50u64 {
+                        registry
+                            .lock()
+                            .unwrap()
+                            .record_own_row(agent_idx, agent * 1000 + i);
+                    }
+                    for i in (0..50u64).step_by(2) {
+                        registry.lock().unwrap().remove(agent_idx, agent * 1000 + i);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let guard = registry.lock().unwrap();
+        for agent_idx in 0..4usize {
+            assert_eq!(
+                guard.own_rows(agent_idx).len(),
+                25,
+                "agent {agent_idx} should have exactly the 25 odd-indexed rows left \
+                 (0..50 step 2 removes the 25 even-indexed ones)"
+            );
+        }
+    }
+
+    #[test]
     fn commit_with_retry_once_commits_on_first_success() {
         let outcome = commit_with_retry_once(|| Ok(()), "test");
         assert_eq!(outcome, RetryOutcome::Committed);

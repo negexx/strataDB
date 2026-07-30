@@ -12,8 +12,8 @@ mod reader;
 mod schema;
 
 use std::io::Write as _;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 
 use rand::{Rng as _, SeedableRng as _};
 use rand_chacha::ChaCha8Rng;
@@ -140,14 +140,14 @@ fn main() {
     );
 
     let num_agents_usize = usize::try_from(num_agents).unwrap();
-    let mut registry = Registry::new(num_agents_usize);
+    let registry = Arc::new(Mutex::new(Registry::new(num_agents_usize)));
     // Deliberately `std::io::stdout()`, NOT `.lock()`'d: `Stdout` itself
     // implements `Write` by locking/unlocking internally on every single
     // call, rather than holding the lock across this whole function --
     // see the comment on the scheduler loop's `out` below for why holding
     // it for any extended span is unsafe here.
     let mut out = std::io::stdout();
-    setup_contested_pool(&dataset, seed, &mut registry, &mut out);
+    setup_contested_pool(&dataset, seed, &mut registry.lock().unwrap(), &mut out);
 
     let (reader_handle, reader_done) = reader::spawn(Arc::clone(&dataset));
 
@@ -223,11 +223,13 @@ fn main() {
                 )
             }
             OpVerb::Delete => {
-                if let Some(target_row_id) = resolve_target(
-                    &mut agent_target_rngs[pick],
-                    registry.pool_rows(),
-                    registry.own_rows(pick),
-                ) {
+                let (pool_rows, own_rows) = {
+                    let guard = registry.lock().unwrap();
+                    (guard.pool_rows().to_vec(), guard.own_rows(pick).to_vec())
+                };
+                if let Some(target_row_id) =
+                    resolve_target(&mut agent_target_rngs[pick], &pool_rows, &own_rows)
+                {
                     execute_delete(&dataset, target_row_id)
                 } else {
                     // No eligible target yet -- downgrade to Insert per design doc §3.1.
@@ -242,11 +244,13 @@ fn main() {
                 }
             }
             OpVerb::Update => {
-                if let Some(target_row_id) = resolve_target(
-                    &mut agent_target_rngs[pick],
-                    registry.pool_rows(),
-                    registry.own_rows(pick),
-                ) {
+                let (pool_rows, own_rows) = {
+                    let guard = registry.lock().unwrap();
+                    (guard.pool_rows().to_vec(), guard.own_rows(pick).to_vec())
+                };
+                if let Some(target_row_id) =
+                    resolve_target(&mut agent_target_rngs[pick], &pool_rows, &own_rows)
+                {
                     let global_id = agent * ops_per_agent + op;
                     let vector = agent_vectors[pick][usize::try_from(op).unwrap()];
                     execute_update(
@@ -270,18 +274,24 @@ fn main() {
         };
 
         match &outcome {
-            ExecOutcome::CommittedInsert { row_id, .. } => registry.record_own_row(pick, *row_id),
+            ExecOutcome::CommittedInsert { row_id, .. } => {
+                registry.lock().unwrap().record_own_row(pick, *row_id);
+            }
             ExecOutcome::CommittedUpdate {
                 target_row_id,
                 row_id,
             } => {
-                registry.remove(pick, *target_row_id);
-                registry.record_own_row(pick, *row_id);
+                let mut guard = registry.lock().unwrap();
+                guard.remove(pick, *target_row_id);
+                guard.record_own_row(pick, *row_id);
             }
-            ExecOutcome::CommittedDelete { target_row_id } => registry.remove(pick, *target_row_id),
+            ExecOutcome::CommittedDelete { target_row_id } => {
+                registry.lock().unwrap().remove(pick, *target_row_id);
+            }
             ExecOutcome::CommittedMultiBatch { row_ids } => {
-                registry.record_own_row(pick, row_ids[0]);
-                registry.record_own_row(pick, row_ids[1]);
+                let mut guard = registry.lock().unwrap();
+                guard.record_own_row(pick, row_ids[0]);
+                guard.record_own_row(pick, row_ids[1]);
             }
             ExecOutcome::Dropped => {}
         }
