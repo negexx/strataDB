@@ -350,8 +350,17 @@ In `commit_ops.rs`, replace the existing `print_outcome` function with:
 pub(crate) fn print_line(line: &str) {
     let stdout = std::io::stdout();
     let mut locked = stdout.lock();
-    let _ = writeln!(locked, "{line}");
-    let _ = locked.flush();
+    // Unwrap, not `let _ =`: this worker's entire contract with
+    // `tests/sim`'s orchestrator IS the ack stream, so a write/flush
+    // failure (e.g. the orchestrator's read end closing) must panic and
+    // go through `install_failure_hook`, not be silently swallowed while
+    // this thread keeps committing rows nobody will ever hear about --
+    // the exact false "lost write" signature this harness exists to rule
+    // out. Safe to unwrap from inside a held `StdoutLock`: the hook's own
+    // `stdout().lock()` call reacquires the SAME thread's reentrant lock,
+    // never another thread's (see `stdout_lock_discipline_tests`).
+    writeln!(locked, "{line}").unwrap();
+    locked.flush().unwrap();
 }
 
 /// Builds the acknowledgment line text for one op outcome, matching the
