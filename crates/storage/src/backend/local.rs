@@ -39,6 +39,18 @@ impl LocalFs {
             )
             .into());
         }
+        // Check the raw string for empty segments, `.`, `..`, and doubled/trailing
+        // separators that `Path::components()` would silently normalize away.
+        if key
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("key {key:?} must not contain empty, '.', or '..' segments"),
+            )
+            .into());
+        }
         let has_invalid_component = Path::new(key)
             .components()
             .any(|c| !matches!(c, std::path::Component::Normal(_)));
@@ -487,6 +499,48 @@ mod tests {
         assert!(
             result.is_err(),
             "a key with a '..' component must be rejected, not silently escape root"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn put_rejects_a_key_with_an_interior_dot_segment() {
+        let root = temp_root("key-validation-dot");
+        let backend = LocalFs::new(&root);
+
+        let result = backend.put("a/./b", b"x");
+
+        assert!(
+            result.is_err(),
+            "a key with an interior '.' segment must be rejected, not silently normalized"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn put_rejects_a_key_with_a_doubled_separator() {
+        let root = temp_root("key-validation-double-slash");
+        let backend = LocalFs::new(&root);
+
+        let result = backend.put("a//b", b"x");
+
+        assert!(
+            result.is_err(),
+            "a key with a doubled separator must be rejected, not silently normalized"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn put_rejects_a_key_with_a_trailing_separator() {
+        let root = temp_root("key-validation-trailing-slash");
+        let backend = LocalFs::new(&root);
+
+        let result = backend.put("a/b/", b"x");
+
+        assert!(
+            result.is_err(),
+            "a key with a trailing separator must be rejected, not silently normalized"
         );
         fs::remove_dir_all(&root).ok();
     }

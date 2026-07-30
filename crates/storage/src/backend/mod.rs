@@ -33,6 +33,10 @@ pub struct ObjectMeta {
 /// This keeps key identity consistent across backends: a real object
 /// store (e.g. S3) treats these as literal, distinct key strings with no
 /// path semantics at all.
+///
+/// Note: [`Backend::list`]'s `prefix` parameter is exempt from the
+/// "non-empty" and "no normalization" rules — `list("")` is valid and
+/// means "everything."
 pub trait Backend: Send + Sync {
     /// Reads the full contents of `key`.
     ///
