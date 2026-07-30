@@ -17,5 +17,6 @@ arrow.workspace = true
 strata-txn = { path = "../txn", features = ["chaos-injection"] }
 strata-storage = { path = "../storage", features = ["chaos-injection"] }
 strata-query = { path = "../query" }
+strata-index = { path = "../index" }
 rand = "0.9"
 rand_chacha = "0.9"

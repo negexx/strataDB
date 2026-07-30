@@ -10,11 +10,15 @@
 //! since `vector_search`'s pruned path applies `live_set` as an exact
 //! per-row membership filter after pruning); (2) a reverse-direction check
 //! (one pseudo-randomly chosen name-scoped reference row per poll, queried
-//! by its own vector) that CAN catch a merged zone-map range too narrow,
-//! wrongly pruning a segment out; (3) [not yet implemented — see Task 5]
-//! an `id`-range compound-predicate subset check, which exercises real
-//! cross-batch/cross-segment min/max merge arithmetic, unlike `name`
-//! (constant per agent, hence a degenerate merge for that column alone).
+//! by its own vector) that CAN catch a bad live-set resolution or a
+//! wrongly-narrow zone map on the `name` column itself — but every commit
+//! path gives all of a multi-batch insert's rows the SAME `name`
+//! (`commit_ops::execute_multi_batch_insert`), so the `name` zone map's
+//! merge is degenerate (min == max, a single value) and this check alone
+//! does NOT exercise real cross-batch min/max merge arithmetic; (3) [not
+//! yet implemented — see Task 5] an `id`-range compound-predicate subset
+//! check, which does exercise that arithmetic, since `id` genuinely varies
+//! per row unlike `name`.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -25,6 +29,7 @@ use arrow::array::{
 };
 use rand::{Rng as _, SeedableRng as _};
 use rand_chacha::ChaCha8Rng;
+use strata_index::VectorMatch;
 use strata_query::Predicate;
 use strata_storage::Value;
 use strata_txn::Dataset;
@@ -37,9 +42,14 @@ const READER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_mill
 /// This bounds only the post-merge truncation across parts
 /// (`SegmentSet::search_filtered_pruned_live`'s final `k`-truncation) --
 /// per-part recall is governed by `ef` (`EF_SEARCH_DEFAULT`, widened by
-/// `widen_ef`), not by this constant. Fine for this one-directional
-/// pruned-subset-of-reference check; a future reverse-direction check
-/// (reference implies prunable) would need to reason about `ef` instead.
+/// `widen_ef`), not by this constant. Fine for the pruned-subset-of-
+/// reference check's large `k`. The reverse-direction check below queries
+/// with `k=1` instead and does NOT reuse this constant -- it currently
+/// gets away with an exact top-1 match without reasoning about `ef`
+/// because this workload's segments are tiny (1-2 rows per commit), so
+/// the target's own part is searched exhaustively regardless of `ef`;
+/// this would need revisiting if segment size ever grows enough for
+/// approximate search to plausibly miss the exact match.
 const READER_SEARCH_K: usize = 100_000;
 /// Distinct RNG stream for the reverse-direction check's per-poll
 /// reference-row pick — see design doc Part 2 §2a. Seeded once from the
@@ -77,21 +87,35 @@ fn assert_pruned_is_subset_of_reference(
     );
 }
 
+/// One reverse-direction check's own-vector round-trip, as a pure function
+/// over an already-fetched hit list so it's unit-testable without a real
+/// `Dataset` -- mirrors [`disagreement`]'s own rationale. `hits` is the
+/// top-1 result of querying by `expected_row_id`'s own vector; correct
+/// means that row itself came back as the (only) hit, not a farther point
+/// or nothing at all.
+fn reverse_hit_is_correct(hits: &[VectorMatch], expected_row_id: u64) -> bool {
+    hits.first()
+        .is_some_and(|h| h.row_id == expected_row_id && h.squared_distance < 1.0)
+}
+
 /// Downcasts a named column from an unpruned reference scan to its
 /// expected arrow array type — every column this reader reads
 /// (`schema_with_row_id`'s fields) is required, so a missing column or a
 /// type mismatch is a genuine bug, not a recoverable condition.
 fn required_column<'a, T: 'static>(batch: &'a RecordBatch, name: &str) -> &'a T {
-    batch
-        .column(
-            batch
-                .schema()
-                .index_of(name)
-                .unwrap_or_else(|_| panic!("schema_with_row_id must include column {name}")),
+    let column = batch.column(
+        batch
+            .schema()
+            .index_of(name)
+            .unwrap_or_else(|_| panic!("schema_with_row_id must include column {name}")),
+    );
+    column.as_any().downcast_ref::<T>().unwrap_or_else(|| {
+        panic!(
+            "column {name} has arrow type {:?}, expected {}",
+            column.data_type(),
+            std::any::type_name::<T>()
         )
-        .as_any()
-        .downcast_ref::<T>()
-        .unwrap_or_else(|| panic!("column {name} must downcast to the expected arrow array type"))
+    })
 }
 
 /// Spawns the reader thread. The caller must set the returned
@@ -184,8 +208,7 @@ fn check_once(dataset: &Dataset, name_predicate: &Predicate, reverse_rng: &mut C
             .vector_search(&query, 1, Some(name_predicate))
             .expect("vector_search must succeed against a live snapshot");
         assert!(
-            hits.first()
-                .is_some_and(|h| h.row_id == expected_row_id && h.squared_distance < 1.0),
+            reverse_hit_is_correct(&hits, expected_row_id),
             "reverse-direction disagreement: row {expected_row_id}'s own vector, queried under \
              Eq(name, {READER_PREDICATE_NAME:?}), did not come back as the top-1 pruned hit \
              (got {hits:?}) — zone-map pruning wrongly excluded the segment holding this row"
@@ -217,6 +240,29 @@ mod tests {
     fn disagreement_reports_a_pruned_id_missing_from_the_reference() {
         let reference: HashSet<u64> = [1, 2].into_iter().collect();
         assert_eq!(disagreement(&[1, 2, 99], &reference), vec![99]);
+    }
+
+    #[test]
+    fn reverse_hit_is_correct_is_false_on_an_empty_hit_list() {
+        assert!(!reverse_hit_is_correct(&[], 5));
+    }
+
+    #[test]
+    fn reverse_hit_is_correct_is_false_when_the_top_hit_is_a_different_row() {
+        let hits = [VectorMatch {
+            row_id: 99,
+            squared_distance: 0.0,
+        }];
+        assert!(!reverse_hit_is_correct(&hits, 5));
+    }
+
+    #[test]
+    fn reverse_hit_is_correct_is_true_when_the_top_hit_is_the_expected_row_at_zero_distance() {
+        let hits = [VectorMatch {
+            row_id: 5,
+            squared_distance: 0.0,
+        }];
+        assert!(reverse_hit_is_correct(&hits, 5));
     }
 
     #[test]
@@ -286,8 +332,12 @@ mod tests {
         );
         let mut reverse_rng = ChaCha8Rng::seed_from_u64(1);
         // Run several times: the reverse check picks a pseudo-random
-        // reference row each call, and with 2 candidate rows this
-        // exercises both across repeated calls.
+        // reference row each call. This does not ASSERT both of the 2
+        // candidate rows get picked across these 10 calls (a seed that
+        // picked the same index every time would still pass) -- it's
+        // exercising check_once against real multi-batch data without
+        // panicking, not proving reverse_hit_is_correct's own logic
+        // (that's covered directly by its own unit tests above).
         for _ in 0..10 {
             check_once(&dataset, &predicate, &mut reverse_rng);
         }

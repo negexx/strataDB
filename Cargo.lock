@@ -1976,6 +1976,7 @@ dependencies = [
  "arrow",
  "rand",
  "rand_chacha",
+ "strata-index",
  "strata-query",
  "strata-storage",
  "strata-txn",
