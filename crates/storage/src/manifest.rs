@@ -11,12 +11,13 @@
 //! committed version" MVP checklist item tests.
 
 use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::backend::{Backend, LocalFs};
 use crate::error::{Result, StorageError};
 use crate::stats::ColumnStats;
 
@@ -173,10 +174,12 @@ impl Manifest {
     }
 }
 
+#[cfg(test)]
 fn versions_dir(dataset_dir: &Path) -> PathBuf {
     dataset_dir.join("_versions")
 }
 
+#[cfg(test)]
 fn manifest_path(dataset_dir: &Path, version: u64) -> PathBuf {
     versions_dir(dataset_dir).join(format!("{version:020}.manifest"))
 }
@@ -191,30 +194,19 @@ fn manifest_path(dataset_dir: &Path, version: u64) -> PathBuf {
 /// Returns an error if the `_versions/` directory can't be created, if the
 /// manifest can't be serialized or written, or if the atomic rename fails.
 pub fn commit_manifest(dataset_dir: &Path, manifest: &Manifest) -> Result<()> {
-    let versions = versions_dir(dataset_dir);
-    fs::create_dir_all(&versions)?;
-
-    let final_path = manifest_path(dataset_dir, manifest.version);
-    let tmp_path = versions.join(format!(".tmp-{}", manifest.version));
-
+    let backend = LocalFs::new(dataset_dir);
+    let key = format!("_versions/{:020}.manifest", manifest.version);
     let json = serde_json::to_vec(manifest)?;
-    {
-        let mut tmp_file = File::create(&tmp_path)?;
-        tmp_file.write_all(&json)?;
-        tmp_file.sync_all()?;
-        crate::chaos::chaos_checkpoint(); // tmp manifest is durable, about to rename
-    }
-    fs::rename(&tmp_path, &final_path)?;
-    crate::chaos::chaos_checkpoint(); // renamed into place, about to fsync the directory entry
-
-    // fsync the containing directory so the rename itself survives a crash,
-    // not just the file content — see `crate::datafile::sync_dir`. Not fatal
-    // if unsupported on this platform, since `rename()` on both POSIX and
-    // NTFS is itself atomic; the worst case without this is a rename that
-    // completed but whose *durability* is unconfirmed on an immediate power
-    // loss, not a torn or partially-visible write.
-    crate::datafile::sync_dir(&versions)?;
-
+    // `LocalFs::put` fsyncs the containing directory internally (see Task
+    // 1), so there is no separate `sync_dir` call here the way the
+    // pre-Backend code had one -- folding that step into `put` itself
+    // (rather than leaving it a caller-remembered step) is what makes
+    // `Backend::put`'s durability contract self-contained. Do not add a
+    // second explicit `sync_dir` call here: `versions_dir(dataset_dir)` is
+    // exactly the directory `put` already fsyncs for this key, so a second
+    // call would double a chaos checkpoint and break the "checkpoint count
+    // unchanged" global constraint below.
+    backend.put(&key, &json)?;
     Ok(())
 }
 
@@ -229,18 +221,15 @@ pub fn commit_manifest(dataset_dir: &Path, manifest: &Manifest) -> Result<()> {
 /// genuinely corrupt manifest, not a crash-in-progress one (see the module
 /// doc comment for why those are distinguishable).
 pub fn read_current(dataset_dir: &Path) -> Result<Option<Manifest>> {
-    let versions = versions_dir(dataset_dir);
-    if !versions.exists() {
-        return Ok(None);
-    }
+    let backend = LocalFs::new(dataset_dir);
 
-    let mut best: Option<(u64, PathBuf)> = None;
-    for entry in fs::read_dir(&versions)? {
-        let path = entry?.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        let Some(stem) = name.strip_suffix(".manifest") else {
+    let mut best: Option<(u64, String)> = None;
+    for meta in backend.list("_versions/")? {
+        let Some(stem) = meta
+            .key
+            .strip_prefix("_versions/")
+            .and_then(|s| s.strip_suffix(".manifest"))
+        else {
             continue;
         };
         let Ok(version) = stem.parse::<u64>() else {
@@ -248,16 +237,16 @@ pub fn read_current(dataset_dir: &Path) -> Result<Option<Manifest>> {
         };
         let is_newer = best.as_ref().is_none_or(|(v, _)| version > *v);
         if is_newer {
-            best = Some((version, path));
+            best = Some((version, meta.key.clone()));
         }
     }
 
-    let Some((_, path)) = best else {
+    let Some((_, key)) = best else {
         return Ok(None);
     };
-    let bytes = fs::read(&path)?;
+    let bytes = backend.get(&key)?;
     let manifest: Manifest = serde_json::from_slice(&bytes)
-        .map_err(|e| StorageError::CorruptManifest(path.clone(), e.to_string()))?;
+        .map_err(|e| StorageError::CorruptManifest(dataset_dir.join(&key), e.to_string()))?;
     Ok(Some(manifest))
 }
 
@@ -265,6 +254,9 @@ pub fn read_current(dataset_dir: &Path) -> Result<Option<Manifest>> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use std::fs::{self, File};
+    use std::io::Write as _;
+
     use crate::stats::Value;
 
     fn temp_dataset_dir(label: &str) -> PathBuf {
