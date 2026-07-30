@@ -143,7 +143,7 @@ fn main() {
     setup_contested_pool(&dataset, seed, &mut registry);
     let registry = Arc::new(Mutex::new(registry));
 
-    let (reader_handle, reader_done) = reader::spawn(Arc::clone(&dataset));
+    let (reader_handle, reader_done) = reader::spawn(Arc::clone(&dataset), seed);
 
     // Per-agent vector generation (unchanged from the original insert-only
     // worker) and verb generation (ops.rs), both pre-generated up front.
