@@ -420,4 +420,14 @@ mod tests {
         assert!(backend.delete("a.bin").is_err());
         fs::remove_dir_all(&root).ok();
     }
+
+    #[test]
+    fn local_fs_passes_the_backend_conformance_suite() {
+        let root = temp_root("conformance");
+        let root_for_closure = root.clone();
+        crate::backend::conformance::run(move || {
+            Box::new(LocalFs::new(root_for_closure.clone())) as Box<dyn Backend>
+        });
+        fs::remove_dir_all(&root).ok();
+    }
 }

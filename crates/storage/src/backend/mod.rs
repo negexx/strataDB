@@ -6,6 +6,9 @@
 
 pub mod local;
 
+#[cfg(test)]
+mod conformance;
+
 use crate::error::Result;
 
 /// One object's key and size, as returned by [`Backend::list`].
