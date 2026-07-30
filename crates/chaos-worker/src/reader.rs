@@ -455,14 +455,14 @@ mod tests {
     #[test]
     fn check_once_skips_the_id_range_check_with_fewer_than_two_distinct_ids() {
         // A single row -- distinct_ids.len() == 1, so the id-range block's
-        // `>= 2` guard must skip it entirely. This does NOT distinguish a
-        // correct `>= 2` guard from an off-by-one `>= 1` guard (with one
-        // row, min==max==1, id_split would still be called with
-        // min_id==max_id, violating its own precondition but not panicking
-        // in a release build since the debug_assert! compiles out) -- it
-        // only proves the block doesn't panic on a single-row dataset.
-        // id_split's own preconditions/arithmetic are covered directly by
-        // the id_split_* tests above.
+        // `>= 2` guard must skip it entirely. This DOES catch an off-by-one
+        // `>= 1` guard under the default `cargo test` (dev profile,
+        // debug_assertions on): with one row, min==max==1, a mutated guard
+        // would call id_split(1, 1), violating its own
+        // `debug_assert!(min_id < max_id)` precondition and panicking this
+        // test. That assert compiles out under `cargo test --release`
+        // only -- not relevant to the default workspace test invocation
+        // this test actually runs under.
         let dir = temp_dir("check-once-single-row");
         let dataset = Dataset::create(&dir).unwrap();
         let mut txn = dataset.begin();
