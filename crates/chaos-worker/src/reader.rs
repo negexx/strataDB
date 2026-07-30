@@ -4,29 +4,36 @@
 //! concurrently with the agent threads, comparing zone-map-pruned
 //! predicate queries against unpruned references on the SAME snapshot.
 //!
-//! Three checks run every poll: (1) the original pruned-subset-of-reference
-//! check for `Eq(name, "agent0")` (§3.3's first direction — pruned ⊆
-//! reference holds by construction regardless of zone-map correctness,
-//! since `vector_search`'s pruned path applies `live_set` as an exact
-//! per-row membership filter after pruning); (2) a reverse-direction check
-//! (one pseudo-randomly chosen name-scoped reference row per poll, queried
-//! by its own vector) that CAN catch a bad live-set resolution or a
-//! wrongly-narrow zone map on the `name` column itself — but every commit
-//! path gives all of a multi-batch insert's rows the SAME `name`
-//! (`commit_ops::execute_multi_batch_insert`), so the `name` zone map's
-//! merge is degenerate (min == max, a single value) and this check alone
-//! does NOT exercise real cross-batch min/max merge arithmetic; (3) an
-//! `id`-range compound-predicate subset check (`Predicate::And(GtEq,
-//! Lt)` over the full visible table's `id` column, split at its midpoint
-//! via [`id_split`]) that runs the merge code path on genuinely
-//! non-degenerate input, unlike `name`. Check (3) is, like check (1), a
-//! SUBSET-only check (pruned ⊆ reference holds by construction, same
-//! reasoning as check (1)) -- it exercises the id-column merge code path
-//! without being able to verify the merge produced a CORRECT result. Only
-//! check (2)'s targeted own-vector lookup can catch an over-narrow zone
-//! map actually excluding a row it shouldn't (and only for `name`, whose
-//! own merge is degenerate) -- no check here does the equivalent
-//! reverse-direction probe under the `id` predicate.
+//! Four checks run every poll, in two pairs, each pair covering one
+//! predicate with both directions:
+//!
+//! - **`name` pair:** (1) the original pruned-subset-of-reference check for
+//!   `Eq(name, "agent0")` (§3.3's first direction — pruned ⊆ reference
+//!   holds by construction regardless of zone-map correctness, since
+//!   `vector_search`'s pruned path applies `live_set` as an exact per-row
+//!   membership filter after pruning); (2) a reverse-direction check (one
+//!   pseudo-randomly chosen name-scoped reference row per poll, queried by
+//!   its own vector) that catches a bad live-set resolution or a
+//!   wrongly-narrow zone map on the `name` column itself. But every commit
+//!   path gives all of a multi-batch insert's rows the SAME `name`
+//!   (`commit_ops::execute_multi_batch_insert`), so the `name` zone map's
+//!   merge is degenerate (min == max, a single value) — this pair alone
+//!   does NOT exercise real cross-batch min/max merge arithmetic.
+//! - **`id`-range pair:** (3) an `id`-range compound-predicate subset check
+//!   (`Predicate::And(GtEq, Lt)` over the full visible table's `id`
+//!   column, split at its midpoint via [`id_split`]) that runs the merge
+//!   code path on genuinely non-degenerate input, unlike `name`; (4) the
+//!   SAME reverse-direction probe as (2), run under the `id`-range
+//!   predicate instead — this is the pair that actually closes the
+//!   zone-map-merge-correctness gap (2)/(3) alone leave open: (3) is
+//!   subset-only and structurally cannot detect an over-narrow merge
+//!   result, but (4) can, and now runs on the one column whose merge has
+//!   real arithmetic to get wrong. [`assert_reverse_hit_is_correct`] is
+//!   the shared helper both reverse checks call.
+//!
+//! Every subset check ((1) and (3)) shares [`assert_pruned_is_subset_of_reference`]/
+//! [`disagreement`]; every reverse check ((2) and (4)) shares
+//! [`assert_reverse_hit_is_correct`]/[`reverse_hit_is_correct`].
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -104,6 +111,47 @@ fn assert_pruned_is_subset_of_reference(
 fn reverse_hit_is_correct(hits: &[VectorMatch], expected_row_id: u64) -> bool {
     hits.first()
         .is_some_and(|h| h.row_id == expected_row_id && h.squared_distance < 1.0)
+}
+// NOTE: `tests/sim/tests/chaos.rs`'s row+index-consistency invariant does
+// the same "own vector must find itself" check with `< 0.001`, 1000x
+// tighter. Both are correct for their own purpose (an exact self-match is
+// 0.0 either way; distinct committed vectors here are always >>1.0 apart
+// per `main.rs`'s `global_id + rand` vector generation, so `< 1.0` never
+// actually admits a false positive at this workload's scale) -- flagging
+// so the two don't drift further apart without a reason.
+
+/// Runs one reverse-direction own-vector round-trip against a real
+/// snapshot and panics via [`reverse_hit_is_correct`] on failure -- shared
+/// by the `name` and `id`-range checks in [`check_once`] below, since both
+/// need the identical extract-vector/query-k1/assert shape under a
+/// different predicate. `idx` indexes into the SAME unpruned reference
+/// scan `row_id_col`/`vector_col` were built from.
+fn assert_reverse_hit_is_correct(
+    snapshot: &strata_txn::Snapshot,
+    predicate: &Predicate,
+    predicate_description: &str,
+    row_id_col: &UInt64Array,
+    vector_col: &FixedSizeListArray,
+    idx: usize,
+) {
+    let expected_row_id = row_id_col.value(idx);
+    let vector_value = vector_col.value(idx);
+    let vector_values: &Float32Array = vector_value
+        .as_any()
+        .downcast_ref()
+        .expect("vector column elements must be Float32");
+    let query: Vec<f32> = (0..vector_values.len())
+        .map(|i| vector_values.value(i))
+        .collect();
+    let hits = snapshot
+        .vector_search(&query, 1, Some(predicate))
+        .expect("vector_search must succeed against a live snapshot");
+    assert!(
+        reverse_hit_is_correct(&hits, expected_row_id),
+        "reverse-direction disagreement under {predicate_description}: row {expected_row_id}'s \
+         own vector did not come back as the top-1 pruned hit (got {hits:?}) -- zone-map \
+         pruning wrongly excluded the segment holding this row"
+    );
 }
 
 /// Splits `[min_id, max_id]` (both inclusive, `min_id < max_id` required --
@@ -221,23 +269,13 @@ fn check_once(dataset: &Dataset, name_predicate: &Predicate, reverse_rng: &mut C
     // reference row yet.
     if !name_reference_indices.is_empty() {
         let idx = name_reference_indices[reverse_rng.random_range(0..name_reference_indices.len())];
-        let expected_row_id = row_id_col.value(idx);
-        let vector_value = vector_col.value(idx);
-        let vector_values: &Float32Array = vector_value
-            .as_any()
-            .downcast_ref()
-            .expect("vector column elements must be Float32");
-        let query: Vec<f32> = (0..vector_values.len())
-            .map(|i| vector_values.value(i))
-            .collect();
-        let hits = snapshot
-            .vector_search(&query, 1, Some(name_predicate))
-            .expect("vector_search must succeed against a live snapshot");
-        assert!(
-            reverse_hit_is_correct(&hits, expected_row_id),
-            "reverse-direction disagreement: row {expected_row_id}'s own vector, queried under \
-             Eq(name, {READER_PREDICATE_NAME:?}), did not come back as the top-1 pruned hit \
-             (got {hits:?}) — zone-map pruning wrongly excluded the segment holding this row"
+        assert_reverse_hit_is_correct(
+            &snapshot,
+            name_predicate,
+            &format!("Eq(name, {READER_PREDICATE_NAME:?})"),
+            row_id_col,
+            vector_col,
+            idx,
         );
     }
 
@@ -262,17 +300,45 @@ fn check_once(dataset: &Dataset, name_predicate: &Predicate, reverse_rng: &mut C
             .vector_search(&[0.0, 0.0, 0.0], READER_SEARCH_K, Some(&id_predicate))
             .expect("vector_search must succeed against a live snapshot");
         let id_pruned_row_ids: Vec<u64> = id_pruned.into_iter().map(|m| m.row_id).collect();
-        let id_reference: HashSet<u64> = (0..all_rows.num_rows())
+        let id_reference_indices: Vec<usize> = (0..all_rows.num_rows())
             .filter(|&i| {
                 let id = id_col.value(i);
                 id >= lo && id < hi
             })
-            .map(|i| row_id_col.value(i))
             .collect();
+        let id_reference: HashSet<u64> = id_reference_indices
+            .iter()
+            .map(|&i| row_id_col.value(i))
+            .collect();
+        let id_predicate_description = format!("And(GtEq(id,{lo}), Lt(id,{hi}))");
         assert_pruned_is_subset_of_reference(
             &id_pruned_row_ids,
             &id_reference,
-            &format!("And(GtEq(id,{lo}), Lt(id,{hi}))"),
+            &id_predicate_description,
+        );
+
+        // Reverse-direction check under the id predicate -- closes design
+        // doc gap 2 for real, not just nominally: the subset check above
+        // is, like check (1), structurally unable to detect an over-narrow
+        // id-column zone map (vector_search's pruned path applies
+        // live_set as an exact per-row filter regardless of predicate, so
+        // pruned <= reference holds no matter what the merge produced).
+        // This probes the one thing that check cannot: pick a row
+        // genuinely inside [lo, hi), query by its own vector under the
+        // SAME id_predicate, and confirm it comes back as the top-1 hit.
+        // Unlike the name-scoped reverse check above (degenerate merge --
+        // every row in one commit shares one name), id's zone map has
+        // real, non-degenerate min/max arithmetic, so this is the only
+        // check in this file that can catch a wrongly-narrow merge on the
+        // one column where the merge has something real to get wrong.
+        let idx = id_reference_indices[reverse_rng.random_range(0..id_reference_indices.len())];
+        assert_reverse_hit_is_correct(
+            &snapshot,
+            &id_predicate,
+            &id_predicate_description,
+            row_id_col,
+            vector_col,
+            idx,
         );
     }
 }

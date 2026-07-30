@@ -1,9 +1,17 @@
-//! Chaos-testing worker: deterministically commits a seed-derived sequence
-//! of operations against a real `Dataset`, printing and flushing an
-//! acknowledgment after every successful commit. Meant to be spawned as a
-//! child process by `tests/sim`'s orchestrator with `STRATA_CHAOS_ABORT_AT`
-//! set, so it may be aborted mid-run by `strata_storage::chaos`. See
-//! `docs/superpowers/specs/2026-07-27-chaos-worker-workload-extension-design.md`.
+//! Chaos-testing worker: runs `NUM_AGENTS` real OS threads (`run_agent`),
+//! each committing its own seed-derived op sequence against a shared,
+//! real `Dataset`, printing a `starting` ack line immediately before and a
+//! `committed`/`dropped` ack line immediately after every op's commit
+//! attempt. Meant to be spawned as a child process by `tests/sim`'s
+//! orchestrator with `STRATA_CHAOS_ABORT_AT` set, so it may be aborted
+//! mid-run by `strata_storage::chaos`. Per-agent op *content* (which verb,
+//! which vector, which target) is fully seed-derived and reproducible;
+//! cross-agent *interleaving* is genuine OS thread scheduling and is NOT
+//! reproducible from the seed alone -- see
+//! `docs/superpowers/specs/2026-07-30-chaos-worker-real-concurrency-and-zonemap-verification-design.md`'s
+//! "Reproducibility tradeoff" section. See also
+//! `docs/superpowers/specs/2026-07-27-chaos-worker-workload-extension-design.md`
+//! for the original op-verb/commit-execution design this builds on.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod commit_ops;
@@ -80,7 +88,9 @@ fn install_failure_hook() {
 /// interleaved phase starts, establishing the shared contested row-id
 /// pool — see design doc §3.1. Business ids are negative (`-1..-POOL_SIZE`)
 /// so they can never collide with an agent's own `global_id` business ids
-/// (always >= 0).
+/// (always >= 0). Each insert prints a `"pool starting insert row {i}"`
+/// line immediately before `execute_insert` -- part of the same ack
+/// protocol `run_agent` uses; see that function's doc for the contract.
 fn setup_contested_pool(dataset: &strata_txn::Dataset, seed: u64, registry: &mut Registry) {
     let mut rng = ChaCha8Rng::seed_from_u64(seed ^ POOL_STREAM);
     for i in 0..POOL_SIZE {
@@ -204,8 +214,32 @@ fn main() {
 /// `registry` — see design doc Part 1. `resolve_slot_consumption`'s
 /// downgrade logic still applies per-thread; the only remaining source of
 /// interleaving randomness across agents is genuine OS thread scheduling,
-/// which is the actual thing this design exists to exercise.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+/// which is the actual thing this design exists to exercise. Op-target
+/// *values* (which pool/own row gets picked) are consequently no longer
+/// diffable run-to-run the way the RNG *stream* still is -- two runs of
+/// the same seed draw the same targets-to-choose-from in the same order,
+/// but which ones actually exist at each draw depends on cross-thread
+/// timing, so the resolved values themselves can differ.
+///
+/// **The `starting`/`committed`/`dropped` ack-line contract is
+/// load-bearing, not just logging.** Every op prints exactly one
+/// `"agent {agent} starting {verb} op {op}"` line, via [`print_line`],
+/// IMMEDIATELY before its `execute_*` call -- using the FINAL resolved
+/// verb (after any Delete/Update-to-Insert downgrade), never the
+/// originally-drawn one -- and exactly one `committed`/`dropped`
+/// completion line (via [`commit_ops::print_outcome`]) immediately after.
+/// `tests/sim/tests/chaos.rs`'s entire crash-tolerance budget for the
+/// lost/phantom-commit invariants is computed by matching these two
+/// lines: any `starting` line with no matching completion line by the end
+/// of a run's captured stdout is treated as the op that was genuinely in
+/// flight when a chaos abort fired, and its `ambiguity_shape(verb)` is
+/// summed into that run's tolerance (see `chaos.rs`'s `run_worker`/
+/// `ambiguity_shape`). Moving a `starting` print after its `execute_*`
+/// call, adding a new op path that skips it, or printing the
+/// pre-downgrade verb instead of the resolved one would silently corrupt
+/// that budget without failing to compile or necessarily failing any
+/// single test run.
+#[allow(clippy::too_many_lines)]
 fn run_agent(
     dataset: &strata_txn::Dataset,
     registry: &Mutex<Registry>,

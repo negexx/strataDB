@@ -70,7 +70,15 @@ impl Registry {
     /// some agent's own-row list) after it's been tombstoned. A target is
     /// always either a pool row or the ACTING agent's own row (never
     /// another agent's), so checking the pool then this agent's own list
-    /// is exhaustive.
+    /// is exhaustive. Since real concurrent agent threads landed, `row_id`
+    /// may already be gone by the time this runs -- e.g. two agents both
+    /// resolved the SAME pool row as their target before either committed,
+    /// and the other one's delete/update already removed it here first.
+    /// This is silently correct in that case: `position` returns `None`
+    /// in both branches below, so the `if let`/`else if let` is a
+    /// harmless no-op rather than a panic or an incorrect removal from
+    /// the wrong list -- the row genuinely is gone, just not because of
+    /// THIS call.
     pub(crate) fn remove(&mut self, agent: usize, row_id: u64) {
         if let Some(pos) = self.pool_live.iter().position(|&r| r == row_id) {
             self.pool_live.swap_remove(pos);

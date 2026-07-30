@@ -50,6 +50,25 @@ This design closes both, on this same branch/PR, before merge.
   batches/segments is correct — not "structurally cannot fail" coverage
   alone.
 
+**Resolved, both bullets (final whole-branch review):** Bullet 1 is
+genuinely closed — real OS threads plus `write_phase` running outside
+`commit_lock` (`crates/txn/src/dataset.rs`) produce actually-overlapping
+commit windows, and the measured 10-23% conflict-drop rate is live
+evidence `TxnError::Conflict` → `commit_with_retry_once` →
+`ExecOutcome::Dropped` executes (see the Open Question's Resolved note
+below for the tuning that got there). Bullet 2 needed a mid-review
+correction: `reader.rs`'s original `id`-range check (§2b below) was
+subset-only, like the original `name` check, and a subset check can
+*never* detect an over-narrow zone-map merge -- `vector_search`'s pruned
+path applies `live_set` as an exact per-row filter regardless of what the
+merge produced, so `pruned ⊆ reference` holds even when the merge is
+wrong. The final whole-branch review added a second reverse-direction
+probe (mirroring §2a's, sharing its `assert_reverse_hit_is_correct`
+helper) under the `id`-range predicate specifically, since `id`'s merge is
+the one with real, non-degenerate arithmetic to get wrong (unlike
+`name`'s). That pair -- §2b's subset check plus its own reverse probe --
+is what actually closes this bullet; §2b alone did not.
+
 ## Non-Goals
 
 - Exact interleaving reproducibility from a chaos seed. This design

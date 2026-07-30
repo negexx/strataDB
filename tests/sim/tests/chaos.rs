@@ -25,8 +25,10 @@ use rand::SeedableRng as _;
 /// 8 agents/5 ops -> 3/30 (~10%), 8 agents/8 ops -> 7/30 (~23%). Also
 /// tested `POOL_SIZE = 3` (a smaller contested pool, concentrating target
 /// collisions) at 3 agents/5 ops -> 0/30 and at 8 agents/5 ops -> 2/30 --
-/// both are AT OR BELOW the matching `POOL_SIZE = 6` runs, so shrinking the
-/// pool is not a real lever here (plausible reading: a conflict needs
+/// both are AT OR BELOW the matching `POOL_SIZE = 6` runs -- no measurable
+/// improvement at the sizings tested (n=30/config, so 2-vs-3 is within
+/// noise; not a claim shrinking the pool never helps at any scale).
+/// Plausible reading: a conflict needs
 /// overlapping COMMIT WINDOWS, not just overlapping op targets in general;
 /// concentrating targets doesn't help if two threads' commits essentially
 /// never overlap in wall-clock time to begin with). `NUM_AGENTS` is the
@@ -37,8 +39,8 @@ use rand::SeedableRng as _;
 /// tested (not the smallest -- 8/5, 6/10, and 3/20 are all cheaper by total
 /// op-slot count and were tried first) -- kept over the cheaper 8/5 (~10%)
 /// because the actual measured thorough-tier cost at 8/8 was acceptable
-/// (2000/2000 seeds, zero violations, ~1175s/~20min at concurrency=8 --
-/// see the ledger) and the higher yield means more of the 2000-seed budget
+/// (2000/2000 seeds, zero violations, ~1175s/~20min at concurrency=8) and
+/// the higher yield means more of the 2000-seed budget
 /// actually exercises the conflict/drop path this whole task exists to
 /// close.
 const NUM_AGENTS: u64 = 8;
@@ -94,9 +96,10 @@ const POOL_SIZE: u64 = 6;
 /// over the theoretical maximum -- the failure mode if a rare run's true
 /// total DID exceed 450 is benign, not a false failure: `abort_at` would
 /// simply always land inside that run (guaranteeing `crashed = true`),
-/// which only means that seed's clean-run assertions (Step 2's exact
-/// slot-count check) don't get exercised, not that any invariant check
-/// produces a wrong answer. A higher threshold than needed isn't free
+/// which only means that seed's clean-run-only assertions (the fast
+/// tier's exact slot-count/pool-ack checks, and the two `!crashed`
+/// zero-budget asserts in `check_invariants`) don't get exercised, not
+/// that any invariant check produces a wrong answer. A higher threshold than needed isn't free
 /// either way: `abort_at` is drawn uniformly from `1..MAX_ABORT_THRESHOLD`,
 /// so a threshold much above the true total wastes iterations on clean
 /// (non-crashing) runs instead of exercising a crash -- the thorough tier
@@ -476,6 +479,31 @@ fn check_invariants(dir: &std::path::Path, result: &RunResult) {
     // needed here (unlike the old flat-constant version, which had to
     // reason about the worst case across UNKNOWN verbs; this version
     // knows each in-flight op's actual verb from its "starting" line).
+    //
+    // WHY THE SUM, NOT A MAX: `commit_lock` (crates/txn/src/dataset.rs)
+    // does NOT bound this to one ambiguous op. `write_phase` runs OUTSIDE
+    // commit_lock, and each op's ack line prints AFTER commit() returns --
+    // i.e. after commit_lock is already released -- so arbitrarily many
+    // agent threads can each be sitting in their own post-commit,
+    // pre-ack-line window at the same instant when a chaos abort fires.
+    // Every op with a "starting" line and no matching completion line by
+    // the end of the run is independently ambiguous; this is why the
+    // budget is a genuine sum over the whole in-flight set (up to
+    // NUM_AGENTS entries), not a single-op cap the way it correctly was
+    // when the scheduler was sequential.
+    //
+    // KNOWN RESIDUAL IMPRECISION (false-negative only, never a false
+    // failure): if 2+ in-flight ops are Delete/Update targeting the SAME
+    // pool row, this sums a `lost` budget of 2+ for that row even though
+    // only 1 row can actually go missing -- a real regression there could
+    // hide behind the extra slack. The collision probability scales with
+    // NUM_AGENTS/POOL_SIZE, so it's non-trivially higher now (8/6) than
+    // when this was first measured Minor (3/6). Inherent to the
+    // per-verb-shape model (the alternative -- printing each delete/
+    // update's target row-id in its "starting" line and tolerating an
+    // exact id-set instead of a count -- is a real fix, just not done
+    // here) and still strictly narrower than the flat constant it
+    // replaced.
     let max_tolerated_combined = max_tolerated_lost + max_tolerated_phantoms;
     assert!(
         lost.len() + phantom.len() <= max_tolerated_combined,
