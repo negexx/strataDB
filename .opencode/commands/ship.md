@@ -1,7 +1,5 @@
 ---
-name: ship
 description: Open a PR for the current branch after running verification. Drafts a clean conventional-commit-style PR title and body.
-argument-hint: "[--draft]"
 ---
 
 # /ship — Open a pull request
@@ -14,7 +12,7 @@ Ship the current branch as a PR. The user expects this command to do the boring 
 
 2. **Run /verify** — build + tests + clippy + format must all pass. If the branch touches `crates/txn/` or `crates/index/`, the loom pass must also be green. If anything fails, stop and report.
 
-3. **Review** — dispatch the `reviewer` subagent (Opus 4.8) against the full diff. Resolve or explicitly accept every `Critical`/`Important` finding before continuing — a `REQUEST_CHANGES` verdict blocks shipping until addressed.
+3. **Review** — dispatch the `reviewer` subagent against the full diff. Resolve or explicitly accept every `Critical`/`Important` finding before continuing — a `REQUEST_CHANGES` verdict blocks shipping until addressed.
 
 4. **Push** — `git push -u origin HEAD` (only if branch isn't already tracking remote).
 
@@ -47,5 +45,5 @@ Ship the current branch as a PR. The user expects this command to do the boring 
 - Never push directly to `main`.
 - Never force-push unless the user asked.
 - If verification fails, do NOT push or open the PR — fix first.
-- Never skip the Opus 4.8 review step, even under time pressure — it's the mandatory gate, not an optional nicety.
+- Never skip the reviewer subagent review step, even under time pressure — it's the mandatory gate, not an optional nicety.
 - Include any on-disk format changes, manifest schema changes, or isolation-level implications in the Notes section explicitly — these are the hardest things to walk back once shipped.

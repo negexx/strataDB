@@ -1,0 +1,53 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "default_agent": "orchestrator",
+  "subagent_depth": 2,
+  "model": "opencode-go/deepseek-v4-flash",
+  "instructions": [
+    ".opencode/rules/concurrency-txn-layer.md",
+    ".opencode/rules/python-bindings.md",
+    ".opencode/rules/vector-index.md"
+  ],
+  "plugin": [
+    "superpowers@git+https://github.com/obra/superpowers.git"
+  ],
+  "mcp": {
+    "context7": {
+      "type": "remote",
+      "url": "https://mcp.context7.com/mcp",
+      "headers": {
+        "CONTEXT7_API_KEY": "ctx7sk-47cd3386-572d-4090-8f7a-573c9247ae88"
+      }
+    }
+  },
+  "permission": {
+    "bash": {
+      "*": "allow",
+      "git push --force *": "deny",
+      "git reset --hard *": "deny",
+      "git checkout -- *": "deny",
+      "git checkout .": "deny",
+      "git clean -f*": "deny",
+      "*--no-verify*": "deny",
+      "rm -rf *": "deny",
+      "cargo add *": "deny",
+      "cargo remove *": "deny",
+      "cargo publish*": "deny"
+    },
+    "read": {
+      "*": "allow",
+      ".env*": "deny",
+      "**/secrets/**": "deny",
+      "**/*.pem": "deny",
+      "**/*.key": "deny",
+      ".env.example": "allow"
+    },
+    "edit": "allow"
+  },
+  "formatter": {
+    "rustfmt": {
+      "command": ["cargo", "fmt", "--", "$FILE"],
+      "extensions": [".rs"]
+    }
+  }
+}

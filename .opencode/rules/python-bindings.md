@@ -1,9 +1,3 @@
----
-paths:
-  - "crates/bindings/**/*.rs"
-  - "crates/bindings/**/*.py"
----
-
 # Python Bindings (PyO3)
 
 - Use the modern `#[pymodule] mod strata_ext { #[pymodule_export] use super::...; }` form, not the older function-based `#[pymodule] fn strata_ext(py: Python, m: &PyModule)` API — this project standardized on the module form; don't mix styles across files.
