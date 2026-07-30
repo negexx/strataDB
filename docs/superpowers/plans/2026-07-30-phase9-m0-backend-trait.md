@@ -983,6 +983,118 @@ git add crates/storage/src/manifest.rs
 git commit -m "refactor(storage): migrate commit_manifest/read_current onto Backend/LocalFs"
 ```
 
+- [ ] **Step 9: Fix the module doc comment and add a regression test for the real tmp-file shape**
+
+Review found that this module's header doc comment (near the top of
+`crates/storage/src/manifest.rs`, above the `use` statements) now asserts
+something false. It currently says a crash mid-write leaves a `.tmp-*`
+file "which never matches the `*.manifest` glob `read_current` looks
+for." That was true for the pre-`Backend` naming (`.tmp-{version}`), but
+`LocalFs::tmp_path_for` (Task 1) produces `.tmp-{pid}-{n}-{file_name}`,
+and for a manifest commit `file_name` is the target's own filename
+(`00000000000000000001.manifest`) — so the real leftover tmp file's name
+*does* end in `.manifest`. Exclusion in the new `read_current` rests
+entirely on the stem (everything before `.manifest`) never parsing as a
+`u64`, since it always starts with a literal `.`. Still correct, just a
+different, single-guarded mechanism than the comment describes — and the
+two existing tests that were meant to be "the real regression check" for
+this (`leftover_tmp_file_is_never_picked_up_as_current`,
+`read_current_is_none_when_versions_dir_has_only_a_leftover_tmp_file`)
+both use the old `.tmp-{version}` naming, so neither exercises the shape
+a real crash actually produces today.
+
+Replace the module doc comment's crash-safety paragraph. Find:
+
+```rust
+//! A manifest is one immutable file per version, named so lexicographic
+//! order equals numeric order (`{version:020}.manifest`, following Lance's
+//! own convention). Commit is: write to a temp name, fsync, atomically
+//! rename into place. A crash mid-write leaves only a `.tmp-*` file, which
+//! never matches the `*.manifest` glob `read_current` looks for — so a
+//! reader can never observe a partially-written version. This *is* the
+//! mechanism the Phase 1 "kill -9 mid-write, restart, recover last
+//! committed version" MVP checklist item tests.
+```
+
+Replace with:
+
+```rust
+//! A manifest is one immutable file per version, named so lexicographic
+//! order equals numeric order (`{version:020}.manifest`, following Lance's
+//! own convention). Commit is: write to a temp name (via
+//! [`crate::backend::LocalFs::put`]), fsync, atomically rename into place.
+//! A crash mid-write leaves only a `.tmp-*` file behind. Its stem (the
+//! part before `.manifest`) always starts with a `.` from the temp-name
+//! prefix, so it can never parse as a `u64` version — `read_current`
+//! excludes it on that basis. The leftover tmp file's name does still end
+//! in `.manifest` (it's derived from the target filename), so this is a
+//! single-guarded exclusion (numeric-parse failure), not a
+//! `*.manifest`-glob mismatch — but a reader still can never observe a
+//! partially-written version either way. This *is* the mechanism the
+//! Phase 1 "kill -9 mid-write, restart, recover last committed version"
+//! MVP checklist item tests.
+```
+
+Then add a test exercising the real shape. Add to
+`crates/storage/src/manifest.rs`'s `#[cfg(test)] mod tests` (alongside the
+existing `leftover_tmp_file_is_never_picked_up_as_current` test):
+
+```rust
+    #[test]
+    fn leftover_tmp_file_with_the_real_localfs_naming_shape_is_never_picked_up_as_current() {
+        // Unlike `leftover_tmp_file_is_never_picked_up_as_current` above
+        // (which uses the pre-Backend `.tmp-{version}` naming and so only
+        // exercises the suffix-mismatch path), this uses the actual shape
+        // `LocalFs::tmp_path_for` produces: `.tmp-{pid}-{n}-{file_name}`,
+        // where `file_name` is the target's own filename -- so this tmp
+        // file's name *does* end in `.manifest`. Exclusion here rests
+        // entirely on the stem (`.tmp-1234-0-...`) never parsing as a u64.
+        let dir = temp_dataset_dir("real-tmp-shape");
+        let m0 = Manifest {
+            version: 0,
+            data_files: vec![DataFileEntry {
+                name: "a.arrow".to_string(),
+                stats: HashMap::new(),
+            }],
+            next_row_id: 0,
+            tombstones: Vec::new(),
+            next_attempt_id: 0,
+            commit_time_high_water: 0,
+            segments: Vec::new(),
+        };
+        commit_manifest(&dir, &m0).unwrap();
+
+        let versions = versions_dir(&dir);
+        let mut tmp = File::create(
+            versions.join(format!(".tmp-{}-0-{:020}.manifest", std::process::id(), 1)),
+        )
+        .unwrap();
+        tmp.write_all(b"{ incomplete json").unwrap();
+
+        let current = read_current(&dir).unwrap().unwrap();
+        assert_eq!(
+            current, m0,
+            "a leftover tmp file using LocalFs's real naming shape must not be treated as current"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+```
+
+Run: `cargo test -p strata-storage manifest:: -- --nocapture`
+Expected: PASS — 14 manifest tests green (13 pre-existing + this one).
+
+Then run the full crate suite and clippy again:
+
+Run: `cargo test -p strata-storage -- --nocapture` — expect PASS.
+Run: `cargo clippy -p strata-storage --all-targets -- -D warnings` — expect clean.
+
+- [ ] **Step 10: Commit**
+
+```bash
+git add crates/storage/src/manifest.rs
+git commit -m "docs(storage): fix stale crash-safety claim, test the real tmp-file shape"
+```
+
 ---
 
 ### Task 7: Full verification gate
