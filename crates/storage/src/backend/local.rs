@@ -274,4 +274,29 @@ mod tests {
         assert_eq!(backend.get("a.bin").unwrap(), b"first");
         fs::remove_dir_all(&root).ok();
     }
+
+    #[test]
+    fn put_if_absent_under_concurrent_racers_exactly_one_wins() {
+        let root = temp_root("if-absent-race");
+        let backend = LocalFs::new(&root);
+
+        let (ok_count, winner_bytes) = std::thread::scope(|scope| {
+            let backend_ref = &backend;
+            let h1 = scope.spawn(move || backend_ref.put_if_absent("a.bin", b"writer-one"));
+            let h2 = scope.spawn(move || backend_ref.put_if_absent("a.bin", b"writer-two"));
+            let r1 = h1.join().unwrap();
+            let r2 = h2.join().unwrap();
+
+            let ok_count = [&r1, &r2].iter().filter(|r| r.is_ok()).count();
+            let winner_bytes = backend_ref.get("a.bin").unwrap();
+            (ok_count, winner_bytes)
+        });
+
+        assert_eq!(ok_count, 1, "exactly one racer must succeed");
+        assert!(
+            winner_bytes == b"writer-one" || winner_bytes == b"writer-two",
+            "final content must be exactly one racer's payload, got {winner_bytes:?}"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
 }
