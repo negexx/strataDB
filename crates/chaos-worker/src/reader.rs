@@ -15,17 +15,19 @@
 //! path gives all of a multi-batch insert's rows the SAME `name`
 //! (`commit_ops::execute_multi_batch_insert`), so the `name` zone map's
 //! merge is degenerate (min == max, a single value) and this check alone
-//! does NOT exercise real cross-batch min/max merge arithmetic; (3) [not
-//! yet implemented — see Task 5] an `id`-range compound-predicate subset
-//! check, which does exercise that arithmetic, since `id` genuinely varies
-//! per row unlike `name`.
+//! does NOT exercise real cross-batch min/max merge arithmetic; (3) an
+//! `id`-range compound-predicate subset check (`Predicate::And(GtEq,
+//! Lt)` over the full visible table's `id` column, split at its
+//! midpoint), which exercises real cross-batch/cross-segment min/max merge
+//! arithmetic, unlike `name` (constant per agent, hence a degenerate merge
+//! for that column alone).
 
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use arrow::array::{
-    Array, FixedSizeListArray, Float32Array, RecordBatch, StringArray, UInt64Array,
+    Array, FixedSizeListArray, Float32Array, Int64Array, RecordBatch, StringArray, UInt64Array,
 };
 use rand::{Rng as _, SeedableRng as _};
 use rand_chacha::ChaCha8Rng;
@@ -214,6 +216,42 @@ fn check_once(dataset: &Dataset, name_predicate: &Predicate, reverse_rng: &mut C
              (got {hits:?}) — zone-map pruning wrongly excluded the segment holding this row"
         );
     }
+
+    // id-range compound-predicate check (design doc Part 2 §2b): `name`
+    // is constant per agent (a degenerate zone-map merge); the business
+    // `id` column genuinely varies per row, so this is the actual
+    // zone-map-merge exerciser. Scoped to the FULL visible table (every
+    // agent's rows plus pool rows), not just the name-scoped reference set
+    // above -- deliberately broader scope than the name check. Skipped
+    // when fewer than 2 distinct ids are visible (nothing to split).
+    let id_col = required_column::<Int64Array>(&all_rows, "id");
+    let distinct_ids: HashSet<i64> = (0..all_rows.num_rows()).map(|i| id_col.value(i)).collect();
+    if distinct_ids.len() >= 2 {
+        let min_id = *distinct_ids.iter().min().unwrap();
+        let max_id = *distinct_ids.iter().max().unwrap();
+        let lo = min_id;
+        let hi = min_id + (max_id - min_id) / 2 + 1;
+        let id_predicate = Predicate::And(
+            Box::new(Predicate::GtEq("id".to_string(), Value::Int64(lo))),
+            Box::new(Predicate::Lt("id".to_string(), Value::Int64(hi))),
+        );
+        let id_pruned = snapshot
+            .vector_search(&[0.0, 0.0, 0.0], READER_SEARCH_K, Some(&id_predicate))
+            .expect("vector_search must succeed against a live snapshot");
+        let id_pruned_row_ids: Vec<u64> = id_pruned.into_iter().map(|m| m.row_id).collect();
+        let id_reference: HashSet<u64> = (0..all_rows.num_rows())
+            .filter(|&i| {
+                let id = id_col.value(i);
+                id >= lo && id < hi
+            })
+            .map(|i| row_id_col.value(i))
+            .collect();
+        assert_pruned_is_subset_of_reference(
+            &id_pruned_row_ids,
+            &id_reference,
+            &format!("And(GtEq(id,{lo}), Lt(id,{hi}))"),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -341,6 +379,51 @@ mod tests {
         for _ in 0..10 {
             check_once(&dataset, &predicate, &mut reverse_rng);
         }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn check_once_passes_against_rows_spanning_a_real_id_range() {
+        // Two rows with distinct business ids from one multi-batch commit
+        // -- makes the id-range split's lo/hi arithmetic load-bearing
+        // (min=1, max=2 -> lo=1, hi=2, so exactly one row falls in
+        // [lo, hi)).
+        let dir = temp_dir("check-once-id-range");
+        let dataset = Dataset::create(&dir).unwrap();
+        let mut txn = dataset.begin();
+        txn.insert(strata_txn::mvp_fixtures::mvp_row(1, "agent0", [1.0, 0.0, 0.0]).unwrap());
+        txn.insert(strata_txn::mvp_fixtures::mvp_row(2, "agent0", [0.0, 1.0, 0.0]).unwrap());
+        txn.commit().unwrap();
+
+        let predicate = Predicate::Eq(
+            "name".to_string(),
+            Value::Utf8(READER_PREDICATE_NAME.to_string()),
+        );
+        let mut reverse_rng = ChaCha8Rng::seed_from_u64(1);
+        check_once(&dataset, &predicate, &mut reverse_rng);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn check_once_skips_the_id_range_check_with_fewer_than_two_distinct_ids() {
+        // A single row -- distinct_ids.len() == 1, so the id-range block
+        // must not run (and, in particular, must not construct an empty
+        // or inverted range). Passing at all is the assertion: an
+        // off-by-one in the skip condition would panic here.
+        let dir = temp_dir("check-once-single-row");
+        let dataset = Dataset::create(&dir).unwrap();
+        let mut txn = dataset.begin();
+        txn.insert(strata_txn::mvp_fixtures::mvp_row(1, "agent0", [1.0, 0.0, 0.0]).unwrap());
+        txn.commit().unwrap();
+
+        let predicate = Predicate::Eq(
+            "name".to_string(),
+            Value::Utf8(READER_PREDICATE_NAME.to_string()),
+        );
+        let mut reverse_rng = ChaCha8Rng::seed_from_u64(1);
+        check_once(&dataset, &predicate, &mut reverse_rng);
 
         std::fs::remove_dir_all(&dir).ok();
     }
