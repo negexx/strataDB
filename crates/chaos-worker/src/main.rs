@@ -20,7 +20,7 @@ use rand_chacha::ChaCha8Rng;
 
 use commit_ops::{
     ExecOutcome, Registry, execute_delete, execute_insert, execute_multi_batch_insert,
-    execute_update,
+    execute_update, print_line,
 };
 use ops::{OpVerb, generate_verb_sequence, resolve_slot_consumption, resolve_target};
 
@@ -81,12 +81,7 @@ fn install_failure_hook() {
 /// pool — see design doc §3.1. Business ids are negative (`-1..-POOL_SIZE`)
 /// so they can never collide with an agent's own `global_id` business ids
 /// (always >= 0).
-fn setup_contested_pool(
-    dataset: &strata_txn::Dataset,
-    seed: u64,
-    registry: &mut Registry,
-    out: &mut impl std::io::Write,
-) {
+fn setup_contested_pool(dataset: &strata_txn::Dataset, seed: u64, registry: &mut Registry) {
     let mut rng = ChaCha8Rng::seed_from_u64(seed ^ POOL_STREAM);
     for i in 0..POOL_SIZE {
         let business_id = -1 - i64::try_from(i).unwrap();
@@ -100,8 +95,7 @@ fn setup_contested_pool(
             panic!("pool setup insert must always commit cleanly: {outcome:?}");
         };
         registry.record_pool_row(row_id);
-        writeln!(out, "pool committed insert row_id {row_id}").unwrap();
-        out.flush().unwrap();
+        print_line(&format!("pool committed insert row_id {row_id}"));
     }
 }
 
@@ -150,13 +144,7 @@ fn main() {
     // Task 3's real agent threads inherit this exact pattern, so it must
     // not establish the one counter-example to it.
     let mut registry = Registry::new(num_agents_usize);
-    // Deliberately `std::io::stdout()`, NOT `.lock()`'d: `Stdout` itself
-    // implements `Write` by locking/unlocking internally on every single
-    // call, rather than holding the lock across this whole function --
-    // see the comment on the scheduler loop's `out` below for why holding
-    // it for any extended span is unsafe here.
-    let mut out = std::io::stdout();
-    setup_contested_pool(&dataset, seed, &mut registry, &mut out);
+    setup_contested_pool(&dataset, seed, &mut registry);
     let registry = Arc::new(Mutex::new(registry));
 
     let (reader_handle, reader_done) = reader::spawn(Arc::clone(&dataset));
@@ -305,7 +293,7 @@ fn main() {
             }
             ExecOutcome::Dropped => {}
         }
-        commit_ops::print_outcome(&mut out, agent, op, &outcome);
+        commit_ops::print_outcome(agent, op, &outcome);
 
         next_op[pick] += slots_consumed;
         remaining[pick] -= slots_consumed;
@@ -376,20 +364,18 @@ mod stdout_lock_discipline_tests {
     // while a first thread still holds it, and unblocks once that first
     // thread drops its guard.
     //
-    // main() and setup_contested_pool print through a plain
-    // `std::io::Stdout` handle, never a `StdoutLock` -- `Stdout` itself
-    // implements `Write` by locking and unlocking internally on every
-    // single call, so no thread here ever holds the lock across a
-    // blocking operation (the scheduler loop, reader_handle.join(), etc).
+    // Every line this worker prints goes through commit_ops::print_line,
+    // which acquires a StdoutLock for exactly one write+flush and drops it
+    // immediately -- never held across a blocking operation (an agent
+    // thread's commit(), or main()'s join() on the agent/reader threads).
     // That matters because install_failure_hook's hook calls
-    // stdout().lock() from whichever thread panics: if the main thread
-    // instead held a `StdoutLock` across `reader_handle.join()` (an
-    // earlier version of this file did exactly that), a reader-thread
-    // panic's own lock() call would block forever on it, and join() could
-    // never return since the reader thread could never finish exiting
-    // through its own blocked hook. This test exists to document that
-    // hazard precisely, so nobody "optimizes" the printing here back into
-    // a held `StdoutLock` without understanding what it would reintroduce.
+    // stdout().lock() from whichever thread panics: if some other thread
+    // instead held a StdoutLock across a blocking call, a panicking
+    // thread's own lock() call would block forever on it, and whatever
+    // that other thread was blocked joining could never return either.
+    // This test exists to document that hazard precisely, so nobody
+    // "optimizes" print_line back into a lock held across a wider span
+    // without understanding what it would reintroduce.
     #[test]
     fn a_thread_holding_the_stdout_lock_blocks_another_threads_lock_until_it_is_dropped() {
         let stdout = std::io::stdout();

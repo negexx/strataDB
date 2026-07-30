@@ -3,7 +3,7 @@
 //! `docs/superpowers/specs/2026-07-27-chaos-worker-workload-extension-design.md`
 //! §3.1, §3.2, and §3.5 (ack-line printing).
 
-use std::io::Write;
+use std::io::Write as _;
 
 use arrow::array::UInt64Array;
 use strata_query::Predicate;
@@ -237,49 +237,55 @@ pub(crate) fn execute_multi_batch_insert(
     }
 }
 
-/// Prints one acknowledgment line matching the design doc §3.5 protocol,
-/// and flushes immediately (`tests/sim`'s orchestrator reads this over a
-/// pipe and needs each line as soon as it's written, same as the
-/// pre-existing insert-only worker's own behavior).
-pub(crate) fn print_outcome(out: &mut impl Write, agent: u64, op: u64, outcome: &ExecOutcome) {
+/// Writes one already-fully-formatted line to real stdout, locking it
+/// exactly once for this one write+flush and dropping the lock
+/// immediately after — never across a blocking operation. `Write::write_fmt`'s
+/// default implementation decomposes a format string into one `write_str`
+/// call per literal fragment/interpolated value, and a bare unlocked
+/// `Stdout` re-locks internally on every one of those calls — harmless
+/// with a single printer, but it risks two threads' lines interleaving
+/// mid-line once multiple agent threads print concurrently. Locking once
+/// here, before any of those internal `write_str` calls happen, means they
+/// all run under the SAME held lock, so no other thread's `print_line`
+/// call can interleave until this one's guard drops. See
+/// `docs/superpowers/specs/2026-07-30-chaos-worker-real-concurrency-and-zonemap-verification-design.md`.
+pub(crate) fn print_line(line: &str) {
+    let stdout = std::io::stdout();
+    let mut locked = stdout.lock();
+    let _ = writeln!(locked, "{line}");
+    let _ = locked.flush();
+}
+
+/// Builds the acknowledgment line text for one op outcome, matching the
+/// design doc §3.5 protocol — separated from [`print_line`] so the exact
+/// format stays unit-testable without going through real stdout.
+pub(crate) fn format_outcome_line(agent: u64, op: u64, outcome: &ExecOutcome) -> String {
     match outcome {
         ExecOutcome::CommittedInsert { row_id, .. } => {
-            writeln!(
-                out,
-                "agent {agent} committed insert op {op} row_id {row_id}"
-            )
-            .unwrap();
+            format!("agent {agent} committed insert op {op} row_id {row_id}")
         }
         ExecOutcome::CommittedDelete { target_row_id } => {
-            writeln!(
-                out,
-                "agent {agent} committed delete op {op} target_row_id {target_row_id}"
-            )
-            .unwrap();
+            format!("agent {agent} committed delete op {op} target_row_id {target_row_id}")
         }
         ExecOutcome::CommittedUpdate {
             target_row_id,
             row_id,
-        } => {
-            writeln!(
-                out,
-                "agent {agent} committed update op {op} target_row_id {target_row_id} row_id {row_id}"
-            )
-            .unwrap();
-        }
-        ExecOutcome::CommittedMultiBatch { row_ids } => {
-            writeln!(
-                out,
-                "agent {agent} committed multibatch op {op} row_ids {},{}",
-                row_ids[0], row_ids[1]
-            )
-            .unwrap();
-        }
-        ExecOutcome::Dropped => {
-            writeln!(out, "agent {agent} dropped op {op} (conflict)").unwrap();
-        }
+        } => format!(
+            "agent {agent} committed update op {op} target_row_id {target_row_id} row_id {row_id}"
+        ),
+        ExecOutcome::CommittedMultiBatch { row_ids } => format!(
+            "agent {agent} committed multibatch op {op} row_ids {},{}",
+            row_ids[0], row_ids[1]
+        ),
+        ExecOutcome::Dropped => format!("agent {agent} dropped op {op} (conflict)"),
     }
-    out.flush().unwrap();
+}
+
+/// Prints one acknowledgment line and flushes immediately (`tests/sim`'s
+/// orchestrator reads this over a pipe and needs each line as soon as it's
+/// written).
+pub(crate) fn print_outcome(agent: u64, op: u64, outcome: &ExecOutcome) {
+    print_line(&format_outcome_line(agent, op, outcome));
 }
 
 #[cfg(test)]
@@ -461,55 +467,46 @@ mod tests {
     }
 
     #[test]
-    fn print_outcome_matches_the_documented_ack_line_format_for_every_variant() {
+    fn format_outcome_line_matches_the_documented_ack_line_format_for_every_variant() {
         // Task 7's orchestrator parses these lines by exact format -- a
         // typo here (a missing token, "multi_batch" instead of
-        // "multibatch", a space instead of a comma) would compile and
-        // pass every execute_* test while silently breaking Task 7's
-        // parser. Round-trips through a Vec<u8> writer rather than
-        // spawning the real worker binary, so this stays a fast unit test.
-        let mut out: Vec<u8> = Vec::new();
-        print_outcome(
-            &mut out,
-            1,
-            2,
-            &ExecOutcome::CommittedInsert {
-                business_id: 99,
-                row_id: 5,
-            },
+        // "multibatch", a space instead of a comma) would compile and pass
+        // every execute_* test while silently breaking the orchestrator's
+        // parser.
+        assert_eq!(
+            format_outcome_line(
+                1,
+                2,
+                &ExecOutcome::CommittedInsert {
+                    business_id: 99,
+                    row_id: 5
+                }
+            ),
+            "agent 1 committed insert op 2 row_id 5"
         );
-        print_outcome(
-            &mut out,
-            1,
-            3,
-            &ExecOutcome::CommittedDelete { target_row_id: 5 },
+        assert_eq!(
+            format_outcome_line(1, 3, &ExecOutcome::CommittedDelete { target_row_id: 5 }),
+            "agent 1 committed delete op 3 target_row_id 5"
         );
-        print_outcome(
-            &mut out,
-            1,
-            4,
-            &ExecOutcome::CommittedUpdate {
-                target_row_id: 5,
-                row_id: 6,
-            },
+        assert_eq!(
+            format_outcome_line(
+                1,
+                4,
+                &ExecOutcome::CommittedUpdate {
+                    target_row_id: 5,
+                    row_id: 6
+                }
+            ),
+            "agent 1 committed update op 4 target_row_id 5 row_id 6"
         );
-        print_outcome(
-            &mut out,
-            1,
-            5,
-            &ExecOutcome::CommittedMultiBatch { row_ids: [7, 8] },
+        assert_eq!(
+            format_outcome_line(1, 5, &ExecOutcome::CommittedMultiBatch { row_ids: [7, 8] }),
+            "agent 1 committed multibatch op 5 row_ids 7,8"
         );
-        print_outcome(&mut out, 1, 6, &ExecOutcome::Dropped);
-
-        let printed = String::from_utf8(out).unwrap();
-        let expected = "\
-agent 1 committed insert op 2 row_id 5
-agent 1 committed delete op 3 target_row_id 5
-agent 1 committed update op 4 target_row_id 5 row_id 6
-agent 1 committed multibatch op 5 row_ids 7,8
-agent 1 dropped op 6 (conflict)
-";
-        assert_eq!(printed, expected);
+        assert_eq!(
+            format_outcome_line(1, 6, &ExecOutcome::Dropped),
+            "agent 1 dropped op 6 (conflict)"
+        );
     }
 
     #[test]
