@@ -17,10 +17,16 @@
 //! merge is degenerate (min == max, a single value) and this check alone
 //! does NOT exercise real cross-batch min/max merge arithmetic; (3) an
 //! `id`-range compound-predicate subset check (`Predicate::And(GtEq,
-//! Lt)` over the full visible table's `id` column, split at its
-//! midpoint), which exercises real cross-batch/cross-segment min/max merge
-//! arithmetic, unlike `name` (constant per agent, hence a degenerate merge
-//! for that column alone).
+//! Lt)` over the full visible table's `id` column, split at its midpoint
+//! via [`id_split`]) that runs the merge code path on genuinely
+//! non-degenerate input, unlike `name`. Check (3) is, like check (1), a
+//! SUBSET-only check (pruned ⊆ reference holds by construction, same
+//! reasoning as check (1)) -- it exercises the id-column merge code path
+//! without being able to verify the merge produced a CORRECT result. Only
+//! check (2)'s targeted own-vector lookup can catch an over-narrow zone
+//! map actually excluding a row it shouldn't (and only for `name`, whose
+//! own merge is degenerate) -- no check here does the equivalent
+//! reverse-direction probe under the `id` predicate.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -98,6 +104,24 @@ fn assert_pruned_is_subset_of_reference(
 fn reverse_hit_is_correct(hits: &[VectorMatch], expected_row_id: u64) -> bool {
     hits.first()
         .is_some_and(|h| h.row_id == expected_row_id && h.squared_distance < 1.0)
+}
+
+/// Splits `[min_id, max_id]` (both inclusive, `min_id < max_id` required --
+/// callers only invoke this once at least 2 distinct ids are known to be
+/// visible) into a half-open `[lo, hi)` range covering roughly the lower
+/// half, as a pure function so the load-bearing `+1` is unit-testable
+/// without a real `Dataset` -- mirrors [`disagreement`]'s own rationale.
+/// The `+1` guarantees `hi > lo` (never empty) even when `max_id - min_id
+/// == 1`, and `hi <= max_id` always holds for `max_id - min_id >= 1` (the
+/// range never covers the full set, so it's a genuine split, not a no-op).
+fn id_split(min_id: i64, max_id: i64) -> (i64, i64) {
+    debug_assert!(
+        min_id < max_id,
+        "id_split requires at least 2 distinct ids (min_id < max_id)"
+    );
+    let lo = min_id;
+    let hi = min_id + (max_id - min_id) / 2 + 1;
+    (lo, hi)
 }
 
 /// Downcasts a named column from an unpruned reference scan to its
@@ -229,8 +253,7 @@ fn check_once(dataset: &Dataset, name_predicate: &Predicate, reverse_rng: &mut C
     if distinct_ids.len() >= 2 {
         let min_id = *distinct_ids.iter().min().unwrap();
         let max_id = *distinct_ids.iter().max().unwrap();
-        let lo = min_id;
-        let hi = min_id + (max_id - min_id) / 2 + 1;
+        let (lo, hi) = id_split(min_id, max_id);
         let id_predicate = Predicate::And(
             Box::new(Predicate::GtEq("id".to_string(), Value::Int64(lo))),
             Box::new(Predicate::Lt("id".to_string(), Value::Int64(hi))),
@@ -301,6 +324,25 @@ mod tests {
             squared_distance: 0.0,
         }];
         assert!(reverse_hit_is_correct(&hits, 5));
+    }
+
+    #[test]
+    fn id_split_matches_the_documented_examples() {
+        assert_eq!(id_split(1, 2), (1, 2));
+        assert_eq!(id_split(0, 10), (0, 6));
+    }
+
+    #[test]
+    fn id_split_always_produces_a_non_empty_range_that_excludes_max_id() {
+        for (min_id, max_id) in [(1, 2), (0, 10), (-5, -4), (-3, 7), (100, 101)] {
+            let (lo, hi) = id_split(min_id, max_id);
+            assert!(hi > lo, "range [{lo}, {hi}) must be non-empty");
+            assert!(
+                hi <= max_id,
+                "range [{lo}, {hi}) must not cover max_id ({max_id}) -- a genuine split, not a no-op"
+            );
+            assert_eq!(lo, min_id);
+        }
     }
 
     #[test]
@@ -386,9 +428,13 @@ mod tests {
     #[test]
     fn check_once_passes_against_rows_spanning_a_real_id_range() {
         // Two rows with distinct business ids from one multi-batch commit
-        // -- makes the id-range split's lo/hi arithmetic load-bearing
-        // (min=1, max=2 -> lo=1, hi=2, so exactly one row falls in
-        // [lo, hi)).
+        // -- exercises check_once's id-range block end-to-end against real
+        // committed data (min=1, max=2 -> lo=1, hi=2 per id_split, so
+        // exactly one row falls in [lo, hi)). The lo/hi arithmetic itself
+        // is unit-tested directly above (id_split_*) -- this test is
+        // about the block wiring (predicate construction, reference-set
+        // filtering, calling assert_pruned_is_subset_of_reference), not
+        // re-proving the arithmetic.
         let dir = temp_dir("check-once-id-range");
         let dataset = Dataset::create(&dir).unwrap();
         let mut txn = dataset.begin();
@@ -408,10 +454,15 @@ mod tests {
 
     #[test]
     fn check_once_skips_the_id_range_check_with_fewer_than_two_distinct_ids() {
-        // A single row -- distinct_ids.len() == 1, so the id-range block
-        // must not run (and, in particular, must not construct an empty
-        // or inverted range). Passing at all is the assertion: an
-        // off-by-one in the skip condition would panic here.
+        // A single row -- distinct_ids.len() == 1, so the id-range block's
+        // `>= 2` guard must skip it entirely. This does NOT distinguish a
+        // correct `>= 2` guard from an off-by-one `>= 1` guard (with one
+        // row, min==max==1, id_split would still be called with
+        // min_id==max_id, violating its own precondition but not panicking
+        // in a release build since the debug_assert! compiles out) -- it
+        // only proves the block doesn't panic on a single-row dataset.
+        // id_split's own preconditions/arithmetic are covered directly by
+        // the id_split_* tests above.
         let dir = temp_dir("check-once-single-row");
         let dataset = Dataset::create(&dir).unwrap();
         let mut txn = dataset.begin();
