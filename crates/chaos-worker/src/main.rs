@@ -99,11 +99,6 @@ fn setup_contested_pool(dataset: &strata_txn::Dataset, seed: u64, registry: &mut
     }
 }
 
-// One linear scheduler loop wiring together pool setup, the reader thread,
-// and every op verb's commit path -- splitting it into smaller functions
-// would scatter the ordering this task's brief specifies as one coherent
-// unit, not make it clearer.
-#[allow(clippy::too_many_lines)]
 fn main() {
     install_failure_hook();
 
@@ -150,9 +145,10 @@ fn main() {
     let (reader_handle, reader_done) = reader::spawn(Arc::clone(&dataset));
 
     // Per-agent vector generation (unchanged from the original insert-only
-    // worker) and verb generation (new — see ops.rs), both pre-generated
-    // up front. Target resolution for Delete/Update stays just-in-time
-    // (see resolve_target's own doc comment for why).
+    // worker) and verb generation (ops.rs), both pre-generated up front.
+    // Target resolution for Delete/Update stays just-in-time -- see
+    // resolve_target's own doc comment for why -- and now happens inside
+    // each agent's own thread (run_agent), not a shared scheduler.
     let agent_vectors: Vec<Vec<[f32; 3]>> = (0..num_agents)
         .map(|agent| {
             let mut agent_rng = ChaCha8Rng::seed_from_u64(seed ^ agent);
@@ -173,33 +169,66 @@ fn main() {
     let agent_verbs: Vec<Vec<OpVerb>> = (0..num_agents)
         .map(|agent| generate_verb_sequence(seed, agent, ops_per_agent))
         .collect();
-    let mut agent_target_rngs: Vec<ChaCha8Rng> = (0..num_agents)
-        .map(|agent| ChaCha8Rng::seed_from_u64(seed ^ agent ^ TARGET_STREAM))
+    let agent_handles: Vec<std::thread::JoinHandle<()>> = (0..num_agents)
+        .map(|agent| {
+            let dataset = Arc::clone(&dataset);
+            let registry = Arc::clone(&registry);
+            let vectors = agent_vectors[usize::try_from(agent).unwrap()].clone();
+            let verbs = agent_verbs[usize::try_from(agent).unwrap()].clone();
+            std::thread::spawn(move || {
+                run_agent(
+                    &dataset,
+                    &registry,
+                    agent,
+                    ops_per_agent,
+                    &vectors,
+                    &verbs,
+                    seed,
+                );
+            })
+        })
         .collect();
+    for handle in agent_handles {
+        handle.join().expect(
+            "agent thread panicked without going through the failure hook -- this should be unreachable",
+        );
+    }
 
-    let mut next_op: Vec<u64> = vec![0; num_agents_usize];
-    let mut remaining: Vec<u64> = vec![ops_per_agent; num_agents_usize];
-    let mut scheduler_rng = ChaCha8Rng::seed_from_u64(seed ^ 0xA9E1_C0DE_u64);
+    reader_done.store(true, Ordering::SeqCst);
+    reader_handle.join().expect("reader thread panicked without going through the failure hook -- this should be unreachable");
+}
 
-    loop {
-        let live_agents: Vec<usize> = (0..num_agents_usize)
-            .filter(|&a| remaining[a] > 0)
-            .collect();
-        if live_agents.is_empty() {
-            break;
-        }
-        let pick = live_agents[scheduler_rng.random_range(0..live_agents.len())];
-        let agent = pick as u64;
-        let op = next_op[pick];
-        let drawn_verb = agent_verbs[pick][usize::try_from(op).unwrap()];
-        let (verb, slots_consumed) = resolve_slot_consumption(drawn_verb, remaining[pick]);
+/// Runs one agent's full, pre-generated op sequence to completion,
+/// sequentially within this thread, against the shared `dataset`/
+/// `registry` — see design doc Part 1. `resolve_slot_consumption`'s
+/// downgrade logic still applies per-thread; the only remaining source of
+/// interleaving randomness across agents is genuine OS thread scheduling,
+/// which is the actual thing this design exists to exercise.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn run_agent(
+    dataset: &strata_txn::Dataset,
+    registry: &Mutex<Registry>,
+    agent: u64,
+    ops_per_agent: u64,
+    vectors: &[[f32; 3]],
+    verbs: &[OpVerb],
+    seed: u64,
+) {
+    let pick = usize::try_from(agent).unwrap();
+    let mut target_rng = ChaCha8Rng::seed_from_u64(seed ^ agent ^ TARGET_STREAM);
+    let mut op = 0u64;
+    let mut remaining = ops_per_agent;
+
+    while remaining > 0 {
+        let drawn_verb = verbs[usize::try_from(op).unwrap()];
+        let (verb, slots_consumed) = resolve_slot_consumption(drawn_verb, remaining);
 
         let outcome = match verb {
             OpVerb::Insert => {
                 let global_id = agent * ops_per_agent + op;
-                let vector = agent_vectors[pick][usize::try_from(op).unwrap()];
+                let vector = vectors[usize::try_from(op).unwrap()];
                 execute_insert(
-                    &dataset,
+                    dataset,
                     i64::try_from(global_id).unwrap(),
                     &format!("agent{agent}"),
                     vector,
@@ -208,10 +237,10 @@ fn main() {
             OpVerb::MultiBatchInsert => {
                 let global_id_0 = agent * ops_per_agent + op;
                 let global_id_1 = agent * ops_per_agent + op + 1;
-                let vector_0 = agent_vectors[pick][usize::try_from(op).unwrap()];
-                let vector_1 = agent_vectors[pick][usize::try_from(op + 1).unwrap()];
+                let vector_0 = vectors[usize::try_from(op).unwrap()];
+                let vector_1 = vectors[usize::try_from(op + 1).unwrap()];
                 execute_multi_batch_insert(
-                    &dataset,
+                    dataset,
                     [
                         i64::try_from(global_id_0).unwrap(),
                         i64::try_from(global_id_1).unwrap(),
@@ -225,16 +254,15 @@ fn main() {
                     let guard = registry.lock().unwrap();
                     (guard.pool_rows().to_vec(), guard.own_rows(pick).to_vec())
                 };
-                if let Some(target_row_id) =
-                    resolve_target(&mut agent_target_rngs[pick], &pool_rows, &own_rows)
+                if let Some(target_row_id) = resolve_target(&mut target_rng, &pool_rows, &own_rows)
                 {
-                    execute_delete(&dataset, target_row_id)
+                    execute_delete(dataset, target_row_id)
                 } else {
                     // No eligible target yet -- downgrade to Insert per design doc §3.1.
                     let global_id = agent * ops_per_agent + op;
-                    let vector = agent_vectors[pick][usize::try_from(op).unwrap()];
+                    let vector = vectors[usize::try_from(op).unwrap()];
                     execute_insert(
-                        &dataset,
+                        dataset,
                         i64::try_from(global_id).unwrap(),
                         &format!("agent{agent}"),
                         vector,
@@ -246,13 +274,12 @@ fn main() {
                     let guard = registry.lock().unwrap();
                     (guard.pool_rows().to_vec(), guard.own_rows(pick).to_vec())
                 };
-                if let Some(target_row_id) =
-                    resolve_target(&mut agent_target_rngs[pick], &pool_rows, &own_rows)
+                if let Some(target_row_id) = resolve_target(&mut target_rng, &pool_rows, &own_rows)
                 {
                     let global_id = agent * ops_per_agent + op;
-                    let vector = agent_vectors[pick][usize::try_from(op).unwrap()];
+                    let vector = vectors[usize::try_from(op).unwrap()];
                     execute_update(
-                        &dataset,
+                        dataset,
                         target_row_id,
                         i64::try_from(global_id).unwrap(),
                         &format!("agent{agent}"),
@@ -260,9 +287,9 @@ fn main() {
                     )
                 } else {
                     let global_id = agent * ops_per_agent + op;
-                    let vector = agent_vectors[pick][usize::try_from(op).unwrap()];
+                    let vector = vectors[usize::try_from(op).unwrap()];
                     execute_insert(
-                        &dataset,
+                        dataset,
                         i64::try_from(global_id).unwrap(),
                         &format!("agent{agent}"),
                         vector,
@@ -295,12 +322,9 @@ fn main() {
         }
         commit_ops::print_outcome(agent, op, &outcome);
 
-        next_op[pick] += slots_consumed;
-        remaining[pick] -= slots_consumed;
+        op += slots_consumed;
+        remaining -= slots_consumed;
     }
-
-    reader_done.store(true, Ordering::SeqCst);
-    reader_handle.join().expect("reader thread panicked without going through the failure hook -- this should be unreachable");
 }
 
 #[cfg(test)]
