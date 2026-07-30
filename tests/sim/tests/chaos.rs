@@ -12,8 +12,24 @@ use std::process::Command;
 use rand::Rng as _;
 use rand::SeedableRng as _;
 
-const NUM_AGENTS: u64 = 3;
-const OPS_PER_AGENT: u64 = 5;
+/// Bumped from 3 (Task 3.5 and earlier) per Task 6's real-concurrency
+/// closure work: measured empirically (direct chaos-worker invocations,
+/// `STRATA_CHAOS_ABORT_AT` unset, 30 seeds per configuration) that 3 real
+/// agent threads at `OPS_PER_AGENT = 5` never produced a genuine
+/// `TxnError::Conflict`/dropped-op ack line in 50 seeds -- commits finish
+/// fast enough relative to OS thread scheduling that 3 short-lived threads
+/// rarely have overlapping commit windows. `NUM_AGENTS` alone was the
+/// dominant lever, not `OPS_PER_AGENT` or `POOL_SIZE`: 3 agents/20 ops gave
+/// 1/30 runs with a drop, 6 agents/5 ops gave 0/30, 6 agents/10 ops gave
+/// 2/30, but 8 agents/8 ops gave 7/30 (~23%) -- more concurrent threads
+/// raises the chance several are mid-commit at the same instant far more
+/// than lengthening any one thread's op sequence does. 8/8 is the smallest
+/// configuration tested that reliably produces real conflict-drop evidence
+/// without inflating `MAX_ABORT_THRESHOLD` (see below) more than necessary.
+const NUM_AGENTS: u64 = 8;
+/// See `NUM_AGENTS`'s doc comment for the measurement this was tuned
+/// alongside.
+const OPS_PER_AGENT: u64 = 8;
 /// Locally duplicated from `crates/chaos-worker/src/main.rs`'s private
 /// `POOL_SIZE` (design doc §3.1) -- that constant is not reachable from
 /// here, and this file needs its exact value for the clean-run slot-count
@@ -33,30 +49,34 @@ const POOL_SIZE: u64 = 6;
 /// only one `write_bytes`/`commit_manifest` (one segment, one manifest
 /// entry, built from both batches together) -- 7 checkpoints for that one
 /// op, not 6. A delete-only commit writes no new data file or segment at
-/// all, so it has fewer (this workload has had deletes since Task 6,
-/// unlike when this comment previously claimed otherwise). Per-AGENT
-/// worst case is still all-Insert (Insert's 6/slot is the single highest
-/// per-slot cost -- `MultiBatchInsert`'s 7 checkpoints buys 2 slots, or
-/// 3.5/slot): `OPS_PER_AGENT` * 6 * `NUM_AGENTS` = 90. `setup_contested_pool`
-/// (Task 6) adds `POOL_SIZE` more single-row inserts, UNCONDITIONALLY, on
-/// every run, before any agent op: `POOL_SIZE` * 6 = 36 more. Plus
-/// `Dataset::create`'s own initial `commit_manifest` call (3 more, for a
-/// freshly-created dataset). Conservative total estimate: 90 + 36 + 3 =
-/// 129. Empirically confirmed by binary-searching the true checkpoint
-/// total on 12 real seeds: 95-119, comfortably under this estimate. A
-/// higher threshold than needed isn't free: `abort_at` is drawn uniformly
-/// from `1..MAX_ABORT_THRESHOLD`, so a threshold much above the true
-/// total wastes iterations on clean (non-crashing) runs instead of
-/// exercising a crash -- Task 8's thorough tier is the actual Phase 7
-/// exit criterion, and every non-crashing iteration there is one fewer
-/// crash-path check out of its fixed seed budget. Kept at 200, not
-/// pushed up to a larger "safe" round number, for exactly that reason.
+/// all, so it has fewer. Per-AGENT worst case is still all-Insert (Insert's
+/// 6/slot is the single highest per-slot cost -- `MultiBatchInsert`'s 7
+/// checkpoints buys 2 slots, or 3.5/slot): `OPS_PER_AGENT` * 6 *
+/// `NUM_AGENTS` = 8 * 6 * 8 = 384 (was 90 at the old 3-agent/5-op sizing).
+/// `setup_contested_pool` adds `POOL_SIZE` more single-row inserts,
+/// UNCONDITIONALLY, on every run, before any agent thread spawns:
+/// `POOL_SIZE` * 6 = 36 more. Plus `Dataset::create`'s own initial
+/// `commit_manifest` call (3 more, for a freshly-created dataset).
+/// Conservative total estimate: 384 + 36 + 3 = 423. Empirically confirmed
+/// by binary-searching the true checkpoint total on 8 real seeds (0-7) at
+/// the new `NUM_AGENTS`/`OPS_PER_AGENT` sizing: every seed's true total
+/// fell in (350, 400], comfortably under this estimate and consistent
+/// with real per-agent threads sharing one global checkpoint counter
+/// rather than one thread accounting for the whole run. A higher threshold
+/// than needed isn't free: `abort_at` is drawn uniformly from
+/// `1..MAX_ABORT_THRESHOLD`, so a threshold much above the true total
+/// wastes iterations on clean (non-crashing) runs instead of exercising a
+/// crash -- the thorough tier is the actual Phase 7 exit criterion, and
+/// every non-crashing iteration there is one fewer crash-path check out of
+/// its fixed seed budget. Set to 450 (roughly 12% above the highest
+/// observed real total, 400), not a larger "safe" round number, for
+/// exactly that reason.
 ///
 /// `STRATA_CHAOS_ABORT_AT` counts checkpoints since **process start** off
 /// one process-global counter, so this constant must be re-checked
 /// whenever a checkpoint site is added or removed anywhere in
-/// `strata-storage`.
-const MAX_ABORT_THRESHOLD: u64 = 200;
+/// `strata-storage`, or whenever `NUM_AGENTS`/`OPS_PER_AGENT` change.
+const MAX_ABORT_THRESHOLD: u64 = 450;
 
 /// The (lost, phantom) tolerance a single op of this shape contributes if
 /// it was genuinely in flight — mid-commit, ack line not yet printed —
