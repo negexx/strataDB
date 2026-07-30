@@ -90,6 +90,7 @@ fn setup_contested_pool(dataset: &strata_txn::Dataset, seed: u64, registry: &mut
             rng.random::<f32>(),
             rng.random::<f32>(),
         ];
+        print_line(&format!("pool starting insert row {i}"));
         let outcome = execute_insert(dataset, business_id, "pool", vector);
         let ExecOutcome::CommittedInsert { row_id, .. } = outcome else {
             panic!("pool setup insert must always commit cleanly: {outcome:?}");
@@ -227,6 +228,7 @@ fn run_agent(
             OpVerb::Insert => {
                 let global_id = agent * ops_per_agent + op;
                 let vector = vectors[usize::try_from(op).unwrap()];
+                print_line(&format!("agent {agent} starting insert op {op}"));
                 execute_insert(
                     dataset,
                     i64::try_from(global_id).unwrap(),
@@ -239,6 +241,7 @@ fn run_agent(
                 let global_id_1 = agent * ops_per_agent + op + 1;
                 let vector_0 = vectors[usize::try_from(op).unwrap()];
                 let vector_1 = vectors[usize::try_from(op + 1).unwrap()];
+                print_line(&format!("agent {agent} starting multibatch op {op}"));
                 execute_multi_batch_insert(
                     dataset,
                     [
@@ -256,11 +259,13 @@ fn run_agent(
                 };
                 if let Some(target_row_id) = resolve_target(&mut target_rng, &pool_rows, &own_rows)
                 {
+                    print_line(&format!("agent {agent} starting delete op {op}"));
                     execute_delete(dataset, target_row_id)
                 } else {
                     // No eligible target yet -- downgrade to Insert per design doc §3.1.
                     let global_id = agent * ops_per_agent + op;
                     let vector = vectors[usize::try_from(op).unwrap()];
+                    print_line(&format!("agent {agent} starting insert op {op}"));
                     execute_insert(
                         dataset,
                         i64::try_from(global_id).unwrap(),
@@ -278,6 +283,7 @@ fn run_agent(
                 {
                     let global_id = agent * ops_per_agent + op;
                     let vector = vectors[usize::try_from(op).unwrap()];
+                    print_line(&format!("agent {agent} starting update op {op}"));
                     execute_update(
                         dataset,
                         target_row_id,
@@ -288,6 +294,7 @@ fn run_agent(
                 } else {
                     let global_id = agent * ops_per_agent + op;
                     let vector = vectors[usize::try_from(op).unwrap()];
+                    print_line(&format!("agent {agent} starting insert op {op}"));
                     execute_insert(
                         dataset,
                         i64::try_from(global_id).unwrap(),
