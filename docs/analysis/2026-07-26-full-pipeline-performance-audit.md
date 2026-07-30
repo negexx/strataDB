@@ -125,7 +125,7 @@ structural validation — over 100% of on-disk index bytes, for e.g. `strata ins
 - **B2**: `handle_search` resolves k matched row-ids via a *full table scan* (`snapshot.scan`)
   instead of a targeted lookup — negates the index advantage for the CLI path specifically.
 - **B3**: no FFI code exists to have a bottleneck in. The design constraints are already correctly
-  written down in `.claude/rules/python-bindings.md` (mandates `allow_threads` around blocking
+  written down in `.opencode/rules/python-bindings.md` (mandates `allow_threads` around blocking
   calls, typed exceptions not stringified) — nothing violates them because nothing implements
   them yet.
 

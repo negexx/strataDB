@@ -36,13 +36,13 @@
 - Use a typed `enum` error (via `thiserror` or hand-rolled `impl std::error::Error`) on the hot commit/conflict path in `crates/txn/` — no `Box<dyn Error>` or stringly-typed errors on that path, callers need to match on the specific conflict variant.
 - `anyhow`-style dynamic errors are fine at the CLI boundary (`crates/cli/`) where there's no caller left to match on a specific variant.
 - Never swallow an error silently — propagate with `?` or log with enough context to debug later (which transaction, which keys, for anything in `crates/txn/`).
-- A panic across the PyO3 FFI boundary is undefined behavior, not just an ugly traceback — see `.claude/rules/python-bindings.md`.
+- A panic across the PyO3 FFI boundary is undefined behavior, not just an ugly traceback — see `.opencode/rules/python-bindings.md`.
 
 ## Tests
 
 - One assertion idea per test (multiple `assert!`/`assert_eq!` calls are fine if they test the same idea).
 - Test names describe behavior, not implementation: `conflicting_writes_return_typed_error`, not `test_conflict_check`.
-- For `crates/txn/` and `crates/index/`: every change needs a `loom`-based interleaving test alongside the normal `#[test]` happy path — see `.claude/rules/concurrency-txn-layer.md`.
+- For `crates/txn/` and `crates/index/`: every change needs a `loom`-based interleaving test alongside the normal `#[test]` happy path — see `.opencode/rules/concurrency-txn-layer.md`.
 
 ## Commits
 

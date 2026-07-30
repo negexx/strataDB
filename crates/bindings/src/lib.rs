@@ -1,6 +1,6 @@
 //! Placeholder Python extension module proving `PyO3` links correctly. The
 //! real transaction API (begin/commit/retry-on-conflict) lands once
-//! `strata-txn` has real logic — see `.claude/rules/python-bindings.md`.
+//! `strata-txn` has real logic — see `.opencode/rules/python-bindings.md`.
 
 use pyo3::prelude::*;
 

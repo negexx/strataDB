@@ -55,7 +55,7 @@ pub struct Snapshot {
     pub(crate) index: strata_index::SegmentSet,
     pub(crate) tombstones: Arc<imbl::HashSet<u64>>,
     /// Per-predicate resolved-row-id cache — see
-    /// `.claude/docs/analysis/2026-07-25-filtered-vector-search-memory-audit.md`
+    /// `docs/analysis/2026-07-25-filtered-vector-search-memory-audit.md`
     /// and `crate::live_set_cache`'s module doc for why this is sound (this
     /// `Snapshot` is immutable) and how it's bounded (a byte budget, not an
     /// entry count).
@@ -105,7 +105,7 @@ const MAX_EF_SCALE: f64 = 20.0;
 
 /// Widens `base_ef` using `Snapshot::explain`'s scanned/total file ratio as
 /// a coarse, file-granularity *upper bound* on selectivity — see
-/// `.claude/docs/design/phase-4-vector-index-spec.md` §4. Erring toward a
+/// `docs/design/phase-4-vector-index-spec.md` §4. Erring toward a
 /// wider `ef` costs search time, never correctness, so an overestimate of
 /// how many rows survive is the safe direction.
 fn widen_ef(base_ef: usize, snapshot: &Snapshot, predicate: &Predicate) -> usize {
@@ -163,7 +163,7 @@ impl Snapshot {
     /// [`Snapshot::scan_with_predicate`], and [`Snapshot::row_ids_matching`]
     /// — one enforcement point for tombstone visibility, rather than three
     /// call sites each independently responsible for remembering it. Per
-    /// `.claude/docs/design/phase-0-transaction-and-format-spec.md` §8's
+    /// `docs/design/phase-0-transaction-and-format-spec.md` §8's
     /// "Tombstone GC" paragraph: `scan` must treat a tombstoned row-id as
     /// dead regardless of whether its bytes are still on disk.
     ///
@@ -252,7 +252,7 @@ impl Snapshot {
     /// Reports which of this snapshot's files `predicate` would require
     /// scanning, without opening any file body — pure introspection over
     /// stats already loaded in the manifest. See
-    /// `.claude/docs/design/phase-3-query-refinement-spec.md` §3.
+    /// `docs/design/phase-3-query-refinement-spec.md` §3.
     #[must_use]
     pub fn explain(&self, predicate: &Predicate) -> ExplainResult {
         let mut scanned = Vec::new();
@@ -310,7 +310,7 @@ impl Snapshot {
     /// `Self::is_visible` into
     /// [`SegmentSet::search`](strata_index::SegmentSet::search)/
     /// [`SegmentSet::search_filtered_pruned_live`](strata_index::SegmentSet::search_filtered_pruned_live)
-    /// — see `.claude/docs/design/phase-4-vector-index-spec.md` §3-4 and the
+    /// — see `docs/design/phase-4-vector-index-spec.md` §3-4 and the
     /// Phase 5 design doc.
     ///
     /// # Examples
@@ -377,7 +377,7 @@ impl Snapshot {
         // per-snapshot cache keyed by predicate identity instead of calling
         // it directly, so a live `Snapshot` queried with the same predicate
         // more than once pays that cost at most once. See
-        // `.claude/docs/analysis/2026-07-25-filtered-vector-search-memory-audit.md`.
+        // `docs/analysis/2026-07-25-filtered-vector-search-memory-audit.md`.
         //
         // Zone-map pruning (S1 W4b) shrinks the fan-out/search side of that
         // cost only — it does nothing for `row_ids_matching`/
@@ -427,7 +427,7 @@ impl Snapshot {
         // uncached call, at ~1.5GB/s. `resolve_live_set`'s cache is what
         // amortizes this now for a snapshot queried with the same predicate
         // more than once — see
-        // `.claude/docs/analysis/2026-07-25-filtered-vector-search-memory-audit.md`.
+        // `docs/analysis/2026-07-25-filtered-vector-search-memory-audit.md`.
         //
         // Eliminating the underlying per-call cost needs a genuinely
         // column-chunked file format so a single column can be read without

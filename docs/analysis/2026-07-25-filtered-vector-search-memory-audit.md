@@ -75,13 +75,13 @@ S1 and is not designed around it.
 
 A prior, narrower framing of (c) was reportedly considered and rejected during Phase S1 W1's design
 (2026-07-25) for similar reasons; that specific writeup could not be located in this repository's
-history (checked `docs/superpowers/`, `.claude/docs/`, and all S1 branches) — the reasoning above was
+history (checked `docs/superpowers/`, `docs/`, and all S1 branches) — the reasoning above was
 derived independently and reaches the same conclusion.
 
 ## 4. Design review — LLM council
 
 Given this is a memory/latency tradeoff over the transaction layer's read path (`crates/txn`), and
-per `.claude/CLAUDE.md`'s mandate to run hard architectural/tradeoff decisions through `llm-council`,
+per `AGENTS.md`'s mandate to run hard architectural/tradeoff decisions through `llm-council`,
 the choice above was put to a 5-advisor council (Contrarian, First Principles, Expansionist, Outsider,
 Executor) with independent peer review and Opus-tier chairman synthesis. Full transcript not saved;
 findings that changed the design:
@@ -106,7 +106,7 @@ findings that changed the design:
   should hold the resolved bitset (`LiveSet`), not a `Vec<usize>`.
 - **All 5 peer reviewers independently flagged the same gap the advisors missed:** a
   `Mutex`-guarded structure added to `Snapshot` is a concurrency-touching change to `crates/txn`,
-  which `.claude/rules/concurrency-txn-layer.md` and `.claude/CLAUDE.md` make a mandatory `loom`
+  which `.opencode/rules/concurrency-txn-layer.md` and `AGENTS.md` make a mandatory `loom`
   interleaving test, not an optional one.
 - **Lock discipline was identified as the actual design question**, not "Mutex vs. lock-free" in the
   abstract: holding the lock across the ~51 MB file read would serialize concurrent readers on
@@ -135,7 +135,7 @@ Ship **(a)**, in the corrected form the council converged on:
 - **Correctness:** sound because `Snapshot` is immutable and the cache is discarded whole, never
   invalidated incrementally — recorded as a doc comment on the field, not left as tribal knowledge.
 - **Verification:** unit tests (hit/miss/over-budget-skip), plus a `loom` interleaving test for
-  concurrent cache population (scoped per `.claude/rules/concurrency-txn-layer.md`, never a
+  concurrent cache population (scoped per `.opencode/rules/concurrency-txn-layer.md`, never a
   workspace-wide `RUSTFLAGS --cfg loom`).
 
 **Rejected:** (b), (c), and a Bloom-filter/finer-grained zone-map extension to `should_scan_file`
@@ -158,7 +158,7 @@ answer "maybe" for every file too, delivering ~0% on this workload).
    on `Dataset` surviving across commits (the reviewer-proposed idea from §4). Build only if PR 2's
    varying-predicate numbers show cross-commit predicate repetition still dominates cost in practice.
 
-Each PR reviewed by the Opus reviewer subagent before being marked done, per `.claude/CLAUDE.md`'s
+Each PR reviewed by the Opus reviewer subagent before being marked done, per `AGENTS.md`'s
 "what done means" checklist.
 
 ## 7. Measured result — PR 1 + PR 2 implemented
@@ -198,7 +198,7 @@ to an unrelated fix).
 the existing snapshot-isolation and filtered-vector-search correctness tests — no regressions),
 `cargo clippy --workspace --all-targets -- -D warnings` (clean), `cargo fmt --check` (clean), and the
 `LiveSetCache` loom interleaving test (`cargo rustc -p strata-txn --lib --profile test -- --cfg loom`,
-scoped per `.claude/rules/concurrency-txn-layer.md`) — two concurrent misses on the same key compute
+scoped per `.opencode/rules/concurrency-txn-layer.md`) — two concurrent misses on the same key compute
 exactly once, across loom's full interleaving search.
 
 PR 3 (per-file cache surviving across commits) remains deferred: the varying-predicate number above
@@ -208,7 +208,7 @@ benchmark guess.
 
 ## 8. Opus review round — a critical bug caught and fixed before merge
 
-The mandatory Opus reviewer subagent (`.claude/CLAUDE.md`'s "what done means" checklist) requested
+The mandatory Opus reviewer subagent (`AGENTS.md`'s "what done means" checklist) requested
 changes on the first pass. One finding was critical and is the reason this section exists: **the
 original `PredicateKey` canonicalized `-0.0`/`+0.0` together and collapsed all NaN payloads into one
 bit pattern, on the assumption that this matched `f64`'s logical equality.** That assumption was wrong

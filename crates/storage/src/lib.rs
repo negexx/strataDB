@@ -1,5 +1,5 @@
 //! Columnar file format, manifest/versioning. See
-//! `.claude/docs/design/phase-0-transaction-and-format-spec.md`.
+//! `docs/design/phase-0-transaction-and-format-spec.md`.
 
 pub mod backend;
 pub mod chaos;

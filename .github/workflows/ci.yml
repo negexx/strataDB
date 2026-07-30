@@ -28,7 +28,7 @@ jobs:
 
       - name: Test (parallel-insert feature)
         # `insert_batch_parallel`'s clustered-data recall hazard fix (see
-        # `.claude/rules/vector-index.md`) is only exercised end-to-end
+        # `.opencode/rules/vector-index.md`) is only exercised end-to-end
         # through `crates/txn`'s commit path when this feature is on --
         # `cargo test --workspace` above never enables it, since it's off
         # by default (`crates/txn/Cargo.toml`).
@@ -37,7 +37,7 @@ jobs:
       - name: Loom tests (strata-index)
         # Scoped to this one crate rather than a workspace-wide
         # `RUSTFLAGS=--cfg loom cargo test` -- see
-        # `.claude/rules/concurrency-txn-layer.md` for why that would break
+        # `.opencode/rules/concurrency-txn-layer.md` for why that would break
         # other crates in the dependency graph. This is the only CI-visible
         # regression gate for the empty-graph race and the publication-
         # barrier fix (`EntryPoint::claim_if_empty`,

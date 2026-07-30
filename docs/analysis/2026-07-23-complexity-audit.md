@@ -367,7 +367,7 @@ loom-verified concurrency and must be re-validated** against the existing test a
 
 ## Design-gated — decision doc, not a patch
 
-Per `.claude/rules/concurrency-txn-layer.md`, throughput changes in the txn layer are design
+Per `.opencode/rules/concurrency-txn-layer.md`, throughput changes in the txn layer are design
 conversations. These four qualify:
 
 1. **Incremental manifests + data-file compaction** (finding #1). The only real fix for O(v²).
@@ -392,7 +392,7 @@ relative to graph mutation.
 
 Two comments actively mislead, both about the same subject:
 
-1. **`.claude/CLAUDE.md`** lists `hnsw_rs` as the HNSW library. `crates/index/Cargo.toml` has **no
+1. **`AGENTS.md`** lists `hnsw_rs` as the HNSW library. `crates/index/Cargo.toml` has **no
    such dependency** — it depends only on `anndists`. `hnsw_rs` is a **bench-only** dependency, used
    as the comparison baseline in `bench/benches/lockfree_vs_hnsw_rs_bench.rs`. The production index
    is Strata's own hand-rolled lock-free HNSW (`graph.rs`, 1759 lines with loom shims).

@@ -3,9 +3,9 @@
 //! runs upstream of this module, before `write_batch` is ever called — the
 //! files this module reads/writes may carry `Dictionary`-typed columns, but
 //! this module itself has no encoding-specific logic. Strata's own custom
-//! column-chunk/RLE format (`.claude/docs/design/phase-0-transaction-and-format-spec.md`
+//! column-chunk/RLE format (`docs/design/phase-0-transaction-and-format-spec.md`
 //! §6) remains a later, possibly-unnecessary decision — see
-//! `.claude/docs/design/phase-2-encodings-and-groupby-spec.md`'s
+//! `docs/design/phase-2-encodings-and-groupby-spec.md`'s
 //! "Alternatives considered" section.
 
 use std::fs::File;

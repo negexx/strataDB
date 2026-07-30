@@ -69,7 +69,7 @@ fn load_vectors(limit: usize) -> Vec<Vec<f32>> {
     let file = std::fs::File::open(DATASET_PATH).unwrap_or_else(|e| {
         panic!(
             "failed to open {DATASET_PATH}: {e}. Run the download step in \
-             .claude/docs/design/phase-4-implementation-plan.md's Task 7 Step 1 first."
+             docs/design/phase-4-implementation-plan.md's Task 7 Step 1 first."
         )
     });
     let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();

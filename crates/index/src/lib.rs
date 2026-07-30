@@ -1,7 +1,7 @@
 //! HNSW vector index: a lock-free in-memory graph plus the immutable,
 //! self-contained on-disk segment format that graph is sealed into, one
-//! segment per committing transaction. See `.claude/rules/vector-index.md`,
-//! `.claude/docs/design/phase-0-transaction-and-format-spec.md` §4/§6, and
+//! segment per committing transaction. See `.opencode/rules/vector-index.md`,
+//! `docs/design/phase-0-transaction-and-format-spec.md` §4/§6, and
 //! `docs/superpowers/specs/2026-07-24-s1-segment-format-w3-migration-design.md`
 //! §1 for the format.
 

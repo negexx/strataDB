@@ -2,7 +2,7 @@
 //! 10M+ rows, correct, benchmarked"). Correctness against a naive,
 //! obviously-right reference implementation is checked *before* the
 //! throughput numbers are trusted — see
-//! `.claude/docs/design/phase-2-encodings-and-groupby-spec.md` §3.
+//! `docs/design/phase-2-encodings-and-groupby-spec.md` §3.
 //!
 //! `bench_group_by_cardinality_sweep` adds the high-cardinality coverage
 //! `bench_group_by` doesn't exercise (1,000 categories over 10M rows is

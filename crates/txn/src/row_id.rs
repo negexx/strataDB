@@ -1,7 +1,7 @@
 //! Row-id allocation: hands out contiguous, session-durable ranges from a
 //! single global counter.
 //!
-//! `.claude/docs/design/phase-0-transaction-and-format-spec.md` §8 defines
+//! `docs/design/phase-0-transaction-and-format-spec.md` §8 defines
 //! the contract: a commit writing N rows atomically claims the contiguous
 //! range `[next_row_id, next_row_id + N)`, and ids are never reused —
 //! "gaps are safe, reuse is forbidden." One claim per *transaction*, not

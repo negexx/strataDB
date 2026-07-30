@@ -1,6 +1,6 @@
 //! A bounded, per-[`Snapshot`](crate::snapshot::Snapshot) cache from a
 //! predicate's identity to its resolved [`LiveSet`]. See
-//! `.claude/docs/analysis/2026-07-25-filtered-vector-search-memory-audit.md`
+//! `docs/analysis/2026-07-25-filtered-vector-search-memory-audit.md`
 //! for why this exists: `Snapshot::row_ids_matching` re-reads a whole data
 //! file's Arrow IPC body per query to resolve which rows match a predicate,
 //! and `HnswIndex::search_filtered` rebuilds a bitset from that result on
@@ -151,7 +151,7 @@ impl LiveSetCache {
     /// with the same key that's a self-deadlock on the (non-reentrant)
     /// per-key `Mutex`; with a different key it's a slot-before-`slots`
     /// lock-order inversion against this method's own `slots`-then-slot
-    /// order below (see `.claude/rules/concurrency-txn-layer.md`'s
+    /// order below (see `.opencode/rules/concurrency-txn-layer.md`'s
     /// requirement to document lock order at the acquisition site).
     pub(crate) fn get_or_try_compute<E>(
         &self,
@@ -437,7 +437,7 @@ mod tests {
 /// Run with:
 /// `cargo rustc -p strata-txn --lib --profile test -- --cfg loom` then the
 /// resulting test binary directly (never a workspace-wide
-/// `RUSTFLAGS=--cfg loom`) — see `.claude/rules/concurrency-txn-layer.md`.
+/// `RUSTFLAGS=--cfg loom`) — see `.opencode/rules/concurrency-txn-layer.md`.
 #[cfg(all(test, loom))]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod loom_tests {

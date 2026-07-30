@@ -71,7 +71,7 @@ The transaction/conflict layer is an explicit, load-bearing architectural compon
 ## Cross-cutting concerns
 
 - **Concurrency correctness:** the borrow checker rules out data races in *safe* Rust at compile time — a real guarantee, but it says nothing about whether the OCC/conflict-detection logic is actually correct under a given interleaving. `loom` exhaustively tests the interleavings of locks/atomics/CAS loops that matter, on every change to `crates/txn/` or `crates/index/`. Phase 7's harness (`tests/sim/`) does NOT use `madsim`/`turmoil` — both were found to be async/tokio-shaped and a poor fit for this codebase's entirely synchronous production code (see `docs/superpowers/specs/2026-07-22-phase-7-correctness-harness-design.md` §2). It instead follows Jepsen's methodology directly: real process spawn, real `std::process::abort()` at instrumented checkpoints, seed-reproducible scenarios. This is still the concrete payoff of the Rust-over-C++ reversal: `loom`'s exhaustive interleaving search has no C++ equivalent, and ADR 0004 (superseded) spent real effort designing weaker workarounds for that exact gap. See ADR 0005.
-- **Durability:** a write is acknowledged only after fsync + conflict-check + commit — see `.claude/rules/concurrency-txn-layer.md`.
+- **Durability:** a write is acknowledged only after fsync + conflict-check + commit — see `.opencode/rules/concurrency-txn-layer.md`.
 - **Observability:** `EXPLAIN`-style output, scan/row metrics, and a conflict log recording every detected conflict (which transactions, which keys) for debugging contention patterns.
 - **Auth / feature flags:** N/A — Strata is an embedded engine, not a hosted multi-tenant service.
 

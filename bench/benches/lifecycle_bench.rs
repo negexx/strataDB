@@ -121,7 +121,7 @@ fn load_rows(limit: usize) -> Vec<Row> {
     let file = std::fs::File::open(DATASET_PATH).unwrap_or_else(|e| {
         panic!(
             "failed to open {DATASET_PATH}: {e}. Download it first — see \
-             .claude/docs/design/phase-4-implementation-plan.md Task 7 Step 1."
+             docs/design/phase-4-implementation-plan.md Task 7 Step 1."
         )
     });
     let reader = ParquetRecordBatchReaderBuilder::try_new(file)

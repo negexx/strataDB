@@ -6,7 +6,7 @@ mandatory, only possible on a segmented index. The recall-vs-segment de-risk alr
 (`bench/benches/segment_recall_bench.rs`): recall is segment-count-safe, cost is latency.
 **Context:** [`scope-addendum-v2.md`](../scope-addendum-v2.md) §1.1–§1.2, [`architecture.md`](../architecture.md)
 roadmap S1 row, and [`how-strata-works.md`](../how-strata-works.md) §12 for the conceptual picture.
-**Read before implementing:** `.claude/rules/concurrency-txn-layer.md`, `.claude/rules/vector-index.md`,
+**Read before implementing:** `.opencode/rules/concurrency-txn-layer.md`, `.opencode/rules/vector-index.md`,
 `phase-4-vector-index-spec.md`, `phase-5-mvcc-snapshot-isolation-spec.md`.
 
 ---
@@ -264,7 +264,7 @@ migration, not just at the end.
 > `Snapshot::is_visible` collapsed to the tombstone check (the row-id in-flight registry the old
 > shared-graph design needed is now provably redundant — see `crates/txn/src/row_id.rs`'s module doc
 > and loom "Model 3"), and `Snapshot::scan`/`scan_with_predicate` now honor tombstones (a real,
-> independently-discovered gap against `.claude/docs/design/phase-0-transaction-and-format-spec.md`
+> independently-discovered gap against `docs/design/phase-0-transaction-and-format-spec.md`
 > §8, not part of the original S1 scope but found and fixed during it). The chaos harness thorough
 > tier ran clean: 2000/2000 seeds, zero invariant violations, ~6.4 minutes
 > (`STRATA_CHAOS_THOROUGH=1 cargo test -p strata-sim --test chaos

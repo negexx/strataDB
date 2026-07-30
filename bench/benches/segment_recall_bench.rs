@@ -1,5 +1,5 @@
 //! Recall-vs-segment-count experiment — Scope Addendum v2 §7.2 / §8.2, the
-//! gating de-risk for [ADR 0008](../../.claude/docs/decisions/0008-adopt-segmented-index-layout.md).
+//! gating de-risk for [ADR 0008](../../docs/decisions/0008-adopt-segmented-index-layout.md).
 //!
 //! The segmented index layout replaces one large mutable HNSW with K immutable
 //! segments; a query fans out across all K and merges. The addendum names the
