@@ -1514,14 +1514,19 @@ impl Transaction {
         // laid out inside it. If they ever diverge, this hands out row-ids
         // *past* the claimed range — ids some other transaction's claim
         // already covers, which is exactly the reuse spec §8 forbids
-        // outright ("gaps are safe, reuse is forbidden"), and it would fail
-        // silently. Cheap to assert at the one place being wrong is
-        // invisible.
-        debug_assert_eq!(
-            row_id_base,
-            claim.base() + claim.len(),
-            "every claimed row-id must be consumed, and none beyond them"
-        );
+        // outright ("gaps are safe, reuse is forbidden"). This is a real
+        // runtime check (not a `debug_assert` that release builds silently
+        // drop): a divergence is a spec §8 violation that must surface as a
+        // typed error, not pass invisibly. `claim.base() + claim.len()`
+        // cannot overflow — `RowIdAllocator::claim` already bounds-checked
+        // the range against `u64::MAX` before handing it out.
+        let claimed_end = claim.base() + claim.len();
+        if row_id_base != claimed_end {
+            return Err(TxnError::RowIdRangeMismatch {
+                claimed_end,
+                actual_end: row_id_base,
+            });
+        }
         Ok((all_inserts, zone_map))
     }
 }
@@ -2144,6 +2149,49 @@ mod tests {
             80,
             "the counter must cover every id handed out"
         );
+    }
+
+    /// C1: the guard that a transaction's claimed row-id range exactly
+    /// matches the rows it lays out must be a *runtime* check, not a
+    /// `debug_assert` that vanishes in release builds. `write_pending_batches`
+    /// receives `pending` and `claim` as independent parameters, so nothing
+    /// in the type system ties the claim's size to the rows about to be
+    /// written inside it; if they ever diverge the function would hand out
+    /// row-ids *past* the claimed range — ids some other transaction's claim
+    /// already covers, which is exactly the reuse spec §8 forbids ("gaps are
+    /// safe, reuse is forbidden"). This drives the mismatch directly with a
+    /// claim smaller than the batch it's handed alongside and asserts a typed
+    /// `TxnError::RowIdRangeMismatch` rather than relying on a debug-only
+    /// panic that release builds silently drop.
+    #[test]
+    fn write_pending_batches_rejects_a_claim_that_does_not_match_the_rows_it_writes() {
+        use crate::row_id::RowIdRange;
+
+        let dir = temp_dir("row-id-range-mismatch");
+        // A 3-row batch paired with a claim that only covers 2 row-ids — the
+        // exact divergence the guard exists to catch.
+        let batch = vector_batch(
+            vec![1, 2, 3],
+            vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+        );
+        let claim = RowIdRange { base: 0, len: 2 };
+        let mut data_files = Vec::new();
+
+        let result = Transaction::write_pending_batches(
+            std::slice::from_ref(&batch),
+            &dir,
+            0,
+            &claim,
+            0,
+            &mut data_files,
+        );
+
+        assert!(
+            matches!(result, Err(TxnError::RowIdRangeMismatch { .. })),
+            "expected TxnError::RowIdRangeMismatch for a claim/row divergence, got {result:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -6514,9 +6562,21 @@ mod tests {
         );
 
         let result = txn.commit();
-        assert!(
-            matches!(result, Err(TxnError::Conflict { .. })),
-            "expected a conservative conflict once history aged out, got {result:?}"
+        // InsufficientHistory surfaces as `TxnError::Conflict` whose
+        // `contested_row_ids` is the transaction's *entire* write_set (see
+        // the `ConflictCheck::InsufficientHistory` arm in `commit`), not the
+        // intersection a real row-level conflict would report. Asserting
+        // that explicitly distinguishes the aged-out-history path from a
+        // genuine write/write overlap: the fillers below wrote only rows
+        // >= 100, disjoint from row 0, so a real conflict could never name
+        // row 0 as contested — only InsufficientHistory does.
+        let Err(TxnError::Conflict { contested_row_ids }) = result else {
+            panic!("expected a conservative conflict once history aged out, got {result:?}");
+        };
+        assert_eq!(
+            contested_row_ids,
+            vec![0u64],
+            "InsufficientHistory must report the transaction's whole write_set as contested"
         );
         assert_eq!(
             ds.insufficient_history_conflict_count(),

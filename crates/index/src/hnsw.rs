@@ -574,6 +574,14 @@ impl HnswIndex {
     /// doesn't match the dimensionality of the first vector ever inserted —
     /// checked upfront rather than silently truncating, matching
     /// `brute_force_search`'s existing Phase 1 behavior.
+    ///
+    /// # Safety
+    ///
+    /// The `is_visible` filter must not re-enter the HNSW index (e.g. by
+    /// calling `search` or `vector_search` on any snapshot derived from this
+    /// dataset), because it runs while a thread-local scratch buffer is
+    /// borrowed. Re-entering would cause a runtime panic, not undefined
+    /// behavior, but it would still be a panic.
     pub fn search(
         &self,
         query: &[f32],
@@ -612,6 +620,14 @@ impl HnswIndex {
     /// # Errors
     ///
     /// Same as [`Self::search`].
+    ///
+    /// # Safety
+    ///
+    /// The `is_visible` filter must not re-enter the HNSW index (e.g. by
+    /// calling `search` or `vector_search` on any snapshot derived from this
+    /// dataset), because it runs while a thread-local scratch buffer is
+    /// borrowed. Re-entering would cause a runtime panic, not undefined
+    /// behavior, but it would still be a panic.
     pub fn search_filtered(
         &self,
         query: &[f32],
