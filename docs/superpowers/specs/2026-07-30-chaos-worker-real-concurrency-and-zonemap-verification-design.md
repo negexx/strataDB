@@ -92,10 +92,13 @@ actual thing this design exists to exercise.
 
 ```rust
 let dataset = Arc::new(/* ...unchanged... */);
-let registry = Arc::new(Mutex::new(Registry::new(num_agents_usize)));
-// setup_contested_pool unchanged in its own logic, called once before
-// any agent thread spawns (still establishes the pool sequentially).
-setup_contested_pool(&dataset, seed, &mut registry.lock().unwrap(), &mut out);
+// setup_contested_pool unchanged in its own logic, called once before any
+// agent thread spawns (still establishes the pool sequentially) -- kept as
+// a plain `Registry` through setup and wrapped in `Arc<Mutex<>>` only
+// after, so the lock is never held across setup's own commits.
+let mut registry = Registry::new(num_agents_usize);
+setup_contested_pool(&dataset, seed, &mut registry);
+let registry = Arc::new(Mutex::new(registry));
 
 let (reader_handle, reader_done) = reader::spawn(Arc::clone(&dataset));
 

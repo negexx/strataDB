@@ -447,25 +447,29 @@ fn setup_contested_pool(dataset: &strata_txn::Dataset, seed: u64, registry: &mut
 }
 ```
 
-Then change its call site (from Task 1's Step 2) from:
+Then change its call site — this is Task 1's Step 2 pattern (kept as a plain `Registry` through setup, wrapped in `Arc<Mutex<>>` only after, so the lock is never held across setup's commits) — from:
 
 ```rust
+    let mut registry = Registry::new(num_agents_usize);
     // Deliberately `std::io::stdout()`, NOT `.lock()`'d: `Stdout` itself
     // implements `Write` by locking/unlocking internally on every single
     // call, rather than holding the lock across this whole function --
     // see the comment on the scheduler loop's `out` below for why holding
     // it for any extended span is unsafe here.
     let mut out = std::io::stdout();
-    setup_contested_pool(&dataset, seed, &mut registry.lock().unwrap(), &mut out);
+    setup_contested_pool(&dataset, seed, &mut registry, &mut out);
+    let registry = Arc::new(Mutex::new(registry));
 ```
 
 to:
 
 ```rust
-    setup_contested_pool(&dataset, seed, &mut registry.lock().unwrap());
+    let mut registry = Registry::new(num_agents_usize);
+    setup_contested_pool(&dataset, seed, &mut registry);
+    let registry = Arc::new(Mutex::new(registry));
 ```
 
-(The `let mut out = std::io::stdout();` binding and its doc comment are deleted entirely — nothing in `main()` needs an injected writer anymore now that both `setup_contested_pool` and `print_outcome` print via `commit_ops::print_line` internally.)
+(The `let mut out = std::io::stdout();` binding and its doc comment are deleted entirely — nothing in `main()` needs an injected writer anymore now that both `setup_contested_pool` and `print_outcome` print via `commit_ops::print_line` internally. `registry` is still wrapped in `Arc<Mutex<>>` only AFTER `setup_contested_pool` returns — that ordering is load-bearing, not incidental: see Task 1's Step 2 comment on why.)
 
 - [ ] **Step 6: Update the scheduler loop's `print_outcome` call site**
 
@@ -602,8 +606,16 @@ fn main() {
     );
 
     let num_agents_usize = usize::try_from(num_agents).unwrap();
-    let registry = Arc::new(Mutex::new(Registry::new(num_agents_usize)));
-    setup_contested_pool(&dataset, seed, &mut registry.lock().unwrap());
+    // Pool setup runs before any agent thread exists and before the
+    // registry is wrapped for shared access -- taking `&mut Registry`
+    // directly here (rather than `registry.lock().unwrap()`) avoids
+    // holding the mutex across `setup_contested_pool`'s POOL_SIZE commits,
+    // which would otherwise violate this file's own "never hold the
+    // registry lock across a commit or blocking op" discipline -- the
+    // exact discipline the agent threads below depend on.
+    let mut registry = Registry::new(num_agents_usize);
+    setup_contested_pool(&dataset, seed, &mut registry);
+    let registry = Arc::new(Mutex::new(registry));
 
     let (reader_handle, reader_done) = reader::spawn(Arc::clone(&dataset));
 
