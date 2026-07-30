@@ -14,18 +14,33 @@ use rand::SeedableRng as _;
 
 /// Bumped from 3 (Task 3.5 and earlier) per Task 6's real-concurrency
 /// closure work: measured empirically (direct chaos-worker invocations,
-/// `STRATA_CHAOS_ABORT_AT` unset, 30 seeds per configuration) that 3 real
-/// agent threads at `OPS_PER_AGENT = 5` never produced a genuine
-/// `TxnError::Conflict`/dropped-op ack line in 50 seeds -- commits finish
-/// fast enough relative to OS thread scheduling that 3 short-lived threads
-/// rarely have overlapping commit windows. `NUM_AGENTS` alone was the
-/// dominant lever, not `OPS_PER_AGENT` or `POOL_SIZE`: 3 agents/20 ops gave
-/// 1/30 runs with a drop, 6 agents/5 ops gave 0/30, 6 agents/10 ops gave
-/// 2/30, but 8 agents/8 ops gave 7/30 (~23%) -- more concurrent threads
-/// raises the chance several are mid-commit at the same instant far more
-/// than lengthening any one thread's op sequence does. 8/8 is the smallest
-/// configuration tested that reliably produces real conflict-drop evidence
-/// without inflating `MAX_ABORT_THRESHOLD` (see below) more than necessary.
+/// `STRATA_CHAOS_ABORT_AT` unset) that 3 real agent threads at
+/// `OPS_PER_AGENT = 5` never produced a genuine `TxnError::Conflict`/
+/// dropped-op ack line in 50 seeds -- commits finish fast enough relative
+/// to OS thread scheduling that 3 short-lived threads rarely have
+/// overlapping commit windows. Full sweep (30 seeds/config unless noted;
+/// `pool` defaults to `POOL_SIZE`'s real value, 6, unless stated):
+/// 3 agents/5 ops -> 0/50, 3 agents/20 ops -> 1/30, 6 agents/5 ops -> 0/30,
+/// 6 agents/8 ops -> 1/30, 6 agents/10 ops -> 2/30, 4 agents/8 ops -> 0/30,
+/// 8 agents/5 ops -> 3/30 (~10%), 8 agents/8 ops -> 7/30 (~23%). Also
+/// tested `POOL_SIZE = 3` (a smaller contested pool, concentrating target
+/// collisions) at 3 agents/5 ops -> 0/30 and at 8 agents/5 ops -> 2/30 --
+/// both are AT OR BELOW the matching `POOL_SIZE = 6` runs, so shrinking the
+/// pool is not a real lever here (plausible reading: a conflict needs
+/// overlapping COMMIT WINDOWS, not just overlapping op targets in general;
+/// concentrating targets doesn't help if two threads' commits essentially
+/// never overlap in wall-clock time to begin with). `NUM_AGENTS` is the
+/// dominant lever, not `OPS_PER_AGENT` or `POOL_SIZE`: more concurrent
+/// threads raises the chance several are mid-commit at the same instant far
+/// more than lengthening any one thread's op sequence or narrowing its
+/// target pool does. 8 agents/8 ops is the highest-yield configuration
+/// tested (not the smallest -- 8/5, 6/10, and 3/20 are all cheaper by total
+/// op-slot count and were tried first) -- kept over the cheaper 8/5 (~10%)
+/// because the actual measured thorough-tier cost at 8/8 was acceptable
+/// (2000/2000 seeds, zero violations, ~1175s/~20min at concurrency=8 --
+/// see the ledger) and the higher yield means more of the 2000-seed budget
+/// actually exercises the conflict/drop path this whole task exists to
+/// close.
 const NUM_AGENTS: u64 = 8;
 /// See `NUM_AGENTS`'s doc comment for the measurement this was tuned
 /// alongside.
@@ -33,14 +48,18 @@ const OPS_PER_AGENT: u64 = 8;
 /// Locally duplicated from `crates/chaos-worker/src/main.rs`'s private
 /// `POOL_SIZE` (design doc §3.1) -- that constant is not reachable from
 /// here, and this file needs its exact value for the clean-run slot-count
-/// assertion below and for this threshold's own upper-bound estimate.
+/// assertion below and for this threshold's own upper-bound estimate. Left
+/// at 6 -- see `NUM_AGENTS`'s doc comment for why shrinking it doesn't
+/// meaningfully raise the conflict rate here.
 const POOL_SIZE: u64 = 6;
 /// Comfortably above the total number of checkpoints one full run
 /// produces -- an ESTIMATE with real margin built in, not an exact count
 /// (the true total is workload-mix-dependent, since Insert/Update/Delete/
-/// `MultiBatchInsert` each touch a different number of checkpoint sites).
-/// A vector-carrying single-row commit (a plain Insert, or Update's insert
-/// half) passes through six: `write_batch`'s data-file fsync,
+/// `MultiBatchInsert` each touch a different number of checkpoint sites,
+/// AND -- now that real conflicts are reachable, see `NUM_AGENTS`'s doc
+/// comment -- retry-dependent too, see below). A vector-carrying
+/// single-row commit (a plain Insert, or Update's insert half) passes
+/// through six on a clean attempt: `write_batch`'s data-file fsync,
 /// `write_bytes`'s segment fsync (added by S1 W3.2a), `sync_dir`'s
 /// data-dir fsync, `commit_manifest`'s tmp-sync, its rename, and
 /// `sync_dir`'s versions-dir fsync -- confirmed against the actual call
@@ -49,28 +68,40 @@ const POOL_SIZE: u64 = 6;
 /// only one `write_bytes`/`commit_manifest` (one segment, one manifest
 /// entry, built from both batches together) -- 7 checkpoints for that one
 /// op, not 6. A delete-only commit writes no new data file or segment at
-/// all, so it has fewer. Per-AGENT worst case is still all-Insert (Insert's
-/// 6/slot is the single highest per-slot cost -- `MultiBatchInsert`'s 7
-/// checkpoints buys 2 slots, or 3.5/slot): `OPS_PER_AGENT` * 6 *
-/// `NUM_AGENTS` = 8 * 6 * 8 = 384 (was 90 at the old 3-agent/5-op sizing).
-/// `setup_contested_pool` adds `POOL_SIZE` more single-row inserts,
-/// UNCONDITIONALLY, on every run, before any agent thread spawns:
-/// `POOL_SIZE` * 6 = 36 more. Plus `Dataset::create`'s own initial
-/// `commit_manifest` call (3 more, for a freshly-created dataset).
-/// Conservative total estimate: 384 + 36 + 3 = 423. Empirically confirmed
-/// by binary-searching the true checkpoint total on 8 real seeds (0-7) at
-/// the new `NUM_AGENTS`/`OPS_PER_AGENT` sizing: every seed's true total
-/// fell in (350, 400], comfortably under this estimate and consistent
-/// with real per-agent threads sharing one global checkpoint counter
-/// rather than one thread accounting for the whole run. A higher threshold
-/// than needed isn't free: `abort_at` is drawn uniformly from
-/// `1..MAX_ABORT_THRESHOLD`, so a threshold much above the true total
-/// wastes iterations on clean (non-crashing) runs instead of exercising a
-/// crash -- the thorough tier is the actual Phase 7 exit criterion, and
-/// every non-crashing iteration there is one fewer crash-path check out of
-/// its fixed seed budget. Set to 450 (roughly 12% above the highest
-/// observed real total, 400), not a larger "safe" round number, for
-/// exactly that reason.
+/// all on either a clean OR a conflicting attempt (`write_phase` returns
+/// early with no pending batches), so it costs 3 (just the manifest-side
+/// checkpoints) or 0 if the attempt conflicts before even reaching those.
+///
+/// The RETRY path (new since real concurrency landed) can make a single
+/// 1-slot Update MORE expensive than a clean Insert: `Transaction::commit`
+/// runs `write_phase` (the first three checkpoints above) BEFORE the
+/// conflict check, so a conflicting first attempt still burns those three
+/// checkpoints before `commit_with_retry_once`
+/// (`crates/chaos-worker/src/commit_ops.rs`) retries with a fresh
+/// transaction. A conflict-then-succeed Update therefore costs 3 + 6 = 9
+/// checkpoints for one op-slot, not 6 -- the true analytic worst case is
+/// `OPS_PER_AGENT * 9 * NUM_AGENTS` = 8 * 9 * 8 = 576, not the 384 a
+/// clean-attempt-only accounting gives. Plus `setup_contested_pool`'s
+/// `POOL_SIZE` unconditional single-row inserts (`POOL_SIZE * 6` = 36) and
+/// `Dataset::create`'s own initial `commit_manifest` call (3): worst-case
+/// analytic total 576 + 36 + 3 = 615. Reaching that in one real run would
+/// need essentially every agent's every op to conflict-then-succeed, which
+/// the measured ~10-23% any-drop-at-all rate above makes very unlikely --
+/// empirically binary-searching the true checkpoint total on 8 real seeds
+/// (0-7) found every one in (350, 400]. Set `MAX_ABORT_THRESHOLD` to 450
+/// (~12% above the highest observed real total, not the 615 analytic
+/// worst case) as a deliberate, informed bet on the empirical distribution
+/// over the theoretical maximum -- the failure mode if a rare run's true
+/// total DID exceed 450 is benign, not a false failure: `abort_at` would
+/// simply always land inside that run (guaranteeing `crashed = true`),
+/// which only means that seed's clean-run assertions (Step 2's exact
+/// slot-count check) don't get exercised, not that any invariant check
+/// produces a wrong answer. A higher threshold than needed isn't free
+/// either way: `abort_at` is drawn uniformly from `1..MAX_ABORT_THRESHOLD`,
+/// so a threshold much above the true total wastes iterations on clean
+/// (non-crashing) runs instead of exercising a crash -- the thorough tier
+/// is the actual Phase 7 exit criterion, and every non-crashing iteration
+/// there is one fewer crash-path check out of its fixed seed budget.
 ///
 /// `STRATA_CHAOS_ABORT_AT` counts checkpoints since **process start** off
 /// one process-global counter, so this constant must be re-checked

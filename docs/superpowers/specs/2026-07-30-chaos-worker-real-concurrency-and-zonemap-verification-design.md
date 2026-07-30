@@ -323,3 +323,14 @@ conflicts within `OPS_PER_AGENT = 5` ops per agent — if fast-tier seeds
 consistently show zero drops, tuning either constant (not the mechanism)
 is the likely fix. Left for the implementation plan to measure and decide,
 not pre-specified here.
+
+**Resolved (Task 6 of the implementation plan):** measured 0/50 seeds with
+a genuine conflict-drop at `NUM_AGENTS=3`/`OPS_PER_AGENT=5`. `POOL_SIZE`
+turned out NOT to be the lever — reducing it to 3 gave no improvement at
+either sizing tested. `NUM_AGENTS` was the dominant factor (more
+concurrent threads raises the odds several are mid-commit at the same
+instant far more than more ops-per-thread or a smaller target pool does).
+Settled on `NUM_AGENTS=8`/`OPS_PER_AGENT=8` (~23% of seeds show a drop),
+with `MAX_ABORT_THRESHOLD` re-derived from real measurement at the new
+sizing. See `tests/sim/tests/chaos.rs`'s own constant doc comments for the
+full data and reasoning.
