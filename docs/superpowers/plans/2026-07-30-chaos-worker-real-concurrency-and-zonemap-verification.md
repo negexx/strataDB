@@ -68,17 +68,27 @@ to:
 
 ```rust
     let num_agents_usize = usize::try_from(num_agents).unwrap();
-    let registry = Arc::new(Mutex::new(Registry::new(num_agents_usize)));
+    // Pool setup runs before any agent thread exists and before the
+    // registry is wrapped for shared access -- taking `&mut Registry`
+    // directly here (rather than `registry.lock().unwrap()`) avoids
+    // holding the mutex across `setup_contested_pool`'s POOL_SIZE commits
+    // and stdout flushes, which would otherwise violate this file's own
+    // "never hold the registry lock across a commit or blocking I/O"
+    // discipline -- harmless today (nothing else can contend yet), but
+    // Task 3's real agent threads inherit this exact pattern, so it must
+    // not establish the one counter-example to it.
+    let mut registry = Registry::new(num_agents_usize);
     // Deliberately `std::io::stdout()`, NOT `.lock()`'d: `Stdout` itself
     // implements `Write` by locking/unlocking internally on every single
     // call, rather than holding the lock across this whole function --
     // see the comment on the scheduler loop's `out` below for why holding
     // it for any extended span is unsafe here.
     let mut out = std::io::stdout();
-    setup_contested_pool(&dataset, seed, &mut registry.lock().unwrap(), &mut out);
+    setup_contested_pool(&dataset, seed, &mut registry, &mut out);
+    let registry = Arc::new(Mutex::new(registry));
 ```
 
-(`out`/`print_outcome`'s signature is untouched in this task — that's Task 2. This step only changes `registry`'s type and the one call site that used it directly.)
+(`out`/`print_outcome`'s signature is untouched in this task — that's Task 2. This step changes `registry`'s type — wrapped in `Arc<Mutex<>>` only AFTER pool setup completes, so the lock is never held across pool setup's own commits/flushes — and the one call site that used it directly.)
 
 - [ ] **Step 3: Update the scheduler loop's target-resolution call sites to lock, snapshot, unlock**
 
