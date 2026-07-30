@@ -58,9 +58,9 @@ const READER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_mill
 /// (`SegmentSet::search_filtered_pruned_live`'s final `k`-truncation) --
 /// per-part recall is governed by `ef` (`EF_SEARCH_DEFAULT`, widened by
 /// `widen_ef`), not by this constant. Fine for the pruned-subset-of-
-/// reference check's large `k`. The reverse-direction check below queries
-/// with `k=1` instead and does NOT reuse this constant -- it currently
-/// gets away with an exact top-1 match without reasoning about `ef`
+/// reference check's large `k`. The two reverse-direction checks below query
+/// with `k=1` instead and do NOT reuse this constant -- both currently
+/// get away with an exact top-1 match without reasoning about `ef`
 /// because this workload's segments are tiny (1-2 rows per commit), so
 /// the target's own part is searched exhaustively regardless of `ef`;
 /// this would need revisiting if segment size ever grows enough for
