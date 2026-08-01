@@ -366,10 +366,6 @@ impl Dataset {
         sync_dataset_directory_anchor(&dir)?;
         let manifest = Manifest::empty();
         commit_manifest(&dir, &manifest)?;
-        // `commit_manifest` synchronizes `_versions/` after the manifest
-        // rename. Synchronize its parent too, so creation of `_versions/`
-        // itself is durable before Dataset::create returns.
-        sync_dir(&dir)?;
         let last_issued_timestamp = Arc::new(AtomicI64::new(manifest.commit_time_high_water));
         let row_ids = Arc::new(RowIdAllocator::new(manifest.next_row_id));
         let write_attempt_counter = Arc::new(AtomicU64::new(manifest.next_attempt_id));
@@ -2179,7 +2175,6 @@ mod tests {
             parent.clone(),
             dir.join("_versions"),
             dir.clone(),
-            dir.clone(),
         ];
         let actual = recorder.calls();
         assert_eq!(
@@ -2254,7 +2249,6 @@ mod tests {
             parent.clone(),
             dir.join("_versions"),
             dir.clone(),
-            dir.clone(),
         ];
         let actual = recorder.calls();
         assert!(
@@ -2266,11 +2260,11 @@ mod tests {
 
     #[cfg(feature = "test-fault-injection")]
     #[test]
-    fn create_returns_an_error_after_initial_manifest_becomes_visible() {
-        // Break caught: the final dataset-directory sync is required to make
-        // creation of `_versions/` durable. Its failure is uncertain: the
-        // initial manifest was already atomically renamed, so callers must
-        // receive an error even though a later open can observe it.
+    fn create_returns_an_error_when_manifest_publication_root_sync_fails() {
+        // Break caught: LocalFs owns the final dataset-root sync after it
+        // publishes the initial manifest. Its failure is uncertain: the
+        // manifest was already atomically renamed, so callers must receive
+        // an error even though a later open can observe it.
         let parent = temp_dir("create-final-directory-sync-failure-parent");
         let dir = parent.join("dataset");
         let _fault = strata_storage::datafile::test_support::fail_directory_sync_on_call(
