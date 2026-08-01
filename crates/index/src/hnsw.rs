@@ -1,5 +1,5 @@
 //! HNSW vector index — lock-free, from-scratch implementation (replacing
-//! `hnsw_rs` as of this rewrite). See `.claude/rules/vector-index.md` and
+//! `hnsw_rs` as of this rewrite). See `.opencode/rules/vector-index.md` and
 //! `docs/superpowers/specs/2026-07-18-lockfree-hnsw-rewrite-design.md`.
 
 use crate::distance::L2;
@@ -47,7 +47,7 @@ enum ChunkOutcome<R> {
 ///
 /// Uses `std::thread::Builder::spawn_scoped` (which returns `io::Result`),
 /// not `Scope::spawn` (which unwraps internally and panics if the OS
-/// refuses to create the thread) -- `.claude/rules/concurrency-txn-layer.md`
+/// refuses to create the thread) -- `.opencode/rules/concurrency-txn-layer.md`
 /// documents `ERROR_NO_SYSTEM_RESOURCES` under thread pressure as a real,
 /// observed risk in this project's own dev environment, and this runs on
 /// the commit path. A refused spawn is reported as [`ChunkOutcome::SpawnFailed`]
@@ -96,7 +96,7 @@ fn run_chunks_in_parallel<T: Send, R: Send>(
 
 /// One search result: which row-id, and its squared L2 distance to the
 /// query vector. `row_id` is the persistent, global identity from
-/// `.claude/docs/design/phase-0-transaction-and-format-spec.md` §8 — not a
+/// `docs/design/phase-0-transaction-and-format-spec.md` §8 — not a
 /// position within any particular array, unlike `brute_force::Neighbor`.
 ///
 /// `squared_distance` is the sum of squared per-dimension differences (no
@@ -337,7 +337,7 @@ impl HnswIndex {
     /// make it worth it. Intended for `crates/txn`'s per-commit segment
     /// builder, which owns a brand-new, private `HnswIndex` outside
     /// `commit_lock` and never shares it with a reader until it's fully
-    /// built and serialized — see `.claude/rules/vector-index.md`.
+    /// built and serialized — see `.opencode/rules/vector-index.md`.
     ///
     /// **`rows[0]` is always inserted sequentially, before any worker
     /// thread is spawned for the rest.** `Graph::insert`'s "first node in
@@ -511,7 +511,7 @@ impl HnswIndex {
     /// anymore. It remains index-internal API, sound on the same terms it
     /// always was: such a row-id was never committed in *any* version, so
     /// no snapshot should ever observe it, and because row-ids are never
-    /// reused (`.claude/docs/design/phase-0-transaction-and-format-spec.md`
+    /// reused (`docs/design/phase-0-transaction-and-format-spec.md`
     /// §8) — a soft-deleted id can never legitimately reappear.
     ///
     /// **Do not use this to implement a user-level DELETE.** That is
@@ -574,6 +574,14 @@ impl HnswIndex {
     /// doesn't match the dimensionality of the first vector ever inserted —
     /// checked upfront rather than silently truncating, matching
     /// `brute_force_search`'s existing Phase 1 behavior.
+    ///
+    /// # Safety
+    ///
+    /// The `is_visible` filter must not re-enter the HNSW index (e.g. by
+    /// calling `search` or `vector_search` on any snapshot derived from this
+    /// dataset), because it runs while a thread-local scratch buffer is
+    /// borrowed. Re-entering would cause a runtime panic, not undefined
+    /// behavior, but it would still be a panic.
     pub fn search(
         &self,
         query: &[f32],
@@ -612,6 +620,14 @@ impl HnswIndex {
     /// # Errors
     ///
     /// Same as [`Self::search`].
+    ///
+    /// # Safety
+    ///
+    /// The `is_visible` filter must not re-enter the HNSW index (e.g. by
+    /// calling `search` or `vector_search` on any snapshot derived from this
+    /// dataset), because it runs while a thread-local scratch buffer is
+    /// borrowed. Re-entering would cause a runtime panic, not undefined
+    /// behavior, but it would still be a panic.
     pub fn search_filtered(
         &self,
         query: &[f32],
@@ -1578,7 +1594,7 @@ mod tests {
         // points below sequential. `bench/benches/vector_search_bench.rs`
         // is this crate's dedicated recall-at-realistic-scale benchmark
         // (100K real embeddings, floor asserted at recall@10 > 0.8) -- see
-        // `.claude/rules/vector-index.md` for how index-quality tradeoffs
+        // `.opencode/rules/vector-index.md` for how index-quality tradeoffs
         // like this one are meant to be tracked. The 8-point tolerance
         // below has real headroom above this test's own measured range
         // specifically so this stays a regression *gate*, not a bound this

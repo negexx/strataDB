@@ -1,5 +1,5 @@
 //! Hash-based `GROUP BY`, per
-//! `.claude/docs/design/phase-2-encodings-and-groupby-spec.md` §2.
+//! `docs/design/phase-2-encodings-and-groupby-spec.md` §2.
 //!
 //! Internals per
 //! `docs/superpowers/specs/2026-07-19-group-by-phase-a-optimization-design.md`:
@@ -148,7 +148,7 @@ impl ColumnarAccumulator {
 }
 
 /// Groups `batch` by `group_cols` and computes `aggs` per group. See
-/// `.claude/docs/design/phase-2-encodings-and-groupby-spec.md` §2.
+/// `docs/design/phase-2-encodings-and-groupby-spec.md` §2.
 ///
 /// Null values in an agg column are skipped, not treated as zero. **A group
 /// whose agg column is entirely null is not yet handled specially** (flagged

@@ -1,5 +1,5 @@
 //! Expression/filter API. See
-//! `.claude/docs/design/phase-3-query-refinement-spec.md` for `Predicate`,
+//! `docs/design/phase-3-query-refinement-spec.md` for `Predicate`,
 //! the general `filter`, and file-pruning via `should_scan_file`.
 
 use arrow::array::RecordBatch;

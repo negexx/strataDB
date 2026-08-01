@@ -1,5 +1,5 @@
 //! Manifest & versioning, per
-//! `.claude/docs/design/phase-0-transaction-and-format-spec.md` §3.4 and §6.
+//! `docs/design/phase-0-transaction-and-format-spec.md` §3.4 and §6.
 //!
 //! A manifest is one immutable file per version, named so lexicographic
 //! order equals numeric order (`{version:020}.manifest`, following Lance's
@@ -29,7 +29,7 @@ use crate::stats::ColumnStats;
 
 /// One committed data file's name and the per-column statistics computed
 /// for it at commit time — see
-/// `.claude/docs/design/phase-3-query-refinement-spec.md` §1.
+/// `docs/design/phase-3-query-refinement-spec.md` §1.
 ///
 /// `#[serde(deny_unknown_fields)]`: a pre-S1-W3.2 manifest's `DataFileEntry`
 /// still carries a `delta_log` field (removed with no compatibility shim,
@@ -115,7 +115,7 @@ pub struct Manifest {
     pub data_files: Vec<DataFileEntry>,
     /// The row-id to assign to the next inserted row, dataset-wide. Never
     /// resets, never reused — see
-    /// `.claude/docs/design/phase-0-transaction-and-format-spec.md` §8.
+    /// `docs/design/phase-0-transaction-and-format-spec.md` §8.
     pub next_row_id: u64,
     /// Row-ids tombstoned (deleted, or superseded by `update`) as of this
     /// version. Accumulated across every committed version, same as
@@ -134,7 +134,7 @@ pub struct Manifest {
     /// collision across sessions would silently destroy already-durable
     /// data. Analogous to `next_row_id` (never resets, never reused), but
     /// this counter identifies filename-uniqueness attempts rather than row
-    /// identity — see `.claude/docs/design/phase-0-transaction-and-format-spec.md`
+    /// identity — see `docs/design/phase-0-transaction-and-format-spec.md`
     /// §8 for `next_row_id`'s parallel contract.
     ///
     /// `#[serde(default)]` so manifests written before this field existed

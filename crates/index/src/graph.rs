@@ -28,7 +28,7 @@ const NO_ENTRY: u64 = u64::MAX;
 /// attempts. 64 is far beyond either, chosen purely as a paranoia bound
 /// that converts a theoretical, believed-unreachable livelock into a
 /// detectable, typed error rather than an indefinite stall on the commit
-/// path — see `.claude/rules/concurrency-txn-layer.md`'s "no write
+/// path — see `.opencode/rules/concurrency-txn-layer.md`'s "no write
 /// acknowledged until durable" invariant for why an unbounded stall here
 /// would be worse than a loud failure.
 const MAX_SHRINK_RETRIES: u32 = 64;
@@ -388,7 +388,7 @@ impl<D: Distance> Graph<D> {
     /// `mmax0 = 2*M`, `mmax = M`, `PARALLEL_INSERT_THREADS = 4`) -- not
     /// necessarily today's shipping default, since `insert_batch_parallel`
     /// is now gated behind `crates/txn`'s `parallel-insert` Cargo feature,
-    /// off by default (see `.claude/rules/vector-index.md`). Two turned out not to explain the
+    /// off by default (see `.opencode/rules/vector-index.md`). Two turned out not to explain the
     /// measured failure rate; one is a distinct, separately-fixed bug; the
     /// fourth is the actual dominant mechanism, and fixing it closes the
     /// clustered-data hazard completely (verified below).
@@ -1111,7 +1111,7 @@ fn search_layer_generic<S: NodeSource, D: Distance>(
 /// `crates/txn`'s per-commit `Graph`/`HnswIndex` is exclusively under
 /// construction until it's fully built and sealed into an immutable
 /// segment, and is never handed to a reader before then (see
-/// `.claude/rules/vector-index.md`'s first bullet). Hazard #4's
+/// `.opencode/rules/vector-index.md`'s first bullet). Hazard #4's
 /// consequence for a WRITER racing an unpublished node is a permanent,
 /// baked-into-the-graph connectivity loss; the same race for a READER here
 /// would only be a transient, self-healing recall dip during the window a
@@ -2684,7 +2684,7 @@ mod tests {
 mod loom_tests {
     use super::*;
 
-    /// See `.claude/rules/concurrency-txn-layer.md`'s note on loom's tiny
+    /// See `.opencode/rules/concurrency-txn-layer.md`'s note on loom's tiny
     /// default coroutine stack (32 KiB on a 64-bit target -- `generator`'s
     /// own default, not the megabytes a real OS thread gets): a coroutine
     /// stack overflow surfaces as silent memory corruption sensitive to

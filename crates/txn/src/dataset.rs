@@ -2,7 +2,7 @@
 //! in full, including real OCC conflict detection and an atomic
 //! commit critical section (Phase 6) — see
 //! `docs/superpowers/specs/2026-07-21-phase-6-concurrent-write-engine-design.md`
-//! and `.claude/rules/concurrency-txn-layer.md` before editing anything
+//! and `.opencode/rules/concurrency-txn-layer.md` before editing anything
 //! here. Conflict detection is write-write only, keyed by row-id, and
 //! scoped to in-process concurrency (multiple threads/tasks sharing one
 //! `Dataset` handle) — see the design doc §1 for why cross-process
@@ -52,7 +52,7 @@ use crate::snapshot::Snapshot;
 /// producing wrong data. `row_ids_matching` (below) sidesteps this
 /// precondition entirely by reading each file's raw physical batch directly
 /// rather than going through the public schema-based API. See
-/// `.claude/docs/design/phase-0-transaction-and-format-spec.md` §8.
+/// `docs/design/phase-0-transaction-and-format-spec.md` §8.
 pub const ROW_ID_COLUMN: &str = "_row_id";
 
 /// The hidden internal commit-time column every committed batch carries
@@ -627,7 +627,7 @@ pub struct Transaction {
 /// Gated on `cfg(test)` alone, unlike
 /// [`Transaction::inject_manifest_commit_failure`]'s `cfg(any(test,
 /// loom))` — not an oversight. `--cfg loom` is layered *on top of* the test
-/// profile (see `.claude/rules/concurrency-txn-layer.md`'s `cargo rustc
+/// profile (see `.opencode/rules/concurrency-txn-layer.md`'s `cargo rustc
 /// -p strata-txn --lib --profile test -- --cfg loom` recipe), so `test` is
 /// set in a loom build too and these still compile there. The wider gate on
 /// the injector exists because a loom model uses it; nothing here needs to
@@ -1223,7 +1223,7 @@ impl Transaction {
         // difference against this function's dominant work (fsync,
         // JSON serialization) is immaterial, and isn't worth the
         // reduced auditability of proving a weaker ordering correct
-        // per site. See `.claude/rules/concurrency-txn-layer.md`.
+        // per site. See `.opencode/rules/concurrency-txn-layer.md`.
         //
         // Row-ids are *not* handed out this way. `RowIdAllocator::claim`
         // needs a *checked* add — an allocation that would run past
@@ -1327,7 +1327,7 @@ impl Transaction {
         }
         // Gated behind the `parallel-insert` feature (off by default --
         // see that feature's own doc comment in Cargo.toml and
-        // `.claude/rules/vector-index.md`). When enabled, parallelizes
+        // `.opencode/rules/vector-index.md`). When enabled, parallelizes
         // across up to `PARALLEL_INSERT_THREADS` worker threads once
         // `rows` is large enough to be worth it (see
         // `insert_batch_parallel`'s own doc comment for the chunking
@@ -1467,7 +1467,7 @@ impl Transaction {
         let mut row_id_base = claim.base();
         for (i, batch) in pending.iter().enumerate() {
             // Stats computed on the original, pre-encoding, pre-hidden-column
-            // batch — see .claude/docs/design/phase-3-query-refinement-spec.md
+            // batch — see docs/design/phase-3-query-refinement-spec.md
             // §1 for why (logical values, no dictionary-decode step needed
             // later). _row_id gets no stats entry (nothing predicates on it);
             // _timestamp DOES, inserted explicitly below, since every row in
@@ -1514,14 +1514,19 @@ impl Transaction {
         // laid out inside it. If they ever diverge, this hands out row-ids
         // *past* the claimed range — ids some other transaction's claim
         // already covers, which is exactly the reuse spec §8 forbids
-        // outright ("gaps are safe, reuse is forbidden"), and it would fail
-        // silently. Cheap to assert at the one place being wrong is
-        // invisible.
-        debug_assert_eq!(
-            row_id_base,
-            claim.base() + claim.len(),
-            "every claimed row-id must be consumed, and none beyond them"
-        );
+        // outright ("gaps are safe, reuse is forbidden"). This is a real
+        // runtime check (not a `debug_assert` that release builds silently
+        // drop): a divergence is a spec §8 violation that must surface as a
+        // typed error, not pass invisibly. `claim.base() + claim.len()`
+        // cannot overflow — `RowIdAllocator::claim` already bounds-checked
+        // the range against `u64::MAX` before handing it out.
+        let claimed_end = claim.base() + claim.len();
+        if row_id_base != claimed_end {
+            return Err(TxnError::RowIdRangeMismatch {
+                claimed_end,
+                actual_end: row_id_base,
+            });
+        }
         Ok((all_inserts, zone_map))
     }
 }
@@ -1593,7 +1598,7 @@ fn merge_zone_map_stats(
 }
 
 // HNSW parameter defaults — tuned via benchmarks, not guessed, per
-// .claude/rules/vector-index.md.
+// .opencode/rules/vector-index.md.
 const HNSW_MAX_NB_CONNECTION: usize = 16;
 const HNSW_MAX_LAYER: usize = 16;
 // ef_construction is the build-cost dial: the insert-time saturation
@@ -2036,7 +2041,7 @@ pub(crate) fn cast_batch_to_schema(batch: &RecordBatch, schema: &SchemaRef) -> R
 /// Appends a `_row_id: UInt64` column to `batch`, assigning
 /// `row_id_base..row_id_base + num_rows` in row order. This is what makes
 /// every committed row addressable by a stable, global identity — see
-/// `.claude/docs/design/phase-0-transaction-and-format-spec.md` §8.
+/// `docs/design/phase-0-transaction-and-format-spec.md` §8.
 fn append_row_id_column(
     batch: &RecordBatch,
     row_id_base: u64,
@@ -2144,6 +2149,49 @@ mod tests {
             80,
             "the counter must cover every id handed out"
         );
+    }
+
+    /// C1: the guard that a transaction's claimed row-id range exactly
+    /// matches the rows it lays out must be a *runtime* check, not a
+    /// `debug_assert` that vanishes in release builds. `write_pending_batches`
+    /// receives `pending` and `claim` as independent parameters, so nothing
+    /// in the type system ties the claim's size to the rows about to be
+    /// written inside it; if they ever diverge the function would hand out
+    /// row-ids *past* the claimed range — ids some other transaction's claim
+    /// already covers, which is exactly the reuse spec §8 forbids ("gaps are
+    /// safe, reuse is forbidden"). This drives the mismatch directly with a
+    /// claim smaller than the batch it's handed alongside and asserts a typed
+    /// `TxnError::RowIdRangeMismatch` rather than relying on a debug-only
+    /// panic that release builds silently drop.
+    #[test]
+    fn write_pending_batches_rejects_a_claim_that_does_not_match_the_rows_it_writes() {
+        use crate::row_id::RowIdRange;
+
+        let dir = temp_dir("row-id-range-mismatch");
+        // A 3-row batch paired with a claim that only covers 2 row-ids — the
+        // exact divergence the guard exists to catch.
+        let batch = vector_batch(
+            vec![1, 2, 3],
+            vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+        );
+        let claim = RowIdRange { base: 0, len: 2 };
+        let mut data_files = Vec::new();
+
+        let result = Transaction::write_pending_batches(
+            std::slice::from_ref(&batch),
+            &dir,
+            0,
+            &claim,
+            0,
+            &mut data_files,
+        );
+
+        assert!(
+            matches!(result, Err(TxnError::RowIdRangeMismatch { .. })),
+            "expected TxnError::RowIdRangeMismatch for a claim/row divergence, got {result:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -4495,7 +4543,7 @@ mod tests {
     #[allow(clippy::cast_precision_loss)]
     fn vector_search_fan_out_matches_brute_force_ground_truth_across_overlapping_segments() {
         // Phase S1 W3's exit criterion
-        // (`.claude/docs/design/phase-s1-segmented-index-spec.md` §5.3):
+        // (`docs/design/phase-s1-segmented-index-spec.md` §5.3):
         // "recall parity with the pre-migration monolithic baseline
         // (integration test, not just the bench)". The fan-out search this
         // validates (`SegmentSet::search` merging results across segments)
@@ -6514,9 +6562,21 @@ mod tests {
         );
 
         let result = txn.commit();
-        assert!(
-            matches!(result, Err(TxnError::Conflict { .. })),
-            "expected a conservative conflict once history aged out, got {result:?}"
+        // InsufficientHistory surfaces as `TxnError::Conflict` whose
+        // `contested_row_ids` is the transaction's *entire* write_set (see
+        // the `ConflictCheck::InsufficientHistory` arm in `commit`), not the
+        // intersection a real row-level conflict would report. Asserting
+        // that explicitly distinguishes the aged-out-history path from a
+        // genuine write/write overlap: the fillers below wrote only rows
+        // >= 100, disjoint from row 0, so a real conflict could never name
+        // row 0 as contested — only InsufficientHistory does.
+        let Err(TxnError::Conflict { contested_row_ids }) = result else {
+            panic!("expected a conservative conflict once history aged out, got {result:?}");
+        };
+        assert_eq!(
+            contested_row_ids,
+            vec![0u64],
+            "InsufficientHistory must report the transaction's whole write_set as contested"
         );
         assert_eq!(
             ds.insufficient_history_conflict_count(),
@@ -6923,7 +6983,7 @@ mod tests {
 /// (`a_reader_never_sees_one_in_flight_commits_row_while_observing_an_unrelated_commits_row_id_counter`),
 /// is the regression gate for deleting `RowIdAllocator.active` / `in_flight`
 /// / collapsing `Snapshot::is_visible` to the tombstone check — see
-/// `.claude/docs/design/phase-s1-segmented-index-spec.md` §6. It was added
+/// `docs/design/phase-s1-segmented-index-spec.md` §6. It was added
 /// here FIRST, against the then-current watermark+in-flight implementation,
 /// as the "before" half of the required "must pass both before and after the
 /// deletion" proof. The deletion has since landed, and this exact test was
@@ -7430,7 +7490,7 @@ mod loom_tests {
         // Only loom's exhaustive interleaving exploration can rule that
         // out, which is the whole reason this project chose Rust + loom
         // over a hand-rolled concurrency proof (see
-        // `.claude/rules/concurrency-txn-layer.md`).
+        // `.opencode/rules/concurrency-txn-layer.md`).
         //
         // Unlike the deterministic sibling, this model installs no
         // checkpoint and imposes no ordering: both committers begin from

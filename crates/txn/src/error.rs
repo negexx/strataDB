@@ -47,6 +47,20 @@ pub enum TxnError {
     SchemaMismatch { expected: usize, actual: usize },
     #[error("conflict: {contested_row_ids:?} were modified by another transaction")]
     Conflict { contested_row_ids: Vec<u64> },
+    /// The row-id range a transaction claimed does not match the rows it
+    /// actually laid out — spec §8's "gaps are safe, reuse is forbidden"
+    /// invariant. `claimed_end` is one past the last claimed row-id
+    /// (`base + len`); `actual_end` is one past the last row-id the
+    /// transaction wrote. A divergence means the transaction handed out
+    /// row-ids *past* its claim — ids some other transaction's claim may
+    /// already cover — so this is surfaced as a hard error rather than left
+    /// to a `debug_assert` that release builds silently drop.
+    #[error(
+        "row-id range mismatch: the claim ended at row-id {claimed_end} but the transaction \
+         laid out rows through row-id {actual_end} — spec §8 forbids row-id reuse (gaps are \
+         safe, reuse is forbidden)"
+    )]
+    RowIdRangeMismatch { claimed_end: u64, actual_end: u64 },
     #[error(
         "column name '{0}' is reserved for internal use and cannot appear in an inserted batch's schema"
     )]
@@ -90,6 +104,16 @@ mod tests {
         assert_eq!(
             TxnError::ReservedColumnName("_row_id".to_string()).to_string(),
             "column name '_row_id' is reserved for internal use and cannot appear in an inserted batch's schema"
+        );
+        assert_eq!(
+            TxnError::RowIdRangeMismatch {
+                claimed_end: 5,
+                actual_end: 8,
+            }
+            .to_string(),
+            "row-id range mismatch: the claim ended at row-id 5 but the transaction laid out \
+             rows through row-id 8 — spec §8 forbids row-id reuse (gaps are safe, reuse is \
+             forbidden)"
         );
     }
 

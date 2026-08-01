@@ -1,0 +1,15 @@
+# Shared defaults for trusted Strata checkouts. Personal auth, provider,
+# profile, telemetry, notification, connector, and plugin state stays in the
+# user's Codex home and must never be added here.
+model = "gpt-5.6-luna"
+model_reasoning_effort = "medium"
+sandbox_mode = "workspace-write"
+approval_policy = "on-request"
+
+[features]
+multi_agent = true
+
+[agents]
+enabled = true
+max_concurrent_threads_per_session = 4
+interrupt_message = true

@@ -208,7 +208,7 @@ mod tests {
 }
 
 /// Run with: `cargo rustc -p strata-index --lib --profile test -- --cfg loom`
-/// (never a workspace-wide `RUSTFLAGS` — see `.claude/rules/concurrency-txn-layer.md`).
+/// (never a workspace-wide `RUSTFLAGS` — see `.opencode/rules/concurrency-txn-layer.md`).
 #[cfg(loom)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod loom_tests {
