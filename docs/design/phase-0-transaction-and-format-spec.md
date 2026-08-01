@@ -1,12 +1,18 @@
 # Phase 0 Spec ÔÇö File Format & Transaction Model
 
+> **Historical baseline — partially superseded.** This document preserves Phase 0 design rationale, not the authoritative description of all current behavior. The current implementation boundary is the [status ledger](../status.md) and [capability roadmap](../roadmap.md): it provides immutable snapshot reads plus in-process write-write conflict checks, and updates tombstone an old physical row before inserting a replacement with a new row ID.
+
+> **Current implementation deviations.** The current API is write-write OCC on shared `Dataset` handles; it has no read-set tracking, read-your-own-writes, transactional reads, or full read/write snapshot transaction. Manifest publication is lock-serialized local publication, not a storage CAS for independent openers. DELETE/tombstones are implemented, `update` allocates a replacement row ID, and immutable segments replaced the original delta-log design. See the [status ledger](../status.md) and [capability roadmap](../roadmap.md) for current behavior.
+
 **Status:** Draft ÔÇö this is the Phase 0 deliverable itself (see `docs/architecture.md`'s roadmap). Exit criterion: reviewed against FoundationDB's and CockroachDB's public consistency docs, plus Lance's format spec. This document does that review explicitly ÔÇö every design choice below says which reference it follows and which it deliberately departs from, and why.
 
-**Scope:** this defines *what* Strata's transaction and storage model are, precisely enough to implement against. It does not contain code. Real implementation happens in `crates/storage/` and `crates/txn/` starting in Phase 1, and must not diverge from this spec without a new revision here first (see rules/concurrency-txn-layer.md).
+**Scope:** this records the Phase 0 transaction and storage design rationale. It does not contain code. Current implementation changes must follow `AGENTS.md`, the current architecture/status/roadmap, and accepted ADRs; historical proposals below are explicitly labeled where they differ from the implementation.
 
 ---
 
-## 1. What a "conflict" is (precise definition)
+## 1. Historical proposed conflict definition (not current implementation)
+
+> The read/write-overlap model in this section is historical design semantics, not a current guarantee. The implementation performs typed write-write conflict checks only; see the [status ledger](../status.md) and [capability roadmap](../roadmap.md).
 
 A **conflict** exists between transaction A and transaction B if and only if:
 
@@ -24,7 +30,9 @@ This is FoundationDB's read-write-overlap definition, adopted directly: *"A tran
 
 **Explicit non-goal:** Strata does not detect *write skew* (the classic snapshot-isolation anomaly where two transactions each read a value the other writes, and both commit safely under SI but would violate serializability). This is not a bug ÔÇö it's ADR 0003's accepted tradeoff. Do not add write-skew detection without a new ADR superseding 0003.
 
-## 2. What a "transaction boundary" is (precise definition)
+## 2. Historical proposed transaction boundary (not current implementation)
+
+> The transactional-read and read-your-own-writes semantics below are historical design semantics. The current API provides immutable snapshot reads and write-only transactions; see the [status ledger](../status.md) and [capability roadmap](../roadmap.md).
 
 - **Begin:** a transaction's read-version is set to the current manifest version *at the moment of its first operation* (read or write) ÔÇö not at some earlier "session start." This matches FoundationDB's implicit-begin model (no separate `BEGIN` call fixes the version; the first read/write does). Everything the transaction reads from that point on is read *as of* that manifest version, even as later commits land concurrently.
 - **During:** all writes are buffered in-memory (or in a transaction-local staging area) and are **not visible to any other transaction, including via disk reads** ÔÇö this is a deliberate simplification versus CockroachDB's write-intents (see ┬º5, "What we don't need"). Strata is single-node; there is no cross-node intent-resolution problem to solve, so there is no reason to make in-flight writes durable or visible before commit.
@@ -32,12 +40,14 @@ This is FoundationDB's read-write-overlap definition, adopted directly: *"A tran
 - **Abort:** happens if (a) the caller explicitly aborts, or (b) commit-time conflict detection finds a real conflict. An aborted transaction's buffered writes are discarded; nothing it did is ever visible to any reader, including itself after abort.
 - **Visibility:** a transaction's own writes are visible to itself immediately (read-your-own-writes within the transaction), but never to any other transaction until commit succeeds.
 
-## 3. Commit protocol (exact steps)
+## 3. Historical proposed commit, visibility, and CAS protocol
+
+> The commit/visibility/CAS protocol below is historical design semantics, not a storage-level CAS guarantee for independent openers. Current manifest publication is lock-serialized within one shared `Dataset` handle; see the [status ledger](../status.md) and [capability roadmap](../roadmap.md).
 
 Adapted from FoundationDB's pipeline, collapsed for a single-node system (no Proxy/Resolver split needed ÔÇö one process can do all of this in-order):
 
-1. **Read-set / write-set finalization.** The transaction has been accumulating a read-set (row-ids and index keys read) and a write-set (row-ids and index keys written) throughout its lifetime. At commit time, both are finalized.
-2. **Conflict check.** Walk every transaction that committed with a commit-version between this transaction's read-version and "now." For each, check whether *this* transaction's read-set intersects *that* transaction's write-set (┬º1's definition). If any intersection exists: abort, return a typed conflict error naming the contested row-ids/keys (see `rules/concurrency-txn-layer.md`).
+1. **Read-set / write-set finalization (historical proposal; not implemented).** The proposed transaction accumulated a read-set (row-ids and index keys read) and a write-set (row-ids and index keys written) throughout its lifetime. At commit time, both would be finalized.
+2. **Read/write conflict check (historical proposal; not implemented).** The proposed protocol walked every transaction committed between the transaction's read-version and "now" and checked whether this transaction's read-set intersected another transaction's write-set. The current implementation instead performs typed write-write conflict checks only; see the [status ledger](../status.md).
 3. **Durable write.** If clean: write the new row data files, and ÔÇö if this commit carries vectors ÔÇö this commit's immutable vector-index segment, to disk, `fsync` (see ┬º8's "Vector-index segment shape" paragraph: there is no delta log; a commit builds one self-contained segment, not a log entry appended to a shared structure). This happens *before* the manifest pointer moves ÔÇö nothing is visible yet.
 4. **Atomic manifest commit.** Compare-and-swap the "current manifest version" pointer from the transaction's read-version-plus-any-intervening-commits to the new version. On a local filesystem this is implemented as an atomic rename (`rename()` is atomic on the same filesystem on both POSIX and NTFS) of a new manifest file into the well-known "current" path or an equivalent atomic pointer update ÔÇö this is exactly Lance's mechanism (*"A new version is committed via an atomic operation on the underlying object store (rename-if-not-exists or put-if-not-exists)"*), adopted directly since Strata is local-disk-first (Phase 1-8) before any object-storage backend (Phase 9).
 5. **Acknowledge.** Only after step 4 succeeds is the caller told the transaction committed. If the CAS in step 4 fails (another transaction's manifest update landed first), re-run step 2's conflict check against the newly-committed transaction before retrying the CAS ÔÇö do not blindly retry the CAS without re-checking conflicts.
@@ -46,7 +56,9 @@ Adapted from FoundationDB's pipeline, collapsed for a single-node system (no Pro
 
 **Where this differs from CockroachDB:** CockroachDB's Parallel Commits protocol exists to avoid a second network round-trip when resolving intents across a distributed cluster. Strata has no network round-trips to avoid ÔÇö everything is local. There is no `STAGING` state, no intent resolution, no asynchronous cleanup. Commit is synchronous and atomic in one step (┬º3.4).
 
-## 4. Conflict detection granularity
+## 4. Historical proposed conflict-detection granularity
+
+> This read/write conflict-domain design is historical. Current conflict detection is write-write only on row IDs within a shared `Dataset` handle; see the [status ledger](../status.md) and [capability roadmap](../roadmap.md).
 
 Two independent conflict domains, checked separately:
 
@@ -55,7 +67,9 @@ Two independent conflict domains, checked separately:
 
 This directly implements FDB's "conflict ranges" concept, narrowed from arbitrary byte-ranges to row-id sets, matching Strata's existing "row/key-range granularity, not whole-dataset locking" language.
 
-## 5. What we deliberately don't need (vs. FoundationDB / CockroachDB)
+## 5. Historical design comparison (vs. FoundationDB / CockroachDB)
+
+> References to manifest CAS in this comparison describe the historical proposal. They are not a current cross-process or independent-opener guarantee; see the [status ledger](../status.md) and [capability roadmap](../roadmap.md).
 
 Both reference systems solve problems Strata, as a single-node embedded engine, doesn't have:
 
@@ -79,15 +93,17 @@ Adapted from Lance's on-disk layout, since Lance is explicitly named as the stor
 - ~~Exact wire format of the vector-index delta-log entries referenced in ┬º6's manifest~~ ÔÇö resolved by ┬º8, added ahead of Phase 4 (that delta-log design was itself later superseded by the immutable segment format ÔÇö see ┬º8's "Vector-index segment shape" paragraph ÔÇö but the open question this bullet tracked, "what does ┬º6's manifest reference for the index side," has stayed resolved throughout).
 - ~~Whether the row-id conflict-set and the manifest's data-file list need to be stored together or can be derived from each other~~ ÔÇö resolved by ┬º8: row-id is now a defined, first-class concept (a `next_row_id` counter alongside `version` in the manifest), not an implementation detail deferred to commit-check time.
 
-## 8. Row-ID definition and lifecycle (added ahead of Phase 4)
+## 8. Historical proposed row-ID definition and lifecycle (added ahead of Phase 4)
 
-**Status:** added via `llm-council` review before Phase 4 (Vector Index) implementation ÔÇö see `.superpowers/council/council-transcript-20260716-174711.md` for the full deliberation. ┬º4 already presumed a "row-id (or a stable primary-key-derived id)" existed for conflict detection; this section supplies the definition ┬º4 deferred, driven by Phase 4's more immediate need to key HNSW insertions by something stable.
+> **Current implementation difference.** The stable-logical-row-ID and UPDATE model in this section is proposed, not implemented. Current `update` tombstones the old physical row and inserts a replacement with a newly allocated global row ID; see the [status ledger](../status.md) and [capability roadmap](../roadmap.md).
+
+**Historical review attribution.** This section was added after an `llm-council` review before Phase 4 (Vector Index) implementation. The original transcript is no longer retained in the active tree. The historical §4 model already presumed a "row-id (or a stable primary-key-derived id)" for conflict detection; this section supplied the definition deferred there, driven by Phase 4's need to key HNSW insertions by something stable.
 
 **Definition.** A row-id is a **logical identity**, not a physical location or user data. Every row, from the moment it is inserted until it is deleted (not merely superseded by an update), has exactly one row-id for its entire lifetime:
 
 - A `u64`, assigned monotonically at commit time from a `next_row_id: u64` counter stored in the manifest alongside `version`.
 - Global across the dataset's entire history ÔÇö never reset, never reused, even after the row it names is later deleted.
-- Independent of any user-supplied column data (rejected: reusing a user `id` column ÔÇö see the council transcript's Contrarian/First-Principles analysis on why this is a category error, not a shortcut).
+- Independent of any user-supplied column data (rejected: reusing a user `id` column conflates caller data with engine-managed row identity, which have different semantics and lifecycles).
 
 **Assignment timing and atomicity.** A commit writing N rows atomically claims the contiguous range `[next_row_id, next_row_id + N)` for its rows and advances `next_row_id` by N, as one indivisible step. The claim is *one per transaction*, not one per batch: a transaction's row-ids are always contiguous, even under concurrency.
 
@@ -99,15 +115,15 @@ What the original wording was really protecting is a *visibility* property, not 
 
 *Historical note ÔÇö why this was not always this simple.* This paragraph previously specified visibility as a bound plus an exclusion set, PostgreSQL's snapshot in miniature (`xmin`/`xmax` plus the `xip_list` of in-progress transactions): visible when at or below the published bound *and* not among the claims outstanding when the snapshot was published. That exclusion set closed a hazard specific to the *old* shared-mutable-HNSW-graph design, where a committing transaction's vector was applied to one graph object shared by every snapshot before that transaction's own commit was durable ÔÇö so a watermark published by an unrelated commit (reading the same global counter this transaction had already advanced by claiming) could numerically cover a row-id that was *already* physically findable in that shared graph. S1 W3.2 removed the shared graph, which removed the leak channel and with it the need for the exclusion set: the guarantee was migrated first and the mechanism deleted second, gated on `dataset::loom_tests::a_reader_never_sees_one_in_flight_commits_row_while_observing_an_unrelated_commits_row_id_counter` ("Model 3") passing against the old implementation as a baseline and then again, completely unmodified, after the simplification. `crates/txn/src/row_id.rs` keeps only the counter; its module doc has the full argument, and the S1 segmented-index spec ┬º6 has the migrate-then-remove plan.
 
-If the commit fails and the transaction retries per ┬º3 step 5, the row-ids provisionally claimed by the failed attempt are discarded, never reused ÔÇö a fresh range is claimed on the successful retry. Row-ids are therefore monotonically increasing in successful-commit order but may have gaps; **gaps are safe, reuse is forbidden** (a reused row-id could collide with a still-live row's HNSW graph entry and silently corrupt search results ÔÇö exactly the failure mode this project's flagship correctness claim exists to rule out). This mirrors how `Manifest.version` already behaves on abort. Per `.opencode/rules/concurrency-txn-layer.md`, the counter-advance step once carried a `loom` obligation, because what had to be atomic was a *pair*: the advance and the in-flight registration, which a reader must never observe torn apart. With the in-flight registry gone, `RowIdAllocator::claim`'s only remaining atomicity property is that its checked add and the store of the result happen under a `Mutex` ÔÇö a single guarded integer with no intermediate state to observe, so a dedicated `loom` model would add nothing beyond what `std::sync::Mutex`'s own correctness already guarantees. Concurrent-claim correctness (no id handed out twice, none skipped) is still exercised by the multi-threaded `dataset::tests::concurrent_claims_hand_out_non_overlapping_ranges`, and the visibility half of the old obligation is covered by Model 3, cited above.
+If the commit fails and the transaction retries per ┬º3 step 5, the row-ids provisionally claimed by the failed attempt are discarded, never reused ÔÇö a fresh range is claimed on the successful retry. Row-ids are therefore monotonically increasing in successful-commit order but may have gaps; **gaps are safe, reuse is forbidden** (a reused row-id could collide with a still-live row's HNSW graph entry and silently corrupt search results ÔÇö exactly the failure mode this project's flagship correctness claim exists to rule out). This mirrors how `Manifest.version` already behaves on abort. The former counter-advance step carried a `loom` obligation because it had to advance the counter and register an in-flight claim without allowing a reader to observe the pair torn apart. With the in-flight registry gone, `RowIdAllocator::claim`'s only remaining atomicity property is that its checked add and the store of the result happen under a `Mutex` ÔÇö a single guarded integer with no intermediate state to observe, so a dedicated `loom` model would add nothing beyond what `std::sync::Mutex`'s own correctness already guarantees. Concurrent-claim correctness (no id handed out twice, none skipped) is still exercised by the multi-threaded `dataset::tests::concurrent_claims_hand_out_non_overlapping_ranges`, and the visibility half of the old obligation is covered by Model 3, cited above.
 
 **Provisional ids within one transaction.** A transaction buffers rows locally before `commit()` and does not know their final row-ids until the commit's CAS succeeds (the base could shift if another commit lands first). While buffered, each row has a transaction-local, zero-based provisional index (0, 1, 2, ... in insertion order within that transaction). At commit, once the real base is claimed, provisional index `i` resolves to real row-id `claimed_base + i`. Any future in-transaction self-reference to "the row I just inserted" resolves through this offset mapping, never through a value read back from disk mid-transaction.
 
-**UPDATE semantics (not yet implemented, but must not be precluded).** Strata's API today (Phases 1-4) is insert/scan/filter/search only ÔÇö there is no UPDATE. When one is added (Phase 5/6 territory), it is defined as: the row-id is preserved; physically it is a tombstone of the row-id's previous vector-index entry plus a fresh row insert carrying the *same* row-id and new values. The row-id is never reassigned by an UPDATE ÔÇö this is the concrete meaning of "row-id is logical identity." `Dataset::scan`'s existing visibility rule (┬º2) already determines which of a row-id's physical versions across commits is current for a given manifest version; no new mechanism is needed.
+**Stable-row-ID UPDATE semantics (historical proposal; not implemented).** The original proposal preserved a row ID across an update by tombstoning that row ID's prior vector-index entry and inserting fresh values carrying the *same* row ID. Current implementation differs: `update` tombstones the old physical row and inserts a replacement with a newly allocated global row ID. See the [status ledger](../status.md) and [capability roadmap](../roadmap.md) for the current boundary.
 
-**DELETE semantics (not yet implemented, but must not be precluded).** A DELETE is a tombstone entry for the row's row-id with no successor insert. The row-id is retired permanently ÔÇö never reassigned, even after Phase 8 compaction reclaims the physical bytes.
+**DELETE semantics (historical proposal and current implementation).** The original proposal defined DELETE as a tombstone entry for a row ID with no successor insert. Current `delete` implements tombstone deletion for the physical row ID. That ID is retired permanently and never reassigned, even after future physical reclamation; see the [status ledger](../status.md) for the current boundary.
 
-**Vector-index segment shape (supersedes this section's original delta-log design ÔÇö S1 W3.2).** There is no delta log. A commit that carries vectors builds one immutable, self-contained on-disk segment ÔÇö a serialized HNSW graph over exactly that commit's rows, keyed by segment-local ordinals mapped back to global row-ids ÔÇö fsyncs it outside `commit_lock`, and lists it in the manifest (`SegmentEntry`) by the same atomic swap that publishes the commit's row data. See `docs/superpowers/specs/2026-07-24-s1-segment-format-w3-migration-design.md` for the on-disk format and `.opencode/rules/vector-index.md` for the binding invariants. A DELETE/UPDATE's tombstone half needs no entry in any segment at all ÔÇö see the "Revised (S1 W3.2)" paragraph above: it is a row-id in `Manifest.tombstones`, checked by `Snapshot::is_visible`, nothing more.
+**Vector-index segment shape (supersedes this section's original delta-log design ÔÇö S1 W3.2).** There is no delta log. A commit that carries vectors builds one immutable, self-contained on-disk segment ÔÇö a serialized HNSW graph over exactly that commit's rows, keyed by segment-local ordinals mapped back to global row-ids ÔÇö fsyncs it outside `commit_lock`, and lists it in the manifest (`SegmentEntry`) by the same atomic swap that publishes the commit's row data. The current segmented-index baseline is documented in [the S1 specification](phase-s1-segmented-index-spec.md) and [the architecture](../architecture.md). A DELETE/UPDATE's tombstone half needs no entry in any segment at all ÔÇö see the "Revised (S1 W3.2)" paragraph above: it is a row-id in `Manifest.tombstones`, checked by `Snapshot::is_visible`, nothing more.
 
 **Recovery.** `Dataset::open` deserializes every manifest-listed segment directly (`SegmentReader::from_bytes`) ÔÇö `O(bytes)`, zero distance evaluations, zero graph construction, no replay of any kind. A snapshot's index is exactly its manifest's segment list (`SegmentSet`); nothing is rebuilt from history. See `crates/txn/src/dataset.rs`'s `load_segments`.
 

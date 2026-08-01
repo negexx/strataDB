@@ -18,7 +18,7 @@
 > with it, and the second amendment takes precedence over the first for anything concerning W3.2.
 
 **Date:** 2026-07-24
-**Trigger:** [`phase-s1-segmented-index-spec.md`](../../../.claude/docs/design/phase-s1-segmented-index-spec.md) §7
+**Trigger:** [`phase-s1-segmented-index-spec.md`](../../design/phase-s1-segmented-index-spec.md) §7
 and §10 mandate a brainstorm-then-Opus-review pass on the concrete segment format and the W3 cutover
 mechanics before any code is written, since the format is hard to reverse and W3 touches the commit
 path / snapshot-isolation machinery this project just finished stabilizing. This doc is that pass. It

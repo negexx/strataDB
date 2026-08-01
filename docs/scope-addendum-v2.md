@@ -4,7 +4,7 @@
 **Changes from v1:** §1 gains zone maps (new, and it makes the layout decision more load-bearing). §3 gains a deferred learned-index note. §4 gains neural databases. §6 is new — a triage filter for evaluating future research, because more of it will arrive.
 **Unchanged:** the branching thesis, the refusals, the memory positioning, and the next action.
 
-> Filed 2026-07-24. Canonical scope statement (supersedes [`scope-addendum-v1.md`](scope-addendum-v1.md)).
+> Filed 2026-07-24. Canonical scope statement; the superseded v1 addendum is preserved in documentation history.
 > §1.1's decision is **made**: branching is mandatory → segmented layout adopted,
 > [ADR 0008](decisions/0008-adopt-segmented-index-layout.md) (Accepted). §1.2 (zone maps) is a v1
 > companion primitive unlocked by that layout. §8.2's experiment (recall-vs-segment-count) is
@@ -45,7 +45,9 @@ One decision is time-sensitive and cheap. Everything else here can wait, and mos
 - It simplifies crash recovery, snapshot isolation, and compaction scheduling — all of which v1 needs anyway, independent of branching.
 - It is the only layout that makes §1.2 and §3.2 possible.
 
-**What it costs.** Queries fan out across N segments and merge. That is a real recall-per-millisecond penalty versus one large graph, and it must be managed with an aggressive compaction policy. Lucene and Milvus both pay this deliberately.
+**What it costs.** Queries fan out across N segments and merge. The measured Q2 result found no
+segment-count recall cliff; the cost is latency that grows roughly with segment fan-out and must be
+bounded through compaction. Lucene and Milvus both pay this deliberately.
 
 **Recommendation: adopt the layout in v1 and ship zero branching features in v1.**
 
@@ -183,31 +185,42 @@ Applied to the last survey received: the learned-index section passed all three 
 
 ---
 
-## 7. Open questions
+## 7. Open questions and resolved gate
 
-Flagged rather than papered over.
+Open items remain flagged rather than papered over; Q2 is retained here as resolved historical
+context for the accepted layout.
 
 1. **Compaction policy under branch churn.** If thousands of short-lived branches each write a delta segment, when do you compact, and how do you avoid compacting segments a live branch still references? The hard part of §1.1, unsolved here.
-2. **Recall degradation curve across segment count.** Needs measurement, not reasoning. The layout is only defensible if the penalty is bounded and compaction-recoverable.
+2. **Recall-vs-segment-count result (resolved).** The Q2 experiment found no recall degradation as
+   segment count increased. It measured a roughly segment-linear latency cost from fan-out, making
+   compaction a performance bound rather than a correctness condition; see ADR 0008.
 3. **Whether fast abort is achievable** at the vector-index layer, or whether abort cost scales with segments-touched in a way that breaks the agentic case.
 4. **Embeddable vs. server-first.** Affects §4's multi-tenancy escape hatch and probably the whole distribution strategy. Undecided.
 
-Question 2 could invalidate §1.1. It's also cheap to test with a throwaway prototype long before the engine exists — build N segments over a known dataset, measure recall and latency versus one monolithic index at varying N. **That experiment is worth more than the next ten surveys.**
+Question 2 was the proposal's cheap gating test: build N segments over a known dataset and measure
+recall and latency versus one monolithic index at varying N. It has now run and supports the accepted
+§1.1 layout. The remaining work is compaction policy and segmented-index lifecycle/operational
+hardening, not another segmented-vs-monolithic decision. **That experiment was worth more than the
+next ten surveys.**
 
 ---
 
 ## 8. Next action
 
-Exactly two things, both small:
+The proposal named exactly two immediate actions, both small; both are now complete:
 
-> 1. Make the segmented-vs-monolithic call and write it into the MVP spec.
-> 2. Run the segment-count recall experiment (question 2 above).
+> 1. Adopt the segmented immutable layout — completed by ADR 0008.
+> 2. Run the segment-count recall experiment — completed with the measured result recorded in ADR
+>    0008.
 
-Everything else goes into `FUTURE.md` and is not reopened until there is a working commit path.
+Compaction and segmented-index hardening remain open roadmap work; they do not reopen the accepted
+layout decision.
 
 ---
 
-*Scope questions are cheaper than code and feel like progress. This document exists to close them, not to collect them. If a v3 of this file becomes necessary before the experiment in §7.2 is run, that is itself the signal.*
+*Scope questions are cheaper than code and feel like progress. This document exists to close them,
+not to collect them. The §7.2 experiment ran before a v3 was needed, closing the proposal's gating
+question while leaving compaction and hardening to the roadmap.*
 
 ---
 

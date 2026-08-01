@@ -4,10 +4,16 @@
 **Decided by:** [ADR 0008](../decisions/0008-adopt-segmented-index-layout.md) (Accepted) — branching is
 mandatory, only possible on a segmented index. The recall-vs-segment de-risk already ran
 (`bench/benches/segment_recall_bench.rs`): recall is segment-count-safe, cost is latency.
-**Context:** [`scope-addendum-v2.md`](../scope-addendum-v2.md) §1.1–§1.2, [`architecture.md`](../architecture.md)
-roadmap S1 row, and [`how-strata-works.md`](../how-strata-works.md) §12 for the conceptual picture.
-**Read before implementing:** `.opencode/rules/concurrency-txn-layer.md`, `.opencode/rules/vector-index.md`,
-`phase-4-vector-index-spec.md`, `phase-5-mvcc-snapshot-isolation-spec.md`.
+**Context:** [`scope-addendum-v2.md`](../scope-addendum-v2.md) §1.1–§1.2, [the active architecture](../architecture.md),
+[the status ledger](../status.md), and [the roadmap](../roadmap.md).
+**Read before implementing current work:** [AGENTS.md](../../AGENTS.md), [the Phase 0 transaction and format
+spec](phase-0-transaction-and-format-spec.md), the [current decision index](../decisions/README.md), and the
+[status ledger](../status.md).
+
+> **Historical implementation record.** This specification preserves the pre-S1 comparison, planned
+> migration steps, and S1 closure evidence. References below to the prior change-record, shared-index,
+> visibility-marker, or in-flight mechanisms are explicitly **pre-S1 context**, not descriptions of
+> the current implementation. For current behavior, use the status ledger and architecture.
 
 ---
 
@@ -34,7 +40,7 @@ compaction/GC (Phase S2) build on this; they are out of scope here.
 - Dataloader, object storage, language bindings — the productization tail.
 - Verifiable deletion, staleness tracking, budget-shaped ANN — v3.
 
-## 3. What we are migrating *from* (current monolithic design)
+## 3. What we migrated *from* (pre-S1 monolithic design)
 
 Understand this precisely before touching it; S1 is a **migration**, not greenfield.
 
@@ -48,7 +54,7 @@ Understand this precisely before touching it; S1 is a **migration**, not greenfi
   visibility is enforced by a watermark + tombstone set + an in-flight claim registry. **This is the
   machinery that produced this session's two atomicity bugs** — S1 largely dissolves it (see §6).
 
-## 4. Target design
+## 4. Historical target design (completed)
 
 ### 4.1 A segment
 
@@ -61,7 +67,7 @@ vectors themselves (or a reference to the row data file's vector column — deci
 row file already holds the vectors, so the segment may store only graph structure + row-id mapping to
 avoid duplicating embeddings), and a small header with its vector count and dimension.
 
-**Key reframe:** today the delta log is a *change record* that must be *replayed* (re-inserted, an
+**Historical pre-S1 reframe:** the delta log was a *change record* that had to be *replayed* (re-inserted, an
 `O(n·log n)` graph build) to reconstruct the graph. A segment is the *built result* — loading it is
 `O(nodes)` deserialization, no distance computation, no graph construction. This is the whole recovery
 win, and it is the crux of the format design.
@@ -101,13 +107,12 @@ through the existing `explain`-style path so it is testable ("this query touched
 
 ### 4.6 Manifest-load recovery
 
-`Dataset::open` loads the segment list from the manifest and deserializes each segment, instead of
-replaying delta logs to rebuild one graph. The delta log's role shrinks: it is either removed in favour
-of the segment file being the durable record, or kept only as the write-ahead record for a
-not-yet-sealed segment (design decision — see §7 Q1). Recovery time should collapse from the measured
-~36 s rebuild to a load proportional to segment bytes.
+**Historical target outcome:** `Dataset::open` would load the segment list from the manifest and
+deserialize each segment instead of replaying the pre-S1 delta log into one graph. The final result is
+recorded in §7: the delta log was removed and recovery now loads immutable segments. The anticipated
+cost was proportional to segment bytes rather than the measured pre-S1 rebuild.
 
-## 5. Workstreams and PR sequencing
+## 5. Historical workstreams and PR sequencing
 
 Build as vertical slices, one PR each, each ending green. Order is chosen so the low-risk, additive,
 independently-useful work lands first and the risky core migration lands on a stable base.
@@ -152,15 +157,15 @@ time is non-decreasing across versions. Exposed for predicates and for zone maps
 
 This is the risky one. Do it as a behaviour-preserving refactor first, then flip the mechanism:
 1. **Introduce the segment abstraction with a single segment.** Make search go through a "segment set"
-   that initially holds exactly one segment = today's whole graph. This is a pure refactor: same
+   that initially holds exactly one segment = the pre-S1 whole graph. This is a pure refactor: same
    behaviour, same tests green, but the search path is now fan-out-shaped (over a set of one).
 2. **Change the write path to build a per-commit segment** outside the lock and add it to the manifest,
    instead of mutating the shared graph in-lock. Now the segment set grows by one per commit.
 3. **Change search to fan out** over the manifest's segment set and merge (the prototyped shape).
 - **Invariants (critical):** a row write and its segment commit atomically or neither; no write
   acknowledged until durable; snapshot isolation preserved (a snapshot references a fixed segment set);
-  conflicts still typed. **Every step gets a loom test** for the commit/publish interleaving, scoped
-  per the rules file.
+  conflicts still typed. **Every step gets a loom test** for the commit/publish interleaving, using the
+  then-current crate-scoped test guidance.
 - **Tests:** recall parity with the pre-migration monolithic baseline (integration test, not just the
   bench); the existing concurrent-commit and snapshot-isolation suites stay green; a failed commit
   leaves no segment in the manifest and nothing searchable.
@@ -175,7 +180,7 @@ in the manifest segment entry; prune segments a compound predicate cannot match 
 - **Exit:** a selective temporal query skips whole segments.
 
 > **Status (2026-07-26):** implemented. Shipped in two stages exactly as staged by
-> [`2026-07-26-s1-w4-zone-map-design-amendment.md`](../../../docs/superpowers/specs/2026-07-26-s1-w4-zone-map-design-amendment.md):
+> [`2026-07-26-s1-w4-zone-map-design-amendment.md`](../superpowers/specs/2026-07-26-s1-w4-zone-map-design-amendment.md):
 > W4a (compute+store, PR #36) added `SegmentEntry.zone_map`; W4b (prune+explain,
 > `feat/s1-w4b-zone-map-pruning`) added `crates/index`'s opaque per-part zone-map payload and
 > `SegmentSet::search_filtered_pruned`, and wired `Snapshot::vector_search` to gate fan-out through
@@ -186,8 +191,8 @@ in the manifest segment entry; prune segments a compound predicate cannot match 
 
 ### 5.5 W5 — Manifest-load recovery
 
-Change `Dataset::open` to deserialize the manifest's segments instead of replaying delta logs to
-rebuild. Decide the delta log's residual role (§7 Q1).
+Change `Dataset::open` to deserialize the manifest's segments instead of replaying the pre-S1 delta
+log to rebuild. The resolved outcome is recorded in §7.
 - **Tests:** the crash-recovery test still recovers the last committed version; recovery reads the
   same graph state that a rebuild would have (recall parity after reopen); **the chaos harness thorough
   tier still passes** — this is the gate that the cutover did not regress crash recovery.
@@ -203,9 +208,9 @@ rebuild. Decide the delta log's residual role (§7 Q1).
 > resulting confusion between this section's still-open-looking text and the actual shipped state is
 > what produced the "W3.3 vs W4" circularity the 2026-07-26 amendment above had to resolve.
 
-## 6. The snapshot-isolation simplification (benefit + hazard)
+## 6. Historical migration simplification (benefit + hazard)
 
-The current shared-mutable-graph design forced a delicate mechanism: soft-delete of a failed commit's
+The pre-S1 shared-mutable-graph design forced a delicate mechanism: soft-delete of a failed commit's
 inserts (`GraphResidueGuard`), a watermark, and an in-flight claim registry — the exact machinery that
 produced this session's two atomicity bugs. **Immutable segments largely dissolve this.** A failed
 commit simply does not add its segment to the manifest, exactly as a failed row-data write is already
@@ -218,30 +223,38 @@ the now-redundant mechanism, each step gated by the loom tests and the chaos har
 "a failed transaction leaves neither the row nor the index behind" must hold at every commit of the
 migration, not just at the end.
 
-## 7. Open questions to resolve during design (invoke brainstorming / Opus 5-tier review)
+## 7. Resolved outcomes and current follow-ups
 
-1. **Delta log's residual role.** Once segments are the durable built result, is the per-commit delta
-   log removed entirely (segment file *is* the record), or kept as a write-ahead log for a segment not
-   yet fully written? Affects crash-consistency of a commit interrupted mid-segment-write.
-2. **Vectors: duplicate in the segment, or reference the row file?** The row data file already stores
-   the vector column. A segment could store only graph structure + row-id mapping and read vectors from
-   the row file, avoiding duplication — at the cost of a coupling between segment and row file. Decide.
-3. **Segment granularity.** One segment per commit is simplest but produces many tiny segments under
-   frequent small commits (the fan-out latency the recall bench measured). S1 accepts this; S2 compacts.
-   But confirm the per-commit-segment build cost is acceptable for the common small-commit case.
-4. **Serialization format for a segment.** Must be loadable without re-running inserts. Length-prefixed
-   binary is the natural choice; note the delta log's JSON was flagged as slow/write-amplifying, so do
-   not repeat that here.
+### Resolved S1 outcomes
 
-## 8. Invariants that must hold at every step (from the rules files)
+- **Immutable segment loading:** `Dataset::open` loads and validates manifest-listed immutable segments;
+  it does not rebuild an index by replaying inserts.
+- **No delta-log replay:** the pre-S1 delta log was removed. A segment is the durable built index result
+  referenced by the manifest, rather than a change record to replay.
+- **Tombstone-only visibility:** the pre-S1 watermark and in-flight registry were retired. A snapshot's
+  manifest tombstones determine whether its row IDs are visible.
+- **Segment representation:** the shipped binary segment format records serialized HNSW state, row IDs,
+  vectors, format metadata, and integrity checks; it is loaded without re-running HNSW insertion.
+
+### Current follow-ups
+
+- **Compaction and operational lifecycle:** one segment per vector-carrying commit can increase fan-out
+  cost. Compaction, vacuum/orphan cleanup, and safe retained-history management are not implemented;
+  see [the roadmap](../roadmap.md) and [the status ledger](../status.md).
+- **Correctness and workload coverage:** S1 closure evidence does not replace the Phase 1 audit of
+  shared-handle conflicts, updates/deletes, crash behavior, filtered ANN, and multi-batch commits.
+  Use [the active architecture](../architecture.md), [the status ledger](../status.md), and [the
+  roadmap](../roadmap.md) for the current boundary.
+
+## 8. Invariants that had to hold at every step (historical implementation guidance)
 
 - No write acknowledged until durable + conflict-checked + visible. No async buffering, ever.
 - A row write and its index-segment commit are atomic — both published or neither.
 - Snapshot isolation preserved; readers never block writers; a snapshot sees a fixed, consistent
   segment set + row-file set.
 - Conflicts surfaced as typed errors naming contested rows.
-- Every concurrency-touching change gets a loom interleaving test, scoped per the rules file (never a
-  workspace-wide `RUSTFLAGS --cfg loom`).
+- Every concurrency-touching change gets a loom interleaving test; never use a workspace-wide
+  `RUSTFLAGS --cfg loom`.
 - Safe Rust by default; any `unsafe` carries a `// SAFETY:` comment.
 - Index mutations stay inside the transaction boundary — a segment is only ever published through the
   commit path's manifest swap.
@@ -257,7 +270,7 @@ migration, not just at the end.
 - Full workspace suite green; `clippy --workspace --all-targets -- -D warnings` clean; `cargo fmt
   --check` clean; loom green (scoped); **and the chaos harness thorough tier (`STRATA_CHAOS_THOROUGH=1`,
   2000 seeds) still passes** — the migration must not regress crash-recovery correctness.
-- Every task reviewed by the Opus reviewer before being marked done (mandatory, per CLAUDE.md).
+- Every task received the required independent review before being marked done.
 
 > **Status (2026-07-26): Phase S1 exit criteria met — closing.** All five workstreams (W1-W5, see §5)
 > are merged, plus the two follow-up correctness fixes the migration exposed:
@@ -285,10 +298,9 @@ migration, not just at the end.
 > manifest-recovery mechanism is crash-safe for the scenarios it actually drives — it does not yet
 > prove the *interaction* between S1's segments and Phase 6's conflict/delete machinery is crash-safe
 > under load. That gap, and several other post-S1 correctness-coverage and stale-documentation
-> findings the migration left behind, are this session's own audit findings — not yet written down in
-> a committed doc — and are the intended starting scope for the Phase 6/7 hardening pass
-> `architecture.md`'s "Where this slots" sequencing note calls for after S1; a follow-up plan doc
-> should capture them properly before that work starts.
+> findings the migration left behind, are the intended starting scope for the current Phase 1
+> hardening/audit work. See [the status ledger](../status.md), [the roadmap](../roadmap.md), and [the
+> active architecture](../architecture.md) rather than a deleted architecture section.
 
 ## 10. Process
 

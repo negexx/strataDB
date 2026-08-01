@@ -23,7 +23,7 @@
 - `unwrap()`/`expect()` are `clippy::warn`, not banned outright — fine in tests and genuinely-infallible paths (with a comment saying why it's infallible), not fine on a path that can receive untrusted input or fail at runtime.
 - Prefer borrowing (`&T`/`&mut T`) over cloning; when you do clone, that's a signal to double-check whether ownership could be restructured instead.
 - `#[must_use]` on any function whose return value must be checked (especially anything in `crates/txn/` returning a commit/conflict result) — Rust's own unused-`Result`-must-use lint already covers `Result`-returning functions, so this is mainly for non-`Result` return types where a caller could plausibly ignore something they shouldn't.
-- Don't wrap `crates/index`'s segment serialization (`crates/index/src/segment_{format,writer,reader}.rs`) behind an abstraction that hides it from the segment/commit code — see `docs/decisions/0005-rust-over-cpp-reversal.md`.
+- Keep `crates/index`'s segment serialization (`crates/index/src/segment_{format,writer,reader}.rs`) explicit at the segment/commit boundary; preserve its validation and format checks. For the language/tooling rationale, see [ADR 0005](decisions/0005-rust-over-cpp-reversal.md).
 
 ## Imports
 
@@ -36,13 +36,13 @@
 - Use a typed `enum` error (via `thiserror` or hand-rolled `impl std::error::Error`) on the hot commit/conflict path in `crates/txn/` — no `Box<dyn Error>` or stringly-typed errors on that path, callers need to match on the specific conflict variant.
 - `anyhow`-style dynamic errors are fine at the CLI boundary (`crates/cli/`) where there's no caller left to match on a specific variant.
 - Never swallow an error silently — propagate with `?` or log with enough context to debug later (which transaction, which keys, for anything in `crates/txn/`).
-- A panic across the PyO3 FFI boundary is undefined behavior, not just an ugly traceback — see `.opencode/rules/python-bindings.md`.
+- Keep the PyO3 surface thin and do not let panics cross it. The current binding is only `placeholder_version`; a real binding API belongs to the [roadmap](roadmap.md).
 
 ## Tests
 
 - One assertion idea per test (multiple `assert!`/`assert_eq!` calls are fine if they test the same idea).
 - Test names describe behavior, not implementation: `conflicting_writes_return_typed_error`, not `test_conflict_check`.
-- For `crates/txn/` and `crates/index/`: every change needs a `loom`-based interleaving test alongside the normal `#[test]` happy path — see `.opencode/rules/concurrency-txn-layer.md`.
+- For interleaving-sensitive `crates/txn/` and `crates/index/` changes, add a targeted loom model alongside normal tests. Follow the crate-scoped recipe in [AGENTS.md](../AGENTS.md); do not set workspace-wide `RUSTFLAGS=--cfg loom`.
 
 ## Commits
 

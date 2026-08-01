@@ -1,73 +1,30 @@
 # FUTURE — deferred and refused scope
 
-> Created 2026-07-24 per [Scope Addendum v1](scope-addendum-v1.md) §7. This is the parking lot: items
-> that are **not** reopened until there is a working commit path (Phase 6) and, for the branching
-> line, until [ADR 0007](decisions/0007-segmented-vs-monolithic-index-layout.md) is decided.
->
-> Rationale is **not** duplicated here — each item links to where it's argued. The point of this file
-> is a single place that answers "is X in scope?" with "no, and here's why, don't relitigate it."
+This is a short index of deferred and refused product scope. Current implementation status and phase ordering live in the [status ledger](status.md) and [roadmap](roadmap.md); this file does not override them. Historical rationale remains in [Scope Addendum v2](scope-addendum-v2.md), [ADR 0008](decisions/0008-adopt-segmented-index-layout.md), and [documentation history](history/README.md).
 
-## Decided / "do now" (not deferred)
+## Already implemented or partially implemented
 
-- **Segmented immutable index layout — adopted** ([ADR 0008](decisions/0008-adopt-segmented-index-layout.md),
-  Accepted). Branching is mandatory, and it's only possible on a segmented index. Decides the *layout*
-  now (index-storage work must not harden the monolithic design); the branching *features* below wait
-  for Phase 6/7. The gating de-risk **already ran** (`bench/benches/segment_recall_bench.rs`): recall
-  is segment-count-safe, the cost is latency (~linear in K), so compaction bounds latency not recall —
-  ADR 0008 has the numbers.
-- **Per-segment zone maps** ([addendum §1.2](scope-addendum-v2.md)) — v1 companion to the layout.
-  Per-segment min/max (timestamp + low-cardinality columns) in the manifest → temporal/filtered
-  predicates become segment pruning. ~100 lines, nearly free given the layout, impossible without it.
-  Not yet built; the segment format must reserve manifest room for it. A pruning primitive, not a
-  temporal data model.
+- Immutable manifest-listed HNSW segments are the active index layout; see [ADR 0008](decisions/0008-adopt-segmented-index-layout.md).
+- Per-file and per-segment statistics support predicate pruning. The existing query primitives are partial; no planner-integrated query engine is implied.
 
-## Deferred (post-Phase-6, in order)
+## Deferred capability work
 
-| Item | Target | Precondition | Notes |
-|---|---|---|---|
-| Fork (branch) | v2 | segmented layout (ADR 0008 ✓) + Phase 6/7 done | O(segments) manifest copy. The differentiated thesis — "the storage engine an agent can fork." [Addendum §2](scope-addendum-v1.md) |
-| Abort (fast discard) | v2 | Fork | O(mutations); the agentic *hot path*, unlike a traditional DB. |
-| Branch read isolation | v2 | Fork | Snapshot-consistent ANN across a branch's segment set. |
-| Merge | v2.1 | Fork + abort | Correct-but-slow is acceptable for ~a year. Replay the branch's logical insert/delete set, rebuild affected segments. **Do not optimise before someone complains.** |
-| Staleness tracking on derived columns | v3 | — | Store `(source_version, derivation_fn_version) → derived_value`; expose "which rows are stale" as a query. **Do not recompute anything.** [Addendum §3](scope-addendum-v1.md) |
-| Verifiable deletion | v3 | segmented layout | "Provably scrubbed from index + all segments." Narrow, and about to be legally forced (GDPR / EU AI Act). Tractable under segments, near-impossible under monolithic HNSW. |
-| Budget-shaped ANN API | v3 | — | Expose `recall ≥ 0.9 OR cost ≤ X` over the existing `ef_search` knob. Days of work; the honest sliver of cost-aware planning, not a query optimiser. |
+| Capability | Roadmap phase | Current boundary |
+|---|---|---|
+| Compaction, vacuum, and orphan cleanup | 3 | No reclamation or segment-count bound is implemented. |
+| Schema catalog, migration compatibility, point lookup, time travel, stable query API | 2–3 | Current Arrow batches/manifests do not form a complete catalog or migration layer. |
+| Independent-open and cross-process coordination | 4 | Shared-handle locking is not a durable conditional-publication protocol. |
+| Fork, abort, branch reads, and merge | 5 | Immutable segments are a prerequisite, not a delivered branching feature. |
+| Object-store backend and deployment | 6 | `LocalFs` is the implemented backend. |
+| Usable Python API and stable administration CLI | 2 | Bindings are a `placeholder_version` module; CLI commands are fixed-shape demo/inspection tooling. |
+| Verifiable deletion, staleness tracking, and budget-shaped ANN controls | Later product work | These depend on lifecycle and API foundations. |
 
-## Refused (recorded so the space moving doesn't reopen them)
+## Refused for the current product
 
-Full rationale in [Addendum §4](scope-addendum-v1.md) and §5. These are also reflected in
-[`architecture.md`](architecture.md)'s Non-Goals.
+- Distributed or multi-node transactions.
+- Full SQL parser/optimizer and a distributed query planner.
+- Additional ANN families beyond the current HNSW implementation.
+- Automatic conflict resolution or a stronger isolation level without a superseding ADR.
+- A derivation engine, belief semantics, or agent memory product embedded in the database engine.
 
-- **Derivation engine (IVM over model calls)** — that's an orchestrator + a separate product. Ship the
-  staleness primitive; stop there.
-- **Probe optimiser / cost-quality planning** — requires a query optimiser, which requires a query
-  language. Strata is a storage engine. Category error at this stage.
-- **Belief semantics (bi-temporal validity, confidence propagation, retraction cascades)** — a *data
-  model*. Build it **on** Strata, not **in** it. The moment the engine holds opinions about what a
-  "claim" is, it stops being a storage engine.
-- **Extreme multi-tenancy (fork)** — an architectural fork, not a feature. Escape hatch: ship
-  embeddable and million-tenant is ~free (run N instances) — an independent argument for
-  embeddable-first (open question, [Addendum §6 Q4](scope-addendum-v1.md)).
-- **Neural databases (NeuroDB / SNH / NGDB)** — approximate range-aggregate query processing over a
-  fixed distribution; a technique, not a database class, orthogonal to Strata. [Addendum §4](scope-addendum-v2.md)
-- **Agent memory as a product** — memory is the *reference application*, Strata is the *substrate*.
-  Build the engine, then a thin memory layer on top as the demo; don't become "startup sixteen" in a
-  crowded market competing on the axis where the advantage is smallest. [Addendum §5](scope-addendum-v2.md)
-
-## Read later, don't build
-
-- **Learned indexes** (v4+, [addendum §3.2](scope-addendum-v2.md)) — the delta-segment + background-
-  compaction shape shows up again here (Sig2Model: pre-allocate for writes, adjust locally, defer the
-  global rebuild), which is useful confirmation the §1.1 instinct generalises. But learned indexes are
-  weakest exactly where Strata is heaviest (writes), and it's a 2025 preprint. Reading, not a work item.
-
-## Open questions that gate the above
-
-From [Addendum §6](scope-addendum-v1.md). Q2 is the one that could invalidate the whole segmented
-direction and is cheap to prototype against the existing `crates/index` graph *before* any engine
-work:
-
-1. Compaction policy under branch churn (unsolved).
-2. Recall degradation curve vs. segment count — **measure, don't reason.** The pivotal one.
-3. Whether fast abort is achievable at the vector-index layer.
-4. Embeddable vs. server-first (affects multi-tenancy + distribution).
+These boundaries are deliberate. New work should be proposed against the [roadmap](roadmap.md), while current source and [status ledger](status.md) remain authoritative for claims about what Strata does now.
