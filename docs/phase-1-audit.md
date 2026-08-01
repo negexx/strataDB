@@ -31,6 +31,57 @@ source/tests as the anchor.
 | PERF-02..05 / DUR-06 | Later | Lifecycle | Compaction, vacuum, orphan cleanup, bounded history, and index lifecycle belong to Phase 3; document current growth meanwhile. |
 | ARCH-06..08 | Later | Client/backend surfaces | Decide subordinate-crate leakage, backend plumbing, and CLI version semantics during later API stabilization. |
 
+## Complete legacy-ID mapping
+
+The original lane reports used one ID per finding. This table is the lossless crosswalk into the
+consolidated register above; IDs marked "merged" retain the same evidence under a shared mechanism.
+
+| Legacy ID | Consolidated disposition |
+|---|---|
+| COR-01 | Merged with CONC-01 and IDX-01: future tombstone can hide an acknowledged insert. Phase 1 blocker. |
+| COR-02 | Merged with CONC-03: abandoned row-ID reservation can be reused after restart. Phase 1 blocker. |
+| COR-03 | Merged with DUR-01 and DUR-02: directory durability can fail open. Phase 1 blocker. |
+| COR-04 | Merged with DUR-03a: manifest filename and payload versions can disagree. Phase 1 blocker. |
+| COR-05 | Merged with ARCH-02: update/delete target and replacement cardinality are under-specified. Phase 1 blocker. |
+| CONC-01 | Merged with COR-01 and IDX-01: future/in-flight tombstone visibility hole. Phase 1 blocker. |
+| CONC-02 | Merged with VER-02: transaction and cache loom models are not CI gates. Phase 1 blocker. |
+| CONC-03 | Merged with COR-02: restart can reuse an abandoned physical row-ID claim. Phase 1 blocker. |
+| CONC-04 | Preserved as later Phase 4 work: independent openers lack shared conditional publication. Not a Phase 1 scope expansion. |
+| DUR-01 | Merged with COR-03: directory sync errors are discarded before acknowledgement. Phase 1 blocker. |
+| DUR-02 | Preserved separately: initial dataset directory entries lack a durable parent boundary. Phase 1 blocker. |
+| DUR-03 | Split into DUR-03a (manifest identity) and DUR-03b (validly encoded manifest/row-file integrity); both remain Phase 1 blockers. |
+| DUR-04 | Merged with VER-03: process-abort chaos does not prove power-loss durability and can be non-exercising. Phase 1 verification blocker. |
+| DUR-05 | Merged with ARCH-04 and VER-07: active wording overstated durability. Corrected in current docs; evidence remains blocked until implementation fixes land. |
+| DUR-06 | Preserved as later Phase 3 lifecycle work: failed commits/crashes can leave unreachable files; current growth obligation remains documented. |
+| DUR-07 | Preserved as later Phase 3/4/6 boundary work: LocalFs platform/key and durable-delete constraints need an explicit contract. |
+| DUR-08 | Preserved as later Phase 4 work: independent openers can race manifest versions; unsupported in the current boundary. |
+| IDX-01 | Merged with COR-01 and CONC-01: unrestricted tombstone can hide row and vector. Phase 1 blocker. |
+| IDX-02 | Preserved explicitly: recovery does not reject ambiguous cross-segment row/vector identity or vector IDs without row ownership. Phase 1 recovery blocker. |
+| IDX-03 | Preserved explicitly: fixed `ef_search` can underfill `k`, including an unbounded API request above 32. Phase 1 contract decision and Phase 2 API work. |
+| IDX-04 | Merged with ARCH-04 and VER-07: recall experiment was overgeneralized. Current decisions now bound the claim to its workload. |
+| PERF-01 | Preserved: no current retained performance matrix for the segmented implementation. Phase 1 evidence blocker. |
+| PERF-02 | Preserved: manifest publication grows with retained history. Measure and document a bound; incremental manifests/GC remain Phase 3. |
+| PERF-03 | Preserved: recovery cost grows with retained versions and resident segment bytes. Phase 1 bound/evidence blocker; lifecycle work later. |
+| PERF-04 | Preserved: one segment per vector commit increases unpruned fan-out. Measure supported maximum; compaction remains Phase 3. |
+| PERF-05 | Preserved: eager snapshot-pinned segment residency lacks a current memory bound. Phase 1 evidence blocker; reclamation later. |
+| PERF-06 | Preserved as later Phase 2/3 query/layout work: public scans lack projection pushdown and sub-file pruning; establish an honest baseline. |
+| PERF-07 | Preserved as documentation/query work: projection avoids some array construction but not dominant file-body reads; benchmark and correct the claim. |
+| ARCH-01 | Preserved: dataset-owned schema is missing. Phase 1 blocker. |
+| ARCH-02 | Merged with COR-05: target validation and singular update semantics are missing. Phase 1 blocker. |
+| ARCH-03 | Preserved: insufficient history can be reported as a false row conflict. Phase 1 blocker. |
+| ARCH-04 | Merged with IDX-04 and VER-07: accepted decision/active docs overclaimed transaction or recall guarantees. Corrected and bounded in current docs. |
+| ARCH-05 | Preserved: public low-level surfaces can bypass `Dataset` invariants. Phase 1 facade-boundary blocker. |
+| ARCH-06 | Preserved as later Phase 2 API work: subordinate-crate types leak through the transaction facade. |
+| ARCH-07 | Preserved as later Phase 2/6 work: backend abstraction is not threaded through all I/O. |
+| ARCH-08 | Preserved as later Phase 2 client work: CLI snapshot labels can disagree with displayed rows. |
+| VER-01 | Preserved: known counterexamples lack direct regression gates. Phase 1 blocker. |
+| VER-02 | Merged with CONC-02: transaction/cache loom is not CI-visible. Phase 1 blocker. |
+| VER-03 | Merged with DUR-04: chaos/checkpoint suites can report success without exercising intended assertions. Phase 1 blocker. |
+| VER-04 | Preserved as Phase 1 evidence gap: fuzz targets are not build-gated and do not cover all recovery parsers. |
+| VER-05 | Preserved as Phase 1 reproducibility hardening: CI action/tool provenance is mutable. |
+| VER-06 | Preserved as Phase 1 measurement evidence blocker: benchmark inputs/results lack portable provenance. |
+| VER-07 | Merged with ARCH-04 and DUR-05: current docs now qualify intended guarantees and retain Partial status. |
+
 ## Evidence that must be preserved
 
 - Manifest publication is the intended visibility boundary for row data and immutable vector segments
