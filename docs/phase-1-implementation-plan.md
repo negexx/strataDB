@@ -19,6 +19,7 @@
 - Cross-process publication, compaction, orphan cleanup, authenticated tamper protection, and stable client API work remain deferred.
 - No new external dependency is added without recording why it is required and obtaining approval; prefer the already-resolved `crc32c` package used by `strata-index`.
 - `crates/txn/src/dataset.rs`, `crates/txn/src/snapshot.rs`, and `crates/storage/src/manifest.rs` have one serialized writer at a time.
+- Tasks 2 and 4 form one serialized schema/recovery stream: execute Task 4's schema/API contract and caller migration first, then Task 2's recovery catalog. No implementation agent may start Task 2 with a temporary schema representation that Task 4 will replace.
 - Every interleaving-sensitive transaction/index change gets a targeted loom model and normal tests.
 - Do not claim universal power-loss, recall, latency, or unbounded-lifecycle guarantees; report named platforms, workloads, seeds, revisions, and measured bounds.
 
@@ -33,7 +34,9 @@
 - Modify: `crates/storage/src/error.rs`
 - Modify: `crates/storage/src/manifest.rs`
 - Modify: `crates/storage/src/lib.rs`
+- Modify: `crates/txn/src/dataset.rs` (dataset-creation durability integration only)
 - Test: storage unit tests and `crates/storage/tests/chaos_checkpoint_actually_aborts.rs`
+- Test: transaction dataset-creation durability tests
 
 **Interfaces:**
 
@@ -55,6 +58,8 @@
 
 ### Task 2: Versioned manifest/recovery catalog and integrity checks
 
+This task starts only after Task 4's schema/API work and caller migration are complete. It consumes that single persisted schema contract; it does not define a second schema format.
+
 **Files:**
 
 - Modify: `crates/storage/Cargo.toml` only if the already-resolved `crc32c` package must become a direct dependency; otherwise reuse an existing workspace path without adding a package.
@@ -75,6 +80,8 @@
 - Add a manifest checksum calculated over a canonical copy whose checksum field is zeroed.
 - Add `StorageError::LegacyFormatNeedsMigration(PathBuf)` and typed corruption errors that name the violated catalog field.
 - Add a checked `SegmentReader::row_ids()`/iterator accessor for recovery validation without exposing mutable index state.
+
+The on-disk format is exact: `MANIFEST_FORMAT_VERSION` identifies the envelope format and `Manifest.version` identifies the committed snapshot. The persisted value is `ManifestEnvelope { format_version, manifest, checksum }`; checksum is CRC32C over canonical UTF-8 JSON bytes of the envelope with `checksum` set to zero. Canonical JSON recursively sorts object keys before serialization, including the existing stats maps. The logical Arrow schema is encoded with the `arrow-schema` serde representation (using the already-resolved Arrow package/feature, with no new package); a missing or undecodable schema is legacy/corrupt metadata, never inferred from a data file. `DataFileEntry.row_id_range` is `Option<(u64, u64)>`, and is `None` exactly when `row_count == 0`; non-empty ranges are inclusive and validated against every physical row ID.
 
 - [ ] **Step 1: Write failing catalog tests.** Add tests for filename/payload version mismatch, legacy metadata rejection, manifest checksum mutation, row-byte mutation, wrong row count/range, duplicate row ownership, invalid tombstones, duplicate segment row IDs, and a vector ID without a row owner.
 
@@ -113,6 +120,8 @@
 
 - [ ] **Step 3: Implement durable reservation.** Add the metadata record and make allocation persist-before-expose under the allocator lock. Keep the existing lock ordering: commit lock may take the allocator lock, never the reverse.
 
+The high-water record is monotonic across uncertain failures: persist `max(existing, requested_end)` and never overwrite a higher value with a lower one. If rename succeeds but directory sync fails, return the durability error while treating the requested end as possibly visible; an in-process retry and a later restart must read/retain that higher end and must not reuse the abandoned range. Cover failure before rename, after rename/before sync, retry in-process, and restart with real filesystem fault injection/chaos; loom models the publication state machine.
+
 - [ ] **Step 4: Add the loom model.** Model two concurrent claims and a failed publication, asserting non-overlap and that no successful claim is exposed before its durable high-water transition.
 
 - [ ] **Step 5: Run targeted verification.** Run allocator tests, the new reopen test, and the scoped transaction loom binary using the repository's `cargo rustc -p strata-txn --lib --profile test -- --cfg loom` recipe. Record any platform-specific durability limitation.
@@ -129,6 +138,9 @@
 - Modify: `crates/txn/src/lib.rs`
 - Modify: `crates/storage/src/manifest.rs` only through the serialized recovery stream
 - Modify: `crates/chaos-worker/src/commit_ops.rs`, `crates/chaos-worker/src/reader.rs`, and fixtures
+- Modify: `crates/chaos-worker/src/main.rs`, `crates/cli/src/main.rs`, `crates/txn/examples/basic_usage.rs`
+- Modify: all Dataset call sites in `bench/benches/concurrent_commit_bench.rs`, `bench/benches/ef_construction_sweep_bench.rs`, `bench/benches/lifecycle_bench.rs`, `bench/benches/lockfree_vs_hnsw_rs_bench.rs`, `bench/benches/manifest_growth_bench.rs`, `bench/benches/segment_recall_bench.rs`, and `bench/benches/vector_search_bench.rs`
+- Modify: `crates/txn/tests/concurrent_snapshot_isolation.rs`, `crates/txn/tests/mvp_checklist_1_to_5.rs`, `crates/txn/tests/phase_3_pruning.rs`, and `tests/sim/tests/chaos.rs`
 - Test: transaction unit/integration tests, snapshot tests, CLI tests, chaos-worker tests, and bindings compile tests
 
 **Interfaces:**
@@ -154,6 +166,8 @@ pub fn update(&mut self, row_id: u64, replacement: RecordBatch) -> Result<()>;
 - [ ] **Step 5: Revalidate at publication.** Keep write-write OCC for stale targets, then verify the target is still live before adding the tombstone/replacement to the latest manifest. Ensure rejected operations publish neither row files nor tombstones reachable from a later snapshot.
 
 - [ ] **Step 6: Migrate all callers.** Update fixtures, examples, CLI, chaos-worker, tests, and benchmarks to pass explicit schemas and handle `Result` from insert/delete/update. Do not broaden the Python binding scaffold into a client API.
+
+Use `rg -l "Dataset::create|\\.insert\\(|\\.delete\\(|\\.update\\(|\\.scan\\(" crates bench tests` as the mechanical call-site audit, then inspect each match so unrelated query/index/storage matches are not changed accidentally.
 
 - [ ] **Step 7: Run targeted checks.** Run `cargo test -p strata-txn`, CLI/chaos-worker tests, and the exact future-tombstone and update-cardinality regressions. Run clippy for all affected crates.
 
@@ -217,6 +231,8 @@ pub fn update(&mut self, row_id: u64, replacement: RecordBatch) -> Result<()>;
 
 - [ ] **Step 6: Commit.** Commit CI and verification changes with `test(ci): gate phase one concurrency and chaos evidence`.
 
+VER-04 (fuzz-build/discovery), VER-05 (immutable CI provenance), and VER-06 (portable benchmark provenance) remain separately tracked evidence findings in this branch. Task 7 may add reproducible local/CI assertions, but must not relabel those findings as remediated unless the required evidence is actually produced; the final status retains `Partial` and names each residual finding.
+
 ### Task 8: Current segmented performance and operating-bound evidence
 
 **Files:**
@@ -250,12 +266,17 @@ pub fn update(&mut self, row_id: u64, replacement: RecordBatch) -> Result<()>;
 
 ```text
 cargo fmt --check
+cargo build --workspace
 cargo check --workspace
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
+cargo doc --workspace --no-deps
+cargo deny check bans sources advisories
+cargo test -p strata-txn --features parallel-insert
+cargo clippy -p strata-txn --all-targets --features parallel-insert -- -D warnings
 ```
 
-Also run the relevant exact loom models, checkpoint/fast/throughput chaos tests, recovery corruption tests, benchmark matrix, stale-link/claim scans, and `cargo metadata --no-deps`.
+Also run `cargo metadata --no-deps`, the exact recovery corruption tests, and the following named evidence gates. Build each loom binary with its crate-scoped command and assert the JSON artifact contains a test executable before running it: transaction models `dataset::loom_tests::two_threads_deleting_the_same_row_exactly_one_conflicts`, `dataset::loom_tests::two_threads_deleting_disjoint_rows_both_succeed`, `dataset::loom_tests::a_failed_commits_segment_is_never_searchable_under_concurrent_commits`, `dataset::loom_tests::concurrent_first_vector_commits_at_different_dimensions_are_not_both_accepted`, `dataset::loom_tests::a_failed_commits_segment_is_never_visible_to_a_concurrent_reader`, `dataset::loom_tests::a_commits_row_and_its_segment_become_visible_as_one_atomic_step`, and `dataset::loom_tests::a_reader_never_sees_one_in_flight_commits_row_while_observing_an_unrelated_commits_row_id_counter`; cache model `live_set_cache::loom_tests::two_concurrent_misses_on_the_same_key_compute_exactly_once`; index uses the existing `.github/workflows/ci.yml` JSON/`jq` recipe. Run the checkpoint gate as `cargo test -p strata-storage --features chaos-injection --test chaos_checkpoint_actually_aborts -- --exact commit_manifest_aborts_at_the_configured_checkpoint`, the fast chaos gate as `cargo test -p strata-sim fast_tier_random_seeds_survive_random_crash_points -- --exact --nocapture`, and the thorough 2,000-seed chaos gate only as an explicit non-default/ignored command with its seed-count assertion. Run the benchmark matrix, stale-link/claim scans, and `git diff --check`.
 
 - [ ] **Step 3: Dispatch a fresh Sol review.** Review the full branch against this plan and `docs/phase-1-audit.md`, with special attention to transaction invariants, on-disk compatibility, durability acknowledgement, schema ownership, row/vector identity, and deferred-scope claims. Sol makes no edits.
 
