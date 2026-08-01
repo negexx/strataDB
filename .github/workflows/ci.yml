@@ -9,6 +9,32 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  windows-directory-durability:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.90"
+          components: clippy, rustfmt
+
+      - name: Test storage directory durability
+        run: cargo test -p strata-storage
+
+      - name: Test default dataset create and round trip
+        run: cargo test -p strata-txn dataset::tests::insert_then_commit_then_scan_round_trips -- --exact
+
+      - name: Test injected dataset creation durability boundary
+        run: cargo test -p strata-txn --features test-fault-injection dataset::tests::create_returns_an_error_when_manifest_publication_root_sync_fails -- --exact
+
+      - name: Clippy directory durability fault injection
+        run: cargo clippy -p strata-txn --all-targets --features test-fault-injection -- -D warnings
+
+      - name: Format check
+        run: cargo fmt --check
+
   ci:
     runs-on: ubuntu-latest
     steps:

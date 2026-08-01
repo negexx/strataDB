@@ -48,11 +48,13 @@ introducing Phase 3 compaction or lifecycle behavior.
 
 ## Task 1 durability recovery boundary
 
-`Dataset::create` synchronizes the parent of every directory entry it creates, from `data/` back
-to the first pre-existing ancestor, then publishes the initial manifest and synchronizes the
-dataset directory for the newly created `_versions/` entry. The create call returns an error when
-any ordered directory operation fails; it never reports that outcome as an acknowledged durable
-creation.
+`Dataset::create` requires its immediate parent to pre-exist as the caller's durable anchor. It
+creates the dataset-owned `data/` directory, synchronizes the dataset directory and that immediate
+parent, then publishes the initial manifest through `_versions/`. It does not create or synchronize
+an arbitrary caller-owned ancestor chain. A retry after a pre-publication sync failure
+re-synchronizes the same bounded dataset/parent chain before publication. The create call returns an
+error when any ordered directory operation fails; it never reports that outcome as an acknowledged
+durable creation.
 
 The final dataset-directory sync occurs after atomic manifest publication. Consequently an error
 at that boundary is uncertain: an initial manifest can be visible even though `Dataset::create`
@@ -60,8 +62,9 @@ returned an error. On an error, callers must not assume creation succeeded or im
 `create`. First call `Dataset::open` on the path. If it opens, the initial manifest is visible but
 the failed create call remains unacknowledged for durability purposes; preserve/report that error
 and repair or move to a filesystem with working directory synchronization before relying on the
-dataset. If it reports `NotFound`, creation was not visible and a later `create` attempt may
-re-establish the directory tree. Cross-process coordination is still out of scope.
+dataset. If it reports `NotFound`, creation was not visible and a later `create` attempt may retry
+against the same pre-existing immediate-parent anchor, re-synchronizing the bounded chain.
+Cross-process coordination is still out of scope.
 
 | Platform/filesystem boundary | Directory-sync behavior | Claim boundary |
 |---|---|---|

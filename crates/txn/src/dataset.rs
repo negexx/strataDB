@@ -307,6 +307,16 @@ impl Dataset {
     /// Creates a brand-new, empty dataset at `dir`. Errors if one already
     /// exists there.
     ///
+    /// `dir`'s immediate parent must already exist: it is the caller's
+    /// durable anchor. Creation synchronizes the dataset directory and that
+    /// immediate parent, including when a retry follows a pre-publication
+    /// directory-sync failure. It does not create or synchronize an
+    /// arbitrary caller-owned ancestor chain.
+    ///
+    /// A directory-sync failure after initial-manifest publication is
+    /// uncertain: the manifest can be visible although this call returns an
+    /// error. In that case, call [`Dataset::open`] before retrying creation.
+    ///
     /// # Examples
     ///
     /// ```
@@ -336,8 +346,9 @@ impl Dataset {
     /// # Errors
     ///
     /// Returns [`TxnError::AlreadyExists`] if a dataset already exists at
-    /// `dir`, or an I/O/storage error if the directory or initial manifest
-    /// can't be created.
+    /// `dir`, [`TxnError::NotFound`] if its immediate parent is absent, or an
+    /// I/O/storage error if the bounded directory-sync or initial-manifest
+    /// publication path fails.
     pub fn create(dir: impl Into<PathBuf>) -> Result<Self> {
         Self::create_with_commit_log_capacity(dir, COMMIT_LOG_CAPACITY)
     }

@@ -38,18 +38,22 @@ independently does not establish a transaction protocol.
 ## Directory-durability boundary
 
 Dataset creation now fails rather than acknowledging a directory sync that the filesystem rejects.
-It synchronizes every newly-created ancestor bottom-up, then the manifest directory through manifest
-publication, and finally the dataset directory for `_versions/`. The platform boundary is deliberately
-narrow: Windows uses a native directory handle with `FILE_FLAG_BACKUP_SEMANTICS`; POSIX uses a
-directory handle; both are in scope only when the open and flush succeed. Unsupported, invalid-input,
-and POSIX `EINVAL`-like outcomes are typed `DurabilityUnsupported`, not best-effort success. Remote
-backends, cross-process publication, and universal power-loss proof remain out of scope.
+Its immediate parent must already exist as the caller's durable anchor. Creation synchronizes the
+dataset directory and that immediate parent; it does not create or synchronize an arbitrary
+caller-owned ancestor chain. A retry after a pre-publication sync failure re-synchronizes this same
+bounded pair before publishing the initial manifest. Manifest publication also synchronizes its
+`_versions/` directory. The platform boundary is deliberately narrow: Windows uses a native directory
+handle with `FILE_FLAG_BACKUP_SEMANTICS`; POSIX uses a directory handle; both are in scope only when
+the open and flush succeed. Unsupported, invalid-input, and POSIX `EINVAL`-like outcomes are typed
+`DurabilityUnsupported`, not best-effort success. Remote backends, cross-process publication, and
+universal power-loss proof remain out of scope.
 
 A final dataset-directory sync failure can occur after the initial manifest becomes visible. The
-`Dataset::create` call still fails and must not be treated as acknowledged; callers first probe with
-`Dataset::open` rather than blindly retrying creation. A visible dataset remains subject to the failed
-durability boundary until the underlying filesystem condition is repaired or replaced. See the
-[Phase 1 audit](phase-1-audit.md#task-1-durability-recovery-boundary) for the recovery procedure.
+`Dataset::create` call still fails and must not be treated as acknowledged. Callers must first use
+`Dataset::open` before retrying creation: if it opens, preserve/report the failed creation and repair
+the filesystem boundary before relying on the dataset; only `NotFound` permits a later retry, which
+again synchronizes the bounded dataset/parent chain. See the [Phase 1 audit](phase-1-audit.md#task-1-durability-recovery-boundary)
+for the recovery procedure.
 
 ## Status vocabulary
 
