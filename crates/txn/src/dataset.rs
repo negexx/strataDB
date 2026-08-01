@@ -363,7 +363,7 @@ impl Dataset {
         if read_current(&dir)?.is_some() {
             return Err(TxnError::AlreadyExists(dir));
         }
-        sync_new_directory_ancestors(&dir)?;
+        sync_dataset_directory_anchor(&dir)?;
         let manifest = Manifest::empty();
         commit_manifest(&dir, &manifest)?;
         // `commit_manifest` synchronizes `_versions/` after the manifest
@@ -557,41 +557,28 @@ impl Dataset {
     }
 }
 
-/// Creates `dir/data` and durably publishes every directory entry that this
-/// call created, from the leaf back to the first pre-existing ancestor.
+/// Creates `dir/data` after checking that `dir`'s immediate parent already
+/// exists, then durably publishes only the dataset-owned directory boundary.
 ///
-/// A directory entry is made durable by syncing its parent. For example,
-/// creating `a/b/dataset/data` requires syncing `dataset`, `b`, `a`, then
-/// the pre-existing parent of `a`; syncing only `dataset` and `b` leaves the
-/// upper entries vulnerable to a crash after `Dataset::create` succeeds.
-fn sync_new_directory_ancestors(dir: &Path) -> Result<()> {
-    let data_dir = dir.join("data");
-    let absolute_data_dir = if data_dir.is_absolute() {
-        data_dir
-    } else {
-        std::env::current_dir()?.join(data_dir)
-    };
-    let mut created = Vec::new();
-    let mut candidate = absolute_data_dir.as_path();
-
-    while !candidate.try_exists()? {
-        created.push(candidate.to_path_buf());
-        candidate = candidate.parent().ok_or_else(|| {
-            TxnError::Storage(strata_storage::StorageError::DurabilityUnsupported(
-                candidate.to_path_buf(),
-            ))
-        })?;
+/// The immediate parent is the caller's durable anchor. Requiring it to
+/// pre-exist prevents `Dataset::create` from silently extending its
+/// durability responsibility into an arbitrary ancestor chain (which may be
+/// inaccessible on Windows). Syncing `dir` makes the new `data` entry
+/// durable; syncing its immediate parent makes the new dataset entry durable.
+///
+/// Both syncs run on every call, including a retry after a prior sync failure:
+/// a failed attempt can leave `dir` visible but not known durable.
+fn sync_dataset_directory_anchor(dir: &Path) -> Result<()> {
+    let parent = dir
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    if !parent.try_exists()? {
+        return Err(TxnError::NotFound(parent.to_path_buf()));
     }
-
     std::fs::create_dir_all(dir.join("data"))?;
-    for directory in created {
-        let parent = directory.parent().ok_or_else(|| {
-            TxnError::Storage(strata_storage::StorageError::DurabilityUnsupported(
-                directory.clone(),
-            ))
-        })?;
-        sync_dir(parent)?;
-    }
+    sync_dir(dir)?;
+    sync_dir(parent)?;
     Ok(())
 }
 
@@ -2152,40 +2139,54 @@ mod tests {
     /// `create_with_commit_log_capacity`'s doc comment).
     const TEST_COMMIT_LOG_CAPACITY: usize = 8;
 
+    #[test]
+    fn create_requires_an_existing_immediate_parent() {
+        // Break caught: recursively creating a caller-owned parent tree
+        // expands the durability boundary beyond the dataset's owned root.
+        let root = temp_dir("create-missing-immediate-parent-root");
+        let parent = root.join("missing-parent");
+        let dir = parent.join("dataset");
+
+        let result = Dataset::create(&dir);
+
+        assert!(
+            matches!(result, Err(TxnError::NotFound(ref missing)) if missing == &parent),
+            "creation must reject a missing immediate parent before creating directories"
+        );
+        assert!(
+            !parent.exists(),
+            "a rejected create must not manufacture the missing immediate parent"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[cfg(feature = "test-fault-injection")]
     #[test]
-    fn create_syncs_each_new_directory_ancestor_bottom_up() {
-        // Break caught: when create_dir_all creates more than one ancestor,
-        // syncing only the dataset and its immediate parent can lose an
-        // intermediate directory entry after a crash.
-        let parent = temp_dir("create-directory-sync-order-parent");
-        let dir = parent.join("one").join("two").join("dataset");
+    fn create_syncs_only_its_preexisting_parent_bottom_up() {
+        // Break caught: synchronizing above the caller-provided immediate
+        // parent can fail on inaccessible system directories and incorrectly
+        // widens Dataset::create's durability responsibility.
+        let root = temp_dir("create-directory-sync-order-root");
+        let parent = root.join("one").join("two");
+        std::fs::create_dir_all(&parent).unwrap();
+        let dir = parent.join("dataset");
         let recorder = strata_storage::datafile::test_support::record_directory_syncs();
 
         Dataset::create(&dir).unwrap();
 
-        let durable_dir = std::fs::canonicalize(&dir).unwrap();
-        let durable_grandparent = durable_dir.parent().unwrap().to_path_buf();
-        let durable_great_grandparent = durable_grandparent.parent().unwrap().to_path_buf();
-        let durable_parent = std::fs::canonicalize(&parent).unwrap();
         let expected = vec![
-            durable_dir.clone(),
-            durable_grandparent,
-            durable_great_grandparent,
-            durable_parent,
-            durable_dir.join("_versions"),
-            durable_dir,
+            dir.clone(),
+            parent.clone(),
+            dir.join("_versions"),
+            dir.clone(),
+            dir.clone(),
         ];
-        let actual: Vec<_> = recorder
-            .calls()
-            .into_iter()
-            .map(|path| std::fs::canonicalize(path).unwrap())
-            .collect();
+        let actual = recorder.calls();
         assert_eq!(
             actual, expected,
-            "creation must sync each newly-created entry's parent from the leaf to the pre-existing ancestor, then the manifest directory and dataset directory"
+            "creation must synchronize only the dataset and its immediate pre-existing parent, then the manifest directory and dataset directory"
         );
-        std::fs::remove_dir_all(&parent).ok();
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[cfg(feature = "test-fault-injection")]
@@ -2214,6 +2215,53 @@ mod tests {
             "a failed directory durability boundary must not publish the initial manifest"
         );
         std::fs::remove_dir_all(&parent).ok();
+    }
+
+    #[cfg(feature = "test-fault-injection")]
+    #[test]
+    fn create_retry_resyncs_the_bounded_anchor_before_manifest_publication() {
+        // Break caught: after the immediate-parent sync fails before
+        // publication, the dataset is visible but its entry is not known
+        // durable. A retry must re-sync the same bounded anchor pair.
+        let root = temp_dir("create-retry-directory-sync-root");
+        let parent = root.join("one").join("two");
+        std::fs::create_dir_all(&parent).unwrap();
+        let dir = parent.join("dataset");
+        let fault = strata_storage::datafile::test_support::fail_directory_sync_on_call(
+            2,
+            std::io::ErrorKind::Other,
+        );
+
+        let first = Dataset::create(&dir);
+        let Err(error) = first else {
+            panic!("the pre-publication immediate-parent sync must fail");
+        };
+        assert!(
+            matches!(error, TxnError::Storage(strata_storage::StorageError::Io(ref error)) if error.kind() == std::io::ErrorKind::Other),
+            "expected the injected pre-publication immediate-parent sync failure, got {error:?}"
+        );
+        assert!(
+            strata_storage::read_current(&dir).unwrap().is_none(),
+            "the injected failure must happen before initial-manifest publication"
+        );
+        drop(fault);
+
+        let recorder = strata_storage::datafile::test_support::record_directory_syncs();
+        Dataset::create(&dir).unwrap();
+
+        let expected = vec![
+            dir.clone(),
+            parent.clone(),
+            dir.join("_versions"),
+            dir.clone(),
+            dir.clone(),
+        ];
+        let actual = recorder.calls();
+        assert!(
+            actual == expected,
+            "retry must re-sync the same bounded dataset/parent anchor before publishing; expected {expected:?}, got {actual:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[cfg(feature = "test-fault-injection")]

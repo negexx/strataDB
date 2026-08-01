@@ -80,6 +80,47 @@ impl LocalFs {
         final_path.with_file_name(format!(".tmp-{pid}-{n}-{file_name}"))
     }
 
+    /// Converts a possibly-relative path to an absolute path without
+    /// resolving symlinks. Both `root` and `final_path` use this helper so
+    /// their lexical ancestry can be compared consistently.
+    fn absolute_path(path: &Path) -> Result<PathBuf> {
+        if path.is_absolute() {
+            Ok(path.to_path_buf())
+        } else {
+            Ok(std::env::current_dir()?.join(path))
+        }
+    }
+
+    /// Synchronizes every directory containing `final_path`, from the
+    /// immediate parent to this backend's configured `root`, inclusive.
+    /// The leaf sync makes the object publication durable; each later sync
+    /// makes the directory entry that led to the previous directory durable.
+    /// `LocalFs` owns this bounded tree only, so it must never attempt to
+    /// synchronize a parent of `root`.
+    fn sync_containing_directory_chain(&self, final_path: &Path) -> Result<()> {
+        let root = Self::absolute_path(&self.root)?;
+        let final_path = Self::absolute_path(final_path)?;
+        let mut current = final_path
+            .parent()
+            .ok_or_else(|| crate::error::StorageError::DurabilityUnsupported(final_path.clone()))?;
+
+        if !current.starts_with(&root) {
+            return Err(crate::error::StorageError::DurabilityUnsupported(
+                final_path,
+            ));
+        }
+
+        loop {
+            crate::datafile::sync_dir(current)?;
+            if current == root {
+                return Ok(());
+            }
+            current = current
+                .parent()
+                .ok_or_else(|| crate::error::StorageError::DurabilityUnsupported(root.clone()))?;
+        }
+    }
+
     /// Recursively walks `dir` (relative to `root`), collecting every file
     /// whose `root`-relative, `/`-joined key starts with `prefix`. A
     /// missing `dir` (e.g. `root` itself never created because nothing has
@@ -210,9 +251,7 @@ impl Backend for LocalFs {
         // `commit_manifest` + its old explicit `sync_dir` call produced
         // together today -- see Task 6, which removes that now-redundant
         // explicit call.
-        if let Some(parent) = final_path.parent() {
-            crate::datafile::sync_dir(parent)?;
-        }
+        self.sync_containing_directory_chain(&final_path)?;
         Ok(())
     }
 
@@ -251,9 +290,7 @@ impl Backend for LocalFs {
                 // directory so the new hard link survives a crash, not
                 // just the file content. `sync_dir` performs its own
                 // chaos checkpoint internally.
-                if let Some(parent) = final_path.parent() {
-                    crate::datafile::sync_dir(parent)?;
-                }
+                self.sync_containing_directory_chain(&final_path)?;
                 Ok(())
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -359,6 +396,75 @@ mod tests {
     }
 
     #[test]
+    fn put_returns_an_error_when_a_nested_parent_sync_fails() {
+        // Break caught: syncing only the leaf directory lets `put` report
+        // success while a newly-created ancestor directory entry remains
+        // non-durable.
+        let root = temp_root("put-nested-ancestor-sync-failure");
+        let backend = LocalFs::new(&root);
+        let _fault = crate::datafile::test_support::fail_directory_sync_on_call(
+            2,
+            std::io::ErrorKind::Other,
+        );
+
+        let result = backend.put("one/two/a.bin", b"durable payload");
+
+        assert!(
+            matches!(result, Err(StorageError::Io(ref error)) if error.kind() == std::io::ErrorKind::Other),
+            "expected nested ancestor directory-sync failure, got {result:?}"
+        );
+        assert_eq!(
+            backend.get("one/two/a.bin").unwrap(),
+            b"durable payload",
+            "the failure must occur after atomic file publication"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn put_syncs_the_owned_parent_chain_and_never_its_ancestor() {
+        // Break caught: walking above LocalFs::root makes a backend write
+        // depend on directory handles outside its configured ownership.
+        let root = temp_root("put-owned-sync-chain");
+        let backend = LocalFs::new(&root);
+        let recorder = crate::datafile::test_support::record_directory_syncs();
+
+        backend.put("one/two/a.bin", b"durable payload").unwrap();
+
+        assert_eq!(
+            recorder.calls(),
+            vec![root.join("one").join("two"), root.join("one"), root.clone()],
+            "put must synchronize leaf-to-root inclusive and never above LocalFs::root"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn put_retry_resyncs_the_complete_owned_parent_chain() {
+        // Break caught: after a sync failure, directories remain visible;
+        // the next write must still sync every owned directory on the path.
+        let root = temp_root("put-owned-sync-chain-retry");
+        let backend = LocalFs::new(&root);
+        let fault = crate::datafile::test_support::fail_directory_sync_on_call(
+            2,
+            std::io::ErrorKind::Other,
+        );
+
+        assert!(backend.put("one/two/a.bin", b"first").is_err());
+        drop(fault);
+
+        let recorder = crate::datafile::test_support::record_directory_syncs();
+        backend.put("one/two/b.bin", b"second").unwrap();
+
+        assert_eq!(
+            recorder.calls(),
+            vec![root.join("one").join("two"), root.join("one"), root.clone()],
+            "a retry must re-sync the complete leaf-to-root owned chain"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn get_range_reads_only_the_requested_byte_span() {
         let root = temp_root("range");
         let backend = LocalFs::new(&root);
@@ -403,6 +509,78 @@ mod tests {
         backend.put_if_absent("a.bin", b"first").unwrap();
 
         assert_eq!(backend.get("a.bin").unwrap(), b"first");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn put_if_absent_returns_an_error_when_a_nested_parent_sync_fails() {
+        // Break caught: `put_if_absent` has the same durable-completion
+        // obligation as `put`; a successful hard link alone cannot make a
+        // recursively-created parent chain durable.
+        let root = temp_root("if-absent-nested-ancestor-sync-failure");
+        let backend = LocalFs::new(&root);
+        let _fault = crate::datafile::test_support::fail_directory_sync_on_call(
+            2,
+            std::io::ErrorKind::Other,
+        );
+
+        let result = backend.put_if_absent("one/two/a.bin", b"durable payload");
+
+        assert!(
+            matches!(result, Err(StorageError::Io(ref error)) if error.kind() == std::io::ErrorKind::Other),
+            "expected nested ancestor directory-sync failure, got {result:?}"
+        );
+        assert_eq!(
+            backend.get("one/two/a.bin").unwrap(),
+            b"durable payload",
+            "the failure must occur after atomic file publication"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn put_if_absent_syncs_the_owned_parent_chain_and_never_its_ancestor() {
+        // Break caught: `put_if_absent` must hold the same bounded
+        // durability boundary as `put` after atomically linking its object.
+        let root = temp_root("if-absent-owned-sync-chain");
+        let backend = LocalFs::new(&root);
+        let recorder = crate::datafile::test_support::record_directory_syncs();
+
+        backend
+            .put_if_absent("one/two/a.bin", b"durable payload")
+            .unwrap();
+
+        assert_eq!(
+            recorder.calls(),
+            vec![root.join("one").join("two"), root.join("one"), root.clone()],
+            "put_if_absent must synchronize leaf-to-root inclusive and never above LocalFs::root"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn put_if_absent_retry_resyncs_the_complete_owned_parent_chain() {
+        // Break caught: a failed initial link publication can leave its
+        // parent tree visible but uncertain; a later distinct publication
+        // under that tree must re-sync the full owned chain.
+        let root = temp_root("if-absent-owned-sync-chain-retry");
+        let backend = LocalFs::new(&root);
+        let fault = crate::datafile::test_support::fail_directory_sync_on_call(
+            2,
+            std::io::ErrorKind::Other,
+        );
+
+        assert!(backend.put_if_absent("one/two/a.bin", b"first").is_err());
+        drop(fault);
+
+        let recorder = crate::datafile::test_support::record_directory_syncs();
+        backend.put_if_absent("one/two/b.bin", b"second").unwrap();
+
+        assert_eq!(
+            recorder.calls(),
+            vec![root.join("one").join("two"), root.join("one"), root.clone()],
+            "a retry must re-sync the complete leaf-to-root owned chain"
+        );
         fs::remove_dir_all(&root).ok();
     }
 
