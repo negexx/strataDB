@@ -2185,6 +2185,36 @@ mod tests {
         std::fs::remove_dir_all(&parent).ok();
     }
 
+    #[cfg(feature = "test-fault-injection")]
+    #[test]
+    fn create_returns_an_error_after_initial_manifest_becomes_visible() {
+        // Break caught: the final dataset-directory sync is required to make
+        // creation of `_versions/` durable. Its failure is uncertain: the
+        // initial manifest was already atomically renamed, so callers must
+        // receive an error even though a later open can observe it.
+        let parent = temp_dir("create-final-directory-sync-failure-parent");
+        let dir = parent.join("dataset");
+        let _fault = strata_storage::datafile::test_support::fail_directory_sync_on_call(
+            4,
+            std::io::ErrorKind::Other,
+        );
+
+        let result = Dataset::create(&dir);
+        let Err(error) = result else {
+            panic!("Dataset::create must return the final directory-sync failure");
+        };
+
+        assert!(
+            matches!(error, TxnError::Storage(strata_storage::StorageError::Io(ref error)) if error.kind() == std::io::ErrorKind::Other),
+            "the final dataset-directory sync failure must be returned, got {error:?}"
+        );
+        assert!(
+            strata_storage::read_current(&dir).unwrap().is_some(),
+            "the error is uncertain: atomic manifest publication may already be visible"
+        );
+        std::fs::remove_dir_all(&parent).ok();
+    }
+
     /// Proves 8 concurrent claims hand out non-overlapping, contiguous
     /// ranges — no id handed out twice, and none skipped. Uses
     /// `std::thread::scope` rather than `unsafe { transmute }` to borrow

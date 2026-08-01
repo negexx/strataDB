@@ -18,6 +18,29 @@ use arrow::ipc::writer::FileWriter;
 
 use crate::error::{Result, StorageError};
 
+/// Integrity metadata for bytes durably written by [`write_batch`] or
+/// [`write_bytes`].
+///
+/// The digest is CRC32C (Castagnoli), matching the checksum already used for
+/// immutable vector segments. It detects accidental corruption; it is not a
+/// cryptographic authenticity boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WriteMetadata {
+    /// Number of bytes in the durable file.
+    pub byte_len: u64,
+    /// CRC32C of those exact bytes.
+    pub crc32c: u32,
+}
+
+impl WriteMetadata {
+    fn from_bytes(bytes: &[u8]) -> Self {
+        Self {
+            byte_len: bytes.len() as u64,
+            crc32c: crc32c::crc32c(bytes),
+        }
+    }
+}
+
 /// Test-only controls for modelling directory-sync outcomes without mocking
 /// `std::fs` or depending on filesystem-specific permission behavior.
 ///
@@ -31,25 +54,14 @@ pub mod test_support {
     use std::io;
     use std::path::{Path, PathBuf};
 
-    #[derive(Clone)]
+    #[derive(Clone, Default)]
     struct DirectorySyncState {
+        // Production behavior is always the default, including when this
+        // test-only feature is compiled. A test guard must opt in to
+        // intercepting a directory sync.
         force_success: bool,
         fail_on_call: Option<(usize, io::ErrorKind)>,
         calls: Vec<PathBuf>,
-    }
-
-    impl Default for DirectorySyncState {
-        fn default() -> Self {
-            Self {
-                // Storage's own unit tests exercise backend and manifest
-                // semantics independently of the host filesystem's ability
-                // to sync directory handles. Dependent-crate tests must opt
-                // in explicitly through `record_directory_syncs` or a fault.
-                force_success: cfg!(any(test, feature = "test-fault-injection")),
-                fail_on_call: None,
-                calls: Vec::new(),
-            }
-        }
     }
 
     thread_local! {
@@ -150,7 +162,7 @@ pub mod test_support {
 ///
 /// Returns an error if `path` can't be created/written, or if Arrow's IPC
 /// writer fails to serialize `batch`.
-pub fn write_batch(path: &Path, batch: &RecordBatch) -> Result<()> {
+pub fn write_batch(path: &Path, batch: &RecordBatch) -> Result<WriteMetadata> {
     let file = File::create(path)?;
     let mut writer = FileWriter::try_new(file, &batch.schema())?;
     writer.write(batch)?;
@@ -158,7 +170,7 @@ pub fn write_batch(path: &Path, batch: &RecordBatch) -> Result<()> {
     let file = writer.into_inner()?;
     file.sync_all()?;
     crate::chaos::chaos_checkpoint(); // data-file content is now durable
-    Ok(())
+    Ok(WriteMetadata::from_bytes(&std::fs::read(path)?))
 }
 
 /// Writes `bytes` to `path` verbatim, fsyncing before returning so the
@@ -176,12 +188,12 @@ pub fn write_batch(path: &Path, batch: &RecordBatch) -> Result<()> {
 /// # Errors
 ///
 /// Returns an error if `path` can't be created, written, or fsynced.
-pub fn write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+pub fn write_bytes(path: &Path, bytes: &[u8]) -> Result<WriteMetadata> {
     let mut file = File::create(path)?;
     file.write_all(bytes)?;
     file.sync_all()?;
     crate::chaos::chaos_checkpoint(); // segment content is now durable
-    Ok(())
+    Ok(WriteMetadata::from_bytes(bytes))
 }
 
 /// Fsyncs `dir` itself, not just files within it.
@@ -190,16 +202,18 @@ pub fn write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
 /// directory entry (the name→inode link) survives a crash — the containing
 /// directory must be fsynced too, or a real power-loss crash can leave the
 /// file's bytes durable on disk while the file itself is simply absent.
-/// A platform or filesystem that cannot provide this operation fails closed
-/// with [`StorageError::DurabilityUnsupported`]. Other directory-open and
-/// propagated — this mirrors the durability caveat already documented on
-/// [`crate::manifest::commit_manifest`]'s directory-fsync step.
+/// On Windows, this opens a native directory handle with
+/// `FILE_FLAG_BACKUP_SEMANTICS` before calling [`File::sync_all`]. On POSIX,
+/// it uses the ordinary directory file handle. A platform or filesystem that
+/// reports that directory flushing is unsupported fails closed with
+/// [`StorageError::DurabilityUnsupported`]; access, path, and other I/O
+/// errors remain their original typed I/O errors.
 ///
 /// # Errors
 ///
-/// This function does not currently return an error; it always returns
-/// `Ok(())`. It is fallible in signature so a future platform-specific
-/// failure mode can be surfaced without an API break.
+/// Returns an error when the directory cannot be opened or flushed. A
+/// successful return means the local filesystem accepted the requested
+/// directory-entry durability operation.
 pub fn sync_dir(dir: &Path) -> Result<()> {
     #[cfg(any(test, feature = "test-fault-injection"))]
     if let Some(outcome) = test_support::outcome(dir) {
@@ -208,7 +222,7 @@ pub fn sync_dir(dir: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let handle = File::open(dir).map_err(|error| directory_sync_error(dir, error))?;
+    let handle = open_directory_for_sync(dir).map_err(|error| directory_sync_error(dir, error))?;
     handle
         .sync_all()
         .map_err(|error| directory_sync_error(dir, error))?;
@@ -216,14 +230,32 @@ pub fn sync_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+fn open_directory_for_sync(dir: &Path) -> std::io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    // `FILE_FLAG_BACKUP_SEMANTICS` asks CreateFileW (used by OpenOptions) to
+    // return a handle for a directory. `File::open` omits it and therefore
+    // fails on normal Windows directories before `sync_all` can flush the
+    // handle.
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    std::fs::OpenOptions::new()
+        // FlushFileBuffers requires a write-capable handle on Windows.
+        .write(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(dir)
+}
+
+#[cfg(not(windows))]
+fn open_directory_for_sync(dir: &Path) -> std::io::Result<File> {
+    File::open(dir)
+}
+
 fn directory_sync_error(dir: &Path, error: std::io::Error) -> StorageError {
     #[cfg(windows)]
-    if matches!(
-        error.kind(),
-        std::io::ErrorKind::Unsupported
-            | std::io::ErrorKind::InvalidInput
-            | std::io::ErrorKind::PermissionDenied
-    ) {
+    if error.kind() == std::io::ErrorKind::Unsupported
+        || matches!(error.raw_os_error(), Some(1 | 50))
+    {
         return StorageError::DurabilityUnsupported(dir.to_path_buf());
     }
 
@@ -381,6 +413,27 @@ mod tests {
     }
 
     #[test]
+    fn write_batch_returns_durable_length_and_checksum() {
+        let dir = tempfile::Builder::new()
+            .prefix("strata-datafile-metadata-test-")
+            .tempdir()
+            .unwrap()
+            .keep();
+        let path = dir.join("test.arrow");
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))]).unwrap();
+
+        let metadata = write_batch(&path, &batch).unwrap();
+        let persisted = std::fs::read(&path).unwrap();
+
+        assert_eq!(metadata.byte_len, persisted.len() as u64);
+        assert_eq!(metadata.crc32c, crc32c::crc32c(&persisted));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn write_bytes_then_read_round_trips_exactly() {
         let dir = tempfile::Builder::new()
             .prefix("strata-write-bytes-test-")
@@ -395,6 +448,53 @@ mod tests {
         write_bytes(&path, &payload).unwrap();
 
         assert_eq!(std::fs::read(&path).unwrap(), payload);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_bytes_returns_durable_length_and_checksum() {
+        let dir = tempfile::Builder::new()
+            .prefix("strata-write-bytes-metadata-test-")
+            .tempdir()
+            .unwrap()
+            .keep();
+        let path = dir.join("blob.seg");
+        let payload = [0x00, 0x53, 0x54, 0xFF, 0x01];
+
+        let metadata = write_bytes(&path, &payload).unwrap();
+
+        assert_eq!(metadata.byte_len, payload.len() as u64);
+        assert_eq!(metadata.crc32c, crc32c::crc32c(&payload));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn directory_sync_is_not_intercepted_without_an_active_guard() {
+        let dir = tempfile::Builder::new()
+            .prefix("strata-directory-sync-unguarded-")
+            .tempdir()
+            .unwrap()
+            .keep();
+
+        assert!(
+            test_support::outcome(&dir).is_none(),
+            "only an active test guard may intercept directory syncs"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sync_dir_uses_a_native_directory_handle_on_windows() {
+        let dir = tempfile::Builder::new()
+            .prefix("strata-native-directory-sync-")
+            .tempdir()
+            .unwrap()
+            .keep();
+        let _real_sync = test_support::use_real_directory_syncs();
+
+        sync_dir(&dir).unwrap();
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

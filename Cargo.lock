@@ -2032,6 +2032,7 @@ name = "strata-storage"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "crc32c",
  "serde",
  "serde_json",
  "tempfile",
