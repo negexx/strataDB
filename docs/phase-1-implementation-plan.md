@@ -43,6 +43,8 @@
 - `sync_dir(path: &Path) -> Result<()>` must return directory-open and `sync_all` failures.
 - `write_batch` and `write_bytes` return a small digest/length value used by manifest entries while retaining compatibility for callers that ignore the result.
 - Add a typed `DurabilityUnsupported` storage error for a platform/filesystem that cannot provide the declared directory-sync operation.
+- `Dataset::create` requires its immediate parent to pre-exist as the caller-owned durable anchor; it synchronizes only the dataset directory and that immediate parent on every attempt, making retries after a pre-publication failure safe without traversing inaccessible system ancestors.
+- `LocalFs` requires its configured root to pre-exist as its durable anchor, synchronizes the owned parent chain only through that root, and rejects symlinked root/key components before filesystem access.
 
 - [ ] **Step 1: Write failing durability tests.** Add tests proving a directory-open/sync failure is returned, and that a successful file rename is followed by a required containing-directory sync. Use a test-only fault-injection seam rather than mocking `std::fs` in production.
 
@@ -50,7 +52,7 @@
 
 - [ ] **Step 3: Implement the minimal fail-closed primitive.** Remove ignored `File::open`/`sync_all` results, preserve platform-specific unsupported behavior as a typed error, and keep the existing atomic temp-write/rename ordering.
 
-- [ ] **Step 4: Add dataset-root durability tests.** Test that creation synchronizes newly-created dataset directories and their immediate parent before returning. Keep the test portable by asserting the ordered calls through the fault-injection seam and by documenting the named local filesystem support matrix.
+- [ ] **Step 4: Add dataset-root durability tests.** Test that creation synchronizes the newly-created dataset directory and its pre-existing immediate parent before returning, and that a retry repeats the bounded chain after an injected pre-publication failure. Keep the test portable by asserting the ordered calls through the fault-injection seam and by documenting the named local filesystem support matrix.
 
 - [ ] **Step 5: Run targeted storage tests.** Run `cargo test -p strata-storage` and `cargo fmt --check`; record the exact test count and platform behavior.
 
