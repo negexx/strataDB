@@ -36,14 +36,14 @@ Before changing behavior, read the narrowest current sources needed:
 
 1. `docs/architecture.md`, `docs/status.md`, and `docs/roadmap.md` for current system shape,
    implementation boundaries, and planned work.
-2. `docs/design/phase-0-transaction-and-format-spec.md` before `crates/txn` or `crates/storage` work.
-3. `docs/conventions.md` and accepted ADRs under `docs/decisions/`.
+2. `docs/design.md` before `crates/txn` or `crates/storage` work.
+3. `docs/decisions.md` and `docs/phase-1-audit.md` for governing decisions and current blockers.
 4. Current source, tests, Cargo manifests, and `.github/workflows/ci.yml`.
-5. Relevant current design/amendment under `docs/superpowers/specs/`, then its plan.
+5. Relevant historical material under `docs/history/` when the current documents need rationale.
 
-Historical specs/plans preserve rationale and may describe superseded mechanisms or paths. Resolve
-disagreements against accepted ADRs, living specs, current code, and tests. ADR 0005 supersedes the
-C++ toolchain ADRs; ADR 0008 adopts immutable index segments; ADR 0006 group commit is only proposed.
+Historical summaries preserve rationale and may describe superseded mechanisms or paths. Resolve
+disagreements against the current documents, current code, and tests. The Rust toolchain supersedes
+the old C++ direction; immutable index segments are current; group commit remains only proposed.
 
 ## Workspace
 
