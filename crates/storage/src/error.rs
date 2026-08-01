@@ -28,6 +28,8 @@ pub enum StorageError {
     CorruptManifest(PathBuf, String),
     #[error("corrupt data file at {0}: {1}")]
     CorruptDataFile(PathBuf, String),
+    #[error("directory durability is unsupported for {0}")]
+    DurabilityUnsupported(PathBuf),
     #[error("key already exists: {0}")]
     AlreadyExists(String),
 }

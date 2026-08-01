@@ -30,7 +30,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use strata_index::{EfConstruction, HnswIndex, MaxConnections, MaxElements, MaxLayers};
 use strata_storage::{
     ColumnStats, DataFileEntry, Manifest, SegmentEntry, Value, commit_manifest, compute_stats,
-    read_current, write_batch, write_bytes,
+    read_current, sync_dir, write_batch, write_bytes,
 };
 
 use crate::commit_log::{CommitLog, ConflictCheck};
@@ -364,8 +364,23 @@ impl Dataset {
             return Err(TxnError::AlreadyExists(dir));
         }
         std::fs::create_dir_all(dir.join("data"))?;
+        let durable_dir = std::fs::canonicalize(&dir)?;
+        let durable_parent = durable_dir.parent().ok_or_else(|| {
+            TxnError::Storage(strata_storage::StorageError::DurabilityUnsupported(
+                durable_dir.clone(),
+            ))
+        })?;
+        // `data/` is a new entry in the dataset directory, and the dataset
+        // directory is a new entry in its parent. Both entries must survive
+        // the creation acknowledgement, not merely the initial manifest.
+        sync_dir(&durable_dir)?;
+        sync_dir(durable_parent)?;
         let manifest = Manifest::empty();
         commit_manifest(&dir, &manifest)?;
+        // `commit_manifest` synchronizes `_versions/` after the manifest
+        // rename. Synchronize its parent too, so creation of `_versions/`
+        // itself is durable before Dataset::create returns.
+        sync_dir(&durable_dir)?;
         let last_issued_timestamp = Arc::new(AtomicI64::new(manifest.commit_time_high_water));
         let row_ids = Arc::new(RowIdAllocator::new(manifest.next_row_id));
         let write_attempt_counter = Arc::new(AtomicU64::new(manifest.next_attempt_id));
@@ -2109,6 +2124,66 @@ mod tests {
     /// without paying that capacity's fill cost (see
     /// `create_with_commit_log_capacity`'s doc comment).
     const TEST_COMMIT_LOG_CAPACITY: usize = 8;
+
+    #[cfg(feature = "test-fault-injection")]
+    #[test]
+    fn create_syncs_the_dataset_directory_and_its_parent_in_order() {
+        // Break caught: returning from Dataset::create without making the
+        // new dataset entry, data directory, and manifest directory durable
+        // leaves a successful creation vulnerable to power-loss disappearance.
+        let parent = temp_dir("create-directory-sync-order-parent");
+        let dir = parent.join("dataset");
+        let recorder = strata_storage::datafile::test_support::record_directory_syncs();
+
+        Dataset::create(&dir).unwrap();
+
+        let durable_dir = std::fs::canonicalize(&dir).unwrap();
+        let durable_parent = std::fs::canonicalize(&parent).unwrap();
+        let expected = vec![
+            durable_dir.clone(),
+            durable_parent,
+            durable_dir.join("_versions"),
+            durable_dir,
+        ];
+        let actual: Vec<_> = recorder
+            .calls()
+            .into_iter()
+            .map(|path| std::fs::canonicalize(path).unwrap())
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "creation must sync data's parent, the dataset entry's parent, the manifest directory, then the dataset directory after _versions is created"
+        );
+        std::fs::remove_dir_all(&parent).ok();
+    }
+
+    #[cfg(feature = "test-fault-injection")]
+    #[test]
+    fn create_returns_an_error_when_parent_directory_sync_fails() {
+        // Break caught: a creation acknowledgement must depend on syncing the
+        // immediate parent that owns the new dataset directory entry.
+        let parent = temp_dir("create-parent-directory-sync-failure-parent");
+        let dir = parent.join("dataset");
+        let _fault = strata_storage::datafile::test_support::fail_directory_sync_on_call(
+            2,
+            std::io::ErrorKind::Other,
+        );
+
+        let result = Dataset::create(&dir);
+        let Err(error) = result else {
+            panic!("Dataset::create must fail when its parent directory sync fails");
+        };
+
+        assert!(
+            matches!(error, TxnError::Storage(strata_storage::StorageError::Io(ref error)) if error.kind() == std::io::ErrorKind::Other),
+            "expected the immediate parent directory-sync error, got {error:?}"
+        );
+        assert!(
+            strata_storage::read_current(&dir).unwrap().is_none(),
+            "a failed directory durability boundary must not publish the initial manifest"
+        );
+        std::fs::remove_dir_all(&parent).ok();
+    }
 
     /// Proves 8 concurrent claims hand out non-overlapping, contiguous
     /// ranges — no id handed out twice, and none skipped. Uses

@@ -18,6 +18,9 @@ tempfile = { workspace = true }
 
 [features]
 chaos-injection = []
+# Enables the thread-local directory-sync fault seam used only by dependent
+# crate tests. It is not enabled by normal consumers.
+test-fault-injection = []
 
 [[bin]]
 name = "chaos_checkpoint_helper"

@@ -333,6 +333,32 @@ mod tests {
     }
 
     #[test]
+    fn put_returns_the_directory_sync_failure_after_renaming_the_file() {
+        // Break caught: returning success after the rename but before a
+        // successful parent-directory sync would acknowledge non-durable
+        // object publication.
+        let root = temp_root("put-directory-sync-failure");
+        let backend = LocalFs::new(&root);
+        let _fault = crate::datafile::test_support::fail_directory_sync_on_call(
+            1,
+            std::io::ErrorKind::Other,
+        );
+
+        let result = backend.put("a.bin", b"durable payload");
+
+        assert!(
+            matches!(result, Err(StorageError::Io(ref error)) if error.kind() == std::io::ErrorKind::Other),
+            "expected parent-directory sync failure after rename, got {result:?}"
+        );
+        assert_eq!(
+            backend.get("a.bin").unwrap(),
+            b"durable payload",
+            "the test must prove the error happened after the atomic rename"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn get_range_reads_only_the_requested_byte_span() {
         let root = temp_root("range");
         let backend = LocalFs::new(&root);

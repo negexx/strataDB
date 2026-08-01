@@ -39,6 +39,7 @@ tempfile = { workspace = true }
 
 [features]
 chaos-injection = ["strata-storage/chaos-injection"]
+test-fault-injection = ["strata-storage/test-fault-injection"]
 # Off by default, matching `chaos-injection`'s own precedent for a
 # risk-bearing, opt-in code path -- see `build_and_write_segment` in
 # `src/dataset.rs` and `.opencode/rules/vector-index.md` for what this
