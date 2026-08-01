@@ -9,6 +9,43 @@ future fixes can still refer to the original evidence without maintaining seven 
 Line numbers are deliberately omitted because they are unstable; use the finding ID plus current
 source/tests as the anchor.
 
+## Approved remediation design
+
+The Phase 1 remediation keeps Strata's supported boundary at one process using one shared
+`Dataset` handle. The user-approved design is intentionally strict and prospective:
+
+- `Dataset::create` receives and persists the dataset-owned logical Arrow schema. Schema evolution,
+  migrations, and logical keys remain deferred; `_row_id` and `_timestamp` remain reserved physical
+  columns outside that logical schema.
+- Manifests gain an explicit format/version and integrity envelope plus row-file ownership metadata.
+  Recovery validates filename/payload identity, schema, row bytes, tombstones, segment metadata, and
+  cross-segment row/vector ownership before constructing a `Snapshot`.
+- A separate durable allocator high-water record is advanced before a row-ID claim is exposed. The
+  manifest mirrors the value for diagnostics, but is not authoritative for abandoned pre-publication
+  claims after restart.
+- Directory synchronization and dataset creation fail closed. The supported durability claim is
+  limited to named local filesystem/platform combinations where the ordered sync operations succeed;
+  process-abort tests are not presented as universal power-loss proof.
+- Delete/update targets must name a live physical row in the transaction's base snapshot and are
+  revalidated under the commit lock. `update` is exactly one old row to one replacement row; absent,
+  already-dead, malformed, and unsupported shapes have typed errors. Concurrent stale targets remain
+  typed row conflicts.
+- `InsufficientHistory` remains distinct from `Conflict` and carries retained-history context rather
+  than inventing contested row IDs.
+- `Dataset`/`Snapshot`/`Transaction` are the supported engine facade. Direct storage/index use is an
+  internal implementation surface and invalidates Dataset guarantees; subordinate packages remain
+  non-publishable.
+- Verification adds direct counterexample regressions, transaction and cache loom gates, exercising
+  chaos/checkpoint gates, and current segmented performance/boundedness evidence. Compaction,
+  cleanup, cross-process coordination, authenticated tamper protection, and later API work remain
+  deferred.
+
+Datasets written without the new schema/integrity metadata are rejected with a typed
+`LegacyFormatNeedsMigration` result rather than being opened under an unverified guarantee.
+Checksums cover accidental/torn corruption and metadata inconsistency, not an attacker able to
+rewrite both payload and checksum. Performance work records a tested operating envelope without
+introducing Phase 3 compaction or lifecycle behavior.
+
 ## Finding register
 
 | ID | Severity | Area | Disposition / required action |
