@@ -52,7 +52,9 @@ impl WriteMetadata {
 pub mod test_support {
     use std::cell::RefCell;
     use std::io;
+    use std::marker::PhantomData;
     use std::path::{Path, PathBuf};
+    use std::rc::Rc;
 
     #[derive(Clone, Default)]
     struct DirectorySyncState {
@@ -71,6 +73,9 @@ pub mod test_support {
     /// Restores the calling test thread's previous directory-sync state.
     pub struct DirectorySyncGuard {
         previous: DirectorySyncState,
+        // The state is thread-local, so the guard must be dropped on the
+        // thread that installed it. Rc makes this guard !Send and !Sync.
+        _thread_affine: PhantomData<Rc<()>>,
     }
 
     impl Drop for DirectorySyncGuard {
@@ -93,7 +98,10 @@ pub mod test_support {
                 fail_on_call: Some((call, kind)),
                 calls: Vec::new(),
             };
-            DirectorySyncGuard { previous }
+            DirectorySyncGuard {
+                previous,
+                _thread_affine: PhantomData,
+            }
         })
     }
 
@@ -109,7 +117,10 @@ pub mod test_support {
                 fail_on_call: None,
                 calls: Vec::new(),
             };
-            DirectorySyncGuard { previous }
+            DirectorySyncGuard {
+                previous,
+                _thread_affine: PhantomData,
+            }
         })
     }
 
@@ -125,7 +136,10 @@ pub mod test_support {
                 fail_on_call: None,
                 calls: Vec::new(),
             };
-            DirectorySyncGuard { previous }
+            DirectorySyncGuard {
+                previous,
+                _thread_affine: PhantomData,
+            }
         })
     }
 
@@ -252,15 +266,20 @@ fn open_directory_for_sync(dir: &Path) -> std::io::Result<File> {
 }
 
 fn directory_sync_error(dir: &Path, error: std::io::Error) -> StorageError {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::Unsupported | std::io::ErrorKind::InvalidInput
+    ) {
+        return StorageError::DurabilityUnsupported(dir.to_path_buf());
+    }
+
     #[cfg(windows)]
-    if error.kind() == std::io::ErrorKind::Unsupported
-        || matches!(error.raw_os_error(), Some(1 | 50))
-    {
+    if matches!(error.raw_os_error(), Some(1 | 50 | 87)) {
         return StorageError::DurabilityUnsupported(dir.to_path_buf());
     }
 
     #[cfg(not(windows))]
-    if error.kind() == std::io::ErrorKind::Unsupported {
+    if matches!(error.raw_os_error(), Some(22)) {
         return StorageError::DurabilityUnsupported(dir.to_path_buf());
     }
 
@@ -385,6 +404,7 @@ pub fn read_batch_columns(path: &Path, columns: &[&str]) -> Result<RecordBatch> 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use std::path::PathBuf;
     use std::sync::Arc;
 
     use arrow::array::Int64Array;
@@ -579,6 +599,98 @@ mod tests {
             format!("directory durability is unsupported for {}", dir.display())
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sync_dir_maps_invalid_input_to_a_typed_durability_error() {
+        // Break caught: filesystems that report an EINVAL-like directory
+        // flush rejection must not be presented as an ordinary, retryable
+        // data-path I/O failure.
+        let dir = tempfile::Builder::new()
+            .prefix("strata-sync-dir-invalid-input-")
+            .tempdir()
+            .unwrap()
+            .keep();
+        let _fault = test_support::fail_directory_sync_on_call(1, std::io::ErrorKind::InvalidInput);
+
+        let error = sync_dir(&dir).unwrap_err();
+
+        assert!(
+            matches!(error, StorageError::DurabilityUnsupported(ref path) if path == &dir),
+            "expected an invalid directory-flush operation to be typed as unsupported, got {error:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn directory_sync_error_maps_posix_einval_to_a_typed_durability_error() {
+        // Break caught: platforms may preserve raw EINVAL without mapping it
+        // to ErrorKind::InvalidInput, so the raw OS error must be covered too.
+        let dir = PathBuf::from("posix-einval-directory");
+
+        let error = directory_sync_error(&dir, std::io::Error::from_raw_os_error(22));
+
+        assert!(
+            matches!(error, StorageError::DurabilityUnsupported(ref path) if path == &dir),
+            "expected EINVAL to be typed as unsupported directory durability, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn nested_directory_sync_guards_restore_the_outer_interceptor() {
+        // Break caught: an inner test guard that overwrites the TLS state and
+        // fails to restore it makes the enclosing guard silently stop
+        // recording its durability boundary.
+        let first = PathBuf::from("outer-first");
+        let second = PathBuf::from("inner");
+        let third = PathBuf::from("outer-third");
+        let outer = test_support::record_directory_syncs();
+        assert!(test_support::outcome(&first).unwrap().is_ok());
+
+        {
+            let _inner = test_support::fail_directory_sync_on_call(1, std::io::ErrorKind::Other);
+            assert!(test_support::outcome(&second).unwrap().is_err());
+        }
+
+        assert_eq!(outer.calls(), vec![first.clone()]);
+        assert!(test_support::outcome(&third).unwrap().is_ok());
+        assert_eq!(outer.calls(), vec![first, third]);
+    }
+
+    #[test]
+    fn directory_sync_guard_restores_passthrough_after_drop() {
+        // Break caught: leaking an injected outcome after its guard drops can
+        // cause later tests or production-like paths to acknowledge a sync
+        // they never performed.
+        let path = PathBuf::from("restored-passthrough");
+        {
+            let _guard = test_support::record_directory_syncs();
+            assert!(test_support::outcome(&path).unwrap().is_ok());
+        }
+
+        assert!(
+            test_support::outcome(&path).is_none(),
+            "dropping the final guard must restore the real filesystem path"
+        );
+    }
+
+    #[test]
+    fn directory_sync_guard_restores_passthrough_during_unwind() {
+        // Break caught: a panicking test must not leave its thread's
+        // durability seam enabled for the next test.
+        let path = PathBuf::from("unwind-passthrough");
+        let unwound = std::panic::catch_unwind(|| {
+            let _guard = test_support::record_directory_syncs();
+            assert!(test_support::outcome(&path).unwrap().is_ok());
+            panic!("intentional guard-unwind regression");
+        });
+
+        assert!(unwound.is_err());
+        assert!(
+            test_support::outcome(&path).is_none(),
+            "unwinding must restore the real filesystem path"
+        );
     }
 
     #[test]

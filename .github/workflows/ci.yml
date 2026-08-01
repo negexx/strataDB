@@ -34,6 +34,12 @@ jobs:
         # by default (`crates/txn/Cargo.toml`).
         run: cargo test -p strata-txn --features parallel-insert
 
+      - name: Test (directory durability fault injection)
+        # Dataset creation's ordered directory-sync boundaries use this
+        # thread-local fault seam. The default workspace suite intentionally
+        # does not compile this test-only feature, so run it explicitly.
+        run: cargo test -p strata-txn --features test-fault-injection
+
       - name: Loom tests (strata-index)
         # Scoped to this one crate rather than a workspace-wide
         # `RUSTFLAGS=--cfg loom cargo test` -- see
@@ -60,6 +66,9 @@ jobs:
 
       - name: Clippy (parallel-insert feature)
         run: cargo clippy -p strata-txn --all-targets --features parallel-insert -- -D warnings
+
+      - name: Clippy (directory durability fault injection)
+        run: cargo clippy -p strata-txn --all-targets --features test-fault-injection -- -D warnings
 
       - name: Format check
         run: cargo fmt --check

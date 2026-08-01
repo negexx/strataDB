@@ -363,24 +363,13 @@ impl Dataset {
         if read_current(&dir)?.is_some() {
             return Err(TxnError::AlreadyExists(dir));
         }
-        std::fs::create_dir_all(dir.join("data"))?;
-        let durable_dir = std::fs::canonicalize(&dir)?;
-        let durable_parent = durable_dir.parent().ok_or_else(|| {
-            TxnError::Storage(strata_storage::StorageError::DurabilityUnsupported(
-                durable_dir.clone(),
-            ))
-        })?;
-        // `data/` is a new entry in the dataset directory, and the dataset
-        // directory is a new entry in its parent. Both entries must survive
-        // the creation acknowledgement, not merely the initial manifest.
-        sync_dir(&durable_dir)?;
-        sync_dir(durable_parent)?;
+        sync_new_directory_ancestors(&dir)?;
         let manifest = Manifest::empty();
         commit_manifest(&dir, &manifest)?;
         // `commit_manifest` synchronizes `_versions/` after the manifest
         // rename. Synchronize its parent too, so creation of `_versions/`
         // itself is durable before Dataset::create returns.
-        sync_dir(&durable_dir)?;
+        sync_dir(&dir)?;
         let last_issued_timestamp = Arc::new(AtomicI64::new(manifest.commit_time_high_water));
         let row_ids = Arc::new(RowIdAllocator::new(manifest.next_row_id));
         let write_attempt_counter = Arc::new(AtomicU64::new(manifest.next_attempt_id));
@@ -566,6 +555,44 @@ impl Dataset {
         self.insufficient_history_conflicts
             .load(std::sync::atomic::Ordering::Relaxed)
     }
+}
+
+/// Creates `dir/data` and durably publishes every directory entry that this
+/// call created, from the leaf back to the first pre-existing ancestor.
+///
+/// A directory entry is made durable by syncing its parent. For example,
+/// creating `a/b/dataset/data` requires syncing `dataset`, `b`, `a`, then
+/// the pre-existing parent of `a`; syncing only `dataset` and `b` leaves the
+/// upper entries vulnerable to a crash after `Dataset::create` succeeds.
+fn sync_new_directory_ancestors(dir: &Path) -> Result<()> {
+    let data_dir = dir.join("data");
+    let absolute_data_dir = if data_dir.is_absolute() {
+        data_dir
+    } else {
+        std::env::current_dir()?.join(data_dir)
+    };
+    let mut created = Vec::new();
+    let mut candidate = absolute_data_dir.as_path();
+
+    while !candidate.try_exists()? {
+        created.push(candidate.to_path_buf());
+        candidate = candidate.parent().ok_or_else(|| {
+            TxnError::Storage(strata_storage::StorageError::DurabilityUnsupported(
+                candidate.to_path_buf(),
+            ))
+        })?;
+    }
+
+    std::fs::create_dir_all(dir.join("data"))?;
+    for directory in created {
+        let parent = directory.parent().ok_or_else(|| {
+            TxnError::Storage(strata_storage::StorageError::DurabilityUnsupported(
+                directory.clone(),
+            ))
+        })?;
+        sync_dir(parent)?;
+    }
+    Ok(())
 }
 
 pub struct Transaction {
@@ -2127,20 +2154,24 @@ mod tests {
 
     #[cfg(feature = "test-fault-injection")]
     #[test]
-    fn create_syncs_the_dataset_directory_and_its_parent_in_order() {
-        // Break caught: returning from Dataset::create without making the
-        // new dataset entry, data directory, and manifest directory durable
-        // leaves a successful creation vulnerable to power-loss disappearance.
+    fn create_syncs_each_new_directory_ancestor_bottom_up() {
+        // Break caught: when create_dir_all creates more than one ancestor,
+        // syncing only the dataset and its immediate parent can lose an
+        // intermediate directory entry after a crash.
         let parent = temp_dir("create-directory-sync-order-parent");
-        let dir = parent.join("dataset");
+        let dir = parent.join("one").join("two").join("dataset");
         let recorder = strata_storage::datafile::test_support::record_directory_syncs();
 
         Dataset::create(&dir).unwrap();
 
         let durable_dir = std::fs::canonicalize(&dir).unwrap();
+        let durable_grandparent = durable_dir.parent().unwrap().to_path_buf();
+        let durable_great_grandparent = durable_grandparent.parent().unwrap().to_path_buf();
         let durable_parent = std::fs::canonicalize(&parent).unwrap();
         let expected = vec![
             durable_dir.clone(),
+            durable_grandparent,
+            durable_great_grandparent,
             durable_parent,
             durable_dir.join("_versions"),
             durable_dir,
@@ -2152,7 +2183,7 @@ mod tests {
             .collect();
         assert_eq!(
             actual, expected,
-            "creation must sync data's parent, the dataset entry's parent, the manifest directory, then the dataset directory after _versions is created"
+            "creation must sync each newly-created entry's parent from the leaf to the pre-existing ancestor, then the manifest directory and dataset directory"
         );
         std::fs::remove_dir_all(&parent).ok();
     }

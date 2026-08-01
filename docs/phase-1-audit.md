@@ -46,6 +46,34 @@ Checksums cover accidental/torn corruption and metadata inconsistency, not an at
 rewrite both payload and checksum. Performance work records a tested operating envelope without
 introducing Phase 3 compaction or lifecycle behavior.
 
+## Task 1 durability recovery boundary
+
+`Dataset::create` synchronizes the parent of every directory entry it creates, from `data/` back
+to the first pre-existing ancestor, then publishes the initial manifest and synchronizes the
+dataset directory for the newly created `_versions/` entry. The create call returns an error when
+any ordered directory operation fails; it never reports that outcome as an acknowledged durable
+creation.
+
+The final dataset-directory sync occurs after atomic manifest publication. Consequently an error
+at that boundary is uncertain: an initial manifest can be visible even though `Dataset::create`
+returned an error. On an error, callers must not assume creation succeeded or immediately retry
+`create`. First call `Dataset::open` on the path. If it opens, the initial manifest is visible but
+the failed create call remains unacknowledged for durability purposes; preserve/report that error
+and repair or move to a filesystem with working directory synchronization before relying on the
+dataset. If it reports `NotFound`, creation was not visible and a later `create` attempt may
+re-establish the directory tree. Cross-process coordination is still out of scope.
+
+| Platform/filesystem boundary | Directory-sync behavior | Claim boundary |
+|---|---|---|
+| Windows local filesystem | Opens a write-capable native directory handle with `FILE_FLAG_BACKUP_SEMANTICS`, then calls `sync_all`. | Included only when both operations succeed; `ERROR_INVALID_FUNCTION`, `ERROR_NOT_SUPPORTED`, and invalid-parameter outcomes fail closed. |
+| POSIX local filesystem | Opens the directory and calls `sync_all`. | Included only when both operations succeed; `Unsupported`, `InvalidInput`, and `EINVAL` outcomes fail closed. |
+| Any filesystem that rejects directory flushing | Returns typed `DurabilityUnsupported`. | Outside the acknowledged-durability boundary; no fallback or best-effort success exists. |
+| Object/remote backends and independent processes | Not part of this Task 1 path. | Out of scope for Phase 1. |
+
+This is an ordered local-operation contract, not universal power-loss proof. Process-abort tests
+and successful calls on one host/filesystem do not establish a guarantee for another filesystem or
+for cross-process publication.
+
 ## Finding register
 
 | ID | Severity | Area | Disposition / required action |

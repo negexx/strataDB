@@ -22,7 +22,7 @@ single-process/shared-`Dataset` boundary.
 | Update/delete identity | Partial | Tombstone-plus-replacement behavior exists; logical identity, target semantics, and cardinality remain open. |
 | CLI | Partial | Fixed-assumption MVP inspection/demo commands; not a stable administration surface. |
 | Python | Proposed | PyO3 scaffolding exports only `placeholder_version`; no database API exists. |
-| Durability/recovery | Partial | File fsync and crash/reopen evidence exist; directory durability and integrity are not complete. |
+| Durability/recovery | Partial | File fsync and crash/reopen evidence exist. Dataset creation fails closed for ordered local directory-sync errors, but manifest integrity, broader recovery proof, and filesystem-specific evidence remain incomplete. |
 | Schema/migrations | Partial | Caller batch shape and reserved columns are checked; no dataset-owned schema catalog or migration workflow. |
 | Loom/chaos/fuzz/bench evidence | Partial | Useful tooling exists, but important models and opt-in suites are not all CI-visible or retained as current evidence. |
 | Compaction/GC | Proposed | No compaction, vacuum, orphan cleanup, or bounded history implementation. |
@@ -34,6 +34,22 @@ single-process/shared-`Dataset` boundary.
 The supported concurrency scope is **one process using one shared `Dataset` handle**. The commit lock,
 row-ID allocator, recent-write history, and current snapshot live in that handle. Opening the same path
 independently does not establish a transaction protocol.
+
+## Directory-durability boundary
+
+Dataset creation now fails rather than acknowledging a directory sync that the filesystem rejects.
+It synchronizes every newly-created ancestor bottom-up, then the manifest directory through manifest
+publication, and finally the dataset directory for `_versions/`. The platform boundary is deliberately
+narrow: Windows uses a native directory handle with `FILE_FLAG_BACKUP_SEMANTICS`; POSIX uses a
+directory handle; both are in scope only when the open and flush succeed. Unsupported, invalid-input,
+and POSIX `EINVAL`-like outcomes are typed `DurabilityUnsupported`, not best-effort success. Remote
+backends, cross-process publication, and universal power-loss proof remain out of scope.
+
+A final dataset-directory sync failure can occur after the initial manifest becomes visible. The
+`Dataset::create` call still fails and must not be treated as acknowledged; callers first probe with
+`Dataset::open` rather than blindly retrying creation. A visible dataset remains subject to the failed
+durability boundary until the underlying filesystem condition is repaired or replaced. See the
+[Phase 1 audit](phase-1-audit.md#task-1-durability-recovery-boundary) for the recovery procedure.
 
 ## Status vocabulary
 
