@@ -11,11 +11,9 @@
 //! `Transaction::commit` deep-clones the whole `Manifest`, appends this
 //! commit's files, then `serde_json`-serializes and fsyncs the *entire*
 //! accumulated file list — all inside the global commit lock. Each step is
-//! O(F) in the number of data files ever committed, and F only ever grows
-//! (nothing compacts it), so total work across N commits is predicted to be
-//! O(N^2). This benchmark exists to confirm or refute that empirically, and to
-//! locate the scale at which it starts to matter, *before* anyone invests in
-//! the incremental-manifest redesign that would fix it.
+//! coupled to the accumulated history. This benchmark records the observed
+//! timing and manifest-byte envelope of that current path; it does not
+//! establish an asymptotic or universal bound.
 //!
 //! Deliberately NOT a `criterion` benchmark: criterion measures steady state
 //! and resets between iterations, which is precisely the blindness being
@@ -28,7 +26,8 @@
 //!
 //! ```text
 //! cargo bench --bench manifest_growth_bench
-//! STRATA_GROWTH_COMMITS=5000 cargo bench --bench manifest_growth_bench
+//! STRATA_GROWTH_COMMITS=160 STRATA_GROWTH_WARMUP_RUNS=1 \
+//!   STRATA_GROWTH_REPETITIONS=5 cargo bench --bench manifest_growth_bench
 //! ```
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -40,10 +39,24 @@ use arrow::array::{Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 use strata_txn::Dataset;
 
-/// Enough to expose a quadratic term without making the run tedious; a clean
-/// O(F) signal is already obvious well before this on a normal disk.
+/// A bounded default suitable for a local diagnostic run.
 const DEFAULT_COMMITS: usize = 2000;
 const BUCKETS: usize = 20;
+const DEFAULT_REPETITIONS: usize = 1;
+const DEFAULT_WARMUP_RUNS: usize = 0;
+
+struct NumericSummary {
+    median: f64,
+    p95: f64,
+    sample_variance: f64,
+}
+
+struct Measurement {
+    timings: Vec<Duration>,
+    wall: Duration,
+    manifest_bytes: u64,
+    manifest_samples: Vec<(usize, u64)>,
+}
 
 fn mean_micros(samples: &[Duration]) -> f64 {
     if samples.is_empty() {
@@ -56,9 +69,47 @@ fn mean_micros(samples: &[Duration]) -> f64 {
     total / count
 }
 
+#[allow(clippy::cast_precision_loss)]
+fn numeric_summary(samples: &[f64]) -> NumericSummary {
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let count = sorted.len();
+    let middle = count / 2;
+    let median = if count.is_multiple_of(2) {
+        f64::midpoint(sorted[middle - 1], sorted[middle])
+    } else {
+        sorted[middle]
+    };
+    let p95 = sorted[(count * 95).div_ceil(100) - 1];
+    let mean = sorted.iter().sum::<f64>() / count as f64;
+    let sample_variance = if count > 1 {
+        sorted
+            .iter()
+            .map(|sample| (sample - mean).powi(2))
+            .sum::<f64>()
+            / (count - 1) as f64
+    } else {
+        0.0
+    };
+
+    NumericSummary {
+        median,
+        p95,
+        sample_variance,
+    }
+}
+
+fn positive_env(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.parse().ok())
+        .filter(|value: &usize| *value > 0)
+        .unwrap_or(default)
+}
+
 /// Byte size of the largest file in `_versions/` — the newest manifest, since
 /// each version supersedes the last and they only grow. A direct, on-disk
-/// witness of the O(F) term that per-commit latency only measures indirectly.
+/// witness for the measured retained-history point.
 fn newest_manifest_bytes(dir: &std::path::Path) -> u64 {
     std::fs::read_dir(dir.join("_versions"))
         .into_iter()
@@ -71,7 +122,112 @@ fn newest_manifest_bytes(dir: &std::path::Path) -> u64 {
         .unwrap_or(0)
 }
 
+fn measure(commits: usize) -> Measurement {
+    let dir = std::env::temp_dir().join(format!("strata-manifest-growth-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let ds = Dataset::create(&dir, Arc::clone(&schema)).unwrap();
+
+    let mut timings = Vec::with_capacity(commits);
+    let checkpoints = [1, commits.div_ceil(4), commits.div_ceil(2), commits];
+    let mut manifest_samples = Vec::new();
+    let overall = Instant::now();
+    for i in 0..commits {
+        let id = i64::try_from(i).unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![id]))],
+        )
+        .unwrap();
+        let mut txn = ds.begin();
+        txn.insert(batch).unwrap();
+        let started = Instant::now();
+        txn.commit().unwrap();
+        timings.push(started.elapsed());
+        if checkpoints.contains(&(i + 1)) {
+            manifest_samples.push((i + 1, newest_manifest_bytes(&dir)));
+        }
+    }
+    let wall = overall.elapsed();
+    let manifest_bytes = newest_manifest_bytes(&dir);
+
+    drop(ds);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    Measurement {
+        timings,
+        wall,
+        manifest_bytes,
+        manifest_samples,
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn report_repeated() {
+    let commits = positive_env("STRATA_GROWTH_COMMITS", DEFAULT_COMMITS);
+    let repetitions = positive_env("STRATA_GROWTH_REPETITIONS", DEFAULT_REPETITIONS);
+    let warmup_runs = std::env::var("STRATA_GROWTH_WARMUP_RUNS")
+        .ok()
+        .and_then(|raw| raw.parse().ok())
+        .unwrap_or(DEFAULT_WARMUP_RUNS);
+
+    for _ in 0..warmup_runs {
+        let _ = measure(commits);
+    }
+    let measurements: Vec<Measurement> = (0..repetitions).map(|_| measure(commits)).collect();
+    let walls: Vec<f64> = measurements
+        .iter()
+        .map(|measurement| measurement.wall.as_secs_f64() * 1e3)
+        .collect();
+    let manifest_sizes: Vec<f64> = measurements
+        .iter()
+        .map(|measurement| measurement.manifest_bytes as f64)
+        .collect();
+    let wall_summary = numeric_summary(&walls);
+    let manifest_summary = numeric_summary(&manifest_sizes);
+
+    println!();
+    println!("manifest growth â€” {commits} sequential commits, one data file each");
+    println!(
+        "input: deterministic id-only rows; commits={commits}; buckets={BUCKETS}; warmup runs excluded={warmup_runs}; measured repetitions={repetitions}"
+    );
+    println!("(id column only: no vector column, so no HNSW insert is involved)");
+    for (run, measurement) in measurements.iter().enumerate() {
+        let per_bucket = commits.div_ceil(BUCKETS).max(1);
+        let first_mean = mean_micros(&measurement.timings[..per_bucket]);
+        let last_start = (commits - 1) / per_bucket * per_bucket;
+        let last_mean = mean_micros(&measurement.timings[last_start..]);
+        let growth = if first_mean > 0.0 {
+            last_mean / first_mean
+        } else {
+            f64::NAN
+        };
+        println!(
+            "run {run}: total wall={:.3} ms; newest manifest={} bytes; first->last bucket={growth:.2}x",
+            measurement.wall.as_secs_f64() * 1e3,
+            measurement.manifest_bytes
+        );
+        for (version, bytes) in &measurement.manifest_samples {
+            println!("  retained version {version}: {bytes} bytes");
+        }
+    }
+    println!(
+        "median commit-sequence wall: {:.3} ms; p95: {:.3} ms; sample variance: {:.3} ms^2",
+        wall_summary.median, wall_summary.p95, wall_summary.sample_variance
+    );
+    println!(
+        "median newest manifest: {:.0} bytes; p95: {:.0} bytes; sample variance: {:.3} bytes^2",
+        manifest_summary.median, manifest_summary.p95, manifest_summary.sample_variance
+    );
+    println!("OBSERVATION: bounded host-local evidence, not an asymptotic or universal bound.");
+}
+
 fn main() {
+    if std::env::var("STRATA_GROWTH_REPETITIONS").is_ok() {
+        report_repeated();
+        return;
+    }
+
     let commits: usize = std::env::var("STRATA_GROWTH_COMMITS")
         .ok()
         .and_then(|raw| raw.parse().ok())
@@ -109,7 +265,7 @@ fn main() {
     let _ = std::fs::remove_dir_all(&dir);
 
     println!();
-    println!("manifest growth — {commits} sequential commits, one data file each");
+    println!("manifest growth: {commits} sequential commits, one data file each");
     println!("input: deterministic id-only rows; commits={commits}; buckets={BUCKETS}");
     println!("(id column only: no vector column, so no HNSW insert is involved)");
     println!();

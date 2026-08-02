@@ -1,5 +1,55 @@
 # Phase 1 performance evidence
 
+## Task 5 manifest-growth evidence (fresh, bounded)
+
+**Run date:** 2026-08-02
+**Source revision:** `7f164c81e1a593f744f49a52511f0ed6a32648ab` plus the uncommitted Task 5
+benchmark reporting change in `bench/benches/manifest_growth_bench.rs`.
+**Lockfile SHA-256:** `2e6dfa6a8a1c8afd17085660894361256c319f876f5440e19b2902d9d336bb39`.
+**Runner:** Microsoft Windows `10.0.26200`, `x86_64-pc-windows-msvc`.
+**Toolchain:** `rustc 1.90.0 (1159e78c4 2025-09-14)`; Cargo `1.90.0
+(840b83a10 2025-07-30)`; default workspace features and no benchmark-specific feature flags.
+**Filesystem and cache policy:** the benchmark creates its directory through `std::env::temp_dir()` on
+the local Windows temporary filesystem. OS/filesystem caches were not flushed between the excluded
+warmup and measured repetitions.
+**CPU/RAM:** not captured. The attempted `Get-CimInstance Win32_Processor` and
+`Get-CimInstance Win32_ComputerSystem` calls were denied with `Access denied` (`0x80041003`).
+
+The input is deterministic synthetic id-only data: sequential `i64` values from `0` through
+`commits - 1`, one row per commit, with no `vector` column and therefore no HNSW insertion. Each
+point ran one full warmup sequence excluded from results, then five measured sequences. The exact
+commands used the current `Dataset` transaction/manifest path:
+
+```text
+$env:STRATA_GROWTH_COMMITS='1';   $env:STRATA_GROWTH_WARMUP_RUNS='1'; $env:STRATA_GROWTH_REPETITIONS='5'; cargo bench -p strata-bench --bench manifest_growth_bench -- --noplot
+$env:STRATA_GROWTH_COMMITS='10';  $env:STRATA_GROWTH_WARMUP_RUNS='1'; $env:STRATA_GROWTH_REPETITIONS='5'; cargo bench -p strata-bench --bench manifest_growth_bench -- --noplot
+$env:STRATA_GROWTH_COMMITS='20';  $env:STRATA_GROWTH_WARMUP_RUNS='1'; $env:STRATA_GROWTH_REPETITIONS='5'; cargo bench -p strata-bench --bench manifest_growth_bench -- --noplot
+$env:STRATA_GROWTH_COMMITS='40';  $env:STRATA_GROWTH_WARMUP_RUNS='1'; $env:STRATA_GROWTH_REPETITIONS='5'; cargo bench -p strata-bench --bench manifest_growth_bench -- --noplot
+$env:STRATA_GROWTH_COMMITS='80';  $env:STRATA_GROWTH_WARMUP_RUNS='1'; $env:STRATA_GROWTH_REPETITIONS='5'; cargo bench -p strata-bench --bench manifest_growth_bench -- --noplot
+$env:STRATA_GROWTH_COMMITS='160'; $env:STRATA_GROWTH_WARMUP_RUNS='1'; $env:STRATA_GROWTH_REPETITIONS='5'; cargo bench -p strata-bench --bench manifest_growth_bench -- --noplot
+```
+
+| Sequential commits | Median wall time | p95 wall time | Median newest manifest bytes | p95 manifest bytes |
+|---:|---:|---:|---:|---:|
+| 1 | 50.846 ms | 58.733 ms | 712 | 712 |
+| 10 | 468.254 ms | 504.589 ms | 2,917 | 2,918 |
+| 20 | 1,015.169 ms | 1,024.508 ms | 5,403 | 5,408 |
+| 40 | 2,380.915 ms | 2,427.971 ms | 10,377 | 10,383 |
+| 80 | 5,528.159 ms | 5,636.349 ms | 20,328 | 20,331 |
+| 160 | 14,075.935 ms | 14,250.955 ms | 40,475 | 40,489 |
+
+The full per-repetition raw output, timing variances, manifest checkpoint bytes, command exit codes,
+and failed CPU/RAM-provenance attempts are in the Task 5 report. These are host-local observations
+over this exact synthetic envelope, not a universal or asymptotic bound. They do not establish
+portable performance, a retained-history limit, or real-fixture behavior.
+
+No checked-in `bench/cloud-performance/` harness or
+`.github/workflows/cloud-performance-before-after.yml` workflow exists on this branch. Consequently
+PERF-01 remains open for portable, real-fixture, and cloud provenance even though this bounded
+synthetic PERF-02 matrix is recorded.
+
+## Earlier related measurements
+
 **Run date:** 2026-08-02
 **Revision:** `16812af3c196f993ac37834a8a6c06eb5ac6a0b5` (benchmark implementation used for these measurements)
 **Host:** Windows MSVC, `x86_64-pc-windows-msvc`
@@ -45,11 +95,11 @@ Cache state is not forcibly flushed: recovery follows the preceding write in the
 the first vector query warms each segment before timing. The results therefore describe a warm local
 filesystem/query path. The lifecycle benchmark reports allocation and peak-live deltas, not RSS.
 
-## Bounded results
+## Earlier bounded results
 
 | Workload | Observed result | Interpretation |
 |---|---|---|
-| 40 sequential id-only commits | 1.60 s total; manifest bytes 711 / 2,916 / 5,401 / 10,372 at retained versions 1 / 10 / 20 / 40; first-to-last timing bucket 1.23x | No strong latency-growth signal at this small point; manifest bytes grow across all retained versions. Repeat at larger history before drawing a scaling conclusion. |
+| 40 sequential id-only commits | Superseded for manifest-growth evidence by the fresh Task 5 1/10/20/40/80/160 matrix above; this earlier one-run sample is retained only as historical context. | Use the fresh five-repetition values above for current bounded manifest-growth evidence. |
 | 64 synthetic 512-dim rows, 8-row commits | reopen 21.66 ms; 24 concurrent commits 792.68 ms; 4 historical/current pinned handles 600 ns (423,598 live allocator bytes); end-of-run manifest 24,544 bytes after concurrent commits | Shows the current reopen, serialized-fsync, and historical-snapshot retention paths on this host; it is not an operating limit. |
 | 256 synthetic 512-dim rows, 16 queries, K=1…64 manifest-listed segments | K=1 recall@10 0.9938 at 98.2 us/query; K=64 recall@10 1.0000 at 157.2 us/query (1.6x) | This sample shows a bounded fan-out result without a recall drop; it does not prove behavior for production-scale data or all distributions. |
 
