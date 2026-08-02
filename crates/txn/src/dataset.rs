@@ -4663,7 +4663,7 @@ mod tests {
         const N: i64 = 301;
 
         let dir = temp_dir("large-commit-parallel-insert");
-        let ds = Dataset::create(&dir, test_schema()).unwrap();
+        let ds = Dataset::create(&dir, vector_test_schema()).unwrap();
 
         let ids: Vec<i64> = (0..N).collect();
         let vectors: Vec<[f32; 3]> = (0..N).map(|i| [i as f32 * 1000.0, 0.0, 0.0]).collect();
