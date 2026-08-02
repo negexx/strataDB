@@ -38,13 +38,11 @@ use rand::SeedableRng as _;
 /// target pool does. 8 agents/8 ops is the highest-yield configuration
 /// tested (not the smallest -- 8/5, 6/10, and 3/20 are all cheaper by total
 /// op-slot count and were tried first) -- kept over the cheaper 8/5 (~10%)
-/// because the actual measured thorough-tier cost at 8/8 was acceptable
-/// (2000/2000 seeds, zero violations, ~1799s/~30min at concurrency=8 --
-/// re-measured after the reader's 4th check, the id-predicate reverse
-/// probe, was added; ~1175s/~20min before that) and
-/// the higher yield means more of the 2000-seed budget
-/// actually exercises the conflict/drop path this whole task exists to
-/// close.
+/// because the configured thorough-tier target is 2000 seeds and the higher
+/// yield means more of that budget exercises the conflict/drop path this
+/// whole task exists to close. A prior run may be historical tuning context,
+/// but it is not current Phase 1 evidence unless this branch reports
+/// `2000/2000`.
 const NUM_AGENTS: u64 = 8;
 /// See `NUM_AGENTS`'s doc comment for the measurement this was tuned
 /// alongside.

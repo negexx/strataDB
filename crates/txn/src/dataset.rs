@@ -8210,8 +8210,8 @@ mod tests {
 /// as a single test binary invocation can now exceed ten minutes and, on
 /// Windows, can fail with an `ERROR_NO_SYSTEM_RESOURCES` OS error when all
 /// ~9 models run in the same process together -- this is an environmental
-/// resource-exhaustion symptom, not a correctness failure (each model has
-/// been confirmed to pass individually). On Windows especially, prefer
+/// resource-exhaustion symptom, not a correctness failure. On Windows
+/// especially, prefer
 /// running one model at a time: build per the `Run with` instructions above,
 /// then invoke the resulting binary with a single test's full path and
 /// `--exact` (e.g. `dataset::loom_tests::a_commits_row_and_its_segment_become_visible_as_one_atomic_step
@@ -8225,8 +8225,8 @@ mod tests {
 /// `docs/design.md`. It was added
 /// here FIRST, against the then-current watermark+in-flight implementation,
 /// as the "before" half of the required "must pass both before and after the
-/// deletion" proof. The deletion has since landed, and this exact test was
-/// re-run completely unmodified afterward and passed — the "after" half.
+/// deletion" proof. The deletion has since landed; the required post-change
+/// run remains a separately recorded gate when host limits prevent completion.
 #[cfg(loom)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod loom_tests {

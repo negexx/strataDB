@@ -47,12 +47,11 @@
 //! `Snapshot::is_visible` reduces to the tombstone check alone; this
 //! module keeps only the counter.
 //!
-//! Proven, not assumed: `dataset::loom_tests::
+//! The named `dataset::loom_tests::
 //! a_reader_never_sees_one_in_flight_commits_row_while_observing_an_unrelated_commits_row_id_counter`
-//! ("Model 3") passed against the OLD in-flight-tracking implementation as
-//! a baseline, then again, completely unmodified, after this module's
-//! simplification — see the S1 segmented-index spec §6 for the "migrate
-//! the guarantee, then remove the mechanism" plan this followed.
+//! ("Model 3") is the regression gate for this simplification. Its required
+//! post-change run is recorded separately because the full model can exceed
+//! local resource limits; source comments do not imply completion.
 //!
 //! # Locking
 //!

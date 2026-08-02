@@ -1,7 +1,7 @@
 # Phase 1 performance evidence
 
 **Run date:** 2026-08-02
-**Revision:** `48dc624784a8c225b30f8c1bc2c40d6f6bb41667` (before this evidence document)
+**Revision:** `16812af3c196f993ac37834a8a6c06eb5ac6a0b5` (benchmark implementation used for these measurements)
 **Host:** Windows MSVC, `x86_64-pc-windows-msvc`
 **Toolchain:** `rustc 1.90.0 (1159e78c4 2025-09-14)`, Cargo 1.90.0
 **Features:** workspace defaults; no benchmark-specific feature flags

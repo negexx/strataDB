@@ -194,8 +194,9 @@ impl Snapshot {
     /// this snapshot's own `index`/`manifest.data_files` produced, which by
     /// construction can never include a row-id this snapshot's own commit
     /// didn't allocate, and can never include an in-flight (not-yet-durable)
-    /// transaction's row at all. Proven, not assumed:
-    /// `dataset::loom_tests::a_reader_never_sees_one_in_flight_commits_row_while_observing_an_unrelated_commits_row_id_counter`.
+    /// transaction's row at all. The named loom model is the regression gate
+    /// for this invariant; its post-change execution remains separately
+    /// tracked when host resource limits prevent completion.
     ///
     /// This runs once per candidate during HNSW graph traversal.
     pub(crate) fn is_visible(&self, row_id: u64) -> bool {
