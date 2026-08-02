@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, RecordBatch};
 use arrow::compute::cast;
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Schema};
 use arrow::row::{RowConverter, SortField};
 
 use crate::error::Result;
@@ -37,7 +37,7 @@ pub fn encode_batch(batch: &RecordBatch) -> Result<RecordBatch> {
                 Box::new(field.data_type().clone()),
             );
             let encoded = cast(column.as_ref(), &dict_type)?;
-            fields.push(Field::new(field.name(), dict_type, field.is_nullable()));
+            fields.push(field.as_ref().clone().with_data_type(dict_type));
             columns.push(encoded);
         } else {
             fields.push(field.as_ref().clone());
@@ -45,7 +45,10 @@ pub fn encode_batch(batch: &RecordBatch) -> Result<RecordBatch> {
         }
     }
 
-    let schema = Arc::new(Schema::new(fields));
+    let schema = Arc::new(Schema::new_with_metadata(
+        fields,
+        batch.schema_ref().metadata().clone(),
+    ));
     Ok(RecordBatch::try_new(schema, columns)?)
 }
 
@@ -96,6 +99,7 @@ fn should_dictionary_encode(column: &ArrayRef) -> Result<bool> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use arrow::array::{Int64Array, RecordBatch, StringArray};
@@ -258,5 +262,32 @@ mod tests {
             1,
             "the null value must survive the cast to Dictionary"
         );
+    }
+
+    #[test]
+    fn dictionary_encoding_preserves_field_and_schema_metadata() {
+        // Break caught: rebuilding a dictionary field with Field::new and
+        // the batch schema with Schema::new silently discards user metadata.
+        let field_metadata = HashMap::from([("semantic_type".to_string(), "label".to_string())]);
+        let schema_metadata = HashMap::from([("owner".to_string(), "catalog".to_string())]);
+        let field = Field::new("name", DataType::Utf8, false).with_metadata(field_metadata.clone());
+        let schema = Arc::new(Schema::new_with_metadata(
+            vec![field],
+            schema_metadata.clone(),
+        ));
+        let values: Vec<&str> = (0..100)
+            .map(|i| if i % 2 == 0 { "alice" } else { "bob" })
+            .collect();
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(values))]).unwrap();
+
+        let encoded = encode_batch(&batch).unwrap();
+
+        assert!(matches!(
+            encoded.schema_ref().field(0).data_type(),
+            DataType::Dictionary(_, _)
+        ));
+        assert_eq!(encoded.schema_ref().field(0).metadata(), &field_metadata);
+        assert_eq!(encoded.schema_ref().metadata(), &schema_metadata);
     }
 }

@@ -1862,6 +1862,13 @@ fn validate_physical_batch_schema(
     file_name: &str,
 ) -> Result<()> {
     let physical = batch.schema_ref();
+    if physical.metadata() != logical_schema.metadata() {
+        return Err(corrupt_catalog(
+            dir,
+            manifest,
+            format!("data file {file_name} does not preserve owned schema metadata"),
+        ));
+    }
     let expected_len = logical_schema.fields().len() + HIDDEN_COLUMNS.len();
     if physical.fields().len() != expected_len {
         return Err(corrupt_catalog(
@@ -1979,7 +1986,18 @@ fn validate_data_files(
 ) -> Result<HashSet<u64>> {
     let data_dir = data_subdir(dir);
     let mut owned_rows = HashSet::new();
+    let mut data_file_names = HashSet::with_capacity(manifest.data_files.len());
     for entry in &manifest.data_files {
+        if !data_file_names.insert(&entry.name) {
+            return Err(corrupt_catalog(
+                dir,
+                manifest,
+                format!(
+                    "data file {} appears more than once in the manifest",
+                    entry.name
+                ),
+            ));
+        }
         let path = safe_join(&data_dir, &entry.name)?;
         let bytes = std::fs::read(&path)?;
         let actual_len = u64::try_from(bytes.len())?;
@@ -2446,7 +2464,10 @@ fn append_row_id_column(
     let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
     columns.push(row_id_array);
 
-    let schema = Arc::new(Schema::new(fields));
+    let schema = Arc::new(Schema::new_with_metadata(
+        fields,
+        batch.schema_ref().metadata().clone(),
+    ));
     Ok(RecordBatch::try_new(schema, columns)?)
 }
 
@@ -2470,13 +2491,17 @@ fn append_timestamp_column(batch: &RecordBatch, ts: i64, num_rows: u64) -> Resul
     let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
     columns.push(timestamp_array);
 
-    let schema = Arc::new(Schema::new(fields));
+    let schema = Arc::new(Schema::new_with_metadata(
+        fields,
+        batch.schema_ref().metadata().clone(),
+    ));
     Ok(RecordBatch::try_new(schema, columns)?)
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use arrow::array::Int64Array;
@@ -3054,6 +3079,274 @@ mod tests {
         assert!(
             matches!(error, TxnError::CorruptSegment(ref reason) if reason.contains("no row-file owner")),
             "every vector row-id must be owned by a validated data file: {error:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn metadata_bearing_dictionary_dataset_reopens_and_scans() {
+        // Break caught: dictionary and hidden-column schema reconstruction
+        // used to discard Arrow field/schema metadata, so a valid commit
+        // became unrecoverable when Dataset::open compared its physical
+        // field metadata with the owned logical schema.
+        use arrow::array::StringArray;
+
+        let dir = temp_dir("metadata-bearing-dictionary-reopen");
+        let field_metadata = HashMap::from([("semantic_type".to_string(), "label".to_string())]);
+        let schema_metadata = HashMap::from([("owner".to_string(), "catalog".to_string())]);
+        let schema = Arc::new(Schema::new_with_metadata(
+            vec![Field::new("name", DataType::Utf8, false).with_metadata(field_metadata.clone())],
+            schema_metadata.clone(),
+        ));
+        let ds = Dataset::create(&dir, Arc::clone(&schema)).unwrap();
+        let names: Vec<&str> = (0..100)
+            .map(|i| if i % 2 == 0 { "alice" } else { "bob" })
+            .collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringArray::from(names.clone()))],
+        )
+        .unwrap();
+        let mut txn = ds.begin();
+        txn.insert(batch).unwrap();
+        txn.commit().unwrap();
+
+        let on_disk = read_batch(&ds.data_dir().join(&ds.data_files()[0].name)).unwrap();
+        assert!(matches!(
+            on_disk.schema_ref().field(0).data_type(),
+            DataType::Dictionary(_, _)
+        ));
+        assert_eq!(on_disk.schema_ref().field(0).metadata(), &field_metadata);
+        assert_eq!(on_disk.schema_ref().metadata(), &schema_metadata);
+
+        let reopened = Dataset::open(&dir).unwrap();
+        assert_eq!(reopened.schema(), schema);
+        let scanned = reopened.snapshot().scan(&schema).unwrap();
+        let names_on_read = scanned
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(names_on_read.value(0), "alice");
+        assert_eq!(names_on_read.value(1), "bob");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn recovery_rejects_a_row_file_whose_crc_no_longer_matches() {
+        // Break caught: accepting bytes changed after the manifest checksum
+        // was recorded would make a durable catalog point at unverified rows.
+        let dir = temp_dir("recovery-row-file-crc");
+        let ds = Dataset::create(&dir, test_schema()).unwrap();
+        let mut txn = ds.begin();
+        txn.insert(
+            RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![7]))]).unwrap(),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+
+        let path = ds.data_dir().join(&ds.data_files()[0].name);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        std::fs::write(&path, bytes).unwrap();
+
+        let Err(error) = Dataset::open(&dir) else {
+            panic!("recovery must reject a row file changed after its manifest CRC was recorded");
+        };
+        assert!(
+            matches!(error, TxnError::Storage(strata_storage::StorageError::CorruptDataFile(_, ref reason)) if reason.contains("crc32c")),
+            "recovery must reject a row file changed after its manifest CRC was recorded: {error:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn recovery_rejects_a_row_id_range_that_disagrees_with_physical_rows() {
+        // Break caught: trusting a manifest range instead of the physical
+        // _row_id sequence could give two files overlapping ownership.
+        let dir = temp_dir("recovery-row-id-range");
+        let ds = Dataset::create(&dir, test_schema()).unwrap();
+        let mut txn = ds.begin();
+        txn.insert(
+            RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![7]))]).unwrap(),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+
+        let mut corrupt = (*ds.snapshot().manifest).clone();
+        corrupt.version += 1;
+        corrupt.data_files[0].row_id_range = Some((4, 4));
+        commit_manifest(&dir, &corrupt).unwrap();
+
+        let Err(error) = Dataset::open(&dir) else {
+            panic!("recovery must reject a row-id range that disagrees with physical row IDs");
+        };
+        assert!(
+            matches!(error, TxnError::Storage(strata_storage::StorageError::CorruptManifest(_, ref reason)) if reason.contains("row_id")),
+            "recovery must reject a row-id range that disagrees with physical row IDs: {error:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn recovery_rejects_duplicate_physical_row_ownership() {
+        // Break caught: allowing the same _row_id to be owned by two files
+        // makes visibility and update targeting ambiguous.
+        let dir = temp_dir("recovery-duplicate-row-owner");
+        let ds = Dataset::create(&dir, test_schema()).unwrap();
+        let mut txn = ds.begin();
+        txn.insert(
+            RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![7]))]).unwrap(),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+
+        let mut corrupt = (*ds.snapshot().manifest).clone();
+        corrupt.version += 1;
+        let mut copied_entry = corrupt.data_files[0].clone();
+        copied_entry.name = "duplicate-owner.arrow".to_string();
+        std::fs::copy(
+            ds.data_dir().join(&corrupt.data_files[0].name),
+            ds.data_dir().join(&copied_entry.name),
+        )
+        .unwrap();
+        corrupt.data_files.push(copied_entry);
+        commit_manifest(&dir, &corrupt).unwrap();
+
+        let Err(error) = Dataset::open(&dir) else {
+            panic!("recovery must reject multiple data-file owners for one row ID");
+        };
+        assert!(
+            matches!(error, TxnError::Storage(strata_storage::StorageError::CorruptManifest(_, ref reason)) if reason.contains("owned by more than one")),
+            "recovery must reject multiple data-file owners for one row ID: {error:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn recovery_rejects_orphan_tombstones() {
+        // Break caught: a tombstone with no physical owner can hide a future
+        // row if IDs are ever recovered or allocated incorrectly.
+        let dir = temp_dir("recovery-orphan-tombstone");
+        let ds = Dataset::create(&dir, test_schema()).unwrap();
+        let mut txn = ds.begin();
+        txn.insert(
+            RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![7]))]).unwrap(),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+
+        let mut corrupt = (*ds.snapshot().manifest).clone();
+        corrupt.version += 1;
+        corrupt.tombstones.push(99);
+        commit_manifest(&dir, &corrupt).unwrap();
+
+        let Err(error) = Dataset::open(&dir) else {
+            panic!("recovery must reject a tombstone with no physical row owner");
+        };
+        assert!(
+            matches!(error, TxnError::Storage(strata_storage::StorageError::CorruptManifest(_, ref reason)) if reason.contains("no row-file owner")),
+            "recovery must reject a tombstone with no physical row owner: {error:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn recovery_rejects_duplicate_tombstones() {
+        // Break caught: duplicate tombstones make the manifest's delete set
+        // non-canonical and conceal corruption during recovery.
+        let dir = temp_dir("recovery-duplicate-tombstone");
+        let ds = Dataset::create(&dir, test_schema()).unwrap();
+        let mut txn = ds.begin();
+        txn.insert(
+            RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![7]))]).unwrap(),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+
+        let mut corrupt = (*ds.snapshot().manifest).clone();
+        corrupt.version += 1;
+        corrupt.tombstones = vec![0, 0];
+        commit_manifest(&dir, &corrupt).unwrap();
+
+        let Err(error) = Dataset::open(&dir) else {
+            panic!("recovery must reject a duplicated tombstone");
+        };
+        assert!(
+            matches!(error, TxnError::Storage(strata_storage::StorageError::CorruptManifest(_, ref reason)) if reason.contains("appears more than once")),
+            "recovery must reject a duplicated tombstone: {error:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn recovery_rejects_duplicate_zero_row_data_file_entry() {
+        // Break caught: zero-row files contribute no ownership IDs, so row
+        // ownership validation alone cannot detect a repeated manifest entry.
+        let dir = temp_dir("recovery-duplicate-zero-row-file");
+        let schema = test_schema();
+        let ds = Dataset::create(&dir, Arc::clone(&schema)).unwrap();
+        let empty =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(Vec::<i64>::new()))])
+                .unwrap();
+        let mut txn = ds.begin();
+        txn.insert(empty).unwrap();
+        txn.commit().unwrap();
+
+        let mut corrupt = (*ds.snapshot().manifest).clone();
+        assert_eq!(corrupt.data_files[0].row_count, 0);
+        corrupt.version += 1;
+        corrupt.data_files.push(corrupt.data_files[0].clone());
+        commit_manifest(&dir, &corrupt).unwrap();
+
+        let Err(error) = Dataset::open(&dir) else {
+            panic!("recovery must reject duplicate data-file names even when they own zero rows");
+        };
+        assert!(
+            matches!(error, TxnError::Storage(strata_storage::StorageError::CorruptManifest(_, ref reason)) if reason.contains("appears more than once")),
+            "recovery must reject duplicate data-file names even when they own zero rows: {error:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn recovery_rejects_duplicate_vector_ids_across_distinct_segments() {
+        // Break caught: a duplicated vector row ID yields two searchable
+        // graph nodes for one physical row, breaking row/vector identity.
+        let dir = temp_dir("recovery-duplicate-vector-row-id");
+        let ds = Dataset::create(&dir, vector_test_schema()).unwrap();
+        let mut txn = ds.begin();
+        txn.insert(vector_batch(vec![1], vec![[0.0, 0.0, 0.0]]))
+            .unwrap();
+        txn.commit().unwrap();
+
+        let mut corrupt = (*ds.snapshot().manifest).clone();
+        corrupt.version += 1;
+        let mut copied_segment = corrupt.segments[0].clone();
+        copied_segment.name = "duplicate-vector-row-id.seg".to_string();
+        std::fs::copy(
+            ds.data_dir().join(&corrupt.segments[0].name),
+            ds.data_dir().join(&copied_segment.name),
+        )
+        .unwrap();
+        corrupt.segments.push(copied_segment);
+        commit_manifest(&dir, &corrupt).unwrap();
+
+        let Err(error) = Dataset::open(&dir) else {
+            panic!("recovery must reject vector row IDs duplicated across segment files");
+        };
+        assert!(
+            matches!(error, TxnError::CorruptSegment(ref reason) if reason.contains("duplicate vector row_id")),
+            "recovery must reject vector row IDs duplicated across segment files: {error:?}"
         );
 
         std::fs::remove_dir_all(&dir).ok();

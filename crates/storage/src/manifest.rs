@@ -754,6 +754,89 @@ mod tests {
     }
 
     #[test]
+    fn read_current_rejects_a_manifest_with_a_mutated_checksum() {
+        // Break caught: accepting a manifest after its envelope checksum has
+        // changed would make recovery trust an unverified catalog payload.
+        let dir = temp_dataset_dir("mutated-checksum");
+        let manifest = Manifest::empty();
+        commit_manifest(&dir, &manifest).unwrap();
+        let path = manifest_path(&dir, manifest.version);
+        let mut envelope: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let checksum = envelope["checksum"].as_u64().unwrap();
+        envelope["checksum"] = serde_json::Value::from(checksum + 1);
+        fs::write(path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+
+        let result = read_current(&dir);
+        assert!(
+            matches!(result, Err(StorageError::CorruptManifest(_, ref reason)) if reason.contains("checksum")),
+            "recovery must reject a manifest whose checksum no longer matches its canonical payload: {result:?}"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn manifest_checksum_is_independent_of_map_insertion_order() {
+        // Break caught: serializing HashMap iteration order directly would
+        // make otherwise identical manifests produce unstable checksums.
+        let mut left_stats = HashMap::new();
+        left_stats.insert(
+            "z".to_string(),
+            ColumnStats {
+                min: Value::Int64(1),
+                max: Value::Int64(2),
+            },
+        );
+        left_stats.insert(
+            "a".to_string(),
+            ColumnStats {
+                min: Value::Int64(3),
+                max: Value::Int64(4),
+            },
+        );
+        let mut right_stats = HashMap::new();
+        right_stats.insert(
+            "a".to_string(),
+            ColumnStats {
+                min: Value::Int64(3),
+                max: Value::Int64(4),
+            },
+        );
+        right_stats.insert(
+            "z".to_string(),
+            ColumnStats {
+                min: Value::Int64(1),
+                max: Value::Int64(2),
+            },
+        );
+
+        let left = manifest(
+            0,
+            vec![DataFileEntry {
+                stats: left_stats,
+                ..data_file("rows.arrow")
+            }],
+        );
+        let right = manifest(
+            0,
+            vec![DataFileEntry {
+                stats: right_stats,
+                ..data_file("rows.arrow")
+            }],
+        );
+        let left_envelope = ManifestEnvelope::new(left).unwrap();
+        let right_envelope = ManifestEnvelope::new(right).unwrap();
+
+        assert_eq!(left_envelope.checksum, right_envelope.checksum);
+        assert_eq!(
+            canonical_envelope_bytes(&left_envelope).unwrap(),
+            canonical_envelope_bytes(&right_envelope).unwrap(),
+            "canonical JSON must recursively sort map keys before checksumming"
+        );
+    }
+
+    #[test]
     fn read_current_rejects_a_filename_payload_version_mismatch() {
         let dir = temp_dataset_dir("filename-payload-mismatch");
         let manifest = Manifest::empty();
