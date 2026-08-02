@@ -120,6 +120,8 @@ pub fn read_row_id_high_water_with_byte_count(dataset_dir: &Path) -> Result<RowI
 
         let path = dataset_dir.join(&meta.key);
         let bytes = backend.get(&meta.key)?;
+        #[cfg(feature = "test-fault-injection")]
+        test_support::run_after_row_id_read_hook(&bytes);
         bytes_read += u128::from(bytes.len() as u64);
         let recorded_end = decode_record(&path, &bytes)?;
         if recorded_end != end {
@@ -302,8 +304,35 @@ pub mod test_support {
     use std::marker::PhantomData;
     use std::rc::Rc;
 
+    #[cfg(feature = "test-fault-injection")]
+    type AfterRowIdReadHook = Box<dyn FnOnce(&[u8])>;
+
     thread_local! {
         static BEFORE_PUBLISH_FAILURE: RefCell<Option<io::ErrorKind>> = const { RefCell::new(None) };
+    }
+
+    #[cfg(feature = "test-fault-injection")]
+    thread_local! {
+        static AFTER_ROW_ID_READ_HOOK: RefCell<Option<AfterRowIdReadHook>> = const { RefCell::new(None) };
+    }
+
+    /// Installs a one-shot, thread-local hook that runs after a row-ID
+    /// reservation payload has been read from the backend.
+    ///
+    /// This seam exists only for dependent-crate tests that need to mutate
+    /// the catalog after recovery has received bytes but before it returns
+    /// its decoded accounting.
+    #[cfg(feature = "test-fault-injection")]
+    pub fn set_after_row_id_read_hook(hook: impl FnOnce(&[u8]) + 'static) {
+        AFTER_ROW_ID_READ_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    #[cfg(feature = "test-fault-injection")]
+    pub(super) fn run_after_row_id_read_hook(bytes: &[u8]) {
+        let hook = AFTER_ROW_ID_READ_HOOK.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook(bytes);
+        }
     }
 
     /// Thread-affine scoped pre-publication failure injection for the real

@@ -2,11 +2,13 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow::array::{FixedSizeListArray, Float32Array, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use strata_storage::{
-    read_current, read_row_id_high_water, read_row_id_high_water_with_byte_count,
+    persist_row_id_high_water_at_least, read_current, read_row_id_high_water,
+    read_row_id_high_water_with_byte_count, set_after_row_id_read_hook,
 };
 use strata_txn::Dataset;
 
@@ -113,6 +115,35 @@ fn recovery_accounting_for_an_empty_dataset_is_deterministic_and_exact() {
     assert_eq!(first.row_data_bytes, 0);
     assert_eq!(first.segment_bytes, 0);
     assert_accounting_matches_manifest_listed_files(&dir);
+}
+
+#[test]
+fn recovery_accounting_uses_the_row_id_payload_loaded_before_catalog_mutation() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("row-id-read-boundary");
+    let dataset = Dataset::create(&dir, id_schema()).unwrap();
+    drop(dataset);
+
+    let loaded_payload_bytes = Arc::new(AtomicU64::new(0));
+    let loaded_payload_bytes_from_hook = Arc::clone(&loaded_payload_bytes);
+    let hook_dir = dir.clone();
+    set_after_row_id_read_hook(move |bytes| {
+        loaded_payload_bytes_from_hook.store(bytes.len().try_into().unwrap(), Ordering::Relaxed);
+        assert_eq!(persist_row_id_high_water_at_least(&hook_dir, 1).unwrap(), 1);
+    });
+
+    let (_, accounting) = Dataset::open_with_recovery_accounting(&dir).unwrap();
+    let mutated_catalog = read_row_id_high_water_with_byte_count(&dir).unwrap();
+
+    assert_eq!(
+        accounting.row_id_catalog_bytes,
+        u128::from(loaded_payload_bytes.load(Ordering::Relaxed)),
+        "diagnostic accounting must report the payload that recovery loaded"
+    );
+    assert!(
+        mutated_catalog.bytes_read > accounting.row_id_catalog_bytes,
+        "the catalog mutation after the loader read must not change diagnostic accounting"
+    );
 }
 
 #[test]

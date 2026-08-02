@@ -54,3 +54,8 @@ test-fault-injection = ["strata-storage/test-fault-injection"]
 # depends on byte-identical replays, but don't enable this for a chaos-
 # harness workload that ever grows one.
 parallel-insert = []
+
+[[test]]
+name = "recovery_byte_accounting"
+path = "tests/recovery_byte_accounting.rs"
+required-features = ["test-fault-injection"]
