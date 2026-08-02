@@ -8221,15 +8221,14 @@ mod loom_tests {
     /// Only *spawned* threads can be sized (`loom::thread::Builder`); the
     /// model's own root thread always gets the 32 KiB default and loom
     /// exposes no way to change it. So the rule for these models is: the
-    /// root thread does setup and assertions only, and every `commit` runs
-    /// on a thread spawned through [`spawn_committer`].
+    /// root thread owns only the temporary path and assertions; every
+    /// `Dataset::create` and `commit` runs on a thread spawned through
+    /// [`spawn_committer`].
     ///
-    /// "Setup and assertions" is an empirical boundary, not a safe one. The
-    /// root still runs `Dataset::create` (serde_json serialize + write +
-    /// fsync, plus `new_hnsw_index`) and, in the residue model,
-    /// `Snapshot::vector_search` (HNSW candidate heaps at
+    /// Assertions are an empirical boundary, not a safe one. The root can
+    /// still run `Snapshot::vector_search` (HNSW candidate heaps at
     /// `EF_SEARCH_DEFAULT`) — the same *class* of work that just overran 32
-    /// KiB, only smaller. Those two are the next suspects if a model here
+    /// KiB, only smaller. That work is the next suspect if a model here
     /// ever exits 139 again.
     ///
     /// **Spawning is not free: loom caps threads at 5 *created* per
@@ -8241,20 +8240,22 @@ mod loom_tests {
     /// per `#[test]` (each `loom::model` closure gets its own count, not a
     /// crate-wide total), but every commit-running model here still has to
     /// budget against it independently: the two `two_threads_deleting_*`
-    /// models sit at 4 of 5 (root + setup + 2 racing threads);
+    /// models sit at the cap, 5 of 5 (root + create + setup + 2 racing
+    /// threads);
     /// `a_failed_commits_segment_is_never_searchable_under_concurrent_commits`
-    /// sits at the cap itself, 5 of 5 (root + seed + failing + succeeding +
-    /// final);
+    /// sits at the cap itself, 5 of 5 (root + combined create/seed + failing
+    /// + succeeding + final);
     /// `concurrent_first_vector_commits_at_different_dimensions_are_not_both_accepted`
-    /// sits at 3 of 5 (root + the two racing committers);
+    /// sits at 4 of 5 (root + create + the two racing committers);
     /// `a_failed_commits_segment_is_never_visible_to_a_concurrent_reader` sits
-    /// at 4 of 5 (root + seed + failing + a reader racing it directly, rather
+    /// at 4 of 5 (root + combined create/seed + failing + a reader racing it directly, rather
     /// than another committer — the seed was added by Task 10 to make its
     /// search assertion non-vacuous, see that test's own doc comment);
     /// `a_commits_row_and_its_segment_become_visible_as_one_atomic_step` sits
-    /// at 3 of 5 (root + a committer + a reader racing it directly);
+    /// at 4 of 5 (root + create + a committer + a reader racing it directly);
     /// `a_reader_never_sees_one_in_flight_commits_row_while_observing_an_unrelated_commits_row_id_counter`
-    /// ("Model 3") sits at 4 of 5 (root + committer_a + committer_b + reader).
+    /// ("Model 3") sits at the cap, 5 of 5 (root + create + committer_a +
+    /// committer_b + reader).
     /// One more `spawn_committer` in any model already at the cap trips an
     /// assert inside loom, so a commit that only needs the stack — not the
     /// concurrency — still costs a hard-capped slot.
@@ -8317,6 +8318,33 @@ mod loom_tests {
         ]))
     }
 
+    /// Creates a dataset on a sized loom thread: `Dataset::create` performs
+    /// the same serialization, filesystem, and index setup work that overflows
+    /// loom's root coroutine stack.
+    fn create_dataset(
+        dir: std::path::PathBuf,
+        schema: StdArc<arrow::datatypes::Schema>,
+    ) -> crate::Dataset {
+        spawn_committer(move || crate::Dataset::create(dir, schema))
+            .join()
+            .expect("loom dataset creation thread panicked")
+            .expect("loom dataset creation failed")
+    }
+
+    /// Creates the dataset and installs the seed in one sized thread so the
+    /// seeded models retain their existing five-thread loom budget.
+    fn create_seeded_vector_dataset(dir: std::path::PathBuf) -> crate::Dataset {
+        spawn_committer(move || {
+            let ds = crate::Dataset::create(dir, loom_vector_schema()).unwrap();
+            let mut seed = ds.begin();
+            seed.insert(loom_vector_batch(0, &[0.0, 0.0, 0.0])).unwrap();
+            seed.commit().unwrap();
+            ds
+        })
+        .join()
+        .expect("loom dataset creation and seed thread panicked")
+    }
+
     #[test]
     fn one_writer_store_races_safely_with_many_readers_load() {
         loom::model(|| {
@@ -8360,7 +8388,7 @@ mod loom_tests {
                 .tempdir()
                 .unwrap()
                 .keep();
-            let ds = crate::Dataset::create(&dir, test_schema()).unwrap();
+            let ds = create_dataset(dir.clone(), test_schema());
             let schema = StdArc::new(arrow::datatypes::Schema::new(vec![
                 arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
             ]));
@@ -8430,7 +8458,7 @@ mod loom_tests {
                 .tempdir()
                 .unwrap()
                 .keep();
-            let ds = crate::Dataset::create(&dir, test_schema()).unwrap();
+            let ds = create_dataset(dir.clone(), test_schema());
             let schema = StdArc::new(arrow::datatypes::Schema::new(vec![
                 arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
             ]));
@@ -8508,8 +8536,8 @@ mod loom_tests {
         arrow::array::RecordBatch::try_new(schema, vec![ids, vectors]).unwrap()
     }
 
-    /// One row, no `"vector"` column — so `build_vector_inserts` yields no
-    /// entries. Its null `vector` has the owned 3D type, so validation
+    /// One row with an owned-schema nullable `vector` column containing a
+    /// null value, so `build_vector_inserts` yields no entries. Validation
     /// passes while the commit does zero HNSW work and still claims a row-id.
     /// Used for the committers whose only job here is to move the counter,
     /// keeping the loom model small enough to explore.
@@ -8603,23 +8631,13 @@ mod loom_tests {
                 .tempdir()
                 .unwrap()
                 .keep();
-            let ds = crate::Dataset::create(&dir, loom_vector_schema()).unwrap();
+            let ds = create_seeded_vector_dataset(dir.clone());
 
             // Seed: one durable, vector-carrying commit, run to completion
             // *before* the racing pair below — see this test's doc comment
-            // for why the assertions are vacuous without it. Spawned (and
-            // joined immediately, so the schedule below is unaffected) for
-            // the stack, not the concurrency: the root thread's 32 KiB
-            // cannot hold a `commit` (see `COMMIT_STACK_SIZE`).
-            let ds_seed = ds.clone();
-            spawn_committer(move || {
-                let mut seed = ds_seed.begin();
-                seed.insert(loom_vector_batch(0, &[0.0, 0.0, 0.0])).unwrap();
-                seed.commit()
-            })
-            .join()
-            .unwrap()
-            .unwrap();
+            // The helper performs creation and this commit on one sized
+            // thread before the racing pair, preserving the five-thread
+            // budget without changing the schedule below.
 
             let ds_failing = ds.clone();
             let ds_ok = ds.clone();
@@ -8755,7 +8773,7 @@ mod loom_tests {
         // `vector_search`, per Finding 1) and never both failing (which
         // would mean no dimension was ever established at all).
         //
-        // Budget: this model spawns 2 committers (+ root) = 3 of loom's
+        // Budget: root + create + 2 committers = 4 of loom's
         // 5-created-threads-per-execution cap — see [`spawn_committer`]'s
         loom::model(|| {
             let dir = tempfile::Builder::new()
@@ -8767,7 +8785,7 @@ mod loom_tests {
                 .tempdir()
                 .unwrap()
                 .keep();
-            let ds = crate::Dataset::create(&dir, loom_vector_schema()).unwrap();
+            let ds = create_dataset(dir.clone(), loom_vector_schema());
             assert_eq!(
                 ds.snapshot().index.established_dimension(),
                 0,
@@ -8899,8 +8917,9 @@ mod loom_tests {
         // committer model never exercises.
         //
         // Deliberately minimal per §5's flagged risk: one seed row plus one
-        // row from the failing commit, dim 3. Budget: root + seed + failing
-        // + reader = 4 of loom's 5-created-threads-per-execution cap.
+        // row from the failing commit, dim 3. Budget: root + combined
+        // create/seed + failing + reader = 4 of loom's
+        // 5-created-threads-per-execution cap.
         static EXECUTIONS_EXPLORED: std::sync::atomic::AtomicUsize =
             std::sync::atomic::AtomicUsize::new(0);
 
@@ -8916,23 +8935,13 @@ mod loom_tests {
                 .tempdir()
                 .unwrap()
                 .keep();
-            let ds = crate::Dataset::create(&dir, loom_vector_schema()).unwrap();
+            let ds = create_seeded_vector_dataset(dir.clone());
 
             // Seed: one durable, vector-carrying commit, run to completion
             // *before* the racing pair below -- see this test's doc comment
-            // for why the assertions are vacuous without it. Spawned (and
-            // joined immediately, so the schedule below is unaffected) for
-            // the stack, not the concurrency -- the root thread's 32 KiB
-            // cannot hold a `commit` (see `COMMIT_STACK_SIZE`).
-            let ds_seed = ds.clone();
-            spawn_committer(move || {
-                let mut seed = ds_seed.begin();
-                seed.insert(loom_vector_batch(0, &[0.0, 0.0, 0.0])).unwrap();
-                seed.commit()
-            })
-            .join()
-            .unwrap()
-            .unwrap();
+            // The helper performs creation and this commit on one sized
+            // thread before the racing pair, preserving the five-thread
+            // budget without changing the schedule below.
 
             let version_before = ds.snapshot().version;
 
@@ -9073,7 +9082,7 @@ mod loom_tests {
         // exercising B's read on both sides of A's atomic publish, not just
         // replaying whichever side happens to run first.
         //
-        // Budget: root + writer + reader = 3 of loom's
+        // Budget: root + create + writer + reader = 4 of loom's
         // 5-created-threads-per-execution cap.
         static DISTINCT_VERSIONS_OBSERVED: std::sync::atomic::AtomicU8 =
             std::sync::atomic::AtomicU8::new(0);
@@ -9088,7 +9097,7 @@ mod loom_tests {
                 .tempdir()
                 .unwrap()
                 .keep();
-            let ds = crate::Dataset::create(&dir, loom_vector_schema()).unwrap();
+            let ds = create_dataset(dir.clone(), loom_vector_schema());
 
             let ds_writer = ds.clone();
             let writer = spawn_committer(move || {
@@ -9201,8 +9210,8 @@ mod loom_tests {
         // -- disjoint rows, so both always succeed regardless of
         // interleaving, and a hit for either is unambiguous.
         //
-        // Budget: root + committer_a + committer_b + reader = 4 of loom's
-        // 5-created-threads-per-execution cap.
+        // Budget: root + create + committer_a + committer_b + reader = 5 of
+        // loom's 5-created-threads-per-execution cap.
         //
         // **Preemption-bounded at 3, deliberately not exhaustive -- a
         // scoped exception for this one model.** Every other model in this
@@ -9262,7 +9271,7 @@ mod loom_tests {
                 .tempdir()
                 .unwrap()
                 .keep();
-            let ds = crate::Dataset::create(&dir, loom_vector_schema()).unwrap();
+            let ds = create_dataset(dir.clone(), loom_vector_schema());
 
             let ds_a = ds.clone();
             let committer_a = spawn_committer(move || {
