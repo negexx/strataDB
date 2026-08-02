@@ -160,8 +160,12 @@ commits, direct before/after comparison from the synchronized revisions, and art
 
 - `crates/storage/src/datafile.rs`
 - `crates/storage/src/manifest.rs`
+- `crates/storage/src/row_id_high_water.rs` when the diagnostic must account for bytes at the
+  row-ID load boundary
 - `crates/storage/src/lib.rs` only for an existing public diagnostic boundary
 - `crates/txn/src/dataset.rs`
+- `crates/txn/Cargo.toml` only for forwarding the existing storage test-fault-injection feature
+  to a deterministic recovery-accounting regression
 - `crates/storage/tests/*` and `crates/txn/tests/*` for regression/evidence tests
 - `bench/benches/lifecycle_bench.rs`
 - `bench/cloud-performance/run.sh`
