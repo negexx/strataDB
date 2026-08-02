@@ -36,6 +36,14 @@ pub enum TxnError {
     #[error("manifest arithmetic would overflow: {0}")]
     ManifestOverflow(String),
     #[error(
+        "row-id reservation through {end} may be visible but its durable confirmation failed: {source}"
+    )]
+    RowIdReservationDurability {
+        end: u64,
+        #[source]
+        source: strata_storage::StorageError,
+    },
+    #[error(
         "manifest declares an unreasonably large row-id capacity ({0}); maximum allowed is {1}"
     )]
     UnreasonableCapacity(u64, u64),
@@ -96,6 +104,14 @@ mod tests {
         assert_eq!(
             TxnError::UnreasonableCapacity(5_000_000_000, 1_000_000_000).to_string(),
             "manifest declares an unreasonably large row-id capacity (5000000000); maximum allowed is 1000000000"
+        );
+        assert_eq!(
+            TxnError::RowIdReservationDurability {
+                end: 7,
+                source: strata_storage::StorageError::Io(std::io::Error::other("sync failed")),
+            }
+            .to_string(),
+            "row-id reservation through 7 may be visible but its durable confirmation failed: I/O error: sync failed"
         );
         assert_eq!(
             TxnError::UnsafeManifestPath("../escape".to_string()).to_string(),

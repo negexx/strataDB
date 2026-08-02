@@ -31,7 +31,8 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use strata_index::{EfConstruction, HnswIndex, MaxConnections, MaxElements, MaxLayers};
 use strata_storage::{
     ColumnStats, DataFileEntry, Manifest, SegmentEntry, Value, commit_manifest, compute_stats,
-    read_batch, read_current, sync_dir, write_batch, write_bytes,
+    initialize_row_id_high_water, read_batch, read_current, read_row_id_high_water, sync_dir,
+    write_batch, write_bytes,
 };
 
 use crate::commit_log::{CommitLog, ConflictCheck};
@@ -378,9 +379,14 @@ impl Dataset {
         }
         sync_dataset_directory_anchor(&dir)?;
         let manifest = Manifest::empty_with_schema(schema.as_ref());
+        initialize_row_id_high_water(&dir)?;
         commit_manifest(&dir, &manifest)?;
         let last_issued_timestamp = Arc::new(AtomicI64::new(manifest.commit_time_high_water));
-        let row_ids = Arc::new(RowIdAllocator::new(manifest.next_row_id));
+        let durable_high_water = read_row_id_high_water(&dir)?.unwrap_or(0);
+        let row_ids = Arc::new(RowIdAllocator::new(
+            dir.clone(),
+            manifest.next_row_id.max(durable_high_water),
+        ));
         let write_attempt_counter = Arc::new(AtomicU64::new(manifest.next_attempt_id));
         let snapshot = Snapshot {
             dir: dir.clone(),
@@ -452,9 +458,11 @@ impl Dataset {
         // an allocation from it any more, but the ceiling is still a
         // panic-safety bound on what row-ids may reach `NodeTable` — see
         // `MAX_REASONABLE_ROW_ID_CAPACITY`.
-        if manifest.next_row_id > MAX_REASONABLE_ROW_ID_CAPACITY {
+        let durable_high_water = read_row_id_high_water(&dir)?.unwrap_or(0);
+        let allocation_floor = manifest.next_row_id.max(durable_high_water);
+        if allocation_floor > MAX_REASONABLE_ROW_ID_CAPACITY {
             return Err(TxnError::UnreasonableCapacity(
-                manifest.next_row_id,
+                allocation_floor,
                 MAX_REASONABLE_ROW_ID_CAPACITY,
             ));
         }
@@ -465,7 +473,7 @@ impl Dataset {
         // tombstone entries went away with the delta log, and never had a
         // producer on the commit path anyway.
         let tombstones: imbl::HashSet<u64> = manifest.tombstones.iter().copied().collect();
-        let row_ids = Arc::new(RowIdAllocator::new(manifest.next_row_id));
+        let row_ids = Arc::new(RowIdAllocator::new(dir.clone(), allocation_floor));
         // The real fix for the cross-session filename-collision bug: seed
         // from the persisted `manifest.next_attempt_id`, not 0. Without
         // this, a reopened dataset would regenerate the same
@@ -2578,6 +2586,141 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    #[test]
+    fn create_persists_the_initial_immutable_row_id_high_water_record() {
+        // COR-02 / CONC-03: the initial allocation floor must exist before
+        // create acknowledges the dataset, rather than being reconstructed
+        // solely from a later manifest.
+        let dir = temp_dir("initial-row-id-high-water");
+
+        Dataset::create(&dir, test_schema()).unwrap();
+
+        let record = dir
+            .join("_meta")
+            .join("row-id-high-water")
+            .join("00000000000000000000.reservation");
+        assert!(
+            record.is_file(),
+            "create must publish the immutable zero high-water record before acknowledgement"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(feature = "test-fault-injection")]
+    #[test]
+    fn a_pre_publish_reservation_failure_writes_no_row_file_and_leaves_the_range_reusable() {
+        // The failure occurs before the immutable record is linked into
+        // place, so the transaction never receives a range and the next
+        // successful transaction may claim the same initial id.
+        let dir = temp_dir("row-id-reservation-before-publish");
+        let ds = Dataset::create(&dir, test_schema()).unwrap();
+
+        let mut failing = ds.begin();
+        failing
+            .insert(
+                RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![1_i64]))])
+                    .unwrap(),
+            )
+            .unwrap();
+        let fault =
+            strata_storage::row_id_high_water::test_support::fail_reservation_before_publish(
+                std::io::ErrorKind::Other,
+            );
+
+        let error = failing.commit().unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("injected row-id reservation publication failure"),
+            "the failure must be returned from the reservation boundary, got {error:?}"
+        );
+        assert!(
+            ds.data_files().is_empty(),
+            "the failed claim must not publish a manifest entry"
+        );
+        assert!(
+            std::fs::read_dir(ds.data_dir()).unwrap().next().is_none(),
+            "a pre-publication reservation failure must happen before any row file is written"
+        );
+        drop(fault);
+
+        let mut retry = ds.begin();
+        retry
+            .insert(
+                RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![2_i64]))])
+                    .unwrap(),
+            )
+            .unwrap();
+        retry.commit().unwrap();
+        assert_eq!(ds.data_files()[0].row_id_range, Some((0, 0)));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(feature = "test-fault-injection")]
+    #[test]
+    fn a_post_publish_reservation_sync_failure_returns_a_typed_error_and_consumes_the_range() {
+        // `put_if_absent` has linked the immutable end record before it
+        // asks the directory to synchronize. That error is uncertain, so
+        // this process must retain the range as a gap rather than hand it to
+        // the retrying transaction.
+        let dir = temp_dir("row-id-reservation-after-publish");
+        let ds = Dataset::create(&dir, test_schema()).unwrap();
+
+        let mut failing = ds.begin();
+        failing
+            .insert(
+                RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![1_i64]))])
+                    .unwrap(),
+            )
+            .unwrap();
+        let fault = strata_storage::datafile::test_support::fail_directory_sync_on_call(
+            1,
+            std::io::ErrorKind::Other,
+        );
+
+        let error = failing.commit().unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                TxnError::RowIdReservationDurability {
+                    end: 1,
+                    source: strata_storage::StorageError::Io(ref source),
+                } if source.kind() == std::io::ErrorKind::Other
+            ),
+            "the post-publication failure must retain its typed uncertainty and I/O kind"
+        );
+        assert!(
+            ds.data_files().is_empty(),
+            "the failed claim must not publish a row"
+        );
+        assert!(
+            std::fs::read_dir(ds.data_dir()).unwrap().next().is_none(),
+            "reservation durability must fail before any row file is written"
+        );
+        assert_eq!(
+            strata_storage::read_row_id_high_water(&dir).unwrap(),
+            Some(1),
+            "the linked reservation end remains a non-reusable floor"
+        );
+        drop(fault);
+
+        let mut retry = ds.begin();
+        retry
+            .insert(
+                RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![2_i64]))])
+                    .unwrap(),
+            )
+            .unwrap();
+        retry.commit().unwrap();
+        assert_eq!(ds.data_files()[0].row_id_range, Some((1, 1)));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[cfg(feature = "test-fault-injection")]
     #[test]
     fn create_syncs_only_its_preexisting_parent_bottom_up() {
@@ -2595,6 +2738,9 @@ mod tests {
         let expected = vec![
             dir.clone(),
             parent.clone(),
+            dir.join("_meta").join("row-id-high-water"),
+            dir.join("_meta"),
+            dir.clone(),
             dir.join("_versions"),
             dir.clone(),
         ];
@@ -2669,6 +2815,9 @@ mod tests {
         let expected = vec![
             dir.clone(),
             parent.clone(),
+            dir.join("_meta").join("row-id-high-water"),
+            dir.join("_meta"),
+            dir.clone(),
             dir.join("_versions"),
             dir.clone(),
         ];
@@ -2690,7 +2839,7 @@ mod tests {
         let parent = temp_dir("create-final-directory-sync-failure-parent");
         let dir = parent.join("dataset");
         let _fault = strata_storage::datafile::test_support::fail_directory_sync_on_call(
-            4,
+            7,
             std::io::ErrorKind::Other,
         );
 
@@ -2726,7 +2875,8 @@ mod tests {
     fn concurrent_claims_hand_out_non_overlapping_ranges() {
         use crate::row_id::RowIdAllocator;
 
-        let allocator = RowIdAllocator::new(0);
+        let dir = temp_dir("concurrent-row-id-claims");
+        let allocator = RowIdAllocator::new(&dir, 0);
         let claims: Vec<_> = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..8)
                 .map(|_| scope.spawn(|| allocator.claim(10).unwrap()))
@@ -2749,6 +2899,7 @@ mod tests {
             80,
             "the counter must cover every id handed out"
         );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// C1: the guard that a transaction's claimed row-id range exactly
@@ -7335,6 +7486,50 @@ mod tests {
     }
 
     #[test]
+    fn reopening_after_a_failed_manifest_commit_does_not_reuse_the_abandoned_row_id() {
+        // COR-02 / CONC-03: a row-id claim is made before the manifest is
+        // published. If that publication fails and the process later
+        // restarts, the next committed row must start after the abandoned
+        // physical id rather than trusting the stale manifest watermark.
+        let dir = temp_dir("row-id-high-water-restart-non-reuse");
+        let ds = Dataset::create(&dir, test_schema()).unwrap();
+
+        let mut abandoned = ds.begin();
+        abandoned
+            .insert(
+                RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![1_i64]))])
+                    .unwrap(),
+            )
+            .unwrap();
+        abandoned.inject_manifest_commit_failure();
+        assert!(
+            abandoned.commit().is_err(),
+            "the injected manifest failure must abandon a claimed range"
+        );
+        drop(ds);
+
+        let reopened = Dataset::open(&dir).unwrap();
+        let mut committed = reopened.begin();
+        committed
+            .insert(
+                RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![2_i64]))])
+                    .unwrap(),
+            )
+            .unwrap();
+        committed.commit().unwrap();
+
+        let entries = reopened.data_files();
+        assert_eq!(entries.len(), 1, "only the post-restart commit is visible");
+        assert_eq!(
+            entries[0].row_id_range,
+            Some((1, 1)),
+            "the durable allocator high-water must keep row-id 0 permanently abandoned"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn a_concurrent_reader_never_sees_an_in_flight_commits_vector() {
         // Regression test for the snapshot-isolation window spec §2 rules
         // out: "a transaction's writes are never visible to any other
@@ -8092,6 +8287,15 @@ mod loom_tests {
             .stack_size(COMMIT_STACK_SIZE)
             .spawn(f)
             .expect("loom thread spawn")
+    }
+
+    /// The ordinary unit-test fixture is compiled only with `cfg(test)`,
+    /// whereas loom models are built with `--cfg loom`. Keep their schema
+    /// fixture local so the loom test binary remains self-contained.
+    fn test_schema() -> StdArc<arrow::datatypes::Schema> {
+        StdArc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+        ]))
     }
 
     #[test]

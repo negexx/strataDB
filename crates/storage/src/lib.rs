@@ -7,6 +7,7 @@ pub mod datafile;
 pub mod encoding;
 pub mod error;
 pub mod manifest;
+pub mod row_id_high_water;
 pub mod stats;
 
 pub use arrow;
@@ -20,5 +21,9 @@ pub use error::{Result, StorageError};
 pub use manifest::{
     DataFileEntry, MANIFEST_FORMAT_VERSION, Manifest, ManifestEnvelope, SegmentEntry,
     commit_manifest, read_current,
+};
+pub use row_id_high_water::{
+    HighWaterPersistenceError, ROW_ID_HIGH_WATER_PREFIX, initialize_row_id_high_water,
+    persist_row_id_high_water_at_least, read_row_id_high_water,
 };
 pub use stats::{ColumnStats, Value, compute_stats};
