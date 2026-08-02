@@ -8220,10 +8220,10 @@ mod loom_tests {
     ///
     /// Only *spawned* threads can be sized (`loom::thread::Builder`); the
     /// model's own root thread always gets the 32 KiB default and loom
-    /// exposes no way to change it. So the rule for these models is: the
-    /// root thread owns only the temporary path and assertions; every
-    /// `Dataset::create` and `commit` runs on a thread spawned through
-    /// [`spawn_committer`].
+    /// exposes no way to change it. So the rule for these models is:
+    /// `Dataset::create` and `Transaction::commit` run on sized threads
+    /// spawned through [`spawn_committer`]; root models may still take
+    /// snapshots, run vector searches, and make assertions.
     ///
     /// Assertions are an empirical boundary, not a safe one. The root can
     /// still run `Snapshot::vector_search` (HNSW candidate heaps at
