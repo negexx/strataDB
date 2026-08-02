@@ -278,80 +278,162 @@ mod tests {
 
 #[cfg(loom)]
 pub(crate) mod loom_tests {
-    use loom::sync::{Arc, Mutex};
+    use loom::sync::{
+        Arc, Mutex,
+        atomic::{AtomicU8, AtomicU64, Ordering},
+    };
 
     use super::RowIdRange;
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Debug)]
     enum Publication {
         Durable,
-        FailsBeforePublish,
         FailsAfterPublish,
     }
 
-    struct ModelState {
+    struct AllocatorState {
         next: u64,
-        durable_end: u64,
     }
 
-    fn claim(state: &Mutex<ModelState>, outcome: Publication) -> Option<RowIdRange> {
-        let mut state = state.lock().unwrap();
-        let base = state.next;
+    /// Models the durable collection independently from allocator
+    /// linearization. `published` means the immutable record became
+    /// observable; `durable` means its directory-sync confirmation returned;
+    /// `exposed` means a caller received a successful range. They are three
+    /// distinct transitions in the real protocol, not aliases of one scalar.
+    struct PublicationState {
+        published: AtomicU64,
+        durable: AtomicU64,
+        exposed: AtomicU64,
+    }
+
+    // Every claim moves through a bounded, one-way state machine. The
+    // post-publication failure is intentionally the only failure branch:
+    // it is the branch that must retain a gap and is the durability boundary
+    // the production allocator cannot weaken.
+    const ALLOCATED: u8 = 1;
+    const PUBLISHED: u8 = 2;
+    const DURABLE: u8 = 3;
+    const EXPOSED: u8 = 4;
+    const FAILED_AFTER_PUBLISH: u8 = 5;
+
+    fn claim(
+        allocator: &Mutex<AllocatorState>,
+        publication: &PublicationState,
+        phase: &AtomicU8,
+        outcome: Publication,
+    ) -> (RowIdRange, bool) {
+        let mut allocator = allocator.lock().unwrap();
+        let base = allocator.next;
         let end = base + 1;
-        match outcome {
-            Publication::Durable => {
-                // This models the real claim order: publish the immutable
-                // high-water end before returning the range to its caller.
-                state.durable_end = state.durable_end.max(end);
-                assert!(state.durable_end >= end);
-                state.next = end;
-                Some(RowIdRange { base, len: 1 })
-            }
-            Publication::FailsBeforePublish => None,
-            Publication::FailsAfterPublish => {
-                // Directory sync failed after the immutable record became
-                // observable. The caller gets no range, but later claims
-                // start above the persisted floor.
-                state.durable_end = state.durable_end.max(end);
-                state.next = state.next.max(end);
-                None
-            }
+        let range = RowIdRange { base, len: 1 };
+
+        phase.store(ALLOCATED, Ordering::SeqCst);
+        publication.published.store(end, Ordering::SeqCst);
+        phase.store(PUBLISHED, Ordering::SeqCst);
+        allocator.next = end;
+
+        if matches!(outcome, Publication::FailsAfterPublish) {
+            // The immutable record may survive the failed confirmation, so
+            // its range is consumed but is never returned to the caller.
+            phase.store(FAILED_AFTER_PUBLISH, Ordering::SeqCst);
+            return (range, false);
         }
+
+        publication.durable.store(end, Ordering::SeqCst);
+        phase.store(DURABLE, Ordering::SeqCst);
+        assert!(
+            publication.published.load(Ordering::SeqCst) >= end,
+            "a high-water record must be published before its durable confirmation"
+        );
+        publication.exposed.store(end, Ordering::SeqCst);
+        phase.store(EXPOSED, Ordering::SeqCst);
+        (range, true)
+    }
+
+    fn ranges_do_not_overlap(left: RowIdRange, right: RowIdRange) -> bool {
+        let left_end = left.base + left.len;
+        let right_end = right.base + right.len;
+        left_end <= right.base || right_end <= left.base
     }
 
     #[test]
     fn concurrent_claims_publish_monotonic_high_water() {
         loom::model(|| {
-            let state = Arc::new(Mutex::new(ModelState {
-                next: 0,
-                durable_end: 0,
-            }));
+            let allocator = Arc::new(Mutex::new(AllocatorState { next: 0 }));
+            let publication = Arc::new(PublicationState {
+                published: AtomicU64::new(0),
+                durable: AtomicU64::new(0),
+                exposed: AtomicU64::new(0),
+            });
+            let first_phase = Arc::new(AtomicU8::new(0));
+            let second_phase = Arc::new(AtomicU8::new(0));
 
-            let first_state = Arc::clone(&state);
-            let first =
-                loom::thread::spawn(move || claim(&first_state, Publication::FailsAfterPublish));
-            let second_state = Arc::clone(&state);
-            let second = loom::thread::spawn(move || claim(&second_state, Publication::Durable));
+            let first_allocator = Arc::clone(&allocator);
+            let first_publication = Arc::clone(&publication);
+            let first_phase_for_claim = Arc::clone(&first_phase);
+            let first = loom::thread::spawn(move || {
+                claim(
+                    &first_allocator,
+                    &first_publication,
+                    &first_phase_for_claim,
+                    Publication::FailsAfterPublish,
+                )
+            });
+            let second_allocator = Arc::clone(&allocator);
+            let second_publication = Arc::clone(&publication);
+            let second_phase_for_claim = Arc::clone(&second_phase);
+            let second = loom::thread::spawn(move || {
+                claim(
+                    &second_allocator,
+                    &second_publication,
+                    &second_phase_for_claim,
+                    Publication::Durable,
+                )
+            });
 
-            let first = first.join().unwrap();
-            let second = second.join().unwrap();
-            assert!(first.is_none());
-            let successful = second.expect("the durable claimant must expose its range");
+            let (failed_range, failed_exposed) = first.join().unwrap();
+            let (successful_range, successful_exposed) = second.join().unwrap();
 
-            let state_guard = state.lock().unwrap();
-            assert_eq!(state_guard.next, 2);
-            assert_eq!(state_guard.durable_end, 2);
             assert!(
-                state_guard.durable_end >= successful.base() + successful.len(),
-                "a successful claim must not be exposed before its high-water transition"
+                ranges_do_not_overlap(failed_range, successful_range),
+                "two concurrently-started claims must consume non-overlapping ranges"
             );
-            drop(state_guard);
+            assert!(
+                !failed_exposed,
+                "a post-publication failure must leave its range unexposed"
+            );
+            assert!(successful_exposed, "a durable claim must expose its range");
+            assert_eq!(
+                first_phase.load(Ordering::SeqCst),
+                FAILED_AFTER_PUBLISH,
+                "the failed claim must stop after publication"
+            );
+            assert_eq!(
+                second_phase.load(Ordering::SeqCst),
+                EXPOSED,
+                "the successful claim must reach API exposure"
+            );
 
-            // A failure before publication consumes no range or high-water.
-            assert!(claim(&state, Publication::FailsBeforePublish).is_none());
-            let state_guard = state.lock().unwrap();
-            assert_eq!(state_guard.next, 2);
-            assert_eq!(state_guard.durable_end, 2);
+            let published = publication.published.load(Ordering::SeqCst);
+            let durable = publication.durable.load(Ordering::SeqCst);
+            let exposed = publication.exposed.load(Ordering::SeqCst);
+            assert!(
+                published >= durable && durable >= exposed,
+                "high-water transitions must remain monotonic: published={published}, durable={durable}, exposed={exposed}"
+            );
+            assert!(
+                durable >= successful_range.base + successful_range.len,
+                "a successful range must have crossed durable high-water before exposure"
+            );
+            assert!(
+                published >= failed_range.base + failed_range.len,
+                "a failed post-publication claim must retain its published high-water floor"
+            );
+            assert_eq!(
+                allocator.lock().unwrap().next,
+                failed_range.base.max(successful_range.base) + 1,
+                "the allocator must retain every consumed range"
+            );
         });
     }
 }

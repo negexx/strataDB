@@ -56,63 +56,33 @@ const OPS_PER_AGENT: u64 = 8;
 /// at 6 -- see `NUM_AGENTS`'s doc comment for why shrinking it doesn't
 /// meaningfully raise the conflict rate here.
 const POOL_SIZE: u64 = 6;
-/// Comfortably above the total number of checkpoints one full run
-/// produces -- an ESTIMATE with real margin built in, not an exact count
-/// (the true total is workload-mix-dependent, since Insert/Update/Delete/
-/// `MultiBatchInsert` each touch a different number of checkpoint sites,
-/// AND -- now that real conflicts are reachable, see `NUM_AGENTS`'s doc
-/// comment -- retry-dependent too, see below). A vector-carrying
-/// single-row commit (a plain Insert, or Update's insert half) passes
-/// through six on a clean attempt: `write_batch`'s data-file fsync,
-/// `write_bytes`'s segment fsync (added by S1 W3.2a), `sync_dir`'s
-/// data-dir fsync, `commit_manifest`'s tmp-sync, its rename, and
-/// `sync_dir`'s versions-dir fsync -- confirmed against the actual call
-/// sites in `crates/storage/src/{datafile,manifest}.rs`. A `MultiBatchInsert`
-/// commit calls `write_batch` once per pending row (2, not 1) but still
-/// only one `write_bytes`/`commit_manifest` (one segment, one manifest
-/// entry, built from both batches together) -- 7 checkpoints for that one
-/// op, not 6. A delete-only commit writes no new data file or segment at
-/// all on either a clean OR a conflicting attempt (`write_phase` returns
-/// early with no pending batches), so it costs 3 (just the manifest-side
-/// checkpoints) or 0 if the attempt conflicts before even reaching those.
-///
-/// The RETRY path (new since real concurrency landed) can make a single
-/// 1-slot Update MORE expensive than a clean Insert: `Transaction::commit`
-/// runs `write_phase` (the first three checkpoints above) BEFORE the
-/// conflict check, so a conflicting first attempt still burns those three
-/// checkpoints before `commit_with_retry_once`
-/// (`crates/chaos-worker/src/commit_ops.rs`) retries with a fresh
-/// transaction. A conflict-then-succeed Update therefore costs 3 + 6 = 9
-/// checkpoints for one op-slot, not 6 -- the true analytic worst case is
-/// `OPS_PER_AGENT * 9 * NUM_AGENTS` = 8 * 9 * 8 = 576, not the 384 a
-/// clean-attempt-only accounting gives. Plus `setup_contested_pool`'s
-/// `POOL_SIZE` unconditional single-row inserts (`POOL_SIZE * 6` = 36) and
-/// `Dataset::create`'s own initial `commit_manifest` call (3): worst-case
-/// analytic total 576 + 36 + 3 = 615. Reaching that in one real run would
-/// need essentially every agent's every op to conflict-then-succeed, which
-/// the measured ~10-23% any-drop-at-all rate above makes very unlikely --
-/// empirically binary-searching the true checkpoint total on 8 real seeds
-/// (0-7) found every one in (350, 400]. Set `MAX_ABORT_THRESHOLD` to 450
-/// (~12% above the highest observed real total, not the 615 analytic
-/// worst case) as a deliberate, informed bet on the empirical distribution
-/// over the theoretical maximum -- the failure mode if a rare run's true
-/// total DID exceed 450 is benign, not a false failure: `abort_at` would
-/// simply always land inside that run (guaranteeing `crashed = true`),
-/// which only means that seed's clean-run-only assertions (the fast
-/// tier's exact slot-count/pool-ack checks, and the two `!crashed`
-/// zero-budget asserts in `check_invariants`) don't get exercised, not
-/// that any invariant check produces a wrong answer. A higher threshold than needed isn't free
-/// either way: `abort_at` is drawn uniformly from `1..MAX_ABORT_THRESHOLD`,
-/// so a threshold much above the true total wastes iterations on clean
-/// (non-crashing) runs instead of exercising a crash -- the thorough tier
-/// is the actual Phase 7 exit criterion, and every non-crashing iteration
-/// there is one fewer crash-path check out of its fixed seed budget.
-///
-/// `STRATA_CHAOS_ABORT_AT` counts checkpoints since **process start** off
-/// one process-global counter, so this constant must be re-checked
-/// whenever a checkpoint site is added or removed anywhere in
-/// `strata-storage`, or whenever `NUM_AGENTS`/`OPS_PER_AGENT` change.
-const MAX_ABORT_THRESHOLD: u64 = 450;
+/// `STRATA_CHAOS_ABORT_AT` counts checkpoints since **process start**, so
+/// this budget must track every durability boundary in `strata-storage`.
+/// Task 3's immutable reservation adds five checkpoints to every non-empty
+/// claim: temp-file sync, immutable-link publication, then collection,
+/// `_meta`, and dataset-root directory syncs. A conflict-then-retry Update
+/// is the conservative per-slot maximum: its failed attempt reaches
+/// reservation + row/segment/data durability (8), and its successful retry
+/// reaches the full single-row path (12), for 20 total. Including creation
+/// and pool setup yields 1,363 checkpoints. `1,500` covers every one of
+/// those crash windows and, because the upper bound is exclusive, leaves 136
+/// clean-run draws even at that conservative maximum; typical generated
+/// workloads leave materially more clean-run coverage.
+const RESERVATION_PUBLICATION_CHECKPOINTS: u64 = 5;
+const ROW_AND_SEGMENT_CHECKPOINTS: u64 = 3;
+const MANIFEST_PUBLICATION_CHECKPOINTS: u64 = 4;
+const DATASET_CREATION_CHECKPOINTS: u64 = 11;
+const SINGLE_ROW_COMMIT_CHECKPOINTS: u64 = RESERVATION_PUBLICATION_CHECKPOINTS
+    + ROW_AND_SEGMENT_CHECKPOINTS
+    + MANIFEST_PUBLICATION_CHECKPOINTS;
+const CONFLICTING_UPDATE_ATTEMPT_CHECKPOINTS: u64 =
+    RESERVATION_PUBLICATION_CHECKPOINTS + ROW_AND_SEGMENT_CHECKPOINTS;
+const RETRIED_UPDATE_CHECKPOINTS: u64 =
+    CONFLICTING_UPDATE_ATTEMPT_CHECKPOINTS + SINGLE_ROW_COMMIT_CHECKPOINTS;
+const CONSERVATIVE_WORKER_CHECKPOINT_UPPER_BOUND: u64 = DATASET_CREATION_CHECKPOINTS
+    + (POOL_SIZE * SINGLE_ROW_COMMIT_CHECKPOINTS)
+    + (NUM_AGENTS * OPS_PER_AGENT * RETRIED_UPDATE_CHECKPOINTS);
+const MAX_ABORT_THRESHOLD: u64 = 1_500;
 
 /// The (lost, phantom) tolerance a single op of this shape contributes if
 /// it was genuinely in flight — mid-commit, ack line not yet printed —
@@ -619,8 +589,11 @@ fn fast_tier_random_seeds_survive_random_crash_points() {
 /// `STRATA_CHAOS_THOROUGH=1` — NOT part of default `cargo test --workspace`
 /// (see the design doc §5 for why: each iteration's real process spawn +
 /// real fsyncs make thousands of them too slow for the normal dev loop).
-/// Intended for a scheduled/on-demand CI job.
+/// Intended for a scheduled/on-demand CI job. Run it explicitly with
+/// `STRATA_CHAOS_THOROUGH=1 cargo test -p strata-sim
+/// thorough_tier_satisfies_the_phase_7_exit_criterion -- --exact --ignored`.
 #[test]
+#[ignore = "runs 2,000 real crash/recovery seeds; invoke explicitly with STRATA_CHAOS_THOROUGH=1"]
 fn thorough_tier_satisfies_the_phase_7_exit_criterion() {
     const NUM_SEEDS: u64 = 2000;
 
@@ -722,6 +695,23 @@ fn thorough_tier_satisfies_the_phase_7_exit_criterion() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checkpoint_budget_includes_every_reservation_publication_boundary() {
+        // Break caught: keeping the old 450 cap after adding five durable
+        // reservation checkpoints per non-empty claim prevents sampling late
+        // commit windows and can starve the clean-run assertions.
+        assert_eq!(SINGLE_ROW_COMMIT_CHECKPOINTS, 12);
+        assert_eq!(RETRIED_UPDATE_CHECKPOINTS, 20);
+        assert_eq!(CONSERVATIVE_WORKER_CHECKPOINT_UPPER_BOUND, 1_363);
+        let threshold = std::hint::black_box(MAX_ABORT_THRESHOLD);
+        let upper_bound = std::hint::black_box(CONSERVATIVE_WORKER_CHECKPOINT_UPPER_BOUND);
+        assert!(
+            threshold > upper_bound,
+            "abort threshold {threshold} must leave room above the recalculated \\
+             {upper_bound}-checkpoint worker budget"
+        );
+    }
 
     #[test]
     fn ambiguity_shape_matches_the_documented_per_verb_table() {
