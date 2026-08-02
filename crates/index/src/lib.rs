@@ -1,9 +1,11 @@
 //! HNSW vector index: a lock-free in-memory graph plus the immutable,
 //! self-contained on-disk segment format that graph is sealed into, one
-//! segment per committing transaction. See `.opencode/rules/vector-index.md`,
-//! `docs/design/phase-0-transaction-and-format-spec.md` §4/§6, and
-//! `docs/superpowers/specs/2026-07-24-s1-segment-format-w3-migration-design.md`
-//! §1 for the format.
+//! segment per committing transaction. See `docs/design.md`,
+//! and the historical design specification for background on the format.
+//!
+//! This is an internal implementation crate. The supported engine surface is
+//! `strata-txn`'s `Dataset`/`Snapshot`/`Transaction` facade; direct index access
+//! is not a transaction or row/index consistency API.
 
 pub mod brute_force;
 // `#[doc(hidden)] pub`, not a `internal-benchmarks` Cargo feature: an

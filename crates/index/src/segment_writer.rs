@@ -1,14 +1,13 @@
 //! Pure, in-memory serialization of a built HNSW graph into the on-disk
 //! segment format ([`crate::segment_format`]). **Zero file I/O and zero
 //! `strata-storage` dependency by design** — the crate-ownership decision
-//! recorded in `docs/superpowers/specs/2026-07-25-s1-w3-design-amendment.md`
-//! §4: `crates/index` produces the bytes, `crates/txn` writes and fsyncs
+//! reflected in `docs/design.md`: `crates/index` produces the bytes, `crates/txn` writes and fsyncs
 //! them through `strata_storage::write_bytes` (which carries the chaos
 //! checkpoint).
 //!
 //! The source graph is addressed by **segment-local ordinals `0..N`**, not
 //! global row-ids — see
-//! `docs/superpowers/specs/2026-07-25-s1-w3-2-design-amendment.md` §3b for
+//! `docs/design.md` for
 //! why (`row_ids` becomes a direct positional dump that is ascending by
 //! construction, and the working index's `NodeTable` stays inside its first
 //! 65536-id chunk regardless of the commit's actual row-id range).

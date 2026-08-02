@@ -1,6 +1,7 @@
-//! Placeholder Python extension module proving `PyO3` links correctly. The
-//! real transaction API (begin/commit/retry-on-conflict) lands once
-//! `strata-txn` has real logic — see `.opencode/rules/python-bindings.md`.
+//! Placeholder Python extension module proving `PyO3` links correctly. This
+//! is not a stable client facade. The supported engine surface is currently
+//! the Rust `Dataset`/`Snapshot`/`Transaction` API in `strata-txn`; Python
+//! bindings remain deferred — see `docs/architecture.md`.
 
 use pyo3::prelude::*;
 

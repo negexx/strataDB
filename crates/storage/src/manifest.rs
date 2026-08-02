@@ -1,5 +1,5 @@
 //! Manifest & versioning, per
-//! `docs/design/phase-0-transaction-and-format-spec.md` §3.4 and §6.
+//! `docs/design.md`.
 //!
 //! A manifest is one immutable file per version, named so lexicographic
 //! order equals numeric order (`{version:020}.manifest`, following Lance's
@@ -16,20 +16,26 @@
 //! Phase 1 "kill -9 mid-write, restart, recover last committed version"
 //! MVP checklist item tests.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
 
+use arrow::datatypes::{Schema, SchemaRef};
+use arrow::ipc::convert::try_schema_from_flatbuffer_bytes;
+use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator, IpcWriteOptions};
 use serde::{Deserialize, Serialize};
 
 use crate::backend::{Backend, LocalFs};
 use crate::error::{Result, StorageError};
 use crate::stats::ColumnStats;
 
+/// The version of the manifest envelope, deliberately distinct from a
+/// manifest's commit [`Manifest::version`].
+pub const MANIFEST_FORMAT_VERSION: u32 = 1;
+
 /// One committed data file's name and the per-column statistics computed
-/// for it at commit time — see
-/// `docs/design/phase-3-query-refinement-spec.md` §1.
+/// for it at commit time — see `docs/design.md`.
 ///
 /// `#[serde(deny_unknown_fields)]`: a pre-S1-W3.2 manifest's `DataFileEntry`
 /// still carries a `delta_log` field (removed with no compatibility shim,
@@ -46,15 +52,22 @@ use crate::stats::ColumnStats;
 pub struct DataFileEntry {
     /// Relative to the dataset's `data/` directory.
     pub name: String,
+    /// Length of the complete Arrow IPC file, in bytes.
+    pub byte_len: u64,
+    /// CRC32C of the complete Arrow IPC file.
+    pub crc32c: u32,
+    /// Number of physical rows in this file.
+    pub row_count: u64,
+    /// Inclusive physical row-id range, absent exactly for an empty file.
+    pub row_id_range: Option<(u64, u64)>,
     /// Column name -> stats. Absent key means "no stats for this column in
     /// this file" (non-orderable type, or all-null) — never a wrong entry.
     pub stats: HashMap<String, ColumnStats>,
 }
 
 /// One immutable index segment listed in the manifest — see
-/// `docs/superpowers/specs/2026-07-24-s1-segment-format-w3-migration-design.md`
-/// §3. Always an empty `Vec` on `Manifest` until S1 W3.2 starts writing
-/// segments; `#[serde(default)]` on the field below and on `zone_map` here
+/// `docs/design.md`. The segment list is empty only when no vector-bearing commit is
+/// visible; `#[serde(default)]` on the field below and on `zone_map` here
 /// both make "field absent" (a manifest written before this existed) and
 /// "field present but empty" indistinguishable, which is required: an
 /// absent/empty `zone_map` must always mean "must scan," never "may prune"
@@ -111,11 +124,15 @@ pub struct SegmentEntry {
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub version: u64,
+    /// Raw Arrow IPC schema-message bytes for the dataset's owned logical
+    /// schema. The physical `_row_id` and `_timestamp` columns are not part
+    /// of this schema.
+    pub schema_ipc: Vec<u8>,
     /// Accumulated across every committed version so far.
     pub data_files: Vec<DataFileEntry>,
     /// The row-id to assign to the next inserted row, dataset-wide. Never
     /// resets, never reused — see
-    /// `docs/design/phase-0-transaction-and-format-spec.md` §8.
+    /// `docs/design.md`.
     pub next_row_id: u64,
     /// Row-ids tombstoned (deleted, or superseded by `update`) as of this
     /// version. Accumulated across every committed version, same as
@@ -134,8 +151,8 @@ pub struct Manifest {
     /// collision across sessions would silently destroy already-durable
     /// data. Analogous to `next_row_id` (never resets, never reused), but
     /// this counter identifies filename-uniqueness attempts rather than row
-    /// identity — see `docs/design/phase-0-transaction-and-format-spec.md`
-    /// §8 for `next_row_id`'s parallel contract.
+    /// identity — see `docs/design.md` for `next_row_id`'s parallel
+    /// contract.
     ///
     /// `#[serde(default)]` so manifests written before this field existed
     /// still deserialize, same reasoning as `tombstones` above.
@@ -144,8 +161,7 @@ pub struct Manifest {
     /// The commit-order-monotone envelope of every commit's captured
     /// timestamp so far — **not** necessarily equal to the max `_timestamp`
     /// any individual row carries (see
-    /// `docs/superpowers/specs/2026-07-25-s1-w2-timestamp-column-design.md`
-    /// §4 for why: `write_phase` runs outside `commit_lock`, so a row's own
+    /// `docs/design.md` for why: `write_phase` runs outside `commit_lock`, so a row's own
     /// timestamp capture and its eventual commit order can diverge under
     /// concurrency). Updated as `.max()` against each commit's own captured
     /// timestamp, inside the commit lock — which is what makes *this* field
@@ -157,8 +173,7 @@ pub struct Manifest {
     #[serde(default)]
     pub commit_time_high_water: i64,
     /// Immutable index segments as of this version — see
-    /// `docs/superpowers/specs/2026-07-24-s1-segment-format-w3-migration-design.md`
-    /// §3. Empty only for a dataset that has never committed a vector.
+    /// `docs/design.md`. Empty only when no vector-bearing commit is visible.
     /// `#[serde(default)]` so manifests written before this field existed
     /// still deserialize, same reasoning as `tombstones`/`next_attempt_id`.
     #[serde(default)]
@@ -168,8 +183,14 @@ pub struct Manifest {
 impl Manifest {
     #[must_use]
     pub fn empty() -> Self {
+        Self::empty_with_schema(&Schema::empty())
+    }
+
+    #[must_use]
+    pub fn empty_with_schema(schema: &Schema) -> Self {
         Self {
             version: 0,
+            schema_ipc: encode_schema(schema),
             data_files: Vec::new(),
             next_row_id: 0,
             tombstones: Vec::new(),
@@ -177,6 +198,121 @@ impl Manifest {
             commit_time_high_water: 0,
             segments: Vec::new(),
         }
+    }
+
+    /// Decodes the dataset-owned logical schema from its persisted IPC
+    /// message bytes. The caller supplies the manifest path so corruption is
+    /// reported against the durable artifact that carried it.
+    /// Decodes the Arrow schema owned by this manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the persisted IPC schema bytes are malformed.
+    pub fn schema(&self, manifest_path: &Path) -> Result<SchemaRef> {
+        if self.schema_ipc.is_empty() {
+            return Err(StorageError::LegacyFormatNeedsMigration(
+                manifest_path.to_path_buf(),
+            ));
+        }
+        let schema = try_schema_from_flatbuffer_bytes(&self.schema_ipc).map_err(|error| {
+            StorageError::CorruptManifest(
+                manifest_path.to_path_buf(),
+                format!("schema_ipc cannot be decoded: {error}"),
+            )
+        })?;
+        Ok(std::sync::Arc::new(schema))
+    }
+}
+
+/// The exact durable representation of a manifest file.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManifestEnvelope {
+    pub format_version: u32,
+    pub manifest: Manifest,
+    pub checksum: u32,
+}
+
+impl ManifestEnvelope {
+    fn new(manifest: Manifest) -> Result<Self> {
+        let mut envelope = Self {
+            format_version: MANIFEST_FORMAT_VERSION,
+            manifest,
+            checksum: 0,
+        };
+        envelope.checksum = envelope.canonical_checksum()?;
+        Ok(envelope)
+    }
+
+    fn canonical_checksum(&self) -> Result<u32> {
+        Ok(crc32c::crc32c(&canonical_envelope_bytes(self)?))
+    }
+
+    fn validate(&self, path: &Path, filename_version: u64) -> Result<()> {
+        if self.format_version != MANIFEST_FORMAT_VERSION {
+            return Err(StorageError::CorruptManifest(
+                path.to_path_buf(),
+                format!(
+                    "format_version {} is unsupported; expected {MANIFEST_FORMAT_VERSION}",
+                    self.format_version
+                ),
+            ));
+        }
+        let expected_checksum = self.canonical_checksum()?;
+        if self.checksum != expected_checksum {
+            return Err(StorageError::CorruptManifest(
+                path.to_path_buf(),
+                format!(
+                    "checksum {} does not match canonical payload checksum {expected_checksum}",
+                    self.checksum
+                ),
+            ));
+        }
+        if self.manifest.version != filename_version {
+            return Err(StorageError::CorruptManifest(
+                path.to_path_buf(),
+                format!(
+                    "filename version {filename_version} does not match payload version {}",
+                    self.manifest.version
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn encode_schema(schema: &Schema) -> Vec<u8> {
+    let generator = IpcDataGenerator::default();
+    let mut dictionaries = DictionaryTracker::new(true);
+    generator
+        .schema_to_bytes_with_dictionary_tracker(
+            schema,
+            &mut dictionaries,
+            &IpcWriteOptions::default(),
+        )
+        .ipc_message
+}
+
+fn canonical_envelope_bytes(envelope: &ManifestEnvelope) -> Result<Vec<u8>> {
+    let mut zeroed = envelope.clone();
+    zeroed.checksum = 0;
+    let value = serde_json::to_value(zeroed)?;
+    serde_json::to_vec(&canonicalize_json(value)).map_err(StorageError::from)
+}
+
+fn canonicalize_json(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.into_iter().map(canonicalize_json).collect())
+        }
+        serde_json::Value::Object(values) => {
+            let sorted: BTreeMap<_, _> = values
+                .into_iter()
+                .map(|(key, value)| (key, canonicalize_json(value)))
+                .collect();
+            serde_json::Value::Object(sorted.into_iter().collect())
+        }
+        other => other,
     }
 }
 
@@ -202,7 +338,7 @@ fn manifest_path(dataset_dir: &Path, version: u64) -> PathBuf {
 pub fn commit_manifest(dataset_dir: &Path, manifest: &Manifest) -> Result<()> {
     let backend = LocalFs::new(dataset_dir);
     let key = format!("_versions/{:020}.manifest", manifest.version);
-    let json = serde_json::to_vec(manifest)?;
+    let json = serde_json::to_vec(&ManifestEnvelope::new(manifest.clone())?)?;
     // `LocalFs::put` fsyncs the containing directory internally (see Task
     // 1), so there is no separate `sync_dir` call here the way the
     // pre-Backend code had one -- folding that step into `put` itself
@@ -247,13 +383,27 @@ pub fn read_current(dataset_dir: &Path) -> Result<Option<Manifest>> {
         }
     }
 
-    let Some((_, key)) = best else {
+    let Some((filename_version, key)) = best else {
         return Ok(None);
     };
     let bytes = backend.get(&key)?;
-    let manifest: Manifest = serde_json::from_slice(&bytes)
-        .map_err(|e| StorageError::CorruptManifest(dataset_dir.join(&key), e.to_string()))?;
-    Ok(Some(manifest))
+    let path = dataset_dir.join(&key);
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| StorageError::CorruptManifest(path.clone(), e.to_string()))?;
+    if !value
+        .as_object()
+        .is_some_and(|object| object.contains_key("format_version"))
+    {
+        return Err(StorageError::LegacyFormatNeedsMigration(path));
+    }
+    let envelope: ManifestEnvelope = serde_json::from_value(value)
+        .map_err(|e| StorageError::CorruptManifest(path.clone(), e.to_string()))?;
+    envelope.validate(&path, filename_version)?;
+    // A valid envelope must still carry decodable schema bytes. Decode here
+    // so a caller that only uses `read_current` cannot accidentally treat a
+    // catalog with broken schema ownership metadata as usable.
+    envelope.manifest.schema(&path)?;
+    Ok(Some(envelope.manifest))
 }
 
 #[cfg(test)]
@@ -273,6 +423,24 @@ mod tests {
             .keep()
     }
 
+    fn data_file(name: &str) -> DataFileEntry {
+        DataFileEntry {
+            name: name.to_string(),
+            byte_len: 0,
+            crc32c: 0,
+            row_count: 0,
+            row_id_range: None,
+            stats: HashMap::new(),
+        }
+    }
+
+    fn manifest(version: u64, data_files: Vec<DataFileEntry>) -> Manifest {
+        let mut manifest = Manifest::empty();
+        manifest.version = version;
+        manifest.data_files = data_files;
+        manifest
+    }
+
     #[test]
     fn read_current_is_none_for_fresh_dataset() {
         let dir = temp_dataset_dir("fresh");
@@ -283,37 +451,9 @@ mod tests {
     #[test]
     fn commit_then_read_current_round_trips() {
         let dir = temp_dataset_dir("roundtrip");
-        let m0 = Manifest {
-            version: 0,
-            data_files: vec![DataFileEntry {
-                name: "a.arrow".to_string(),
-                stats: HashMap::new(),
-            }],
-            next_row_id: 0,
-            tombstones: Vec::new(),
-            next_attempt_id: 0,
-            commit_time_high_water: 0,
-            segments: Vec::new(),
-        };
+        let m0 = manifest(0, vec![data_file("a.arrow")]);
         commit_manifest(&dir, &m0).unwrap();
-        let m1 = Manifest {
-            version: 1,
-            data_files: vec![
-                DataFileEntry {
-                    name: "a.arrow".to_string(),
-                    stats: HashMap::new(),
-                },
-                DataFileEntry {
-                    name: "b.arrow".to_string(),
-                    stats: HashMap::new(),
-                },
-            ],
-            next_row_id: 0,
-            tombstones: Vec::new(),
-            next_attempt_id: 0,
-            commit_time_high_water: 0,
-            segments: Vec::new(),
-        };
+        let m1 = manifest(1, vec![data_file("a.arrow"), data_file("b.arrow")]);
         commit_manifest(&dir, &m1).unwrap();
 
         let current = read_current(&dir).unwrap().unwrap();
@@ -327,18 +467,7 @@ mod tests {
         // renamed into place. This is the actual crash-safety property the
         // MVP's kill-9 checklist item depends on.
         let dir = temp_dataset_dir("crash-sim");
-        let m0 = Manifest {
-            version: 0,
-            data_files: vec![DataFileEntry {
-                name: "a.arrow".to_string(),
-                stats: HashMap::new(),
-            }],
-            next_row_id: 0,
-            tombstones: Vec::new(),
-            next_attempt_id: 0,
-            commit_time_high_water: 0,
-            segments: Vec::new(),
-        };
+        let m0 = manifest(0, vec![data_file("a.arrow")]);
         commit_manifest(&dir, &m0).unwrap();
 
         let versions = versions_dir(&dir);
@@ -363,18 +492,7 @@ mod tests {
         // file's name *does* end in `.manifest`. Exclusion here rests
         // entirely on the stem (`.tmp-1234-0-...`) never parsing as a u64.
         let dir = temp_dataset_dir("real-tmp-shape");
-        let m0 = Manifest {
-            version: 0,
-            data_files: vec![DataFileEntry {
-                name: "a.arrow".to_string(),
-                stats: HashMap::new(),
-            }],
-            next_row_id: 0,
-            tombstones: Vec::new(),
-            next_attempt_id: 0,
-            commit_time_high_water: 0,
-            segments: Vec::new(),
-        };
+        let m0 = manifest(0, vec![data_file("a.arrow")]);
         commit_manifest(&dir, &m0).unwrap();
 
         let versions = versions_dir(&dir);
@@ -446,18 +564,13 @@ mod tests {
             },
         );
 
-        let m0 = Manifest {
-            version: 0,
-            data_files: vec![DataFileEntry {
-                name: "data.arrow".to_string(),
+        let m0 = manifest(
+            0,
+            vec![DataFileEntry {
                 stats,
+                ..data_file("data.arrow")
             }],
-            next_row_id: 0,
-            tombstones: Vec::new(),
-            next_attempt_id: 0,
-            commit_time_high_water: 0,
-            segments: Vec::new(),
-        };
+        );
 
         commit_manifest(&dir, &m0).unwrap();
         let current = read_current(&dir).unwrap().unwrap();
@@ -545,25 +658,14 @@ mod tests {
         // than pretty-printed — smaller on disk, faster to (de)serialize.
         // JSON is JSON either way, so this is purely a byte-format check.
         let dir = temp_dataset_dir("compact-json");
-        let m0 = Manifest {
-            version: 0,
-            data_files: vec![DataFileEntry {
-                name: "a.arrow".to_string(),
-                stats: HashMap::new(),
-            }],
-            next_row_id: 0,
-            tombstones: Vec::new(),
-            next_attempt_id: 0,
-            commit_time_high_water: 0,
-            segments: Vec::new(),
-        };
+        let m0 = manifest(0, vec![data_file("a.arrow")]);
         commit_manifest(&dir, &m0).unwrap();
 
         let bytes = fs::read(manifest_path(&dir, 0)).unwrap();
         assert_eq!(
             bytes,
-            serde_json::to_vec(&m0).unwrap(),
-            "on-disk manifest bytes must match serde_json::to_vec's compact output exactly"
+            serde_json::to_vec(&ManifestEnvelope::new(m0.clone()).unwrap()).unwrap(),
+            "on-disk manifest bytes must match the compact checksum envelope exactly"
         );
         assert!(
             !bytes.contains(&b'\n'),
@@ -579,6 +681,7 @@ mod tests {
         // `tombstones` does for pre-tombstone manifests.
         let old_json = serde_json::json!({
             "version": 0,
+            "schema_ipc": Manifest::empty().schema_ipc,
             "data_files": [],
             "next_row_id": 0,
         });
@@ -593,6 +696,7 @@ mod tests {
         // does for pre-that-field manifests.
         let old_json = serde_json::json!({
             "version": 0,
+            "schema_ipc": Manifest::empty().schema_ipc,
             "data_files": [],
             "next_row_id": 0,
         });
@@ -609,11 +713,159 @@ mod tests {
     fn manifest_without_segments_field_deserializes_with_default_empty() {
         let old_json = serde_json::json!({
             "version": 0,
+            "schema_ipc": Manifest::empty().schema_ipc,
             "data_files": [],
             "next_row_id": 0,
         });
         let deserialized: Manifest = serde_json::from_value(old_json).unwrap();
         assert!(deserialized.segments.is_empty());
+    }
+
+    #[test]
+    fn committed_manifest_uses_the_versioned_checksum_envelope() {
+        let dir = temp_dataset_dir("versioned-envelope");
+        let manifest = Manifest::empty();
+
+        commit_manifest(&dir, &manifest).unwrap();
+
+        let bytes = fs::read(manifest_path(&dir, manifest.version)).unwrap();
+        let envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            envelope
+                .get("format_version")
+                .and_then(serde_json::Value::as_u64),
+            Some(u64::from(MANIFEST_FORMAT_VERSION)),
+            "a manifest file must carry the distinct on-disk format version"
+        );
+        assert!(
+            envelope.get("manifest").is_some(),
+            "the payload must be nested in the envelope so its checksum covers it"
+        );
+        assert!(
+            envelope.get("checksum").is_some(),
+            "the envelope must carry its canonical JSON checksum"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_current_rejects_a_manifest_with_a_mutated_checksum() {
+        // Break caught: accepting a manifest after its envelope checksum has
+        // changed would make recovery trust an unverified catalog payload.
+        let dir = temp_dataset_dir("mutated-checksum");
+        let manifest = Manifest::empty();
+        commit_manifest(&dir, &manifest).unwrap();
+        let path = manifest_path(&dir, manifest.version);
+        let mut envelope: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let checksum = envelope["checksum"].as_u64().unwrap();
+        envelope["checksum"] = serde_json::Value::from(checksum + 1);
+        fs::write(path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+
+        let result = read_current(&dir);
+        assert!(
+            matches!(result, Err(StorageError::CorruptManifest(_, ref reason)) if reason.contains("checksum")),
+            "recovery must reject a manifest whose checksum no longer matches its canonical payload: {result:?}"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn manifest_checksum_is_independent_of_map_insertion_order() {
+        // Break caught: serializing HashMap iteration order directly would
+        // make otherwise identical manifests produce unstable checksums.
+        let mut left_stats = HashMap::new();
+        left_stats.insert(
+            "z".to_string(),
+            ColumnStats {
+                min: Value::Int64(1),
+                max: Value::Int64(2),
+            },
+        );
+        left_stats.insert(
+            "a".to_string(),
+            ColumnStats {
+                min: Value::Int64(3),
+                max: Value::Int64(4),
+            },
+        );
+        let mut right_stats = HashMap::new();
+        right_stats.insert(
+            "a".to_string(),
+            ColumnStats {
+                min: Value::Int64(3),
+                max: Value::Int64(4),
+            },
+        );
+        right_stats.insert(
+            "z".to_string(),
+            ColumnStats {
+                min: Value::Int64(1),
+                max: Value::Int64(2),
+            },
+        );
+
+        let left = manifest(
+            0,
+            vec![DataFileEntry {
+                stats: left_stats,
+                ..data_file("rows.arrow")
+            }],
+        );
+        let right = manifest(
+            0,
+            vec![DataFileEntry {
+                stats: right_stats,
+                ..data_file("rows.arrow")
+            }],
+        );
+        let left_envelope = ManifestEnvelope::new(left).unwrap();
+        let right_envelope = ManifestEnvelope::new(right).unwrap();
+
+        assert_eq!(left_envelope.checksum, right_envelope.checksum);
+        assert_eq!(
+            canonical_envelope_bytes(&left_envelope).unwrap(),
+            canonical_envelope_bytes(&right_envelope).unwrap(),
+            "canonical JSON must recursively sort map keys before checksumming"
+        );
+    }
+
+    #[test]
+    fn read_current_rejects_a_filename_payload_version_mismatch() {
+        let dir = temp_dataset_dir("filename-payload-mismatch");
+        let manifest = Manifest::empty();
+        commit_manifest(&dir, &manifest).unwrap();
+        fs::copy(manifest_path(&dir, 0), manifest_path(&dir, 1)).unwrap();
+
+        let result = read_current(&dir);
+        assert!(
+            matches!(result, Err(StorageError::CorruptManifest(_, ref reason)) if reason.contains("filename version")),
+            "recovery must reject a manifest whose filename and payload version disagree: {result:?}"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_current_rejects_a_legacy_unenveloped_manifest() {
+        let dir = temp_dataset_dir("legacy-unenveloped");
+        let versions = versions_dir(&dir);
+        fs::create_dir_all(&versions).unwrap();
+        fs::write(
+            manifest_path(&dir, 0),
+            serde_json::to_vec(&Manifest::empty()).unwrap(),
+        )
+        .unwrap();
+
+        let result = read_current(&dir);
+        assert!(
+            matches!(result, Err(StorageError::LegacyFormatNeedsMigration(_))),
+            "the old direct-manifest representation must not open as a verified dataset: {result:?}"
+        );
+
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

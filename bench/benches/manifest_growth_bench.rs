@@ -79,10 +79,12 @@ fn main() {
 
     let dir = std::env::temp_dir().join(format!("strata-manifest-growth-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    let ds = Dataset::create(&dir).unwrap();
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let ds = Dataset::create(&dir, Arc::clone(&schema)).unwrap();
 
     let mut timings: Vec<Duration> = Vec::with_capacity(commits);
+    let checkpoints = [1, commits.div_ceil(4), commits.div_ceil(2), commits];
+    let mut manifest_samples = Vec::new();
     let overall = Instant::now();
     for i in 0..commits {
         let id = i64::try_from(i).unwrap();
@@ -92,10 +94,13 @@ fn main() {
         )
         .unwrap();
         let mut txn = ds.begin();
-        txn.insert(batch);
+        txn.insert(batch).unwrap();
         let started = Instant::now();
         txn.commit().unwrap();
         timings.push(started.elapsed());
+        if checkpoints.contains(&(i + 1)) {
+            manifest_samples.push((i + 1, newest_manifest_bytes(&dir)));
+        }
     }
     let wall = overall.elapsed();
     let manifest_bytes = newest_manifest_bytes(&dir);
@@ -105,6 +110,7 @@ fn main() {
 
     println!();
     println!("manifest growth — {commits} sequential commits, one data file each");
+    println!("input: deterministic id-only rows; commits={commits}; buckets={BUCKETS}");
     println!("(id column only: no vector column, so no HNSW insert is involved)");
     println!();
     println!(
@@ -144,6 +150,10 @@ fn main() {
     println!("total wall time      : {wall:.2?}");
     println!("newest manifest bytes: {manifest_bytes}");
     println!("first->last bucket   : {growth:.2}x");
+    println!("retained versions / manifest bytes:");
+    for (version, bytes) in manifest_samples {
+        println!("  {version:>5} / {bytes} bytes");
+    }
     println!();
 
     if growth >= 2.0 {

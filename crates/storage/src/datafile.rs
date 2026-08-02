@@ -3,10 +3,8 @@
 //! runs upstream of this module, before `write_batch` is ever called — the
 //! files this module reads/writes may carry `Dictionary`-typed columns, but
 //! this module itself has no encoding-specific logic. Strata's own custom
-//! column-chunk/RLE format (`docs/design/phase-0-transaction-and-format-spec.md`
-//! §6) remains a later, possibly-unnecessary decision — see
-//! `docs/design/phase-2-encodings-and-groupby-spec.md`'s
-//! "Alternatives considered" section.
+//! column-chunk/RLE format remains a later, possibly-unnecessary decision;
+//! see `docs/design.md` for the current storage boundary.
 
 use std::fs::File;
 use std::io::Write as _;
@@ -18,6 +16,164 @@ use arrow::ipc::writer::FileWriter;
 
 use crate::error::{Result, StorageError};
 
+/// Integrity metadata for bytes durably written by [`write_batch`] or
+/// [`write_bytes`].
+///
+/// The digest is CRC32C (Castagnoli), matching the checksum already used for
+/// immutable vector segments. It detects accidental corruption; it is not a
+/// cryptographic authenticity boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WriteMetadata {
+    /// Number of bytes in the durable file.
+    pub byte_len: u64,
+    /// CRC32C of those exact bytes.
+    pub crc32c: u32,
+}
+
+impl WriteMetadata {
+    fn from_bytes(bytes: &[u8]) -> Self {
+        Self {
+            byte_len: bytes.len() as u64,
+            crc32c: crc32c_checksum(bytes),
+        }
+    }
+}
+
+/// CRC32C of durable catalog content. This is shared with transaction
+/// recovery so manifest metadata and the inspected bytes use one algorithm.
+#[must_use]
+pub fn crc32c_checksum(bytes: &[u8]) -> u32 {
+    crc32c::crc32c(bytes)
+}
+
+/// Test-only controls for modelling directory-sync outcomes without mocking
+/// `std::fs` or depending on filesystem-specific permission behavior.
+///
+/// The controls are thread-local so parallel tests cannot affect another
+/// test's durability path. They are compiled only for this crate's tests or
+/// when a dependent crate explicitly enables `test-fault-injection`.
+#[cfg(any(test, feature = "test-fault-injection"))]
+#[doc(hidden)]
+pub mod test_support {
+    use std::cell::RefCell;
+    use std::io;
+    use std::marker::PhantomData;
+    use std::path::{Path, PathBuf};
+    use std::rc::Rc;
+
+    #[derive(Clone, Default)]
+    struct DirectorySyncState {
+        // Production behavior is always the default, including when this
+        // test-only feature is compiled. A test guard must opt in to
+        // intercepting a directory sync.
+        force_success: bool,
+        fail_on_call: Option<(usize, io::ErrorKind)>,
+        calls: Vec<PathBuf>,
+    }
+
+    thread_local! {
+        static DIRECTORY_SYNC_STATE: RefCell<DirectorySyncState> = RefCell::new(DirectorySyncState::default());
+    }
+
+    /// Restores the calling test thread's previous directory-sync state.
+    pub struct DirectorySyncGuard {
+        previous: DirectorySyncState,
+        // The state is thread-local, so the guard must be dropped on the
+        // thread that installed it. Rc makes this guard !Send and !Sync.
+        _thread_affine: PhantomData<Rc<()>>,
+    }
+
+    impl Drop for DirectorySyncGuard {
+        fn drop(&mut self) {
+            DIRECTORY_SYNC_STATE.with(|state| *state.borrow_mut() = self.previous.clone());
+        }
+    }
+
+    /// Causes the selected directory-sync invocation to fail on this test
+    /// thread. The production implementation consumes this only when it
+    /// reaches its real directory-sync boundary.
+    #[must_use]
+    pub fn fail_directory_sync_on_call(call: usize, kind: io::ErrorKind) -> DirectorySyncGuard {
+        assert!(call > 0, "directory sync calls are one-based");
+        DIRECTORY_SYNC_STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            let previous = state.clone();
+            *state = DirectorySyncState {
+                force_success: true,
+                fail_on_call: Some((call, kind)),
+                calls: Vec::new(),
+            };
+            DirectorySyncGuard {
+                previous,
+                _thread_affine: PhantomData,
+            }
+        })
+    }
+
+    /// Records directory-sync paths while making those test invocations
+    /// succeed, even on a platform that cannot fsync directories.
+    #[must_use]
+    pub fn record_directory_syncs() -> DirectorySyncGuard {
+        DIRECTORY_SYNC_STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            let previous = state.clone();
+            *state = DirectorySyncState {
+                force_success: true,
+                fail_on_call: None,
+                calls: Vec::new(),
+            };
+            DirectorySyncGuard {
+                previous,
+                _thread_affine: PhantomData,
+            }
+        })
+    }
+
+    /// Makes the next directory-sync calls use the host filesystem. Storage
+    /// tests use this for the narrow cases that assert native error mapping.
+    #[must_use]
+    pub fn use_real_directory_syncs() -> DirectorySyncGuard {
+        DIRECTORY_SYNC_STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            let previous = state.clone();
+            *state = DirectorySyncState {
+                force_success: false,
+                fail_on_call: None,
+                calls: Vec::new(),
+            };
+            DirectorySyncGuard {
+                previous,
+                _thread_affine: PhantomData,
+            }
+        })
+    }
+
+    impl DirectorySyncGuard {
+        #[must_use]
+        pub fn calls(&self) -> Vec<PathBuf> {
+            DIRECTORY_SYNC_STATE.with(|state| state.borrow().calls.clone())
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn outcome(path: &Path) -> Option<io::Result<()>> {
+        DIRECTORY_SYNC_STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            if !state.force_success && state.fail_on_call.is_none() {
+                return None;
+            }
+            state.calls.push(path.to_path_buf());
+            let call = state.calls.len();
+            if let Some((failure_call, kind)) = state.fail_on_call
+                && call == failure_call
+            {
+                return Some(Err(io::Error::from(kind)));
+            }
+            state.force_success.then_some(Ok(()))
+        })
+    }
+}
+
 /// Writes a single `RecordBatch` to `path` as an Arrow IPC file, fsyncing
 /// before returning so the caller can rely on durability once this returns.
 ///
@@ -25,7 +181,7 @@ use crate::error::{Result, StorageError};
 ///
 /// Returns an error if `path` can't be created/written, or if Arrow's IPC
 /// writer fails to serialize `batch`.
-pub fn write_batch(path: &Path, batch: &RecordBatch) -> Result<()> {
+pub fn write_batch(path: &Path, batch: &RecordBatch) -> Result<WriteMetadata> {
     let file = File::create(path)?;
     let mut writer = FileWriter::try_new(file, &batch.schema())?;
     writer.write(batch)?;
@@ -33,7 +189,7 @@ pub fn write_batch(path: &Path, batch: &RecordBatch) -> Result<()> {
     let file = writer.into_inner()?;
     file.sync_all()?;
     crate::chaos::chaos_checkpoint(); // data-file content is now durable
-    Ok(())
+    Ok(WriteMetadata::from_bytes(&std::fs::read(path)?))
 }
 
 /// Writes `bytes` to `path` verbatim, fsyncing before returning so the
@@ -43,7 +199,7 @@ pub fn write_batch(path: &Path, batch: &RecordBatch) -> Result<()> {
 ///
 /// Lives here, not in the caller, so **every** chaos checkpoint in the
 /// commit protocol stays inside `strata-storage` — see
-/// `docs/superpowers/specs/2026-07-25-s1-w3-2-design-amendment.md` §5.
+/// `docs/design.md`.
 /// Truncating (`File::create`) exactly like [`write_batch`]: callers derive
 /// their filenames from a collision-free attempt id, so an existing file at
 /// `path` is a bug to overwrite, not content to append to.
@@ -51,12 +207,12 @@ pub fn write_batch(path: &Path, batch: &RecordBatch) -> Result<()> {
 /// # Errors
 ///
 /// Returns an error if `path` can't be created, written, or fsynced.
-pub fn write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+pub fn write_bytes(path: &Path, bytes: &[u8]) -> Result<WriteMetadata> {
     let mut file = File::create(path)?;
     file.write_all(bytes)?;
     file.sync_all()?;
     crate::chaos::chaos_checkpoint(); // segment content is now durable
-    Ok(())
+    Ok(WriteMetadata::from_bytes(bytes))
 }
 
 /// Fsyncs `dir` itself, not just files within it.
@@ -65,22 +221,74 @@ pub fn write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
 /// directory entry (the name→inode link) survives a crash — the containing
 /// directory must be fsynced too, or a real power-loss crash can leave the
 /// file's bytes durable on disk while the file itself is simply absent.
-/// Best-effort: not supported uniformly across platforms (notably Windows),
-/// so a failure to open/sync the directory is tolerated rather than
-/// propagated — this mirrors the durability caveat already documented on
-/// [`crate::manifest::commit_manifest`]'s directory-fsync step.
+/// On Windows, this opens a native directory handle with
+/// `FILE_FLAG_BACKUP_SEMANTICS` before calling [`File::sync_all`]. On POSIX,
+/// it uses the ordinary directory file handle. A platform or filesystem that
+/// reports that directory flushing is unsupported fails closed with
+/// [`StorageError::DurabilityUnsupported`]; access, path, and other I/O
+/// errors remain their original typed I/O errors.
 ///
 /// # Errors
 ///
-/// This function does not currently return an error; it always returns
-/// `Ok(())`. It is fallible in signature so a future platform-specific
-/// failure mode can be surfaced without an API break.
+/// Returns an error when the directory cannot be opened or flushed. A
+/// successful return means the local filesystem accepted the requested
+/// directory-entry durability operation.
 pub fn sync_dir(dir: &Path) -> Result<()> {
-    if let Ok(handle) = File::open(dir) {
-        let _ = handle.sync_all();
+    #[cfg(any(test, feature = "test-fault-injection"))]
+    if let Some(outcome) = test_support::outcome(dir) {
+        outcome.map_err(|error| directory_sync_error(dir, error))?;
+        crate::chaos::chaos_checkpoint(); // directory entries are now durable
+        return Ok(());
     }
-    crate::chaos::chaos_checkpoint(); // directory entries are now durable (best-effort per-platform, see doc comment above)
+
+    let handle = open_directory_for_sync(dir).map_err(|error| directory_sync_error(dir, error))?;
+    handle
+        .sync_all()
+        .map_err(|error| directory_sync_error(dir, error))?;
+    crate::chaos::chaos_checkpoint(); // directory entries are now durable
     Ok(())
+}
+
+#[cfg(windows)]
+fn open_directory_for_sync(dir: &Path) -> std::io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    // `FILE_FLAG_BACKUP_SEMANTICS` asks CreateFileW (used by OpenOptions) to
+    // return a handle for a directory. `File::open` omits it and therefore
+    // fails on normal Windows directories before `sync_all` can flush the
+    // handle.
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    std::fs::OpenOptions::new()
+        // FlushFileBuffers requires a write-capable handle on Windows.
+        .write(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(dir)
+}
+
+#[cfg(not(windows))]
+fn open_directory_for_sync(dir: &Path) -> std::io::Result<File> {
+    File::open(dir)
+}
+
+fn directory_sync_error(dir: &Path, error: std::io::Error) -> StorageError {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::Unsupported | std::io::ErrorKind::InvalidInput
+    ) {
+        return StorageError::DurabilityUnsupported(dir.to_path_buf());
+    }
+
+    #[cfg(windows)]
+    if matches!(error.raw_os_error(), Some(1 | 50 | 87)) {
+        return StorageError::DurabilityUnsupported(dir.to_path_buf());
+    }
+
+    #[cfg(not(windows))]
+    if matches!(error.raw_os_error(), Some(22)) {
+        return StorageError::DurabilityUnsupported(dir.to_path_buf());
+    }
+
+    StorageError::Io(error)
 }
 
 /// Reads the first (and, for Phase 1, only) `RecordBatch` from an Arrow IPC
@@ -201,6 +409,7 @@ pub fn read_batch_columns(path: &Path, columns: &[&str]) -> Result<RecordBatch> 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use std::path::PathBuf;
     use std::sync::Arc;
 
     use arrow::array::Int64Array;
@@ -229,6 +438,27 @@ mod tests {
     }
 
     #[test]
+    fn write_batch_returns_durable_length_and_checksum() {
+        let dir = tempfile::Builder::new()
+            .prefix("strata-datafile-metadata-test-")
+            .tempdir()
+            .unwrap()
+            .keep();
+        let path = dir.join("test.arrow");
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))]).unwrap();
+
+        let metadata = write_batch(&path, &batch).unwrap();
+        let persisted = std::fs::read(&path).unwrap();
+
+        assert_eq!(metadata.byte_len, persisted.len() as u64);
+        assert_eq!(metadata.crc32c, crc32c::crc32c(&persisted));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn write_bytes_then_read_round_trips_exactly() {
         let dir = tempfile::Builder::new()
             .prefix("strata-write-bytes-test-")
@@ -243,6 +473,53 @@ mod tests {
         write_bytes(&path, &payload).unwrap();
 
         assert_eq!(std::fs::read(&path).unwrap(), payload);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_bytes_returns_durable_length_and_checksum() {
+        let dir = tempfile::Builder::new()
+            .prefix("strata-write-bytes-metadata-test-")
+            .tempdir()
+            .unwrap()
+            .keep();
+        let path = dir.join("blob.seg");
+        let payload = [0x00, 0x53, 0x54, 0xFF, 0x01];
+
+        let metadata = write_bytes(&path, &payload).unwrap();
+
+        assert_eq!(metadata.byte_len, payload.len() as u64);
+        assert_eq!(metadata.crc32c, crc32c::crc32c(&payload));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn directory_sync_is_not_intercepted_without_an_active_guard() {
+        let dir = tempfile::Builder::new()
+            .prefix("strata-directory-sync-unguarded-")
+            .tempdir()
+            .unwrap()
+            .keep();
+
+        assert!(
+            test_support::outcome(&dir).is_none(),
+            "only an active test guard may intercept directory syncs"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sync_dir_uses_a_native_directory_handle_on_windows() {
+        let dir = tempfile::Builder::new()
+            .prefix("strata-native-directory-sync-")
+            .tempdir()
+            .unwrap()
+            .keep();
+        let _real_sync = test_support::use_real_directory_syncs();
+
+        sync_dir(&dir).unwrap();
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -265,6 +542,160 @@ mod tests {
 
         assert_eq!(std::fs::read(&path).unwrap(), vec![9, 9]);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sync_dir_returns_the_directory_open_failure() {
+        // Break caught: suppressing File::open errors would acknowledge a
+        // rename whose containing directory could not be made durable.
+        let parent = tempfile::Builder::new()
+            .prefix("strata-sync-dir-missing-")
+            .tempdir()
+            .unwrap()
+            .keep();
+        let missing = parent.join("does-not-exist");
+        let _real_sync = test_support::use_real_directory_syncs();
+
+        let result = sync_dir(&missing);
+
+        assert!(
+            matches!(result, Err(StorageError::Io(ref error)) if error.kind() == std::io::ErrorKind::NotFound),
+            "expected the missing directory's open failure, got {result:?}"
+        );
+        std::fs::remove_dir_all(&parent).ok();
+    }
+
+    #[test]
+    fn sync_dir_returns_an_injected_sync_failure() {
+        // Break caught: ignoring sync_all errors after a rename would report
+        // a write as durable even though its directory entry was not.
+        let dir = tempfile::Builder::new()
+            .prefix("strata-sync-dir-fault-")
+            .tempdir()
+            .unwrap()
+            .keep();
+        let _fault = test_support::fail_directory_sync_on_call(1, std::io::ErrorKind::Other);
+
+        let result = sync_dir(&dir);
+
+        assert!(
+            matches!(result, Err(StorageError::Io(ref error)) if error.kind() == std::io::ErrorKind::Other),
+            "expected the injected directory-sync failure, got {result:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sync_dir_maps_unsupported_directory_sync_to_a_typed_error() {
+        // Break caught: returning a generic I/O error for an unsupported
+        // directory fsync would hide that this filesystem cannot meet the
+        // engine's declared acknowledgement boundary.
+        let dir = tempfile::Builder::new()
+            .prefix("strata-sync-dir-unsupported-")
+            .tempdir()
+            .unwrap()
+            .keep();
+        let _fault = test_support::fail_directory_sync_on_call(1, std::io::ErrorKind::Unsupported);
+
+        let error = sync_dir(&dir).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            format!("directory durability is unsupported for {}", dir.display())
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sync_dir_maps_invalid_input_to_a_typed_durability_error() {
+        // Break caught: filesystems that report an EINVAL-like directory
+        // flush rejection must not be presented as an ordinary, retryable
+        // data-path I/O failure.
+        let dir = tempfile::Builder::new()
+            .prefix("strata-sync-dir-invalid-input-")
+            .tempdir()
+            .unwrap()
+            .keep();
+        let _fault = test_support::fail_directory_sync_on_call(1, std::io::ErrorKind::InvalidInput);
+
+        let error = sync_dir(&dir).unwrap_err();
+
+        assert!(
+            matches!(error, StorageError::DurabilityUnsupported(ref path) if path == &dir),
+            "expected an invalid directory-flush operation to be typed as unsupported, got {error:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn directory_sync_error_maps_posix_einval_to_a_typed_durability_error() {
+        // Break caught: platforms may preserve raw EINVAL without mapping it
+        // to ErrorKind::InvalidInput, so the raw OS error must be covered too.
+        let dir = PathBuf::from("posix-einval-directory");
+
+        let error = directory_sync_error(&dir, std::io::Error::from_raw_os_error(22));
+
+        assert!(
+            matches!(error, StorageError::DurabilityUnsupported(ref path) if path == &dir),
+            "expected EINVAL to be typed as unsupported directory durability, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn nested_directory_sync_guards_restore_the_outer_interceptor() {
+        // Break caught: an inner test guard that overwrites the TLS state and
+        // fails to restore it makes the enclosing guard silently stop
+        // recording its durability boundary.
+        let first = PathBuf::from("outer-first");
+        let second = PathBuf::from("inner");
+        let third = PathBuf::from("outer-third");
+        let outer = test_support::record_directory_syncs();
+        assert!(test_support::outcome(&first).unwrap().is_ok());
+
+        {
+            let _inner = test_support::fail_directory_sync_on_call(1, std::io::ErrorKind::Other);
+            assert!(test_support::outcome(&second).unwrap().is_err());
+        }
+
+        assert_eq!(outer.calls(), vec![first.clone()]);
+        assert!(test_support::outcome(&third).unwrap().is_ok());
+        assert_eq!(outer.calls(), vec![first, third]);
+    }
+
+    #[test]
+    fn directory_sync_guard_restores_passthrough_after_drop() {
+        // Break caught: leaking an injected outcome after its guard drops can
+        // cause later tests or production-like paths to acknowledge a sync
+        // they never performed.
+        let path = PathBuf::from("restored-passthrough");
+        {
+            let _guard = test_support::record_directory_syncs();
+            assert!(test_support::outcome(&path).unwrap().is_ok());
+        }
+
+        assert!(
+            test_support::outcome(&path).is_none(),
+            "dropping the final guard must restore the real filesystem path"
+        );
+    }
+
+    #[test]
+    fn directory_sync_guard_restores_passthrough_during_unwind() {
+        // Break caught: a panicking test must not leave its thread's
+        // durability seam enabled for the next test.
+        let path = PathBuf::from("unwind-passthrough");
+        let unwound = std::panic::catch_unwind(|| {
+            let _guard = test_support::record_directory_syncs();
+            assert!(test_support::outcome(&path).unwrap().is_ok());
+            panic!("intentional guard-unwind regression");
+        });
+
+        assert!(unwound.is_err());
+        assert!(
+            test_support::outcome(&path).is_none(),
+            "unwinding must restore the real filesystem path"
+        );
     }
 
     #[test]

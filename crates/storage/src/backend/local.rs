@@ -25,6 +25,34 @@ impl LocalFs {
         self.root.join(key)
     }
 
+    /// Verifies the configured root is an existing directory owned by this
+    /// backend. `LocalFs` deliberately does not create it: its parent is the
+    /// caller's durable anchor, outside this backend's bounded sync scope.
+    fn validate_root(&self) -> Result<bool> {
+        let metadata = match fs::symlink_metadata(&self.root) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.file_type().is_symlink() {
+            return Err(Self::invalid_input(format!(
+                "LocalFs root {} must not be a symlink",
+                self.root.display()
+            )));
+        }
+        if !metadata.is_dir() {
+            return Err(Self::invalid_input(format!(
+                "LocalFs root {} must be a directory",
+                self.root.display()
+            )));
+        }
+        Ok(true)
+    }
+
+    fn invalid_input(message: String) -> crate::error::StorageError {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, message).into()
+    }
+
     /// Validates that `key` matches the [`Backend`] trait's key contract:
     /// relative, non-empty, no `.`/`..` component. Called as the first
     /// step of every method taking a single `key: &str` (not `list`,
@@ -64,6 +92,68 @@ impl LocalFs {
         Ok(())
     }
 
+    /// Checks the root and every existing component in `key` without ever
+    /// following a symlink. A missing suffix is allowed for `put` and
+    /// `put_if_absent`, which will create it after this validation.
+    fn validate_existing_key_path(&self, key: &str, require_root: bool) -> Result<()> {
+        if !self.validate_root()? {
+            if require_root {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("LocalFs root {} does not exist", self.root.display()),
+                )
+                .into());
+            }
+            return Ok(());
+        }
+        let mut current = self.root.clone();
+        for component in Path::new(key).components() {
+            current.push(component.as_os_str());
+            match fs::symlink_metadata(&current) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(Self::invalid_input(format!(
+                        "LocalFs key path component {} must not be a symlink",
+                        current.display()
+                    )));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
+    /// `list` accepts an empty or partial prefix, so it cannot use the
+    /// stricter key validator. It still validates every existing component
+    /// the prefix addresses before walking the tree.
+    fn validate_list_prefix(&self, prefix: &str) -> Result<bool> {
+        if !self.validate_root()? {
+            return Ok(false);
+        }
+        let mut current = self.root.clone();
+        for component in Path::new(prefix).components() {
+            if !matches!(component, std::path::Component::Normal(_)) {
+                return Err(Self::invalid_input(format!(
+                    "list prefix {prefix:?} must not contain path navigation components"
+                )));
+            }
+            current.push(component.as_os_str());
+            match fs::symlink_metadata(&current) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(Self::invalid_input(format!(
+                        "LocalFs list prefix component {} must not be a symlink",
+                        current.display()
+                    )));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(true)
+    }
+
     /// A unique, colocated temp filename for `final_path` — colocated so
     /// the eventual `rename` stays within one filesystem/volume. Uses a
     /// process-global counter plus the process id rather than a new
@@ -80,6 +170,47 @@ impl LocalFs {
         final_path.with_file_name(format!(".tmp-{pid}-{n}-{file_name}"))
     }
 
+    /// Converts a possibly-relative path to an absolute path without
+    /// resolving symlinks. Both `root` and `final_path` use this helper so
+    /// their lexical ancestry can be compared consistently.
+    fn absolute_path(path: &Path) -> Result<PathBuf> {
+        if path.is_absolute() {
+            Ok(path.to_path_buf())
+        } else {
+            Ok(std::env::current_dir()?.join(path))
+        }
+    }
+
+    /// Synchronizes every directory containing `final_path`, from the
+    /// immediate parent to this backend's configured `root`, inclusive.
+    /// The leaf sync makes the object publication durable; each later sync
+    /// makes the directory entry that led to the previous directory durable.
+    /// `LocalFs` owns this bounded tree only, so it must never attempt to
+    /// synchronize a parent of `root`.
+    fn sync_containing_directory_chain(&self, final_path: &Path) -> Result<()> {
+        let root = Self::absolute_path(&self.root)?;
+        let final_path = Self::absolute_path(final_path)?;
+        let mut current = final_path
+            .parent()
+            .ok_or_else(|| crate::error::StorageError::DurabilityUnsupported(final_path.clone()))?;
+
+        if !current.starts_with(&root) {
+            return Err(crate::error::StorageError::DurabilityUnsupported(
+                final_path,
+            ));
+        }
+
+        loop {
+            crate::datafile::sync_dir(current)?;
+            if current == root {
+                return Ok(());
+            }
+            current = current
+                .parent()
+                .ok_or_else(|| crate::error::StorageError::DurabilityUnsupported(root.clone()))?;
+        }
+    }
+
     /// Recursively walks `dir` (relative to `root`), collecting every file
     /// whose `root`-relative, `/`-joined key starts with `prefix`. A
     /// missing `dir` (e.g. `root` itself never created because nothing has
@@ -91,9 +222,6 @@ impl LocalFs {
         prefix: &str,
         out: &mut Vec<crate::backend::ObjectMeta>,
     ) -> Result<()> {
-        if !dir.exists() {
-            return Ok(());
-        }
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
@@ -102,6 +230,12 @@ impl LocalFs {
             // which stats through symlinks -- this also stops an unbounded
             // recursion if a symlink cycle ever exists under `root`.
             let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                return Err(Self::invalid_input(format!(
+                    "LocalFs key path component {} must not be a symlink",
+                    path.display()
+                )));
+            }
             if file_type.is_dir() {
                 let sub_key = Self::key_for(root, &path);
                 // Prune: only descend if this subtree could contain
@@ -144,11 +278,13 @@ impl LocalFs {
 impl Backend for LocalFs {
     fn get(&self, key: &str) -> Result<Vec<u8>> {
         Self::validate_key(key)?;
+        self.validate_existing_key_path(key, false)?;
         Ok(fs::read(self.resolve(key))?)
     }
 
     fn get_range(&self, key: &str, range: std::ops::Range<u64>) -> Result<Vec<u8>> {
         Self::validate_key(key)?;
+        self.validate_existing_key_path(key, false)?;
         let resolved = self.resolve(key);
         let mut file = File::open(&resolved)?;
 
@@ -184,6 +320,7 @@ impl Backend for LocalFs {
 
     fn put(&self, key: &str, bytes: &[u8]) -> Result<()> {
         Self::validate_key(key)?;
+        self.validate_existing_key_path(key, true)?;
         let final_path = self.resolve(key);
         if let Some(parent) = final_path.parent() {
             fs::create_dir_all(parent)?;
@@ -210,9 +347,7 @@ impl Backend for LocalFs {
         // `commit_manifest` + its old explicit `sync_dir` call produced
         // together today -- see Task 6, which removes that now-redundant
         // explicit call.
-        if let Some(parent) = final_path.parent() {
-            crate::datafile::sync_dir(parent)?;
-        }
+        self.sync_containing_directory_chain(&final_path)?;
         Ok(())
     }
 
@@ -223,6 +358,7 @@ impl Backend for LocalFs {
     // just colliding ones.
     fn put_if_absent(&self, key: &str, bytes: &[u8]) -> Result<()> {
         Self::validate_key(key)?;
+        self.validate_existing_key_path(key, true)?;
         let final_path = self.resolve(key);
         if let Some(parent) = final_path.parent() {
             fs::create_dir_all(parent)?;
@@ -251,9 +387,7 @@ impl Backend for LocalFs {
                 // directory so the new hard link survives a crash, not
                 // just the file content. `sync_dir` performs its own
                 // chaos checkpoint internally.
-                if let Some(parent) = final_path.parent() {
-                    crate::datafile::sync_dir(parent)?;
-                }
+                self.sync_containing_directory_chain(&final_path)?;
                 Ok(())
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -264,6 +398,9 @@ impl Backend for LocalFs {
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<crate::backend::ObjectMeta>> {
+        if !self.validate_list_prefix(prefix)? {
+            return Ok(Vec::new());
+        }
         let mut results = Vec::new();
         Self::walk(&self.root, &self.root, prefix, &mut results)?;
         results.sort_by(|a, b| a.key.cmp(&b.key));
@@ -272,6 +409,7 @@ impl Backend for LocalFs {
 
     fn delete(&self, key: &str) -> Result<()> {
         Self::validate_key(key)?;
+        self.validate_existing_key_path(key, false)?;
         fs::remove_file(self.resolve(key))?;
         Ok(())
     }
@@ -321,6 +459,95 @@ mod tests {
     }
 
     #[test]
+    fn put_and_put_if_absent_require_a_preexisting_root() {
+        // Break caught: creating the configured root makes LocalFs silently
+        // assume durability responsibility for its caller-owned parent.
+        let parent = temp_root("missing-root-anchor");
+        let root = parent.join("not-created");
+        let backend = LocalFs::new(&root);
+
+        for result in [
+            backend.put("a.bin", b"payload"),
+            backend.put_if_absent("b.bin", b"payload"),
+        ] {
+            assert!(
+                matches!(result, Err(StorageError::Io(ref error)) if error.kind() == std::io::ErrorKind::NotFound),
+                "a missing LocalFs root must fail before writing, got {result:?}"
+            );
+        }
+        assert!(
+            !root.exists(),
+            "a rejected backend write must not create the configured root"
+        );
+        fs::remove_dir_all(&parent).ok();
+    }
+
+    #[test]
+    fn list_on_a_missing_root_returns_an_empty_result() {
+        // Break caught: Dataset::create probes its not-yet-created directory
+        // through read_current, which relies on an empty list rather than an
+        // error before the first manifest exists.
+        let parent = temp_root("missing-root-list");
+        let root = parent.join("not-created");
+
+        let listed = LocalFs::new(&root).list("").unwrap();
+
+        assert!(listed.is_empty());
+        assert!(!root.exists(), "listing must not create the backend root");
+        fs::remove_dir_all(&parent).ok();
+    }
+
+    #[test]
+    fn local_fs_rejects_symlinked_root_and_nested_key_components() {
+        // Break caught: lexical starts_with checks accept a key such as
+        // linked/escaped.bin even when linked escapes the physical root.
+        let parent = temp_root("symlink-containment");
+        let root = parent.join("root");
+        let target = parent.join("target");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&target).unwrap();
+
+        let nested_link = root.join("linked");
+        if let Err(error) = create_directory_symlink(&target, &nested_link) {
+            if symlink_creation_is_unavailable(&error) {
+                // Windows requires developer mode or the symlink privilege;
+                // this is the only platform skip for this regression.
+                fs::remove_dir_all(&parent).ok();
+                return;
+            }
+            panic!("creating a test symlink failed unexpectedly: {error}");
+        }
+
+        fs::write(target.join("existing.bin"), b"outside").unwrap();
+        let backend = LocalFs::new(&root);
+        for result in [
+            backend
+                .put("linked/escaped.bin", b"payload")
+                .map(|()| Vec::new()),
+            backend.get("linked/existing.bin"),
+            backend.list("linked/").map(|_| Vec::new()),
+        ] {
+            assert!(
+                matches!(result, Err(StorageError::Io(ref error)) if error.kind() == std::io::ErrorKind::InvalidInput),
+                "a symlinked key component must be rejected, got {result:?}"
+            );
+        }
+        assert!(
+            !target.join("escaped.bin").exists(),
+            "a rejected write must not escape through the symlink"
+        );
+
+        let symlinked_root = parent.join("symlinked-root");
+        create_directory_symlink(&target, &symlinked_root).unwrap();
+        let result = LocalFs::new(&symlinked_root).list("");
+        assert!(
+            matches!(result, Err(StorageError::Io(ref error)) if error.kind() == std::io::ErrorKind::InvalidInput),
+            "a symlinked LocalFs root must be rejected, got {result:?}"
+        );
+        fs::remove_dir_all(&parent).ok();
+    }
+
+    #[test]
     fn put_overwrites_an_existing_key() {
         let root = temp_root("overwrite");
         let backend = LocalFs::new(&root);
@@ -329,6 +556,101 @@ mod tests {
         backend.put("a.bin", b"second").unwrap();
 
         assert_eq!(backend.get("a.bin").unwrap(), b"second");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn put_returns_the_directory_sync_failure_after_renaming_the_file() {
+        // Break caught: returning success after the rename but before a
+        // successful parent-directory sync would acknowledge non-durable
+        // object publication.
+        let root = temp_root("put-directory-sync-failure");
+        let backend = LocalFs::new(&root);
+        let _fault = crate::datafile::test_support::fail_directory_sync_on_call(
+            1,
+            std::io::ErrorKind::Other,
+        );
+
+        let result = backend.put("a.bin", b"durable payload");
+
+        assert!(
+            matches!(result, Err(StorageError::Io(ref error)) if error.kind() == std::io::ErrorKind::Other),
+            "expected parent-directory sync failure after rename, got {result:?}"
+        );
+        assert_eq!(
+            backend.get("a.bin").unwrap(),
+            b"durable payload",
+            "the test must prove the error happened after the atomic rename"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn put_returns_an_error_when_a_nested_parent_sync_fails() {
+        // Break caught: syncing only the leaf directory lets `put` report
+        // success while a newly-created ancestor directory entry remains
+        // non-durable.
+        let root = temp_root("put-nested-ancestor-sync-failure");
+        let backend = LocalFs::new(&root);
+        let _fault = crate::datafile::test_support::fail_directory_sync_on_call(
+            2,
+            std::io::ErrorKind::Other,
+        );
+
+        let result = backend.put("one/two/a.bin", b"durable payload");
+
+        assert!(
+            matches!(result, Err(StorageError::Io(ref error)) if error.kind() == std::io::ErrorKind::Other),
+            "expected nested ancestor directory-sync failure, got {result:?}"
+        );
+        assert_eq!(
+            backend.get("one/two/a.bin").unwrap(),
+            b"durable payload",
+            "the failure must occur after atomic file publication"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn put_syncs_the_owned_parent_chain_and_never_its_ancestor() {
+        // Break caught: walking above LocalFs::root makes a backend write
+        // depend on directory handles outside its configured ownership.
+        let root = temp_root("put-owned-sync-chain");
+        let backend = LocalFs::new(&root);
+        let recorder = crate::datafile::test_support::record_directory_syncs();
+
+        backend.put("one/two/a.bin", b"durable payload").unwrap();
+
+        assert_eq!(
+            recorder.calls(),
+            vec![root.join("one").join("two"), root.join("one"), root.clone()],
+            "put must synchronize leaf-to-root inclusive and never above LocalFs::root"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn put_retry_resyncs_the_complete_owned_parent_chain() {
+        // Break caught: after a sync failure, directories remain visible;
+        // the next write must still sync every owned directory on the path.
+        let root = temp_root("put-owned-sync-chain-retry");
+        let backend = LocalFs::new(&root);
+        let fault = crate::datafile::test_support::fail_directory_sync_on_call(
+            2,
+            std::io::ErrorKind::Other,
+        );
+
+        assert!(backend.put("one/two/a.bin", b"first").is_err());
+        drop(fault);
+
+        let recorder = crate::datafile::test_support::record_directory_syncs();
+        backend.put("one/two/b.bin", b"second").unwrap();
+
+        assert_eq!(
+            recorder.calls(),
+            vec![root.join("one").join("two"), root.join("one"), root.clone()],
+            "a retry must re-sync the complete leaf-to-root owned chain"
+        );
         fs::remove_dir_all(&root).ok();
     }
 
@@ -377,6 +699,78 @@ mod tests {
         backend.put_if_absent("a.bin", b"first").unwrap();
 
         assert_eq!(backend.get("a.bin").unwrap(), b"first");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn put_if_absent_returns_an_error_when_a_nested_parent_sync_fails() {
+        // Break caught: `put_if_absent` has the same durable-completion
+        // obligation as `put`; a successful hard link alone cannot make a
+        // recursively-created parent chain durable.
+        let root = temp_root("if-absent-nested-ancestor-sync-failure");
+        let backend = LocalFs::new(&root);
+        let _fault = crate::datafile::test_support::fail_directory_sync_on_call(
+            2,
+            std::io::ErrorKind::Other,
+        );
+
+        let result = backend.put_if_absent("one/two/a.bin", b"durable payload");
+
+        assert!(
+            matches!(result, Err(StorageError::Io(ref error)) if error.kind() == std::io::ErrorKind::Other),
+            "expected nested ancestor directory-sync failure, got {result:?}"
+        );
+        assert_eq!(
+            backend.get("one/two/a.bin").unwrap(),
+            b"durable payload",
+            "the failure must occur after atomic file publication"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn put_if_absent_syncs_the_owned_parent_chain_and_never_its_ancestor() {
+        // Break caught: `put_if_absent` must hold the same bounded
+        // durability boundary as `put` after atomically linking its object.
+        let root = temp_root("if-absent-owned-sync-chain");
+        let backend = LocalFs::new(&root);
+        let recorder = crate::datafile::test_support::record_directory_syncs();
+
+        backend
+            .put_if_absent("one/two/a.bin", b"durable payload")
+            .unwrap();
+
+        assert_eq!(
+            recorder.calls(),
+            vec![root.join("one").join("two"), root.join("one"), root.clone()],
+            "put_if_absent must synchronize leaf-to-root inclusive and never above LocalFs::root"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn put_if_absent_retry_resyncs_the_complete_owned_parent_chain() {
+        // Break caught: a failed initial link publication can leave its
+        // parent tree visible but uncertain; a later distinct publication
+        // under that tree must re-sync the full owned chain.
+        let root = temp_root("if-absent-owned-sync-chain-retry");
+        let backend = LocalFs::new(&root);
+        let fault = crate::datafile::test_support::fail_directory_sync_on_call(
+            2,
+            std::io::ErrorKind::Other,
+        );
+
+        assert!(backend.put_if_absent("one/two/a.bin", b"first").is_err());
+        drop(fault);
+
+        let recorder = crate::datafile::test_support::record_directory_syncs();
+        backend.put_if_absent("one/two/b.bin", b"second").unwrap();
+
+        assert_eq!(
+            recorder.calls(),
+            vec![root.join("one").join("two"), root.join("one"), root.clone()],
+            "a retry must re-sync the complete leaf-to-root owned chain"
+        );
         fs::remove_dir_all(&root).ok();
     }
 
@@ -559,8 +953,35 @@ mod tests {
         let call_counter = std::sync::atomic::AtomicU64::new(0);
         crate::backend::conformance::run(move || {
             let n = call_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Box::new(LocalFs::new(root_for_closure.join(format!("group-{n}")))) as Box<dyn Backend>
+            let group_root = root_for_closure.join(format!("group-{n}"));
+            fs::create_dir(&group_root).unwrap();
+            Box::new(LocalFs::new(group_root)) as Box<dyn Backend>
         });
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(unix)]
+    fn create_directory_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn create_directory_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_dir(target, link)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn create_directory_symlink(_target: &Path, _link: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "directory symlinks are unsupported on this platform",
+        ))
+    }
+
+    fn symlink_creation_is_unavailable(error: &std::io::Error) -> bool {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+        ) || cfg!(windows) && error.raw_os_error() == Some(1314)
     }
 }

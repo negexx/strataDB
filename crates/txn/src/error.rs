@@ -36,6 +36,14 @@ pub enum TxnError {
     #[error("manifest arithmetic would overflow: {0}")]
     ManifestOverflow(String),
     #[error(
+        "row-id reservation through {end} may be visible but its durable confirmation failed: {source}"
+    )]
+    RowIdReservationDurability {
+        end: u64,
+        #[source]
+        source: strata_storage::StorageError,
+    },
+    #[error(
         "manifest declares an unreasonably large row-id capacity ({0}); maximum allowed is {1}"
     )]
     UnreasonableCapacity(u64, u64),
@@ -45,8 +53,28 @@ pub enum TxnError {
     CorruptSegment(String),
     #[error("schema mismatch casting a data file: expected {expected} columns, found {actual}")]
     SchemaMismatch { expected: usize, actual: usize },
+    #[error(
+        "batch schema does not match the dataset-owned schema: expected {expected:?}, found {actual:?}"
+    )]
+    BatchSchemaMismatch { expected: String, actual: String },
+    #[error("row {row_id} is not owned by the transaction's base snapshot")]
+    RowNotFound { row_id: u64 },
+    #[error("row {row_id} is already tombstoned in the transaction's base snapshot")]
+    RowNotLive { row_id: u64 },
+    #[error("row {row_id} is already targeted by this transaction")]
+    DuplicateTarget { row_id: u64 },
+    #[error("an update replacement must contain exactly one row, found {actual_rows}")]
+    InvalidUpdateShape { actual_rows: usize },
     #[error("conflict: {contested_row_ids:?} were modified by another transaction")]
     Conflict { contested_row_ids: Vec<u64> },
+    #[error(
+        "commit history for base version {base_version} was evicted; retained history starts at version {oldest_retained_version} and the latest version is {latest_version}"
+    )]
+    InsufficientHistory {
+        base_version: u64,
+        oldest_retained_version: u64,
+        latest_version: u64,
+    },
     /// The row-id range a transaction claimed does not match the rows it
     /// actually laid out — spec §8's "gaps are safe, reuse is forbidden"
     /// invariant. `claimed_end` is one past the last claimed row-id
@@ -84,6 +112,14 @@ mod tests {
         assert_eq!(
             TxnError::UnreasonableCapacity(5_000_000_000, 1_000_000_000).to_string(),
             "manifest declares an unreasonably large row-id capacity (5000000000); maximum allowed is 1000000000"
+        );
+        assert_eq!(
+            TxnError::RowIdReservationDurability {
+                end: 7,
+                source: strata_storage::StorageError::Io(std::io::Error::other("sync failed")),
+            }
+            .to_string(),
+            "row-id reservation through 7 may be visible but its durable confirmation failed: I/O error: sync failed"
         );
         assert_eq!(
             TxnError::UnsafeManifestPath("../escape".to_string()).to_string(),

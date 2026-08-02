@@ -1,6 +1,6 @@
 //! Row-id-indexed, demand-allocated, chunked storage — no hashing, since
-//! `crates/txn`'s row-ids are dense, monotonic `u64`s. See
-//! `docs/superpowers/specs/2026-07-18-lockfree-hnsw-rewrite-design.md` §2.
+//! `crates/txn`'s row IDs are monotonically allocated `u64`s; gaps are valid. See
+//! `docs/design.md`.
 
 #[cfg(loom)]
 use loom::sync::atomic::{AtomicPtr, Ordering};

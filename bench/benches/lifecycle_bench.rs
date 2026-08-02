@@ -4,13 +4,16 @@
 //!
 //! Not a `criterion` benchmark: criterion measures one operation in a tight
 //! loop. This runs the *whole* lifecycle once (ingest → recover → scan →
-//! filter → group-by → vector search → concurrent writes) on the real 100k
-//! 512-dim OpenAI embedding dataset, the same one `vector_search_bench` uses,
-//! and prints a comparison table.
+//! filter → group-by → vector search → concurrent writes) on the configured
+//! fixture when present, or a deterministic synthetic 512-dim source when the
+//! external download is absent, and prints a comparison table.
 //!
 //! ```text
 //! cargo bench --bench lifecycle_bench
 //! STRATA_LIFECYCLE_ROWS=50000 cargo bench --bench lifecycle_bench
+//! STRATA_BENCH_SOURCE=synthetic STRATA_BENCH_SEED=20260801 \
+//!   STRATA_LIFECYCLE_ROWS=64 STRATA_LIFECYCLE_BATCH_ROWS=8 \
+//!   cargo bench -p strata-bench --bench lifecycle_bench
 //! ```
 //!
 //! Memory is measured with a counting global allocator (below): per phase we
@@ -32,12 +35,12 @@
     clippy::cast_lossless,
     clippy::too_many_lines,
     clippy::many_single_char_names,
-    clippy::map_unwrap_or,
     clippy::print_literal,
     clippy::doc_markdown
 )]
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -109,6 +112,7 @@ const DATASET_PATH: &str = concat!(
 const EMBEDDING_COLUMN: &str = "text-embedding-3-small-512-embedding";
 const VECTOR_DIM: usize = 512;
 const VECTOR_DIM_I32: i32 = 512;
+const DEFAULT_SYNTHETIC_SEED: u64 = 20_260_801;
 
 struct Row {
     id: i64,
@@ -121,7 +125,7 @@ fn load_rows(limit: usize) -> Vec<Row> {
     let file = std::fs::File::open(DATASET_PATH).unwrap_or_else(|e| {
         panic!(
             "failed to open {DATASET_PATH}: {e}. Download it first — see \
-             docs/design/phase-4-implementation-plan.md Task 7 Step 1."
+             docs/roadmap.md's Phase 1 performance-evidence work first."
         )
     });
     let reader = ParquetRecordBatchReaderBuilder::try_new(file)
@@ -154,6 +158,129 @@ fn load_rows(limit: usize) -> Vec<Row> {
         }
     }
     out
+}
+
+fn load_rows_from_path(path: &Path, limit: usize) -> Vec<Row> {
+    let file = std::fs::File::open(path)
+        .unwrap_or_else(|error| panic!("open {}: {error}", path.display()));
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut out = Vec::with_capacity(limit);
+    for batch in reader {
+        let batch = batch.unwrap();
+        let col = batch.schema_ref().index_of(EMBEDDING_COLUMN).unwrap();
+        let list = batch
+            .column(col)
+            .as_any()
+            .downcast_ref::<arrow::array::ListArray>()
+            .expect("embedding column is a list");
+        for i in 0..batch.num_rows() {
+            if out.len() >= limit {
+                return out;
+            }
+            let values = list.value(i);
+            let values: &Float64Array = values.as_any().downcast_ref().expect("f64 values");
+            let vector: Vec<f32> = values.values().iter().map(|value| *value as f32).collect();
+            let id = out.len() as i64;
+            out.push(Row {
+                id,
+                category: id % 10,
+                amount: (id % 1000) as f64 + 0.5,
+                vector,
+            });
+        }
+    }
+    out
+}
+
+fn synthetic_rows(limit: usize, mut state: u64) -> Vec<Row> {
+    (0..limit)
+        .map(|id| {
+            let vector = (0..VECTOR_DIM)
+                .map(|dimension| {
+                    // xorshift64 is deliberately specified here, avoiding a
+                    // random-number dependency while keeping the fallback reproducible.
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    let unit = (state >> 40) as f32 / ((1_u64 << 24) - 1) as f32;
+                    unit + dimension as f32 * 0.000_001
+                })
+                .collect();
+            Row {
+                id: id as i64,
+                category: (id % 10) as i64,
+                amount: (id % 1000) as f64 + 0.5,
+                vector,
+            }
+        })
+        .collect()
+}
+
+fn input_rows(limit: usize) -> (Vec<Row>, String) {
+    let source = std::env::var("STRATA_BENCH_SOURCE").unwrap_or_else(|_| "auto".to_owned());
+    let seed = std::env::var("STRATA_BENCH_SEED")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_SYNTHETIC_SEED);
+    let path = std::env::var_os("STRATA_BENCH_FIXTURE")
+        .map_or_else(|| PathBuf::from(DATASET_PATH), PathBuf::from);
+
+    match source.as_str() {
+        "synthetic" => (
+            synthetic_rows(limit, seed),
+            format!("synthetic seed={seed}"),
+        ),
+        "fixture" | "auto" if path == Path::new(DATASET_PATH) && path.is_file() => {
+            (load_rows(limit), format!("fixture {}", path.display()))
+        }
+        "fixture" | "auto" if path.is_file() => (
+            load_rows_from_path(&path, limit),
+            format!("fixture {}", path.display()),
+        ),
+        "fixture" => panic!(
+            "STRATA_BENCH_SOURCE=fixture requires {}; use synthetic fallback instead",
+            path.display()
+        ),
+        "auto" => (
+            synthetic_rows(limit, seed),
+            format!(
+                "synthetic fallback seed={seed} (fixture absent: {})",
+                path.display()
+            ),
+        ),
+        other => {
+            panic!("unknown STRATA_BENCH_SOURCE={other:?}; expected auto, fixture, or synthetic")
+        }
+    }
+}
+
+fn rows_hash(rows: &[Row]) -> u64 {
+    rows.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, row| {
+        row.vector.iter().fold(hash, |hash, value| {
+            value
+                .to_bits()
+                .to_le_bytes()
+                .iter()
+                .fold(hash, |hash, byte| {
+                    (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3)
+                })
+        })
+    })
+}
+
+fn newest_manifest_bytes(dir: &Path) -> u64 {
+    std::fs::read_dir(dir.join("_versions"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| entry.metadata().ok())
+        .filter(std::fs::Metadata::is_file)
+        .map(|meta| meta.len())
+        .max()
+        .unwrap_or(0)
 }
 
 fn schema() -> SchemaRef {
@@ -209,13 +336,24 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(25_000);
-    let batch_sz: usize = 5_000;
+    let batch_sz: usize = std::env::var("STRATA_LIFECYCLE_BATCH_ROWS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5_000);
+    let pinned_snapshots: usize = std::env::var("STRATA_PINNED_SNAPSHOTS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1)
+        .max(1);
     let queries_n: usize = 50;
     let k: usize = 10;
     let threads: usize = 8;
 
-    eprintln!("loading {rows_n} rows ({VECTOR_DIM}-dim) from the dataset...");
-    let rows = load_rows(rows_n);
+    let (rows, source) = input_rows(rows_n);
+    eprintln!(
+        "loading {rows_n} rows ({VECTOR_DIM}-dim) from {source}; input hash={:016x}",
+        rows_hash(&rows)
+    );
     assert_eq!(rows[0].vector.len(), VECTOR_DIM);
     let n = rows.len();
     eprintln!("loaded {n} rows; running lifecycle...");
@@ -224,19 +362,23 @@ fn main() {
     let _ = std::fs::remove_dir_all(&dir);
 
     let mut results: Vec<PhaseResult> = Vec::new();
+    let mut retained_snapshots = Vec::new();
 
     // ---- Phase 1: ingest + commit (write path: encode data file, build +
     // serialize + fsync an index segment, publish both atomically).
     // Batched to model real ingestion. --------------------------------
-    let ds = Dataset::create(&dir).unwrap();
+    let ds = Dataset::create(&dir, schema()).unwrap();
     let m = phase_start();
     let t = Instant::now();
     let mut commits = 0;
     for chunk in rows.chunks(batch_sz) {
         let mut txn = ds.begin();
-        txn.insert(batch_of(chunk));
+        txn.insert(batch_of(chunk)).unwrap();
         txn.commit().unwrap();
         commits += 1;
+        if retained_snapshots.len() < pinned_snapshots.saturating_sub(1) {
+            retained_snapshots.push(ds.snapshot());
+        }
     }
     let wall = t.elapsed();
     results.push(PhaseResult {
@@ -270,7 +412,27 @@ fn main() {
         mem: phase_end(m),
     });
 
-    let snap = ds.snapshot();
+    let snapshot_start = phase_start();
+    let snapshot_time = Instant::now();
+    let current_snapshot = ds.snapshot();
+    let mut pinned = retained_snapshots;
+    pinned.push(current_snapshot.clone());
+    while pinned.len() < pinned_snapshots {
+        pinned.push(ds.snapshot());
+    }
+    let snapshot_wall = snapshot_time.elapsed();
+    results.push(PhaseResult {
+        name: "pinned snapshot/cache residency",
+        kind: "memory (immutable snapshot handles)",
+        wall: snapshot_wall,
+        detail: format!(
+            "{} historical/current pinned handles; live allocator bytes={}",
+            pinned.len(),
+            LIVE.load(Ordering::Relaxed)
+        ),
+        mem: phase_end(snapshot_start),
+    });
+    let snap = current_snapshot;
     let sch = schema();
 
     // ---- Phase 3: full scan (read every file, all columns incl. vectors) --
@@ -433,7 +595,7 @@ fn main() {
                         vector: r.vector.clone(),
                     };
                     let mut txn = ds.begin();
-                    txn.insert(batch_of(std::slice::from_ref(&one)));
+                    txn.insert(batch_of(std::slice::from_ref(&one))).unwrap();
                     txn.commit().unwrap();
                 }
             });
@@ -452,7 +614,9 @@ fn main() {
         mem: phase_end(m),
     });
 
+    let manifest_bytes = newest_manifest_bytes(&dir);
     drop(snap);
+    drop(pinned);
     drop(ds);
     let _ = std::fs::remove_dir_all(&dir);
 
@@ -469,18 +633,15 @@ fn main() {
     let slowest = results
         .iter()
         .max_by_key(|r| r.wall.as_nanos())
-        .map(|r| r.name)
-        .unwrap_or("");
+        .map_or("", |r| r.name);
     let heaviest_mem = results
         .iter()
         .max_by_key(|r| r.mem.peak_over_start.max(0))
-        .map(|r| r.name)
-        .unwrap_or("");
+        .map_or("", |r| r.name);
     let most_alloc = results
         .iter()
         .max_by_key(|r| r.mem.allocated)
-        .map(|r| r.name)
-        .unwrap_or("");
+        .map_or("", |r| r.name);
     for r in &results {
         println!(
             "{:<28} {:>11} {:>10.1}MB {:>10.1}MB  {}",
@@ -497,6 +658,9 @@ fn main() {
         on_disk,
         mib((n * VECTOR_DIM * 4) as i64)
     );
+    println!("input source           : {source}");
+    println!("input hash             : {:016x}", rows_hash(&rows));
+    println!("newest manifest bytes  : {manifest_bytes}");
     println!("\nSLOWEST phase        : {slowest}");
     println!("MOST CPU/alloc churn : {most_alloc}");
     println!("HEAVIEST peak memory : {heaviest_mem}");

@@ -1,7 +1,7 @@
 //! Row-id allocation: hands out contiguous, session-durable ranges from a
 //! single global counter.
 //!
-//! `docs/design/phase-0-transaction-and-format-spec.md` §8 defines
+//! `docs/design.md` defines
 //! the contract: a commit writing N rows atomically claims the contiguous
 //! range `[next_row_id, next_row_id + N)`, and ids are never reused —
 //! "gaps are safe, reuse is forbidden." One claim per *transaction*, not
@@ -47,12 +47,11 @@
 //! `Snapshot::is_visible` reduces to the tombstone check alone; this
 //! module keeps only the counter.
 //!
-//! Proven, not assumed: `dataset::loom_tests::
+//! The named `dataset::loom_tests::
 //! a_reader_never_sees_one_in_flight_commits_row_while_observing_an_unrelated_commits_row_id_counter`
-//! ("Model 3") passed against the OLD in-flight-tracking implementation as
-//! a baseline, then again, completely unmodified, after this module's
-//! simplification — see the S1 segmented-index spec §6 for the "migrate
-//! the guarantee, then remove the mechanism" plan this followed.
+//! ("Model 3") is the regression gate for this simplification. Its required
+//! post-change run is recorded separately because the full model can exceed
+//! local resource limits; source comments do not imply completion.
 //!
 //! # Locking
 //!
@@ -67,10 +66,13 @@
 
 #[cfg(loom)]
 use loom::sync::Mutex;
+use std::path::PathBuf;
 #[cfg(not(loom))]
 use std::sync::Mutex;
 
 use crate::error::{Result, TxnError};
+#[cfg(not(loom))]
+use strata_storage::persist_row_id_high_water_at_least;
 
 /// A half-open range of row-ids, `[base, base + len)`, claimed for one
 /// transaction. There is nothing to release: once granted, a range is
@@ -101,14 +103,22 @@ struct AllocatorState {
 /// Hands out contiguous row-id ranges from a single global counter.
 pub(crate) struct RowIdAllocator {
     state: Mutex<AllocatorState>,
+    #[cfg(not(loom))]
+    dataset_dir: PathBuf,
 }
 
 impl RowIdAllocator {
     /// Starts allocating at `next_row_id` — `Manifest::next_row_id` on
     /// `Dataset::create`/`open`, so ids are never reused across sessions.
-    pub(crate) fn new(next_row_id: u64) -> Self {
+    pub(crate) fn new(dataset_dir: impl Into<PathBuf>, next_row_id: u64) -> Self {
+        #[cfg(not(loom))]
+        let dataset_dir = dataset_dir.into();
+        #[cfg(loom)]
+        let _ = dataset_dir;
         Self {
             state: Mutex::new(AllocatorState { next_row_id }),
+            #[cfg(not(loom))]
+            dataset_dir,
         }
     }
 
@@ -143,6 +153,44 @@ impl RowIdAllocator {
     /// [`TxnError::ManifestOverflow`] if the range would run past
     /// `u64::MAX`. Checked *before* the counter moves, so a rejected claim
     /// consumes no row-ids at all.
+    #[cfg(not(loom))]
+    pub(crate) fn claim(&self, count: u64) -> Result<RowIdRange> {
+        let mut state = self.lock();
+        loop {
+            let base = state.next_row_id;
+            let end = base.checked_add(count).ok_or_else(|| {
+                TxnError::ManifestOverflow(format!("next_row_id {base} + {count}"))
+            })?;
+            match persist_row_id_high_water_at_least(&self.dataset_dir, end) {
+                Ok(persisted_end) if persisted_end == end => {
+                    state.next_row_id = end;
+                    return Ok(RowIdRange { base, len: count });
+                }
+                Ok(persisted_end) => {
+                    // A record discovered above the in-memory seed is a
+                    // durable floor, never a range this allocator may use.
+                    state.next_row_id = state.next_row_id.max(persisted_end);
+                }
+                Err(error) => {
+                    if let Some(possibly_published_end) = error.possibly_published_end() {
+                        // The immutable record became visible before a
+                        // directory-sync failure. Return the error without
+                        // exposing this range, but retain the gap forever.
+                        state.next_row_id = state.next_row_id.max(possibly_published_end);
+                        return Err(TxnError::RowIdReservationDurability {
+                            end: possibly_published_end,
+                            source: error.into_storage_error(),
+                        });
+                    }
+                    return Err(TxnError::Storage(error.into_storage_error()));
+                }
+            }
+        }
+    }
+
+    /// Filesystem publication is modeled separately under loom. The real
+    /// claim path stays disk-free in existing dataset loom models.
+    #[cfg(loom)]
     pub(crate) fn claim(&self, count: u64) -> Result<RowIdRange> {
         let mut state = self.lock();
         let base = state.next_row_id;
@@ -167,9 +215,18 @@ impl RowIdAllocator {
 mod tests {
     use super::*;
 
+    fn allocator_dir(label: &str) -> std::path::PathBuf {
+        tempfile::Builder::new()
+            .prefix(&format!("strata-row-id-allocator-{label}-"))
+            .tempdir()
+            .unwrap()
+            .keep()
+    }
+
     #[test]
     fn successive_claims_hand_out_contiguous_non_overlapping_ranges() {
-        let allocator = RowIdAllocator::new(0);
+        let dir = allocator_dir("successive");
+        let allocator = RowIdAllocator::new(&dir, 0);
         let first = allocator.claim(3).unwrap();
         let second = allocator.claim(2).unwrap();
         assert_eq!(first.base(), 0);
@@ -179,11 +236,13 @@ mod tests {
             5,
             "the counter must cover every id handed out, committed or not"
         );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn a_claim_that_would_overflow_is_rejected_without_consuming_row_ids() {
-        let allocator = RowIdAllocator::new(u64::MAX - 1);
+        let dir = allocator_dir("overflow");
+        let allocator = RowIdAllocator::new(&dir, u64::MAX - 1);
         assert!(matches!(
             allocator.claim(2),
             Err(TxnError::ManifestOverflow(_))
@@ -194,5 +253,186 @@ mod tests {
             "a rejected claim must not advance the counter"
         );
         assert!(allocator.claim(1).is_ok(), "the last id is still available");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(feature = "test-fault-injection")]
+    #[test]
+    fn a_pre_publish_failure_does_not_advance_the_allocator() {
+        let dir = allocator_dir("pre-publish-failure");
+        let allocator = RowIdAllocator::new(&dir, 0);
+        let _fault =
+            strata_storage::row_id_high_water::test_support::fail_reservation_before_publish(
+                std::io::ErrorKind::Other,
+            );
+
+        let result = allocator.claim(1);
+
+        assert!(matches!(result, Err(TxnError::Storage(_))));
+        assert_eq!(allocator.next_row_id(), 0);
+        assert_eq!(strata_storage::read_row_id_high_water(&dir).unwrap(), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(loom)]
+pub(crate) mod loom_tests {
+    use loom::sync::{
+        Arc, Mutex,
+        atomic::{AtomicU8, AtomicU64, Ordering},
+    };
+
+    use super::RowIdRange;
+
+    #[derive(Clone, Copy, Debug)]
+    enum Publication {
+        Durable,
+        FailsAfterPublish,
+    }
+
+    struct AllocatorState {
+        next: u64,
+    }
+
+    /// Models the durable collection independently from allocator
+    /// linearization. `published` means the immutable record became
+    /// observable; `durable` means its directory-sync confirmation returned;
+    /// `exposed` means a caller received a successful range. They are three
+    /// distinct transitions in the real protocol, not aliases of one scalar.
+    struct PublicationState {
+        published: AtomicU64,
+        durable: AtomicU64,
+        exposed: AtomicU64,
+    }
+
+    // Every claim moves through a bounded, one-way state machine. The
+    // post-publication failure is intentionally the only failure branch:
+    // it is the branch that must retain a gap and is the durability boundary
+    // the production allocator cannot weaken.
+    const ALLOCATED: u8 = 1;
+    const PUBLISHED: u8 = 2;
+    const DURABLE: u8 = 3;
+    const EXPOSED: u8 = 4;
+    const FAILED_AFTER_PUBLISH: u8 = 5;
+
+    fn claim(
+        allocator: &Mutex<AllocatorState>,
+        publication: &PublicationState,
+        phase: &AtomicU8,
+        outcome: Publication,
+    ) -> (RowIdRange, bool) {
+        let mut allocator = allocator.lock().unwrap();
+        let base = allocator.next;
+        let end = base + 1;
+        let range = RowIdRange { base, len: 1 };
+
+        phase.store(ALLOCATED, Ordering::SeqCst);
+        publication.published.store(end, Ordering::SeqCst);
+        phase.store(PUBLISHED, Ordering::SeqCst);
+        allocator.next = end;
+
+        if matches!(outcome, Publication::FailsAfterPublish) {
+            // The immutable record may survive the failed confirmation, so
+            // its range is consumed but is never returned to the caller.
+            phase.store(FAILED_AFTER_PUBLISH, Ordering::SeqCst);
+            return (range, false);
+        }
+
+        publication.durable.store(end, Ordering::SeqCst);
+        phase.store(DURABLE, Ordering::SeqCst);
+        assert!(
+            publication.published.load(Ordering::SeqCst) >= end,
+            "a high-water record must be published before its durable confirmation"
+        );
+        publication.exposed.store(end, Ordering::SeqCst);
+        phase.store(EXPOSED, Ordering::SeqCst);
+        (range, true)
+    }
+
+    fn ranges_do_not_overlap(left: RowIdRange, right: RowIdRange) -> bool {
+        let left_end = left.base + left.len;
+        let right_end = right.base + right.len;
+        left_end <= right.base || right_end <= left.base
+    }
+
+    #[test]
+    fn concurrent_claims_publish_monotonic_high_water() {
+        loom::model(|| {
+            let allocator = Arc::new(Mutex::new(AllocatorState { next: 0 }));
+            let publication = Arc::new(PublicationState {
+                published: AtomicU64::new(0),
+                durable: AtomicU64::new(0),
+                exposed: AtomicU64::new(0),
+            });
+            let first_phase = Arc::new(AtomicU8::new(0));
+            let second_phase = Arc::new(AtomicU8::new(0));
+
+            let first_allocator = Arc::clone(&allocator);
+            let first_publication = Arc::clone(&publication);
+            let first_phase_for_claim = Arc::clone(&first_phase);
+            let first = loom::thread::spawn(move || {
+                claim(
+                    &first_allocator,
+                    &first_publication,
+                    &first_phase_for_claim,
+                    Publication::FailsAfterPublish,
+                )
+            });
+            let second_allocator = Arc::clone(&allocator);
+            let second_publication = Arc::clone(&publication);
+            let second_phase_for_claim = Arc::clone(&second_phase);
+            let second = loom::thread::spawn(move || {
+                claim(
+                    &second_allocator,
+                    &second_publication,
+                    &second_phase_for_claim,
+                    Publication::Durable,
+                )
+            });
+
+            let (failed_range, failed_exposed) = first.join().unwrap();
+            let (successful_range, successful_exposed) = second.join().unwrap();
+
+            assert!(
+                ranges_do_not_overlap(failed_range, successful_range),
+                "two concurrently-started claims must consume non-overlapping ranges"
+            );
+            assert!(
+                !failed_exposed,
+                "a post-publication failure must leave its range unexposed"
+            );
+            assert!(successful_exposed, "a durable claim must expose its range");
+            assert_eq!(
+                first_phase.load(Ordering::SeqCst),
+                FAILED_AFTER_PUBLISH,
+                "the failed claim must stop after publication"
+            );
+            assert_eq!(
+                second_phase.load(Ordering::SeqCst),
+                EXPOSED,
+                "the successful claim must reach API exposure"
+            );
+
+            let published = publication.published.load(Ordering::SeqCst);
+            let durable = publication.durable.load(Ordering::SeqCst);
+            let exposed = publication.exposed.load(Ordering::SeqCst);
+            assert!(
+                published >= durable && durable >= exposed,
+                "high-water transitions must remain monotonic: published={published}, durable={durable}, exposed={exposed}"
+            );
+            assert!(
+                durable >= successful_range.base + successful_range.len,
+                "a successful range must have crossed durable high-water before exposure"
+            );
+            assert!(
+                published >= failed_range.base + failed_range.len,
+                "a failed post-publication claim must retain its published high-water floor"
+            );
+            assert_eq!(
+                allocator.lock().unwrap().next,
+                failed_range.base.max(successful_range.base) + 1,
+                "the allocator must retain every consumed range"
+            );
+        });
     }
 }

@@ -1,15 +1,12 @@
 // bench/benches/lockfree_vs_hnsw_rs_bench.rs
-//! Recall@k and QPS comparison: the new lock-free `strata_index::graph::Graph`
-//! vs. `hnsw_rs` — the empirical evidence for the lock-free HNSW rewrite's
-//! stated success bar (match or beat `hnsw_rs`), per
-//! `docs/superpowers/specs/2026-07-18-hnsw-rs-wrap-vs-replace-decision.md`.
+//! Measures Recall@k and QPS for the lock-free `strata_index::graph::Graph`
+//! alongside `hnsw_rs` for this benchmark workload.
 //!
 //! Both indexes are graded against `strata_index::brute_force_search` as
-//! true ground truth, not against each other — this directly answers
-//! whether Graph's recall@k is >= `hnsw_rs`'s, which "vs. `hnsw_rs`'s own
-//! results as ground truth" alone would not (two implementations can agree
-//! with each other while both being wrong, or diverge without telling you
-//! which one is closer to correct).
+//! true ground truth, not against each other, so the results report each
+//! implementation's measured recall independently (two implementations can
+//! agree with each other while both being wrong, or diverge without telling
+//! you which one is closer to correct).
 //!
 //! `load_vectors` duplicates `vector_search_bench.rs`'s loader rather than
 //! sharing it — each file under `benches/` compiles as an independent
@@ -69,7 +66,7 @@ fn load_vectors(limit: usize) -> Vec<Vec<f32>> {
     let file = std::fs::File::open(DATASET_PATH).unwrap_or_else(|e| {
         panic!(
             "failed to open {DATASET_PATH}: {e}. Run the download step in \
-             docs/design/phase-4-implementation-plan.md's Task 7 Step 1 first."
+             docs/roadmap.md's Phase 1 performance-evidence work first."
         )
     });
     let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();

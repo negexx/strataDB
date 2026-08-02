@@ -39,6 +39,15 @@ covers its own commit. It must not become silent buffering or weaken the acknowl
 Before acceptance it needs a version model, failure/recovery semantics, a loom model, bounded latency
 policy, and workload measurements. Current commit serialization remains authoritative.
 
+## 0009 - Supported engine facade and package boundary
+
+**Status:** Accepted for Phase 1.
+
+`strata-txn`'s `Dataset`, `Snapshot`, and `Transaction` are the supported engine surface. Storage,
+index, and query crates are internal implementation layers and are marked non-publishable; direct
+use of those layers does not carry the facade's schema, conflict, or recovery guarantees. This
+decision does not create a stable Python or administration API.
+
 ## Decision rules
 
 - Preserve the embedded, single-node scope and the one-process/shared-`Dataset` concurrency boundary.

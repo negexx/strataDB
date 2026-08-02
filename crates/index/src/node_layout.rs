@@ -1,6 +1,6 @@
 //! Raw single-block layout for a graph node: header, vector, and every
 //! layer's edge slots packed into one allocation. See
-//! `docs/superpowers/specs/2026-07-23-single-allocation-hnsw-node-layout-design.md`.
+//! `docs/design.md`.
 
 use std::alloc::Layout;
 

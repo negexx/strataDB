@@ -1,7 +1,6 @@
 //! Per-agent operation-verb generation and just-in-time target resolution
 //! for the chaos workload. See
-//! `docs/superpowers/specs/2026-07-27-chaos-worker-workload-extension-design.md`
-//! §3.1.
+//! `docs/phase-1-audit.md` for the current verification boundary.
 
 use rand::{Rng as _, SeedableRng as _};
 use rand_chacha::ChaCha8Rng;

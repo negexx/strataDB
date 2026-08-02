@@ -1,6 +1,6 @@
 //! `Predicate` — the shared vocabulary for row-level filtering (`filter`)
 //! and file-level pruning (`should_scan_file`). See
-//! `docs/design/phase-3-query-refinement-spec.md` §2.
+//! `docs/design.md`.
 
 use std::collections::HashMap;
 
@@ -135,7 +135,7 @@ fn compare(array: &ArrayRef, predicate: &Predicate) -> Result<BooleanArray, Arro
 /// Decides whether a file whose column stats are `stats` could possibly
 /// contain a row matching `predicate`. Fails open (returns `true`)
 /// whenever it can't prove otherwise — see
-/// `docs/design/phase-3-query-refinement-spec.md` §2. Pure
+/// `docs/design.md`. Pure
 /// function, zero I/O.
 ///
 /// For a compound predicate: an `And` can prune the file if *either* side

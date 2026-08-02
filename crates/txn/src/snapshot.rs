@@ -1,5 +1,5 @@
 //! A point-in-time, immutable view of a [`Dataset`](crate::Dataset) — see
-//! `docs/superpowers/specs/2026-07-17-phase-5-mvcc-snapshot-isolation-design.md`.
+//! `docs/design.md`.
 //! `Snapshot` itself is never cloned — callers hold it behind
 //! [`Dataset::snapshot`](crate::dataset::Dataset::snapshot)'s `Arc<Snapshot>`,
 //! and cloning *that* `Arc` is cheap and never touches the data it points to.
@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use arrow::array::{Array, BooleanArray, RecordBatch, UInt64Array};
 use arrow::compute::{concat_batches, filter_record_batch};
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{Field, SchemaRef};
 use strata_index::LiveSet;
 use strata_query::{Predicate, PredicateKey, filter, mask, should_scan_file};
 use strata_storage::{DataFileEntry, Manifest, read_batch, read_batch_columns};
@@ -29,7 +29,7 @@ use crate::live_set_cache::LiveSetCache;
 /// (`HashMap<String, ColumnStats>`), and applies the existing
 /// `should_scan_file` evaluator — S1 W4b. `crates/index` never sees a
 /// `Predicate` or a `ColumnStats`; see
-/// `docs/superpowers/specs/2026-07-26-s1-w4-zone-map-design-amendment.md` §2.
+/// `docs/design.md`.
 ///
 /// The `None` arm (a payload that isn't a `HashMap<String, ColumnStats>`)
 /// is unreachable in practice — `crates/txn` is the only code that ever
@@ -51,6 +51,7 @@ fn zone_map_permits_scan(
 pub struct Snapshot {
     pub(crate) dir: PathBuf,
     pub(crate) version: u64,
+    pub(crate) schema: SchemaRef,
     pub(crate) manifest: Arc<Manifest>,
     pub(crate) index: strata_index::SegmentSet,
     pub(crate) tombstones: Arc<imbl::HashSet<u64>>,
@@ -105,7 +106,7 @@ const MAX_EF_SCALE: f64 = 20.0;
 
 /// Widens `base_ef` using `Snapshot::explain`'s scanned/total file ratio as
 /// a coarse, file-granularity *upper bound* on selectivity — see
-/// `docs/design/phase-4-vector-index-spec.md` §4. Erring toward a
+/// `docs/design.md`. Erring toward a
 /// wider `ef` costs search time, never correctness, so an overestimate of
 /// how many rows survive is the safe direction.
 fn widen_ef(base_ef: usize, snapshot: &Snapshot, predicate: &Predicate) -> usize {
@@ -123,6 +124,61 @@ fn widen_ef(base_ef: usize, snapshot: &Snapshot, predicate: &Predicate) -> usize
 }
 
 impl Snapshot {
+    /// The immutable logical schema owned by this dataset.
+    #[must_use]
+    pub fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    pub(crate) fn owns_row(&self, row_id: u64) -> bool {
+        self.manifest.data_files.iter().any(|entry| {
+            entry
+                .row_id_range
+                .is_some_and(|(first, last)| first <= row_id && row_id <= last)
+        })
+    }
+
+    pub(crate) fn owns_live_row(&self, row_id: u64) -> bool {
+        self.owns_row(row_id) && self.is_visible(row_id)
+    }
+
+    fn validate_projection_schema(&self, requested: &SchemaRef) -> Result<()> {
+        if requested.metadata() != self.schema.metadata() {
+            return Err(TxnError::BatchSchemaMismatch {
+                expected: format!("owned schema metadata {:?}", self.schema.metadata()),
+                actual: format!("requested schema metadata {:?}", requested.metadata()),
+            });
+        }
+        for field in requested.fields() {
+            let expected = match field.name().as_str() {
+                ROW_ID_COLUMN => {
+                    Field::new(ROW_ID_COLUMN, arrow::datatypes::DataType::UInt64, false)
+                }
+                crate::dataset::TIMESTAMP_COLUMN => Field::new(
+                    crate::dataset::TIMESTAMP_COLUMN,
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                ),
+                name => self
+                    .schema
+                    .field_with_name(name)
+                    .map_err(|_| TxnError::BatchSchemaMismatch {
+                        expected: format!("owned field named {name:?}"),
+                        actual: format!("requested field {field:?}"),
+                    })?
+                    .as_ref()
+                    .clone(),
+            };
+            if field.as_ref() != &expected {
+                return Err(TxnError::BatchSchemaMismatch {
+                    expected: format!("{expected:?}"),
+                    actual: format!("{field:?}"),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Whether `row_id` is visible under this snapshot: not tombstoned as
     /// of this snapshot's version. No per-tombstone version needs to be
     /// stored for this to be correct — the version boundary comes from
@@ -138,8 +194,9 @@ impl Snapshot {
     /// this snapshot's own `index`/`manifest.data_files` produced, which by
     /// construction can never include a row-id this snapshot's own commit
     /// didn't allocate, and can never include an in-flight (not-yet-durable)
-    /// transaction's row at all. Proven, not assumed:
-    /// `dataset::loom_tests::a_reader_never_sees_one_in_flight_commits_row_while_observing_an_unrelated_commits_row_id_counter`.
+    /// transaction's row at all. The named loom model is the regression gate
+    /// for this invariant; its post-change execution remains separately
+    /// tracked when host resource limits prevent completion.
     ///
     /// This runs once per candidate during HNSW graph traversal.
     pub(crate) fn is_visible(&self, row_id: u64) -> bool {
@@ -163,8 +220,7 @@ impl Snapshot {
     /// [`Snapshot::scan_with_predicate`], and [`Snapshot::row_ids_matching`]
     /// — one enforcement point for tombstone visibility, rather than three
     /// call sites each independently responsible for remembering it. Per
-    /// `docs/design/phase-0-transaction-and-format-spec.md` §8's
-    /// "Tombstone GC" paragraph: `scan` must treat a tombstoned row-id as
+    /// `docs/design.md`: `scan` must treat a tombstoned row-id as
     /// dead regardless of whether its bytes are still on disk.
     ///
     /// `columns`, when `Some`, restricts the Arrow IPC read to those columns
@@ -244,6 +300,7 @@ impl Snapshot {
     /// column can't be cast to `schema`'s corresponding field type, or if
     /// the cast batches can't be concatenated against `schema`.
     pub fn scan(&self, schema: &SchemaRef) -> Result<RecordBatch> {
+        self.validate_projection_schema(schema)?;
         let batches =
             self.read_surviving_files(None, None, |batch| cast_batch_to_schema(&batch, schema))?;
         Ok(concat_batches(schema, &batches)?)
@@ -251,8 +308,7 @@ impl Snapshot {
 
     /// Reports which of this snapshot's files `predicate` would require
     /// scanning, without opening any file body — pure introspection over
-    /// stats already loaded in the manifest. See
-    /// `docs/design/phase-3-query-refinement-spec.md` §3.
+    /// stats already loaded in the manifest. See `docs/design.md`.
     #[must_use]
     pub fn explain(&self, predicate: &Predicate) -> ExplainResult {
         let mut scanned = Vec::new();
@@ -297,6 +353,7 @@ impl Snapshot {
         schema: &SchemaRef,
         predicate: &Predicate,
     ) -> Result<RecordBatch> {
+        self.validate_projection_schema(schema)?;
         let batches = self.read_surviving_files(Some(predicate), None, |batch| {
             let cast = cast_batch_to_schema(&batch, schema)?;
             Ok(filter(&cast, predicate)?)
@@ -310,8 +367,7 @@ impl Snapshot {
     /// `Self::is_visible` into
     /// [`SegmentSet::search`](strata_index::SegmentSet::search)/
     /// [`SegmentSet::search_filtered_pruned_live`](strata_index::SegmentSet::search_filtered_pruned_live)
-    /// — see `docs/design/phase-4-vector-index-spec.md` §3-4 and the
-    /// Phase 5 design doc.
+    /// — see `docs/design.md`.
     ///
     /// # Examples
     ///
@@ -324,8 +380,6 @@ impl Snapshot {
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let dir = std::env::temp_dir()
     ///     .join(format!("strata-doctest-vector-search-{}", std::process::id()));
-    /// let dataset = Dataset::create(&dir)?;
-    ///
     /// let schema = Arc::new(Schema::new(vec![
     ///     Field::new("id", DataType::Int64, false),
     ///     Field::new(
@@ -334,6 +388,7 @@ impl Snapshot {
     ///         false,
     ///     ),
     /// ]));
+    /// let dataset = Dataset::create(&dir, Arc::clone(&schema))?;
     /// let ids = Arc::new(Int64Array::from(vec![1, 2]));
     /// let item_field = Arc::new(Field::new("item", DataType::Float32, false));
     /// let values = Arc::new(Float32Array::from(vec![0.0, 0.0, 0.0, 9.0, 9.0, 9.0]));
@@ -341,7 +396,7 @@ impl Snapshot {
     /// let batch = RecordBatch::try_new(schema, vec![ids, vectors])?;
     ///
     /// let mut txn = dataset.begin();
-    /// txn.insert(batch);
+    /// txn.insert(batch)?;
     /// txn.commit()?;
     ///
     /// let results = dataset.snapshot().vector_search(&[0.0, 0.0, 0.0], 1, None)?;
@@ -476,6 +531,7 @@ mod tests {
         Snapshot {
             dir: PathBuf::from("unused-in-these-tests"),
             version: 1,
+            schema: Arc::new(arrow::datatypes::Schema::empty()),
             manifest: Arc::new(Manifest::empty()),
             // This test exercises `is_visible`'s tombstone check only and
             // never searches, so an empty segment set is exactly right and
@@ -511,7 +567,6 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("strata-w4b-explain-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let dataset = Dataset::create(&dir).unwrap();
 
         let schema = StdArc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
@@ -525,6 +580,7 @@ mod tests {
                 false,
             ),
         ]));
+        let dataset = Dataset::create(&dir, StdArc::clone(&schema)).unwrap();
 
         // Segment 0: every row tagged "a", clustered near the origin.
         let mut txn = dataset.begin();
@@ -543,7 +599,8 @@ mod tests {
                 ],
             )
             .unwrap(),
-        );
+        )
+        .unwrap();
         txn.commit().unwrap();
 
         // Segment 1: every row tagged "b", clustered far away.
@@ -565,7 +622,8 @@ mod tests {
                 ],
             )
             .unwrap(),
-        );
+        )
+        .unwrap();
         txn.commit().unwrap();
 
         let snapshot = dataset.snapshot();
@@ -615,7 +673,6 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        let dataset = Dataset::create(&dir).unwrap();
 
         let schema = StdArc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
@@ -629,6 +686,7 @@ mod tests {
                 false,
             ),
         ]));
+        let dataset = Dataset::create(&dir, StdArc::clone(&schema)).unwrap();
 
         // Segment 0 ("a"): clustered at the origin -- nearest to the query
         // below, but must never be returned once filtered to category "b".
@@ -648,7 +706,8 @@ mod tests {
                 ],
             )
             .unwrap(),
-        );
+        )
+        .unwrap();
         txn.commit().unwrap();
 
         // Segment 1 ("b"): far from the query, but the only segment that
@@ -669,7 +728,8 @@ mod tests {
                 ],
             )
             .unwrap(),
-        );
+        )
+        .unwrap();
         txn.commit().unwrap();
 
         let snapshot = dataset.snapshot();
@@ -709,7 +769,6 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        let dataset = Dataset::create(&dir).unwrap();
 
         let schema = StdArc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
@@ -723,6 +782,7 @@ mod tests {
                 false,
             ),
         ]));
+        let dataset = Dataset::create(&dir, StdArc::clone(&schema)).unwrap();
 
         // Segment 0 ("a"): clustered at the origin -- nearest to the query
         // below, but must never be returned once filtered to category "b".
@@ -742,7 +802,8 @@ mod tests {
                 ],
             )
             .unwrap(),
-        );
+        )
+        .unwrap();
         txn.commit().unwrap();
 
         // Segment 1 ("b"): far from the query, but the only segment that
@@ -763,7 +824,8 @@ mod tests {
                 ],
             )
             .unwrap(),
-        );
+        )
+        .unwrap();
         txn.commit().unwrap();
 
         // Drop the in-memory handle entirely so the reopened dataset's
@@ -827,7 +889,6 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        let dataset = Dataset::create(&dir).unwrap();
 
         let schema = StdArc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
@@ -841,6 +902,7 @@ mod tests {
                 false,
             ),
         ]));
+        let dataset = Dataset::create(&dir, StdArc::clone(&schema)).unwrap();
 
         // Segment 0: every row tagged "a".
         let mut txn = dataset.begin();
@@ -859,7 +921,8 @@ mod tests {
                 ],
             )
             .unwrap(),
-        );
+        )
+        .unwrap();
         txn.commit().unwrap();
 
         // Segment 1: every row tagged "b".
@@ -879,7 +942,8 @@ mod tests {
                 ],
             )
             .unwrap(),
-        );
+        )
+        .unwrap();
         txn.commit().unwrap();
 
         let snapshot = dataset.snapshot();
@@ -996,7 +1060,6 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        let dataset = Dataset::create(&dir).unwrap();
 
         let schema = StdArc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
@@ -1010,6 +1073,7 @@ mod tests {
                 false,
             ),
         ]));
+        let dataset = Dataset::create(&dir, StdArc::clone(&schema)).unwrap();
 
         // Segment 0 ("a"), row-id 0.
         let mut txn = dataset.begin();
@@ -1028,7 +1092,8 @@ mod tests {
                 ],
             )
             .unwrap(),
-        );
+        )
+        .unwrap();
         txn.commit().unwrap();
 
         // Segment 1 ("b"), row-id 1.
@@ -1048,7 +1113,8 @@ mod tests {
                 ],
             )
             .unwrap(),
-        );
+        )
+        .unwrap();
         txn.commit().unwrap();
 
         // In-memory snapshot: exercises `with_appended` (`Transaction::commit`).
@@ -1070,7 +1136,7 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("strata-scan-tombstone-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let dataset = Dataset::create(&dir).unwrap();
+        let dataset = Dataset::create(&dir, mvp_schema()).unwrap();
 
         // Row-ids 0, 1, 2 in commit order.
         let mut txn = dataset.begin();
@@ -1081,11 +1147,12 @@ mod tests {
                 (2, "c", [2.0, 0.0, 0.0]),
             ])
             .unwrap(),
-        );
+        )
+        .unwrap();
         txn.commit().unwrap();
 
         let mut delete_txn = dataset.begin();
-        delete_txn.delete(1);
+        delete_txn.delete(1).unwrap();
         delete_txn.commit().unwrap();
 
         let batch = dataset.snapshot().scan(&mvp_schema()).unwrap();
@@ -1117,7 +1184,7 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        let dataset = Dataset::create(&dir).unwrap();
+        let dataset = Dataset::create(&dir, mvp_schema()).unwrap();
 
         let mut txn = dataset.begin();
         txn.insert(
@@ -1127,14 +1194,15 @@ mod tests {
                 (2, "c", [2.0, 0.0, 0.0]),
             ])
             .unwrap(),
-        );
+        )
+        .unwrap();
         txn.commit().unwrap();
 
         // Take a snapshot BEFORE the delete.
         let old_snapshot = dataset.snapshot();
 
         let mut delete_txn = dataset.begin();
-        delete_txn.delete(1);
+        delete_txn.delete(1).unwrap();
         delete_txn.commit().unwrap();
 
         let old_count = old_snapshot.scan(&mvp_schema()).unwrap().num_rows();
@@ -1166,14 +1234,15 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        let dataset = Dataset::create(&dir).unwrap();
+        let dataset = Dataset::create(&dir, mvp_schema()).unwrap();
 
         let mut txn = dataset.begin();
-        txn.insert(mvp_batch(&[(0, "a", [0.0, 0.0, 0.0]), (1, "b", [1.0, 0.0, 0.0])]).unwrap());
+        txn.insert(mvp_batch(&[(0, "a", [0.0, 0.0, 0.0]), (1, "b", [1.0, 0.0, 0.0])]).unwrap())
+            .unwrap();
         txn.commit().unwrap();
 
         let mut delete_txn = dataset.begin();
-        delete_txn.delete(1); // deletes the row named "b"
+        delete_txn.delete(1).unwrap(); // deletes the row named "b"
         delete_txn.commit().unwrap();
 
         let predicate = Predicate::Eq("name".to_string(), Value::Utf8("b".to_string()));
@@ -1216,14 +1285,17 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        let dataset = Dataset::create(&dir).unwrap();
+        let dataset = Dataset::create(&dir, mvp_schema()).unwrap();
 
         let mut txn = dataset.begin();
-        txn.insert(mvp_batch(&[(0, "original", [0.0, 0.0, 0.0])]).unwrap());
+        txn.insert(mvp_batch(&[(0, "original", [0.0, 0.0, 0.0])]).unwrap())
+            .unwrap();
         txn.commit().unwrap();
 
         let mut update_txn = dataset.begin();
-        update_txn.update(0, mvp_row(0, "replacement", [1.0, 0.0, 0.0]).unwrap());
+        update_txn
+            .update(0, mvp_row(0, "replacement", [1.0, 0.0, 0.0]).unwrap())
+            .unwrap();
         update_txn.commit().unwrap();
 
         let batch = dataset.snapshot().scan(&mvp_schema()).unwrap();
@@ -1306,22 +1378,24 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        let dataset = Dataset::create(&dir).unwrap();
+        let dataset = Dataset::create(&dir, mvp_schema()).unwrap();
 
         // First commit -- its own data file, one row, row-id 0.
         let mut txn = dataset.begin();
-        txn.insert(mvp_batch(&[(0, "a", [0.0, 0.0, 0.0])]).unwrap());
+        txn.insert(mvp_batch(&[(0, "a", [0.0, 0.0, 0.0])]).unwrap())
+            .unwrap();
         txn.commit().unwrap();
 
         // Second commit -- a different data file, two rows, row-ids 1, 2.
         let mut txn2 = dataset.begin();
-        txn2.insert(mvp_batch(&[(1, "b", [1.0, 0.0, 0.0]), (2, "c", [2.0, 0.0, 0.0])]).unwrap());
+        txn2.insert(mvp_batch(&[(1, "b", [1.0, 0.0, 0.0]), (2, "c", [2.0, 0.0, 0.0])]).unwrap())
+            .unwrap();
         txn2.commit().unwrap();
 
         // Delete the ONLY row in the first commit's file -- that file's
         // batch filters down to zero rows; the second file's is untouched.
         let mut delete_txn = dataset.begin();
-        delete_txn.delete(0);
+        delete_txn.delete(0).unwrap();
         delete_txn.commit().unwrap();
 
         let snapshot = dataset.snapshot();

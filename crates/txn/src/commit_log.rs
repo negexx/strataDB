@@ -1,7 +1,6 @@
 //! A bounded, in-memory ring buffer of recently-committed transactions'
 //! write-sets — see
-//! `docs/superpowers/specs/2026-07-21-phase-6-concurrent-write-engine-design.md`
-//! §4. `Snapshot`s don't retain write-set history once unreferenced, so
+//! `docs/design.md`. `Snapshot`s don't retain write-set history once unreferenced, so
 //! conflict-checking "did anything land between my read-version and now
 //! touch my rows" needs its own structure independent of `Snapshot`'s
 //! lifetime.
@@ -20,10 +19,12 @@ pub enum ConflictCheck {
     Conflict(Vec<u64>),
     /// The log's oldest entry is newer than `since_version` — some
     /// commits in the requested range have already been evicted, so
-    /// "clean" cannot be proven. Treated as a conflict by the caller (see
-    /// design doc §4's "conservative conflict" rule), kept as a distinct
-    /// variant so tests can assert on it specifically.
-    InsufficientHistory,
+    /// "clean" cannot be proven. `oldest_retained_version` is the first
+    /// version still represented by the ring buffer. Treated as a
+    /// conservative rejection by the caller (see design doc §4's
+    /// "conservative conflict" rule), but kept distinct from a row conflict
+    /// because no contested row-id can be identified.
+    InsufficientHistory { oldest_retained_version: u64 },
 }
 
 /// Write-set size above which [`CommitLog::conflicts_with`] hashes the
@@ -101,14 +102,20 @@ impl CommitLog {
         }
         if let Some((oldest_version, _)) = self.entries.front() {
             if *oldest_version > since_version + 1 {
-                return ConflictCheck::InsufficientHistory;
+                return ConflictCheck::InsufficientHistory {
+                    oldest_retained_version: *oldest_version,
+                };
             }
         } else {
             // Empty log but a non-empty range was requested: only "clean"
             // if nothing could possibly have committed in that range,
             // i.e. since_version == up_to_version handled above. An empty
             // log with a real gap to cover has no history at all.
-            return ConflictCheck::InsufficientHistory;
+            return ConflictCheck::InsufficientHistory {
+                // There is no retained version. Represent the empty retained
+                // range by the first version after the checked latest one.
+                oldest_retained_version: up_to_version.saturating_add(1),
+            };
         }
 
         // Hash the committing write-set once, rather than paying a linear
@@ -236,7 +243,9 @@ mod tests {
         log.push(3, vec![30]); // evicts version 1's entry
         assert_eq!(
             log.conflicts_with(0, 3, &[999]),
-            ConflictCheck::InsufficientHistory
+            ConflictCheck::InsufficientHistory {
+                oldest_retained_version: 2,
+            }
         );
     }
 
@@ -362,7 +371,12 @@ mod tests {
             let naive = if write_set.is_empty() || up_to_version <= since_version {
                 ConflictCheck::Clean
             } else if history_gap {
-                ConflictCheck::InsufficientHistory
+                let oldest_retained_version = committed
+                    .first()
+                    .map_or_else(|| up_to_version.saturating_add(1), |(version, _)| *version);
+                ConflictCheck::InsufficientHistory {
+                    oldest_retained_version,
+                }
             } else {
                 let mut contested: Vec<u64> = committed
                     .iter()

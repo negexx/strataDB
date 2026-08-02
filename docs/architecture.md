@@ -29,7 +29,7 @@ for the current blockers.
 - Predicate pruning, filtered ANN primitives, and in-memory group-by.
 - Real-process crash/reopen tests, targeted loom models, fuzz targets, and benchmarks.
 
-These are usable slices, not a finished database API. There is no complete schema catalog, planner,
+These are usable slices, not a finished database API. There is no schema-evolution/migration workflow, planner,
 stable Python API, stable administration CLI, point lookup, compaction, vacuum, orphan cleanup, time
 travel, or cross-process protocol.
 
@@ -45,7 +45,8 @@ travel, or cross-process protocol.
    is rejected conservatively.
 4. A clean commit creates and publishes a manifest containing data files, tombstones, and segment
    metadata, then installs a replacement immutable snapshot. The manifest is the intended visibility
-   boundary; directory durability and end-to-end integrity remain Phase 1 blockers.
+   boundary; directory durability and end-to-end integrity are limited to the named local filesystem
+   evidence and typed fail-closed paths documented in `docs/status.md`.
 
 Publication is lock-serialized inside one `Dataset` handle. Independent handles/processes do not share
 the lock, allocator, history, or in-memory snapshot, so the implementation is not a cross-process
@@ -57,9 +58,10 @@ conditional-CAS protocol.
 captured view. `Transaction` writes and `Snapshot` reads are separate APIs; the current engine does not
 provide a full read/write snapshot-transaction interface.
 
-Rows are append-only physical records. `delete` adds a tombstone. `update` tombstones the old physical
-row and inserts replacement data with a new physical row ID. Logical identity, absent-target semantics,
-and update cardinality remain Phase 1 contract work.
+Rows are append-only physical records. `delete` and `update` must target one live physical row in the
+transaction's base snapshot and are revalidated under the commit lock. `update` tombstones that old
+physical row and inserts exactly one replacement with a new physical row ID; invalid, absent, or
+already-dead targets return typed errors. Logical identity remains deferred.
 
 Each vector-carrying commit creates an immutable HNSW segment. Search asks applicable segments for local
 candidates, merges them into global top-k, and applies live/tombstone filtering. This provides a coherent

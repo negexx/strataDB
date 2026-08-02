@@ -27,7 +27,7 @@ fn a_snapshot_never_gains_or_loses_rows_after_it_was_taken() {
         .tempdir()
         .unwrap()
         .keep();
-    Dataset::create(&dir).unwrap();
+    Dataset::create(&dir, mvp_schema()).unwrap();
     let writer_dataset = Dataset::open(&dir).unwrap();
 
     // Seed one row before any reader takes a snapshot, so every reader's
@@ -36,7 +36,9 @@ fn a_snapshot_never_gains_or_loses_rows_after_it_was_taken() {
     // column, unrelated to the internal system row-id the commit path
     // assigns automatically.
     let mut seed_txn = writer_dataset.begin();
-    seed_txn.insert(mvp_batch(&[(0, "seed", [0.0, 0.0, 0.0])]).unwrap());
+    seed_txn
+        .insert(mvp_batch(&[(0, "seed", [0.0, 0.0, 0.0])]).unwrap())
+        .unwrap();
     seed_txn.commit().unwrap();
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -48,7 +50,8 @@ fn a_snapshot_never_gains_or_loses_rows_after_it_was_taken() {
     let writer = std::thread::spawn(move || {
         for i in 1..=20i64 {
             let mut txn = writer_dataset_clone.begin();
-            txn.insert(mvp_batch(&[(i, "row", [i as f32, 0.0, 0.0])]).unwrap());
+            txn.insert(mvp_batch(&[(i, "row", [i as f32, 0.0, 0.0])]).unwrap())
+                .unwrap();
             txn.commit().unwrap();
         }
         writer_stop.store(true, Ordering::SeqCst);
@@ -126,7 +129,7 @@ fn an_old_snapshots_scan_never_gains_a_later_commits_rows() {
         .tempdir()
         .unwrap()
         .keep();
-    Dataset::create(&dir).unwrap();
+    Dataset::create(&dir, mvp_schema()).unwrap();
     let dataset = Dataset::open(&dir).unwrap();
 
     let mut txn = dataset.begin();
@@ -137,7 +140,8 @@ fn an_old_snapshots_scan_never_gains_a_later_commits_rows() {
             (2, "c", [2.0, 0.0, 0.0]),
         ])
         .unwrap(),
-    );
+    )
+    .unwrap();
     txn.commit().unwrap();
 
     // Take a snapshot BEFORE the later commit.
@@ -149,8 +153,7 @@ fn an_old_snapshots_scan_never_gains_a_later_commits_rows() {
     // `scan_with_predicate` did not consult `Snapshot::tombstones` at all
     // (only `Snapshot::vector_search`'s HNSW traversal did, via
     // `is_visible`), which violated
-    // `docs/design/phase-0-transaction-and-format-spec.md` §8's
-    // "Tombstone GC" paragraph — "`scan`, `search`, and (later) conflict
+    // `docs/design.md`'s tombstone rule — "`scan`, `search`, and (later) conflict
     // detection must all treat a tombstoned row-id as dead". That gap is
     // now CLOSED: tombstone filtering lives in `read_surviving_files`, the
     // single helper all three read paths funnel through. Its coverage lives
@@ -164,7 +167,8 @@ fn an_old_snapshots_scan_never_gains_a_later_commits_rows() {
     // exactly the old snapshot's own row count, proving old_snapshot's
     // manifest/view is frozen and can never grow after the fact.
     let mut txn2 = dataset.begin();
-    txn2.insert(mvp_batch(&[(3, "d", [3.0, 0.0, 0.0]), (4, "e", [4.0, 0.0, 0.0])]).unwrap());
+    txn2.insert(mvp_batch(&[(3, "d", [3.0, 0.0, 0.0]), (4, "e", [4.0, 0.0, 0.0])]).unwrap())
+        .unwrap();
     txn2.commit().unwrap();
 
     let old_count_again = old_snapshot.scan(&mvp_schema()).unwrap().num_rows();
@@ -224,7 +228,7 @@ fn cluster_vectors(count: usize, center: [f32; 3], spacing: f32) -> Vec<[f32; 3]
 fn an_old_snapshots_vector_search_never_leaks_a_later_commits_rows() {
     // A later commit's INSERTS never leak into an old snapshot's
     // `vector_search` results. Since S1 (`crates/index`'s segmented
-    // immutable index — see `.opencode/rules/vector-index.md`), a
+    // immutable index — see `docs/architecture.md`), a
     // `Snapshot`'s index is its OWN `SegmentSet`: an immutable list of
     // segments fixed at the instant that snapshot was published
     // (`Snapshot.index`, `crates/txn/src/snapshot.rs`). A later commit
@@ -277,7 +281,7 @@ fn an_old_snapshots_vector_search_never_leaks_a_later_commits_rows() {
         .tempdir()
         .unwrap()
         .keep();
-    Dataset::create(&dir).unwrap();
+    Dataset::create(&dir, mvp_schema()).unwrap();
     let dataset = Dataset::open(&dir).unwrap();
 
     // First commit: a 20-point cluster near the origin, row-ids 0..19.
@@ -286,7 +290,7 @@ fn an_old_snapshots_vector_search_never_leaks_a_later_commits_rows() {
         .map(|i| (i as i64, "near", near_cluster[i]))
         .collect();
     let mut txn = dataset.begin();
-    txn.insert(mvp_batch(&near_rows).unwrap());
+    txn.insert(mvp_batch(&near_rows).unwrap()).unwrap();
     txn.commit().unwrap();
 
     // Take a snapshot BEFORE the second (far) cluster is committed.
@@ -315,7 +319,7 @@ fn an_old_snapshots_vector_search_never_leaks_a_later_commits_rows() {
         .map(|i| (CLUSTER_SIZE as i64 + i as i64, "far", far_cluster[i]))
         .collect();
     let mut txn2 = dataset.begin();
-    txn2.insert(mvp_batch(&far_rows).unwrap());
+    txn2.insert(mvp_batch(&far_rows).unwrap()).unwrap();
     txn2.commit().unwrap();
 
     // Re-run vector_search on the SAME old_snapshot. The far cluster's
@@ -401,7 +405,7 @@ fn an_old_snapshots_vector_search_still_sees_a_row_a_later_commit_tombstones() {
     // (`crates/txn/src/snapshot.rs`), where `tombstones` is captured from `Manifest.tombstones` as
     // of THAT snapshot's own version.
     //
-    // Deletion never rewrites a segment (`.opencode/rules/vector-index.md`) — a deleted row's vector
+    // Deletion never rewrites a segment (`docs/architecture.md`) — a deleted row's vector
     // stays physically present in its segment forever; only the manifest's tombstone set (and
     // therefore what `is_visible` filters) changes.
     let dir = tempfile::Builder::new()
@@ -409,7 +413,7 @@ fn an_old_snapshots_vector_search_still_sees_a_row_a_later_commit_tombstones() {
         .tempdir()
         .unwrap()
         .keep();
-    Dataset::create(&dir).unwrap();
+    Dataset::create(&dir, mvp_schema()).unwrap();
     let dataset = Dataset::open(&dir).unwrap();
 
     let row_0_vector = [0.0f32, 0.0, 0.0];
@@ -421,14 +425,15 @@ fn an_old_snapshots_vector_search_still_sees_a_row_a_later_commit_tombstones() {
             (2, "c", [2.0, 0.0, 0.0]),
         ])
         .unwrap(),
-    );
+    )
+    .unwrap();
     txn.commit().unwrap();
 
     // Take a snapshot BEFORE the tombstoning commit.
     let old_snapshot = dataset.snapshot();
 
     let mut delete_txn = dataset.begin();
-    delete_txn.delete(0);
+    delete_txn.delete(0).unwrap();
     delete_txn.commit().unwrap();
 
     // Query at row 0's OWN exact coordinates with k=1, rather than a larger k against the whole

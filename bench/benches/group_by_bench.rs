@@ -2,14 +2,13 @@
 //! 10M+ rows, correct, benchmarked"). Correctness against a naive,
 //! obviously-right reference implementation is checked *before* the
 //! throughput numbers are trusted — see
-//! `docs/design/phase-2-encodings-and-groupby-spec.md` §3.
+//! `docs/design.md`.
 //!
 //! `bench_group_by_cardinality_sweep` adds the high-cardinality coverage
 //! `bench_group_by` doesn't exercise (1,000 categories over 10M rows is
 //! ~10,000 rows/group -- allocation-per-group cost is a tiny fraction of
 //! total work there). See
-//! `docs/superpowers/specs/2026-07-19-group-by-phase-a-optimization-design.md`
-//! §8.
+//! `docs/architecture.md`.
 
 // This file is a bench target, not a #[cfg(test)] module, but
 // `cargo clippy --all-targets` still lints it under the workspace's
@@ -244,8 +243,7 @@ fn bench_group_by(c: &mut Criterion) {
 /// High-cardinality sweep at a fixed 1,000,000 rows -- exercises the
 /// allocation-heavy path `bench_group_by`'s low-cardinality (1,000
 /// categories) shape doesn't reach. See
-/// `docs/superpowers/specs/2026-07-19-group-by-phase-a-optimization-design.md`
-/// §8.
+/// `docs/architecture.md`.
 fn bench_group_by_cardinality_sweep(c: &mut Criterion) {
     let mut group = c.benchmark_group("group_by_cardinality_sweep");
     group.sample_size(10);

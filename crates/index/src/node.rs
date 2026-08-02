@@ -1,6 +1,6 @@
 //! A graph node: its vector, one slot region per layer it participates
 //! in, and its deleted flag, all packed into a single raw allocation. See
-//! `docs/superpowers/specs/2026-07-23-single-allocation-hnsw-node-layout-design.md`.
+//! `docs/design.md`.
 
 #[cfg(loom)]
 use loom::sync::atomic::{AtomicU64, Ordering};
@@ -338,8 +338,7 @@ mod tests {
 }
 
 /// Run with: `cargo rustc -p strata-index --lib --profile test -- --cfg loom`
-/// (never a workspace-wide `RUSTFLAGS` — see
-/// `.opencode/rules/concurrency-txn-layer.md`).
+/// (never a workspace-wide `RUSTFLAGS` — see `docs/phase-1-audit.md`).
 #[cfg(loom)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod loom_tests {

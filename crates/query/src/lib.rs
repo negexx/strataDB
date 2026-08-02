@@ -1,6 +1,9 @@
 //! Expression/filter API. See
-//! `docs/design/phase-3-query-refinement-spec.md` for `Predicate`,
+//! `docs/design.md` for `Predicate`,
 //! the general `filter`, and file-pruning via `should_scan_file`.
+//!
+//! Query primitives are internal building blocks. The supported engine
+//! facade is `strata-txn`'s `Dataset`/`Snapshot`/`Transaction` surface.
 
 use arrow::array::RecordBatch;
 use arrow::error::ArrowError;

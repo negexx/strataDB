@@ -1,6 +1,6 @@
 //! HNSW vector index — lock-free, from-scratch implementation (replacing
-//! `hnsw_rs` as of this rewrite). See `.opencode/rules/vector-index.md` and
-//! `docs/superpowers/specs/2026-07-18-lockfree-hnsw-rewrite-design.md`.
+//! `hnsw_rs` as of this rewrite). See `docs/architecture.md` and
+//! `docs/design.md`.
 
 use crate::distance::L2;
 use crate::graph::Graph;
@@ -47,10 +47,9 @@ enum ChunkOutcome<R> {
 ///
 /// Uses `std::thread::Builder::spawn_scoped` (which returns `io::Result`),
 /// not `Scope::spawn` (which unwraps internally and panics if the OS
-/// refuses to create the thread) -- `.opencode/rules/concurrency-txn-layer.md`
-/// documents `ERROR_NO_SYSTEM_RESOURCES` under thread pressure as a real,
-/// observed risk in this project's own dev environment, and this runs on
-/// the commit path. A refused spawn is reported as [`ChunkOutcome::SpawnFailed`]
+/// refuses to create the thread) -- operating systems can refuse thread
+/// creation under resource pressure, and this runs on the commit path. A
+/// refused spawn is reported as [`ChunkOutcome::SpawnFailed`]
 /// rather than panicking or silently dropping the chunk.
 ///
 /// Real OS threads are unsupported here under `--cfg loom`: `Graph::insert`
@@ -96,7 +95,7 @@ fn run_chunks_in_parallel<T: Send, R: Send>(
 
 /// One search result: which row-id, and its squared L2 distance to the
 /// query vector. `row_id` is the persistent, global identity from
-/// `docs/design/phase-0-transaction-and-format-spec.md` §8 — not a
+/// `docs/design.md` — not a
 /// position within any particular array, unlike `brute_force::Neighbor`.
 ///
 /// `squared_distance` is the sum of squared per-dimension differences (no
@@ -337,7 +336,7 @@ impl HnswIndex {
     /// make it worth it. Intended for `crates/txn`'s per-commit segment
     /// builder, which owns a brand-new, private `HnswIndex` outside
     /// `commit_lock` and never shares it with a reader until it's fully
-    /// built and serialized — see `.opencode/rules/vector-index.md`.
+    /// built and serialized — see `docs/architecture.md`.
     ///
     /// **`rows[0]` is always inserted sequentially, before any worker
     /// thread is spawned for the rest.** `Graph::insert`'s "first node in
@@ -511,8 +510,8 @@ impl HnswIndex {
     /// anymore. It remains index-internal API, sound on the same terms it
     /// always was: such a row-id was never committed in *any* version, so
     /// no snapshot should ever observe it, and because row-ids are never
-    /// reused (`docs/design/phase-0-transaction-and-format-spec.md`
-    /// §8) — a soft-deleted id can never legitimately reappear.
+    /// reused (`docs/design.md`) — a soft-deleted id can never legitimately
+    /// reappear.
     ///
     /// **Do not use this to implement a user-level DELETE.** That is
     /// `crates/txn`'s versioned `Snapshot::tombstones` set, which is
@@ -680,7 +679,7 @@ impl HnswIndex {
     /// *not* the dataset's global row-ids. `row_ids[local]` supplies the
     /// global row-id each ordinal stands for, and must be strictly
     /// ascending. See
-    /// `docs/superpowers/specs/2026-07-25-s1-w3-2-design-amendment.md` §3b.
+    /// `docs/design.md`.
     ///
     /// # Errors
     ///
@@ -1594,7 +1593,7 @@ mod tests {
         // points below sequential. `bench/benches/vector_search_bench.rs`
         // is this crate's dedicated recall-at-realistic-scale benchmark
         // (100K real embeddings, floor asserted at recall@10 > 0.8) -- see
-        // `.opencode/rules/vector-index.md` for how index-quality tradeoffs
+        // `docs/architecture.md` for how index-quality tradeoffs
         // like this one are meant to be tracked. The 8-point tolerance
         // below has real headroom above this test's own measured range
         // specifically so this stays a regression *gate*, not a bound this

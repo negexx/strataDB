@@ -3,8 +3,7 @@
 //! non-conflicting writers vs. a single-writer baseline, and under a
 //! high-conflict-rate workload — the number that validates (or refutes)
 //! the tightly-scoped `commit_lock` design. See
-//! `docs/superpowers/specs/2026-07-21-phase-6-concurrent-write-engine-design.md`
-//! §3 and §7.
+//! `docs/design.md` for the current commit lifecycle and concurrency boundary.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::path::PathBuf;
@@ -54,12 +53,12 @@ fn setup_dataset(row_count: i64) -> TempDataset {
         row_count
     ));
     std::fs::remove_dir_all(&dir).ok();
-    let dataset = Dataset::create(&dir).unwrap();
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let dataset = Dataset::create(&dir, Arc::clone(&schema)).unwrap();
     let ids: Vec<i64> = (0..row_count).collect();
     let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(ids))]).unwrap();
     let mut txn = dataset.begin();
-    txn.insert(batch);
+    txn.insert(batch).unwrap();
     txn.commit().unwrap();
     TempDataset { dir, dataset }
 }
@@ -111,9 +110,9 @@ fn setup_vector_dataset() -> TempDataset {
         std::process::id()
     ));
     std::fs::remove_dir_all(&dir).ok();
-    let dataset = Dataset::create(&dir).unwrap();
+    let dataset = Dataset::create(&dir, vector_schema()).unwrap();
     let mut txn = dataset.begin();
-    txn.insert(vector_row_batch(0));
+    txn.insert(vector_row_batch(0)).unwrap();
     txn.commit().unwrap();
     TempDataset { dir, dataset }
 }
@@ -145,7 +144,7 @@ fn bench_concurrent_non_conflicting_inserts(c: &mut Criterion) {
                                 )
                                 .unwrap();
                                 let mut txn = ds.begin();
-                                txn.insert(batch);
+                                txn.insert(batch).unwrap();
                                 txn.commit().unwrap();
                             }
                         });
@@ -168,8 +167,7 @@ fn bench_concurrent_non_conflicting_inserts(c: &mut Criterion) {
 /// commit" workload: here the segment build/serialize/fsync (the expensive
 /// work) runs in `write_phase`, *before* `commit_lock` is ever acquired: the
 /// in-lock step is just a manifest push, not an index mutation. See
-/// `docs/superpowers/specs/2026-07-21-phase-6-concurrent-write-engine-design.md`
-/// §3 for why that placement was a deliberate, but until now unmeasured,
+/// `docs/design.md` for why that placement remains a deliberate, but unmeasured,
 /// choice.
 fn bench_concurrent_non_conflicting_vector_inserts(c: &mut Criterion) {
     c.bench_function("concurrent_non_conflicting_vector_inserts", |b| {
@@ -186,7 +184,7 @@ fn bench_concurrent_non_conflicting_vector_inserts(c: &mut Criterion) {
                                     + i
                                     + 1;
                                 let mut txn = ds.begin();
-                                txn.insert(vector_row_batch(id));
+                                txn.insert(vector_row_batch(id)).unwrap();
                                 txn.commit().unwrap();
                             }
                         });
@@ -210,7 +208,7 @@ fn bench_single_writer_vector_baseline(c: &mut Criterion) {
                 let total = i64::try_from(NUM_THREADS).unwrap() * VECTOR_COMMITS_PER_THREAD;
                 for i in 1..=total {
                     let mut txn = temp_dataset.dataset.begin();
-                    txn.insert(vector_row_batch(i));
+                    txn.insert(vector_row_batch(i)).unwrap();
                     txn.commit().unwrap();
                 }
             },
@@ -255,14 +253,17 @@ fn bench_high_conflict_rate(c: &mut Criterion) {
                             // this benchmark only measures one contended
                             // commit attempt per thread).
                             let mut txn = ds.begin();
-                            txn.delete(0);
-                            match txn.commit() {
-                                // Row 0 is the only contested row in this
-                                // benchmark, so either this thread won the
-                                // race or another thread already deleted it
-                                // — both are the expected, done outcome.
-                                Ok(()) | Err(strata_txn::TxnError::Conflict { .. }) => {}
-                                Err(e) => panic!("unexpected error: {e}"),
+                            match txn.delete(0) {
+                                Err(strata_txn::TxnError::RowNotLive { .. }) => {}
+                                Ok(()) => match txn.commit() {
+                                    // Row 0 is the only contested row in this
+                                    // benchmark, so either this thread won the
+                                    // race or another thread already deleted it
+                                    // — both are the expected, done outcome.
+                                    Ok(()) | Err(strata_txn::TxnError::Conflict { .. }) => {}
+                                    Err(e) => panic!("unexpected error: {e}"),
+                                },
+                                Err(e) => panic!("unexpected target error: {e}"),
                             }
                         });
                     }
@@ -293,7 +294,7 @@ fn bench_single_writer_baseline(c: &mut Criterion) {
                         RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![i]))])
                             .unwrap();
                     let mut txn = temp_dataset.dataset.begin();
-                    txn.insert(batch);
+                    txn.insert(batch).unwrap();
                     txn.commit().unwrap();
                 }
             },

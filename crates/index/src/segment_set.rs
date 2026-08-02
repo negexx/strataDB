@@ -14,8 +14,7 @@
 //! [`SegmentSet::search_filtered_pruned`] is the one entry point that skips
 //! a part entirely (no traversal, no distance evaluations against it at
 //! all) when the caller's `should_scan_part` gate rejects that part's
-//! opaque zone-map payload — see `docs/superpowers/specs/2026-07-26-s1-w4-zone-map-design-amendment.md`
-//! §2. This crate never interprets that payload: `crates/index`'s
+//! opaque zone-map payload — see `docs/design.md`. This crate never interprets that payload: `crates/index`'s
 //! dependency list (`anndists`, `arrow`, `bytemuck`, `crc32c`, `thiserror`
 //! only) deliberately excludes `strata-storage`/`strata-query`, so a
 //! `ColumnStats`-typed zone map cannot be a concrete type this crate names.
@@ -34,8 +33,7 @@
 //! variants it exists for, and every method below already matches
 //! exhaustively, so adding one is a compile error at each site rather than
 //! a runtime surprise. That forcing property is exactly what
-//! `docs/superpowers/specs/2026-07-25-s1-w3-2-design-amendment.md` §1
-//! required when `Live` was removed.
+//! `docs/design.md` requires for the current immutable-segment design.
 //!
 //! The zone-map payload lives *inside* [`IndexPart::Sealed`] itself, next
 //! to the `Arc<SegmentReader>` it describes, rather than in a second
@@ -314,7 +312,7 @@ impl SegmentSet {
     /// set is empty (no vector has ever been committed). `crates/txn` uses
     /// this to pre-validate a commit's vector dimensions before building
     /// anything — see
-    /// `docs/superpowers/specs/2026-07-25-s1-w3-2-design-amendment.md` §2.
+    /// `docs/design.md`.
     ///
     /// Every part necessarily agrees (that pre-validation is what enforces
     /// it), so the first non-empty part's dimension is the set's.

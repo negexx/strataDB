@@ -3,6 +3,7 @@ name = "strata-txn"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+publish = false
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }
@@ -39,9 +40,10 @@ tempfile = { workspace = true }
 
 [features]
 chaos-injection = ["strata-storage/chaos-injection"]
+test-fault-injection = ["strata-storage/test-fault-injection"]
 # Off by default, matching `chaos-injection`'s own precedent for a
 # risk-bearing, opt-in code path -- see `build_and_write_segment` in
-# `src/dataset.rs` and `.opencode/rules/vector-index.md` for what this
+# `src/dataset.rs` and `docs/architecture.md` for what this
 # switches between. Unlike `chaos-injection` (always compiled, inert
 # unless an env var is set), this is a genuine compile-time branch: the
 # commit path calls `HnswIndex::insert_batch_parallel` only when this

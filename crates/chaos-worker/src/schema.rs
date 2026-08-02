@@ -1,9 +1,8 @@
 //! `mvp_schema()`'s fields plus the hidden row-id column — needed to read
 //! back the internal system row-id `Transaction::commit()` itself never
 //! returns. See
-//! `docs/superpowers/specs/2026-07-27-chaos-worker-workload-extension-design.md`
-//! Global Constraint 6 in the implementation plan for why this is a
-//! read-back rather than a prediction from the row-id allocator's own
+//! `docs/phase-1-audit.md`; this is a read-back rather than a prediction
+//! from the row-id allocator's own
 //! claim-order semantics.
 
 use std::sync::Arc;

@@ -4,11 +4,40 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * 0'
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  windows-directory-durability:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.90"
+          components: clippy, rustfmt
+
+      - name: Test storage directory durability
+        run: cargo test -p strata-storage
+
+      - name: Test default dataset create and round trip
+        run: cargo test -p strata-txn dataset::tests::insert_then_commit_then_scan_round_trips -- --exact
+
+      - name: Test injected dataset creation durability boundary
+        run: cargo test -p strata-txn --features test-fault-injection dataset::tests::create_returns_an_error_when_manifest_publication_root_sync_fails -- --exact
+
+      - name: Clippy directory durability fault injection
+        run: cargo clippy -p strata-txn --all-targets --features test-fault-injection -- -D warnings
+
+      - name: Format check
+        run: cargo fmt --check
+
   ci:
     runs-on: ubuntu-latest
     steps:
@@ -27,18 +56,68 @@ jobs:
         run: cargo test --workspace
 
       - name: Test (parallel-insert feature)
-        # `insert_batch_parallel`'s clustered-data recall hazard fix (see
-        # `.opencode/rules/vector-index.md`) is only exercised end-to-end
-        # through `crates/txn`'s commit path when this feature is on --
+        # `insert_batch_parallel`'s clustered-data recall hazard fix is
+        # exercised end-to-end through `crates/txn`'s commit path only when
+        # this feature is on --
         # `cargo test --workspace` above never enables it, since it's off
         # by default (`crates/txn/Cargo.toml`).
         run: cargo test -p strata-txn --features parallel-insert
 
+      - name: Test (directory durability fault injection)
+        # Dataset creation's ordered directory-sync boundaries use this
+        # thread-local fault seam. The default workspace suite intentionally
+        # does not compile this test-only feature, so run it explicitly.
+        run: cargo test -p strata-txn --features test-fault-injection
+
+      - name: Test chaos checkpoint abort
+        run: cargo test -p strata-storage --features chaos-injection --test chaos_checkpoint_actually_aborts -- --exact commit_manifest_aborts_at_the_configured_checkpoint
+
+      - name: Test fast chaos tier
+        run: cargo test -p strata-sim fast_tier_random_seeds_survive_random_crash_points -- --exact --nocapture
+
+      - name: Loom transaction models (strata-txn)
+        run: |
+          set -euo pipefail
+          cargo rustc -p strata-txn --lib --profile test --message-format=json -- --cfg loom \
+            | tee /tmp/loom-txn-build.json
+          bin=$(jq -r 'select(.reason == "compiler-artifact" and .executable != null) | .executable' /tmp/loom-txn-build.json | tail -1)
+          if [ -z "$bin" ]; then
+            echo "::error::no test binary produced by the --cfg loom build"
+            exit 1
+          fi
+          models=(
+            dataset::loom_tests::two_threads_deleting_the_same_row_exactly_one_conflicts
+            dataset::loom_tests::two_threads_deleting_disjoint_rows_both_succeed
+            dataset::loom_tests::a_failed_commits_segment_is_never_searchable_under_concurrent_commits
+            dataset::loom_tests::concurrent_first_vector_commits_at_different_dimensions_are_not_both_accepted
+            dataset::loom_tests::a_failed_commits_segment_is_never_visible_to_a_concurrent_reader
+            dataset::loom_tests::a_commits_row_and_its_segment_become_visible_as_one_atomic_step
+            dataset::loom_tests::a_reader_never_sees_one_in_flight_commits_row_while_observing_an_unrelated_commits_row_id_counter
+            row_id::loom_tests::concurrent_claims_publish_monotonic_high_water
+          )
+          for model in "${models[@]}"; do
+            "$bin" --list --format terse | grep -Fx "${model}: test"
+            "$bin" --exact "$model" --test-threads=1
+          done
+
+      - name: Loom live-set-cache model (strata-txn)
+        run: |
+          set -euo pipefail
+          cargo rustc -p strata-txn --lib --profile test --message-format=json -- --cfg loom \
+            | tee /tmp/loom-txn-cache-build.json
+          bin=$(jq -r 'select(.reason == "compiler-artifact" and .executable != null) | .executable' /tmp/loom-txn-cache-build.json | tail -1)
+          if [ -z "$bin" ]; then
+            echo "::error::no test binary produced by the --cfg loom build"
+            exit 1
+          fi
+          model=live_set_cache::loom_tests::two_concurrent_misses_on_the_same_key_compute_exactly_once
+          "$bin" --list --format terse | grep -Fx "${model}: test"
+          "$bin" --exact "$model" --test-threads=1
+
       - name: Loom tests (strata-index)
         # Scoped to this one crate rather than a workspace-wide
-        # `RUSTFLAGS=--cfg loom cargo test` -- see
-        # `.opencode/rules/concurrency-txn-layer.md` for why that would break
-        # other crates in the dependency graph. This is the only CI-visible
+        # `RUSTFLAGS=--cfg loom cargo test`; AGENTS.md explains why that
+        # would break other crates in the dependency graph. This is the only CI-visible
         # regression gate for the empty-graph race and the publication-
         # barrier fix (`EntryPoint::claim_if_empty`,
         # `Node::is_published`/`mark_published`) -- both are proven solely
@@ -61,6 +140,31 @@ jobs:
       - name: Clippy (parallel-insert feature)
         run: cargo clippy -p strata-txn --all-targets --features parallel-insert -- -D warnings
 
+      - name: Clippy (directory durability fault injection)
+        run: cargo clippy -p strata-txn --all-targets --features test-fault-injection -- -D warnings
+
+      - name: Verify facade and package boundaries
+        run: |
+          set -euo pipefail
+          test ! -d docs/superpowers
+          cargo metadata --no-deps --format-version 1 > /tmp/strata-metadata.json
+          jq -e '
+            . as $metadata
+            | (($metadata.workspace_members | length) > 0)
+              and all(
+                $metadata.workspace_members[];
+                . as $workspace_member
+                | any($metadata.packages[]; .id == $workspace_member and .publish == [])
+              )
+          ' /tmp/strata-metadata.json
+          deleted_tree_roots=(docs/superpowers docs/design)
+          deleted_tree_suffix=/
+          for deleted_tree_root in "${deleted_tree_roots[@]}"; do
+            ! git grep -n -F "${deleted_tree_root}${deleted_tree_suffix}" -- . ':(exclude)docs/phase-1-implementation-plan.md'
+          done
+          ! rg -n "no dataset-owned schema|target semantics remain open|restart-safe non-reuse.*unresolved|all newly-created ancestor" \
+            docs/status.md docs/architecture.md docs/design.md
+
       - name: Format check
         run: cargo fmt --check
 
@@ -72,3 +176,21 @@ jobs:
 
       - name: cargo-deny (bans, sources, advisories)
         run: cargo deny check bans sources advisories
+
+  thorough-chaos:
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.90"
+
+      - name: Test thorough chaos tier
+        run: |
+          set -euo pipefail
+          STRATA_CHAOS_THOROUGH=1 cargo test -p strata-sim thorough_tier_satisfies_the_phase_7_exit_criterion -- --exact --ignored --nocapture \
+            2>&1 | tee /tmp/strata-chaos-thorough.log
+          grep -F "thorough tier: 2000/2000 seeds checked" /tmp/strata-chaos-thorough.log

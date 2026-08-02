@@ -3,7 +3,7 @@
 //! exact-result reference implementation, and is still what Phase 1's MVP
 //! checklist ("run a brute-force nearest-neighbor search on the vector
 //! column, correctly") and the CLI's `search --exact` flag use. See
-//! `.opencode/rules/vector-index.md`.
+//! `docs/architecture.md`.
 
 use arrow::array::{Array, FixedSizeListArray, Float32Array};
 use arrow::error::ArrowError;

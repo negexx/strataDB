@@ -3,7 +3,7 @@
 //! `Dataset::vector_search`, correctness-gated against
 //! `strata_index::brute_force_search` before any timing is trusted — same
 //! discipline as `group_by_bench.rs` (Phase 2). See
-//! `docs/design/phase-4-vector-index-spec.md` §6.
+//! `docs/design.md`.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::path::Path;
@@ -51,7 +51,7 @@ fn load_vectors(limit: usize) -> Vec<(Vec<f32>, i64)> {
     let file = std::fs::File::open(DATASET_PATH).unwrap_or_else(|e| {
         panic!(
             "failed to open {DATASET_PATH}: {e}. Run the download step in \
-             docs/design/phase-4-implementation-plan.md's Task 7 Step 1 first."
+             docs/roadmap.md's Phase 1 performance-evidence work first."
         )
     });
     let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
@@ -95,7 +95,7 @@ fn build_dataset(dir: &Path, rows: &[(Vec<f32>, i64)]) -> Dataset {
             false,
         ),
     ]));
-    let ds = Dataset::create(dir).unwrap();
+    let ds = Dataset::create(dir, Arc::clone(&schema)).unwrap();
 
     let ids: Vec<i64> = rows.iter().map(|(_, cat)| *cat).collect();
     let id_arr = Arc::new(Int64Array::from(ids));
@@ -111,7 +111,7 @@ fn build_dataset(dir: &Path, rows: &[(Vec<f32>, i64)]) -> Dataset {
     let batch = RecordBatch::try_new(schema.clone(), vec![id_arr, vec_arr]).unwrap();
 
     let mut txn = ds.begin();
-    txn.insert(batch);
+    txn.insert(batch).unwrap();
     txn.commit().unwrap();
     ds
 }

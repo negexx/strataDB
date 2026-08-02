@@ -1,5 +1,5 @@
 //! Per-column file statistics for pruning, per
-//! `docs/design/phase-3-query-refinement-spec.md` §1.
+//! `docs/design.md`.
 
 use std::collections::HashMap;
 
@@ -26,7 +26,7 @@ pub struct ColumnStats {
 
 /// Computes per-column min/max for every orderable column in `batch`.
 /// Called on the *original, pre-encoding* batch at commit time — see
-/// `docs/design/phase-3-query-refinement-spec.md` §1. Columns with
+/// `docs/design.md`. Columns with
 /// no non-null values, or a non-orderable type (e.g. a vector column), get
 /// no entry — never a wrong or placeholder one.
 #[must_use]

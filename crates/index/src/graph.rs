@@ -1,6 +1,6 @@
 //! The lock-free HNSW graph: entry point, `SEARCH-LAYER`,
 //! `SELECT-NEIGHBORS-*`, `INSERT`, `K-NN-SEARCH`. See
-//! `docs/superpowers/specs/2026-07-18-lockfree-hnsw-rewrite-design.md`.
+//! `docs/design.md`.
 
 #[cfg(loom)]
 use loom::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -28,7 +28,7 @@ const NO_ENTRY: u64 = u64::MAX;
 /// attempts. 64 is far beyond either, chosen purely as a paranoia bound
 /// that converts a theoretical, believed-unreachable livelock into a
 /// detectable, typed error rather than an indefinite stall on the commit
-/// path — see `.opencode/rules/concurrency-txn-layer.md`'s "no write
+/// path — see `docs/design.md`'s "no write
 /// acknowledged until durable" invariant for why an unbounded stall here
 /// would be worse than a loud failure.
 const MAX_SHRINK_RETRIES: u32 = 64;
@@ -388,7 +388,7 @@ impl<D: Distance> Graph<D> {
     /// `mmax0 = 2*M`, `mmax = M`, `PARALLEL_INSERT_THREADS = 4`) -- not
     /// necessarily today's shipping default, since `insert_batch_parallel`
     /// is now gated behind `crates/txn`'s `parallel-insert` Cargo feature,
-    /// off by default (see `.opencode/rules/vector-index.md`). Two turned out not to explain the
+    /// off by default (see `docs/architecture.md`). Two turned out not to explain the
     /// measured failure rate; one is a distinct, separately-fixed bug; the
     /// fourth is the actual dominant mechanism, and fixing it closes the
     /// clustered-data hazard completely (verified below).
@@ -857,7 +857,8 @@ impl<D: Distance> Graph<D> {
     /// to serve as a live traversal waypoint for other queries (Stage 1's
     /// tombstone-flag-only scope — see design doc §1/§3). A no-op if
     /// `row_id` was never inserted.
-    // Before S1 W3.2, reachable in production through `HnswIndex::remove`,
+    // Before immutable segments became the production index architecture,
+    // this was reachable through `HnswIndex::remove`,
     // which `crates/txn`'s commit path called to undo an in-memory insert
     // whose transaction failed before durably committing. That guarantee is
     // now provided structurally (a failed commit's segment is never
@@ -907,16 +908,15 @@ impl<D: Distance> Graph<D> {
 /// traversal-time filtering, not just the deleted flag. See design doc §3.
 ///
 /// Generic over `NodeSource` so the identical algorithm runs over
-/// `Graph<D>` today and a segment reader from W3.2 — see
-/// `docs/superpowers/specs/2026-07-24-s1-segment-format-w3-migration-design.md`
-/// §2. `filter`/`row_id` operate in row-id space; everything else (`entry`,
+/// a live `Graph<D>` and the current immutable segment reader — see
+/// `docs/design.md`. `filter`/`row_id` operate in row-id space; everything else (`entry`,
 /// the returned ids, traversal) is in `source`'s local-id space — for
 /// `Graph<D>` these coincide (`row_id` is the identity), so this is not yet
-/// externally visible, but callers over a future segment must remember the
+/// externally visible, but callers over an immutable segment must remember the
 /// two domains can differ.
 // As a method, `search_layer` kept this under the 7-argument default via
 // clippy's implicit `&self` exemption; as a free function taking `source`
-// and `distance` explicitly (so the same body can run over a future
+// and `distance` explicitly (so the same body can run over an immutable
 // segment reader, not just `Graph<D>`), those two become real parameters
 // and push the count to 8. Splitting them into a struct would just be
 // indirection around the same eight logically-independent inputs — same
@@ -984,8 +984,7 @@ fn search_layer_generic<S: NodeSource, D: Distance>(
         // Graph::insert's own construction-time search_layer calls
         // permanently bakes truncated-candidate-set edges into the graph
         // for a one-time build-speed win, a worse trade than the intended
-        // recurring per-query one -- see design doc
-        // docs/superpowers/specs/2026-07-19-saturation-during-insert-design.md.
+        // recurring per-query one -- see the index boundary in docs/design.md.
         #[allow(clippy::items_after_statements)]
         const SATURATION_THRESHOLD_PERCENT: u32 = 95;
         #[allow(
@@ -1111,7 +1110,7 @@ fn search_layer_generic<S: NodeSource, D: Distance>(
 /// `crates/txn`'s per-commit `Graph`/`HnswIndex` is exclusively under
 /// construction until it's fully built and sealed into an immutable
 /// segment, and is never handed to a reader before then (see
-/// `.opencode/rules/vector-index.md`'s first bullet). Hazard #4's
+/// `docs/architecture.md`'s immutable-segment boundary). Hazard #4's
 /// consequence for a WRITER racing an unpublished node is a permanent,
 /// baked-into-the-graph connectivity loss; the same race for a READER here
 /// would only be a transient, self-healing recall dip during the window a
@@ -2684,8 +2683,7 @@ mod tests {
 mod loom_tests {
     use super::*;
 
-    /// See `.opencode/rules/concurrency-txn-layer.md`'s note on loom's tiny
-    /// default coroutine stack (32 KiB on a 64-bit target -- `generator`'s
+    /// Loom's default coroutine stack is tiny (32 KiB on a 64-bit target -- `generator`'s
     /// own default, not the megabytes a real OS thread gets): a coroutine
     /// stack overflow surfaces as silent memory corruption sensitive to
     /// unrelated code-shape changes elsewhere in the binary, NOT a clean

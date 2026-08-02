@@ -3,12 +3,14 @@ name = "strata-storage"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+publish = false
 
 [lints]
 workspace = true
 
 [dependencies]
 arrow.workspace = true
+crc32c = "0.6"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -18,6 +20,9 @@ tempfile = { workspace = true }
 
 [features]
 chaos-injection = []
+# Enables the thread-local directory-sync fault seam used only by dependent
+# crate tests. It is not enabled by normal consumers.
+test-fault-injection = []
 
 [[bin]]
 name = "chaos_checkpoint_helper"
@@ -27,4 +32,9 @@ name = "chaos_checkpoint_helper"
 # since it has no #[test] fns, but prints a "found in multiple build
 # targets" warning on every build).
 path = "tests/bin/chaos_checkpoint_helper.rs"
+required-features = ["chaos-injection"]
+
+[[test]]
+name = "chaos_checkpoint_actually_aborts"
+path = "tests/chaos_checkpoint_actually_aborts.rs"
 required-features = ["chaos-injection"]

@@ -1,7 +1,6 @@
 //! Commit execution, conflict retry, and the contested-row-id registry
 //! for the chaos workload. See
-//! `docs/superpowers/specs/2026-07-27-chaos-worker-workload-extension-design.md`
-//! §3.1, §3.2, and §3.5 (ack-line printing).
+//! `docs/phase-1-audit.md` for the current verification boundary.
 
 use std::io::Write as _;
 
@@ -135,7 +134,8 @@ pub(crate) fn execute_insert(
     let batch = strata_txn::mvp_fixtures::mvp_row(business_id, name, vector)
         .expect("mvp_row must succeed for a well-formed insert");
     let mut txn = dataset.begin();
-    txn.insert(batch);
+    txn.insert(batch)
+        .expect("mvp_row must match the dataset schema");
     match txn.commit() {
         Ok(()) => ExecOutcome::CommittedInsert {
             business_id,
@@ -160,17 +160,22 @@ enum RetryOutcome {
 /// commit a FRESH transaction on every call (never reuse transaction
 /// state across calls), since a retry needs a `dataset.begin()` at the
 /// post-winner version to have any chance of succeeding. `context` names
-/// the operation for the panic message on an unexpected (non-`Conflict`)
-/// error.
+/// the operation for the panic message on an unexpected error. A dead
+/// target is a normal terminal drop under the strict target contract, while
+/// a typed OCC conflict gets the one retry.
 fn commit_with_retry_once(
     mut attempt: impl FnMut() -> Result<(), TxnError>,
     context: &str,
 ) -> RetryOutcome {
     match attempt() {
         Ok(()) => RetryOutcome::Committed,
-        Err(TxnError::Conflict { .. }) => match attempt() {
+        Err(TxnError::RowNotLive { .. }) => RetryOutcome::Dropped,
+        Err(TxnError::Conflict { .. } | TxnError::InsufficientHistory { .. }) => match attempt() {
             Ok(()) => RetryOutcome::Committed,
-            Err(TxnError::Conflict { .. }) => RetryOutcome::Dropped,
+            Err(TxnError::RowNotLive { .. }) => RetryOutcome::Dropped,
+            Err(TxnError::Conflict { .. } | TxnError::InsufficientHistory { .. }) => {
+                RetryOutcome::Dropped
+            }
             Err(e) => panic!("unexpected commit error on {context} retry: {e}"),
         },
         Err(e) => panic!("unexpected commit error on {context}: {e}"),
@@ -182,7 +187,7 @@ fn commit_with_retry_once(
 pub(crate) fn execute_delete(dataset: &Dataset, target_row_id: u64) -> ExecOutcome {
     let attempt = || {
         let mut txn = dataset.begin();
-        txn.delete(target_row_id);
+        txn.delete(target_row_id)?;
         txn.commit()
     };
     match commit_with_retry_once(attempt, "delete") {
@@ -204,7 +209,7 @@ pub(crate) fn execute_update(
         let batch = strata_txn::mvp_fixtures::mvp_row(business_id, name, vector)
             .expect("mvp_row must succeed for a well-formed update");
         let mut txn = dataset.begin();
-        txn.update(target_row_id, batch);
+        txn.update(target_row_id, batch)?;
         txn.commit()
     };
     match commit_with_retry_once(attempt, "update") {
@@ -230,8 +235,10 @@ pub(crate) fn execute_multi_batch_insert(
     let batch1 = strata_txn::mvp_fixtures::mvp_row(business_ids[1], name, vectors[1])
         .expect("mvp_row must succeed for a well-formed multi-batch insert");
     let mut txn = dataset.begin();
-    txn.insert(batch0);
-    txn.insert(batch1);
+    txn.insert(batch0)
+        .expect("mvp_row must match the dataset schema");
+    txn.insert(batch1)
+        .expect("mvp_row must match the dataset schema");
     match txn.commit() {
         Ok(()) => ExecOutcome::CommittedMultiBatch {
             row_ids: [
@@ -256,7 +263,7 @@ pub(crate) fn execute_multi_batch_insert(
 /// here, before any of those internal `write_str` calls happen, means they
 /// all run under the SAME held lock, so no other thread's `print_line`
 /// call can interleave until this one's guard drops. See
-/// `docs/superpowers/specs/2026-07-30-chaos-worker-real-concurrency-and-zonemap-verification-design.md`.
+/// `docs/phase-1-audit.md`.
 pub(crate) fn print_line(line: &str) {
     let stdout = std::io::stdout();
     let mut locked = stdout.lock();
@@ -310,6 +317,10 @@ pub(crate) fn print_outcome(agent: u64, op: u64, outcome: &ExecOutcome) {
 mod tests {
     use super::*;
 
+    fn dataset(dir: &std::path::Path) -> Dataset {
+        Dataset::create(dir, strata_txn::mvp_fixtures::mvp_schema()).unwrap()
+    }
+
     fn temp_dir(label: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "strata-chaos-worker-test-{label}-{}",
@@ -329,12 +340,16 @@ mod tests {
         // column, the wrong Value variant, or ignored the predicate
         // entirely would still pass a single-row version of this test.
         let dir = temp_dir("lookup-row-id");
-        let dataset = Dataset::create(&dir).unwrap();
+        let dataset = dataset(&dir);
         let mut first = dataset.begin();
-        first.insert(strata_txn::mvp_fixtures::mvp_row(42, "agent0", [1.0, 2.0, 3.0]).unwrap());
+        first
+            .insert(strata_txn::mvp_fixtures::mvp_row(42, "agent0", [1.0, 2.0, 3.0]).unwrap())
+            .unwrap();
         first.commit().unwrap();
         let mut second = dataset.begin();
-        second.insert(strata_txn::mvp_fixtures::mvp_row(7, "agent0", [4.0, 5.0, 6.0]).unwrap());
+        second
+            .insert(strata_txn::mvp_fixtures::mvp_row(7, "agent0", [4.0, 5.0, 6.0]).unwrap())
+            .unwrap();
         second.commit().unwrap();
 
         // First-ever commit in a fresh dataset always claims row-id 0; the
@@ -423,6 +438,28 @@ mod tests {
                 if calls == 1 {
                     Err(TxnError::Conflict {
                         contested_row_ids: vec![1],
+                    })
+                } else {
+                    Ok(())
+                }
+            },
+            "test",
+        );
+        assert_eq!(outcome, RetryOutcome::Committed);
+        assert_eq!(calls, 2, "must retry exactly once, not more");
+    }
+
+    #[test]
+    fn commit_with_retry_once_retries_and_commits_after_insufficient_history() {
+        let mut calls = 0;
+        let outcome = commit_with_retry_once(
+            || {
+                calls += 1;
+                if calls == 1 {
+                    Err(TxnError::InsufficientHistory {
+                        base_version: 3,
+                        oldest_retained_version: 5,
+                        latest_version: 12,
                     })
                 } else {
                     Ok(())
@@ -529,7 +566,7 @@ mod tests {
     #[test]
     fn execute_insert_returns_the_looked_up_row_id() {
         let dir = temp_dir("execute-insert");
-        let dataset = Dataset::create(&dir).unwrap();
+        let dataset = dataset(&dir);
         let outcome = execute_insert(&dataset, 1, "agent0", [1.0, 2.0, 3.0]);
         assert!(matches!(
             outcome,
@@ -544,7 +581,7 @@ mod tests {
     #[test]
     fn execute_delete_tombstones_the_target_row() {
         let dir = temp_dir("execute-delete");
-        let dataset = Dataset::create(&dir).unwrap();
+        let dataset = dataset(&dir);
         let insert_outcome = execute_insert(&dataset, 1, "agent0", [1.0, 2.0, 3.0]);
         let ExecOutcome::CommittedInsert { row_id, .. } = insert_outcome else {
             panic!("expected CommittedInsert");
@@ -570,7 +607,7 @@ mod tests {
     #[test]
     fn execute_update_tombstones_the_old_row_and_makes_the_new_one_visible() {
         let dir = temp_dir("execute-update");
-        let dataset = Dataset::create(&dir).unwrap();
+        let dataset = dataset(&dir);
         let insert_outcome = execute_insert(&dataset, 1, "agent0", [1.0, 2.0, 3.0]);
         let ExecOutcome::CommittedInsert {
             row_id: old_row_id, ..
@@ -613,7 +650,7 @@ mod tests {
     #[test]
     fn execute_multi_batch_insert_commits_both_rows_in_one_transaction() {
         let dir = temp_dir("execute-multibatch");
-        let dataset = Dataset::create(&dir).unwrap();
+        let dataset = dataset(&dir);
         let outcome = execute_multi_batch_insert(
             &dataset,
             [1, 2],
@@ -637,19 +674,13 @@ mod tests {
     }
 
     #[test]
-    fn deleting_an_already_tombstoned_row_is_a_harmless_idempotent_commit() {
-        // NOT a test of the retry-then-drop path: this single-threaded
-        // scenario has no second concurrent transaction, so
-        // execute_delete's second call here cannot produce an actual
-        // TxnError::Conflict -- it just re-tombstones an already-dead
-        // row-id, which the design doc's own note says is harmless. This
-        // pins that specific claim down. Genuine conflict-drop coverage
-        // (a real TxnError::Conflict, retried once, then dropped) can
-        // only come from real concurrent interleaving -- that's exercised
-        // by Task 8's chaos-tier runs (many agents, real scheduling, a
-        // shared contested pool), not by a unit test here.
+    fn deleting_an_already_tombstoned_row_drops_under_the_strict_target_contract() {
+        // The approved strict-target contract rejects an already-dead row
+        // with RowNotLive rather than treating re-delete as idempotent.
+        // execute_delete maps that typed terminal target error to Dropped;
+        // this single-threaded case is therefore not an OCC retry scenario.
         let dir = temp_dir("execute-delete-idempotent-retombstone");
-        let dataset = Dataset::create(&dir).unwrap();
+        let dataset = dataset(&dir);
         let insert_outcome = execute_insert(&dataset, 1, "agent0", [1.0, 2.0, 3.0]);
         let ExecOutcome::CommittedInsert { row_id, .. } = insert_outcome else {
             panic!("expected CommittedInsert");
@@ -660,8 +691,8 @@ mod tests {
 
         let second = execute_delete(&dataset, row_id);
         assert!(
-            matches!(second, ExecOutcome::CommittedDelete { .. }),
-            "re-deleting an already-tombstoned row-id must commit cleanly, not error or drop: {second:?}"
+            matches!(second, ExecOutcome::Dropped),
+            "the strict target contract drops an already-tombstoned row-id: {second:?}"
         );
 
         std::fs::remove_dir_all(&dir).ok();

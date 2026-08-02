@@ -15,15 +15,18 @@ in [documentation history](history/README.md). Current implementation claims liv
 
 ## Phase 1 blockers
 
-The [Phase 1 audit](phase-1-audit.md) is complete but blocked by:
+The [Phase 1 audit](phase-1-audit.md) is complete. Phase 1 remains Partial and blocked by:
 
-- invalid future tombstones and unvalidated update/delete targets;
-- row-ID reservation reuse after restart;
-- fail-open directory durability and incomplete manifest/row-file integrity;
-- missing dataset-owned schema semantics;
-- invariant-bypassing low-level public surfaces;
-- missing CI-visible loom/chaos/regression gates; and
-- missing current segmented performance and operating-bound measurements.
+- pending CI execution/provenance and fuzz evidence; and
+- incomplete portable/real-fixture segmented performance and operating-bound evidence.
+
+Targeted implementation and regression evidence now covers future tombstones, live update/delete
+targets and one-row replacement cardinality, restart-safe physical row-ID high-water allocation,
+dataset-owned schema and recovery integrity checks, and the supported `Dataset`/`Snapshot`/
+`Transaction` facade. The acknowledged local durability boundary is limited to successful POSIX
+directory handles and Windows directory handles opened with `FILE_FLAG_BACKUP_SEMANTICS`; unsupported
+or failed directory flushing returns `DurabilityUnsupported`. Legacy datasets without the required schema and
+integrity metadata are rejected with `LegacyFormatNeedsMigration`, rather than opened unverified.
 
 These are not requests for cross-process transactions, serializability, or compaction in Phase 1.
 

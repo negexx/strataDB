@@ -1,15 +1,14 @@
-//! Recall-vs-segment-count experiment — Scope Addendum v2 §7.2 / §8.2, the
-//! gating de-risk for [ADR 0008](../../docs/decisions/0008-adopt-segmented-index-layout.md).
+//! Recall-vs-segment-count experiment — Scope Addendum v2 §7.2 / §8.2.
 //!
 //! The segmented index layout replaces one large mutable HNSW with K immutable
 //! segments; a query fans out across all K and merges. The addendum names the
 //! open risk: "a real recall-per-millisecond penalty versus one large graph."
 //! This measures that penalty directly, against Strata's own `crates/index`
-//! graph and the real 100k 512-dim OpenAI embedding dataset.
+//! graph and the configured fixture or deterministic synthetic vectors.
 //!
 //! Method, holding Strata's production HNSW params (M=16, ef_construction=100,
 //! ef_search=32, k=10) fixed:
-//!   - K=1 is the monolithic baseline — literally what Strata builds today.
+//!   - K=1 is the one-segment comparison baseline.
 //!   - For each K, the same N vectors are split into K contiguous segments
 //!     (modelling K un-compacted time-ordered delta segments), each its own
 //!     HNSW graph. A query searches all K for top-k, merges the K·k candidates,
@@ -25,6 +24,8 @@
 //! ```text
 //! cargo bench --bench segment_recall_bench
 //! STRATA_SEG_ROWS=50000 STRATA_SEG_QUERIES=200 cargo bench --bench segment_recall_bench
+//! STRATA_BENCH_SOURCE=synthetic STRATA_BENCH_SEED=20260801 \
+//!   STRATA_SEG_ROWS=256 STRATA_SEG_QUERIES=16 cargo bench -p strata-bench --bench segment_recall_bench
 //! ```
 
 #![allow(
@@ -42,12 +43,15 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::HashSet;
+use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Instant;
 
-use arrow::array::Float64Array;
+use arrow::array::{FixedSizeListArray, Float32Array, Float64Array, Int64Array, RecordBatch};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use strata_index::{EfConstruction, HnswIndex, MaxConnections, MaxElements, MaxLayers};
+use strata_txn::Dataset;
 
 // ---- peak-live memory tracker --------------------------------------------
 
@@ -96,10 +100,10 @@ const EF_CONSTRUCTION: usize = 100;
 const MAX_LAYER: usize = 16;
 const EF_SEARCH: usize = 32;
 const K: usize = 10;
+const DEFAULT_SYNTHETIC_SEED: u64 = 20_260_801;
 
-fn load(limit: usize) -> Vec<Vec<f32>> {
-    let file = std::fs::File::open(DATASET_PATH)
-        .unwrap_or_else(|e| panic!("open {DATASET_PATH}: {e}. Download the dataset first."));
+fn load_path(path: &Path, limit: usize) -> Vec<Vec<f32>> {
+    let file = std::fs::File::open(path).unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
     let reader = ParquetRecordBatchReaderBuilder::try_new(file)
         .unwrap()
         .build()
@@ -125,6 +129,67 @@ fn load(limit: usize) -> Vec<Vec<f32>> {
     out
 }
 
+fn synthetic(limit: usize, mut state: u64) -> Vec<Vec<f32>> {
+    (0..limit)
+        .map(|_| {
+            (0..DIM)
+                .map(|dimension| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    let unit = (state >> 40) as f32 / ((1_u64 << 24) - 1) as f32;
+                    unit + dimension as f32 * 0.000_001
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn input_vectors(limit: usize) -> (Vec<Vec<f32>>, String) {
+    let source = std::env::var("STRATA_BENCH_SOURCE").unwrap_or_else(|_| "auto".to_owned());
+    let seed = std::env::var("STRATA_BENCH_SEED")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_SYNTHETIC_SEED);
+    let fixture = std::env::var_os("STRATA_BENCH_FIXTURE").map_or_else(
+        || std::path::PathBuf::from(DATASET_PATH),
+        std::path::PathBuf::from,
+    );
+    match source.as_str() {
+        "synthetic" => (synthetic(limit, seed), format!("synthetic seed={seed}")),
+        "fixture" | "auto" if fixture.is_file() => (
+            load_path(&fixture, limit),
+            format!("fixture {}", fixture.display()),
+        ),
+        "fixture" => panic!("STRATA_BENCH_SOURCE=fixture requires {}", fixture.display()),
+        "auto" => (
+            synthetic(limit, seed),
+            format!(
+                "synthetic fallback seed={seed} (fixture absent: {})",
+                fixture.display()
+            ),
+        ),
+        other => {
+            panic!("unknown STRATA_BENCH_SOURCE={other:?}; expected auto, fixture, or synthetic")
+        }
+    }
+}
+
+fn vectors_hash(vectors: &[Vec<f32>]) -> u64 {
+    vectors
+        .iter()
+        .flatten()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, value| {
+            value
+                .to_bits()
+                .to_le_bytes()
+                .iter()
+                .fold(hash, |hash, byte| {
+                    (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3)
+                })
+        })
+}
+
 fn sq_l2(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum()
 }
@@ -141,31 +206,21 @@ fn exact_top_k(query: &[f32], vectors: &[Vec<f32>]) -> HashSet<u64> {
     scored[..K].iter().map(|(_, id)| *id).collect()
 }
 
-fn build_segment(row_ids: &[u64], vectors: &[Vec<f32>]) -> HnswIndex {
-    let idx = HnswIndex::new(
-        MaxConnections(M),
-        MaxElements(row_ids.len().max(1)),
-        MaxLayers(MAX_LAYER),
-        EfConstruction(EF_CONSTRUCTION),
-    )
-    .unwrap();
-    for &id in row_ids {
-        idx.insert(id, &vectors[id as usize]).unwrap();
-    }
-    idx
+fn dataset_schema() -> SchemaRef {
+    let item = Arc::new(Field::new("item", DataType::Float32, false));
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("vector", DataType::FixedSizeList(item, DIM as i32), false),
+    ]))
 }
 
-/// Fan-out search: query every segment for top-k, merge, take global top-k.
-fn segmented_search(segments: &[HnswIndex], query: &[f32]) -> Vec<u64> {
-    let mut merged: Vec<(f32, u64)> = Vec::with_capacity(segments.len() * K);
-    for seg in segments {
-        for m in seg.search(query, K, EF_SEARCH, |_| true).unwrap() {
-            merged.push((m.squared_distance, m.row_id));
-        }
-    }
-    merged.sort_by(|a, b| a.0.total_cmp(&b.0));
-    merged.truncate(K);
-    merged.into_iter().map(|(_, id)| id).collect()
+fn batch_for(vectors: &[Vec<f32>], lo: usize, hi: usize, schema: &SchemaRef) -> RecordBatch {
+    let item = Arc::new(Field::new("item", DataType::Float32, false));
+    let ids = Int64Array::from((lo..hi).map(|id| id as i64).collect::<Vec<_>>());
+    let flat: Vec<f32> = vectors[lo..hi].iter().flatten().copied().collect();
+    let values = Arc::new(Float32Array::from(flat));
+    let vector = FixedSizeListArray::new(item, DIM as i32, values, None);
+    RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(vector)]).unwrap()
 }
 
 fn main() {
@@ -179,9 +234,12 @@ fn main() {
         .unwrap_or(100);
     let k_sweep = [1usize, 2, 4, 8, 16, 32, 64];
 
-    eprintln!("loading {n} rows...");
-    let vectors = load(n);
+    let (vectors, source) = input_vectors(n);
     let n = vectors.len();
+    eprintln!(
+        "loaded {n} rows from {source}; input hash={:016x}",
+        vectors_hash(&vectors)
+    );
     let queries: Vec<Vec<f32>> = vectors.iter().take(q_n).cloned().collect();
     eprintln!(
         "computing exact ground truth for {} queries...",
@@ -192,7 +250,10 @@ fn main() {
     println!(
         "\n==== recall vs segment count — {n} rows x {DIM}-dim, k={K}, ef_search={EF_SEARCH} ===="
     );
-    println!("(K=1 is the monolithic baseline — exactly what Strata builds today)\n");
+    println!(
+        "production HNSW parameters: M={M}, ef_construction={EF_CONSTRUCTION}, max_layer={MAX_LAYER}"
+    );
+    println!("(K=1 is the one-segment comparison baseline)\n");
     println!(
         "{:>4}  {:>10}  {:>12}  {:>11}  {:>9}  {:>11}",
         "K", "recall@10", "us/query", "QPS", "build s", "peak mem"
@@ -207,24 +268,38 @@ fn main() {
         reset_peak();
         // Contiguous partition — models time-ordered delta segments.
         let per = n.div_ceil(k_seg);
+        let dir = std::env::temp_dir().join(format!(
+            "strata-segment-recall-{}-{k_seg}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let schema = dataset_schema();
+        let dataset = Dataset::create(&dir, schema.clone()).unwrap();
         let t_build = Instant::now();
-        let segments: Vec<HnswIndex> = (0..k_seg)
-            .map(|s| {
-                let lo = s * per;
-                let hi = ((s + 1) * per).min(n);
-                let ids: Vec<u64> = (lo as u64..hi as u64).collect();
-                build_segment(&ids, &vectors)
-            })
-            .collect();
+        for segment in 0..k_seg {
+            let lo = segment * per;
+            let hi = ((segment + 1) * per).min(n);
+            let mut txn = dataset.begin();
+            txn.insert(batch_for(&vectors, lo, hi, &schema)).unwrap();
+            txn.commit().unwrap();
+        }
+        drop(dataset);
+        let dataset = Dataset::open(&dir).unwrap();
+        let snapshot = dataset.snapshot();
         let build_s = t_build.elapsed().as_secs_f64();
         let peak = peak_over_now();
 
         // Warm one query, then time the sweep.
-        let _ = segmented_search(&segments, &queries[0]);
+        let _ = snapshot.vector_search(&queries[0], K, None).unwrap();
         let t_q = Instant::now();
         let mut recall_sum = 0.0f64;
         for (qi, query) in queries.iter().enumerate() {
-            let got: HashSet<u64> = segmented_search(&segments, query).into_iter().collect();
+            let got: HashSet<u64> = snapshot
+                .vector_search(query, K, None)
+                .unwrap()
+                .into_iter()
+                .map(|m| m.row_id)
+                .collect();
             let hit = got.intersection(&truth[qi]).count();
             recall_sum += hit as f64 / K as f64;
         }
@@ -243,6 +318,9 @@ fn main() {
             peak as f64 / (1024.0 * 1024.0)
         );
         rows.push((k_seg, recall, us_per, qps));
+        drop(snapshot);
+        drop(dataset);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---- verdict ---------------------------------------------------------
@@ -255,7 +333,7 @@ fn main() {
         f64::NAN
     };
     println!(
-        "\nmonolithic (K=1):  recall {:.4}, {:.1} us/query",
+        "\none-segment baseline (K=1):  recall {:.4}, {:.1} us/query",
         base.1, base.2
     );
     println!(
@@ -270,24 +348,16 @@ fn main() {
             last.0
         );
         println!("  The penalty is LATENCY, not recall — fan-out costs {latency_mult:.1}x here.");
-        println!("  Implication for ADR 0008: compaction only needs to bound *latency*, which it");
-        println!("  does by construction (fewer segments -> less fan-out). This is the good case:");
-        println!("  correctness is segment-count-independent; compaction is a perf knob, not a");
-        println!("  correctness requirement.");
+        println!("  This bounded sample shows a latency cost without a recall drop.");
+        println!("  It is evidence for the current fixture, not a universal guarantee.");
     } else {
         println!(
             "VERDICT: recall DROPS {:.1}pp by K={} — segmentation costs correctness, not just latency.",
             recall_drop * 100.0,
             last.0
         );
-        println!(
-            "  Implication for ADR 0008: compaction is load-bearing for *recall*, a much harder"
-        );
-        println!(
-            "  constraint (a lagging compactor silently degrades answers). The segment format"
-        );
-        println!("  must over-fetch per segment and/or cap segment count aggressively. Re-examine");
-        println!("  before committing the format.");
+        println!("  This bounded sample shows a recall decrease as segments fan out.");
+        println!("  It is a signal for follow-up measurement, not a universal guarantee.");
     }
     println!(
         "\nCaveats: contiguous partition (time-ordered segments); ef_search held constant per"

@@ -20,7 +20,7 @@ fn mvp_checklist_steps_1_through_5() {
         .keep();
 
     // 1. Create a new dataset.
-    let ds = Dataset::create(&dir).unwrap();
+    let ds = Dataset::create(&dir, mvp_schema()).unwrap();
     assert_eq!(ds.current_version(), 0);
 
     // 2. Insert a batch of rows with a numeric column, a string column, and
@@ -32,7 +32,7 @@ fn mvp_checklist_steps_1_through_5() {
     ])
     .unwrap();
     let mut txn = ds.begin();
-    txn.insert(batch.clone());
+    txn.insert(batch.clone()).unwrap();
     txn.commit().unwrap();
     assert_eq!(ds.current_version(), 1);
 

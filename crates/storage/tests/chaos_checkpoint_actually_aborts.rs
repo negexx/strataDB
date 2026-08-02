@@ -3,26 +3,14 @@
 //! calling an aborting function in-process would kill this very test
 //! binary. This is a `tests/` integration test (not a unit test in
 //! `chaos.rs`) specifically so it can build itself as its own tiny binary
-//! and exec that binary as a child — see Step 3's helper.
+//! and exec that binary as a child — see the `chaos_checkpoint_helper` Cargo
+//! helper-bin target.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::process::Command;
 
 #[test]
 fn commit_manifest_aborts_at_the_configured_checkpoint() {
-    // This test only makes sense when strata-storage was built with
-    // chaos-injection — if the feature is off, commit_manifest's
-    // checkpoints are no-ops and nothing would ever abort, which would
-    // make this test either fail confusingly or pass for the wrong
-    // reason. Skip cleanly instead of asserting the wrong thing.
-    if std::env::var("STRATA_CHAOS_TEST_HELPER_BUILT").is_err() {
-        eprintln!(
-            "skipping: run via `cargo test -p strata-storage --features chaos-injection \
-             --test chaos_checkpoint_actually_aborts`"
-        );
-        return;
-    }
-
     let helper_bin = env!("CARGO_BIN_EXE_chaos_checkpoint_helper");
     let output = Command::new(helper_bin)
         .env("STRATA_CHAOS_ABORT_AT", "1")

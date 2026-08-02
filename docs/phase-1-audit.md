@@ -9,6 +9,91 @@ future fixes can still refer to the original evidence without maintaining seven 
 Line numbers are deliberately omitted because they are unstable; use the finding ID plus current
 source/tests as the anchor.
 
+## Approved remediation design
+
+The Phase 1 remediation keeps Strata's supported boundary at one process using one shared
+`Dataset` handle. The user-approved design is intentionally strict and prospective:
+
+- `Dataset::create` receives and persists the dataset-owned logical Arrow schema. Schema evolution,
+  migrations, and logical keys remain deferred; `_row_id` and `_timestamp` remain reserved physical
+  columns outside that logical schema.
+- Manifests gain an explicit format/version and integrity envelope plus row-file ownership metadata.
+  Recovery validates filename/payload identity, schema, row bytes, tombstones, segment metadata, and
+  cross-segment row/vector ownership before constructing a `Snapshot`.
+- A separate durable allocator high-water record is advanced before a row-ID claim is exposed. The
+  manifest mirrors the value for diagnostics, but is not authoritative for abandoned pre-publication
+  claims after restart.
+- Directory synchronization and dataset creation fail closed. The supported durability claim is
+  limited to named local filesystem/platform combinations where the ordered sync operations succeed;
+  process-abort tests are not presented as universal power-loss proof.
+- Delete/update targets must name a live physical row in the transaction's base snapshot and are
+  revalidated under the commit lock. `update` is exactly one old row to one replacement row; absent,
+  already-dead, malformed, and unsupported shapes have typed errors. Concurrent stale targets remain
+  typed row conflicts.
+- `InsufficientHistory` remains distinct from `Conflict` and carries retained-history context rather
+  than inventing contested row IDs.
+- `Dataset`/`Snapshot`/`Transaction` are the supported engine facade. Direct storage/index use is an
+  internal implementation surface and invalidates Dataset guarantees; subordinate packages remain
+  non-publishable.
+- Verification adds direct counterexample regressions, transaction and cache loom gates, exercising
+  chaos/checkpoint gates, and current segmented performance/boundedness evidence. Compaction,
+  cleanup, cross-process coordination, authenticated tamper protection, and later API work remain
+  deferred.
+
+Datasets written without the new schema/integrity metadata are rejected with a typed
+`LegacyFormatNeedsMigration` result rather than being opened under an unverified guarantee.
+Checksums cover accidental/torn corruption and metadata inconsistency, not an attacker able to
+rewrite both payload and checksum. Performance work records a tested operating envelope without
+introducing Phase 3 compaction or lifecycle behavior.
+
+## Implementation status after approved remediation slices
+
+The branch implements the approved COR-01 through COR-04, CONC-01 and CONC-03, DUR-01 through
+DUR-03, IDX-01 and IDX-02, and ARCH-01 through ARCH-03 slices. Completed targeted tests provide
+implementation and recovery evidence for those slices; the supported
+`Dataset`/`Snapshot`/`Transaction` facade is now the documented engine boundary, while subordinate
+packages are marked non-publishable. Task 7 now configures exact transaction and cache loom
+discovery, plus an index whole-binary loom run; checkpoint-abort and fast-chaos gates; and
+scheduled/manual thorough-chaos execution.
+Local targeted evidence exists, but full Linux CI execution/provenance and thorough 2000/2000 output
+remain pending. Task 8 now records bounded Windows synthetic segmented/lifecycle evidence with
+reproduction metadata; the optional real fixture, portable host matrix, and universal operating
+bounds remain open. This does not change the audit verdict from Partial and blocked.
+
+VER-04 through VER-06, PERF-01 through PERF-05, and the later/deferred findings remain separately
+tracked unless the final review proves a dependency for a Phase 1 fix.
+
+## Task 1 durability recovery boundary
+
+`Dataset::create` requires its immediate parent to pre-exist as the caller's durable anchor. It
+creates the dataset-owned `data/` directory, synchronizes the dataset directory and that immediate
+parent, then publishes the initial manifest through `_versions/`. It does not create or synchronize
+an arbitrary caller-owned ancestor chain. A retry after a pre-publication sync failure
+re-synchronizes the same bounded dataset/parent chain before publication. The create call returns an
+error when any ordered directory operation fails; it never reports that outcome as an acknowledged
+durable creation.
+
+The final dataset-directory sync occurs after atomic manifest publication. Consequently an error
+at that boundary is uncertain: an initial manifest can be visible even though `Dataset::create`
+returned an error. On an error, callers must not assume creation succeeded or immediately retry
+`create`. First call `Dataset::open` on the path. If it opens, the initial manifest is visible but
+the failed create call remains unacknowledged for durability purposes; preserve/report that error
+and repair or move to a filesystem with working directory synchronization before relying on the
+dataset. If it reports `NotFound`, creation was not visible and a later `create` attempt may retry
+against the same pre-existing immediate-parent anchor, re-synchronizing the bounded chain.
+Cross-process coordination is still out of scope.
+
+| Platform/filesystem boundary | Directory-sync behavior | Claim boundary |
+|---|---|---|
+| Windows local filesystem | Opens a write-capable native directory handle with `FILE_FLAG_BACKUP_SEMANTICS`, then calls `sync_all`. | Included only when both operations succeed; `ERROR_INVALID_FUNCTION`, `ERROR_NOT_SUPPORTED`, and invalid-parameter outcomes fail closed. |
+| POSIX local filesystem | Opens the directory and calls `sync_all`. | Included only when both operations succeed; `Unsupported`, `InvalidInput`, and `EINVAL` outcomes fail closed. |
+| Any filesystem that rejects directory flushing | Returns typed `DurabilityUnsupported`. | Outside the acknowledged-durability boundary; no fallback or best-effort success exists. |
+| Object/remote backends and independent processes | Not part of this Task 1 path. | Out of scope for Phase 1. |
+
+This is an ordered local-operation contract, not universal power-loss proof. Process-abort tests
+and successful calls on one host/filesystem do not establish a guarantee for another filesystem or
+for cross-process publication.
+
 ## Finding register
 
 | ID | Severity | Area | Disposition / required action |
@@ -59,11 +144,11 @@ consolidated register above; IDs marked "merged" retain the same evidence under 
 | IDX-02 | Preserved explicitly: recovery does not reject ambiguous cross-segment row/vector identity or vector IDs without row ownership. Phase 1 recovery blocker. |
 | IDX-03 | Preserved explicitly: fixed `ef_search` can underfill `k`, including an unbounded API request above 32. Phase 1 contract decision and Phase 2 API work. |
 | IDX-04 | Merged with ARCH-04 and VER-07: recall experiment was overgeneralized. Current decisions now bound the claim to its workload. |
-| PERF-01 | Preserved: no current retained performance matrix for the segmented implementation. Phase 1 evidence blocker. |
-| PERF-02 | Preserved: manifest publication grows with retained history. Measure and document a bound; incremental manifests/GC remain Phase 3. |
-| PERF-03 | Preserved: recovery cost grows with retained versions and resident segment bytes. Phase 1 bound/evidence blocker; lifecycle work later. |
-| PERF-04 | Preserved: one segment per vector commit increases unpruned fan-out. Measure supported maximum; compaction remains Phase 3. |
-| PERF-05 | Preserved: eager snapshot-pinned segment residency lacks a current memory bound. Phase 1 evidence blocker; reclamation later. |
+| PERF-01 | Bounded Windows synthetic retained-version/segment matrix is recorded in `docs/phase-1-performance.md`; real-fixture, CPU/RAM, and portable-host evidence remain open. |
+| PERF-02 | A 40-commit sample records manifest bytes at versions 1/10/20/40; it is evidence, not a universal bound. Incremental manifests/GC remain Phase 3. |
+| PERF-03 | A bounded lifecycle reopen point records recovery time; the separately reported manifest bytes are end-of-run after concurrent commits. Multi-scale recovery bounds and lifecycle work remain open. |
+| PERF-04 | A bounded Dataset/Snapshot fan-out sample covers K=1…64 synthetic segments; it does not establish a supported maximum. Compaction remains Phase 3. |
+| PERF-05 | A bounded sample retains four historical/current snapshots and reports live allocator bytes; RSS and a universal residency bound remain open. |
 | PERF-06 | Preserved as later Phase 2/3 query/layout work: public scans lack projection pushdown and sub-file pruning; establish an honest baseline. |
 | PERF-07 | Preserved as documentation/query work: projection avoids some array construction but not dominant file-body reads; benchmark and correct the claim. |
 | ARCH-01 | Preserved: dataset-owned schema is missing. Phase 1 blocker. |
@@ -75,11 +160,11 @@ consolidated register above; IDs marked "merged" retain the same evidence under 
 | ARCH-07 | Preserved as later Phase 2/6 work: backend abstraction is not threaded through all I/O. |
 | ARCH-08 | Preserved as later Phase 2 client work: CLI snapshot labels can disagree with displayed rows. |
 | VER-01 | Preserved: known counterexamples lack direct regression gates. Phase 1 blocker. |
-| VER-02 | Merged with CONC-02: transaction/cache loom is not CI-visible. Phase 1 blocker. |
-| VER-03 | Merged with DUR-04: chaos/checkpoint suites can report success without exercising intended assertions. Phase 1 blocker. |
+| VER-02 | Merged with CONC-02: Task 7 configures transaction/cache exact-model and index whole-binary loom CI gates; CI execution/provenance remains pending. Phase 1 blocker. |
+| VER-03 | Merged with DUR-04: Task 7 configures checkpoint-abort and fast-chaos CI gates plus scheduled/manual thorough chaos; CI execution/provenance and 2000/2000 output remain pending. Phase 1 blocker. |
 | VER-04 | Preserved as Phase 1 evidence gap: fuzz targets are not build-gated and do not cover all recovery parsers. |
 | VER-05 | Preserved as Phase 1 reproducibility hardening: CI action/tool provenance is mutable. |
-| VER-06 | Preserved as Phase 1 measurement evidence blocker: benchmark inputs/results lack portable provenance. |
+| VER-06 | Preserved as Phase 1 measurement evidence blocker: bounded Windows synthetic inputs/results are recorded, but portable host/fixture provenance is still missing. |
 | VER-07 | Merged with ARCH-04 and DUR-05: current docs now qualify intended guarantees and retain Partial status. |
 
 ## Evidence that must be preserved
