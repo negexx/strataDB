@@ -54,7 +54,7 @@ use crate::snapshot::Snapshot;
 /// producing wrong data. `row_ids_matching` (below) sidesteps this
 /// precondition entirely by reading each file's raw physical batch directly
 /// rather than going through the public schema-based API. See
-/// `docs/design/phase-0-transaction-and-format-spec.md` §8.
+/// `docs/design.md`.
 pub const ROW_ID_COLUMN: &str = "_row_id";
 
 /// The hidden internal commit-time column every committed batch carries
@@ -1624,7 +1624,7 @@ impl Transaction {
         let mut row_id_base = claim.base();
         for (i, batch) in pending.iter().enumerate() {
             // Stats computed on the original, pre-encoding, pre-hidden-column
-            // batch — see docs/design/phase-3-query-refinement-spec.md
+            // batch — see docs/design.md
             // §1 for why (logical values, no dictionary-decode step needed
             // later). _row_id gets no stats entry (nothing predicates on it);
             // _timestamp DOES, inserted explicitly below, since every row in
@@ -2493,7 +2493,7 @@ pub(crate) fn cast_batch_to_schema(batch: &RecordBatch, schema: &SchemaRef) -> R
 /// Appends a `_row_id: UInt64` column to `batch`, assigning
 /// `row_id_base..row_id_base + num_rows` in row order. This is what makes
 /// every committed row addressable by a stable, global identity — see
-/// `docs/design/phase-0-transaction-and-format-spec.md` §8.
+/// `docs/design.md`.
 fn append_row_id_column(
     batch: &RecordBatch,
     row_id_base: u64,
@@ -5862,7 +5862,7 @@ mod tests {
     #[allow(clippy::cast_precision_loss)]
     fn vector_search_fan_out_matches_brute_force_ground_truth_across_overlapping_segments() {
         // Phase S1 W3's exit criterion
-        // (`docs/design/phase-s1-segmented-index-spec.md` §5.3):
+        // (`docs/design.md`):
         // "recall parity with the pre-migration monolithic baseline
         // (integration test, not just the bench)". The fan-out search this
         // validates (`SegmentSet::search` merging results across segments)
@@ -8194,7 +8194,7 @@ mod tests {
 /// (`a_reader_never_sees_one_in_flight_commits_row_while_observing_an_unrelated_commits_row_id_counter`),
 /// is the regression gate for deleting `RowIdAllocator.active` / `in_flight`
 /// / collapsing `Snapshot::is_visible` to the tombstone check — see
-/// `docs/design/phase-s1-segmented-index-spec.md` §6. It was added
+/// `docs/design.md`. It was added
 /// here FIRST, against the then-current watermark+in-flight implementation,
 /// as the "before" half of the required "must pass both before and after the
 /// deletion" proof. The deletion has since landed, and this exact test was

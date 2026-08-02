@@ -102,15 +102,19 @@ jobs:
           test ! -d docs/superpowers
           cargo metadata --no-deps --format-version 1 > /tmp/strata-metadata.json
           jq -e '
-            (.workspace_members | length) > 0
-            and all(
-              .workspace_members[] as $workspace_member |
-              any(.packages[]; .id == $workspace_member and .publish == [])
-            )
+            . as $metadata
+            | (($metadata.workspace_members | length) > 0)
+              and all(
+                $metadata.workspace_members[];
+                . as $workspace_member
+                | any($metadata.packages[]; .id == $workspace_member and .publish == [])
+              )
           ' /tmp/strata-metadata.json
-          deleted_tree_root=docs/superpowers
+          deleted_tree_roots=(docs/superpowers docs/design)
           deleted_tree_suffix=/
-          ! git grep -n -F "${deleted_tree_root}${deleted_tree_suffix}" -- . ':(exclude)docs/phase-1-implementation-plan.md'
+          for deleted_tree_root in "${deleted_tree_roots[@]}"; do
+            ! git grep -n -F "${deleted_tree_root}${deleted_tree_suffix}" -- . ':(exclude)docs/phase-1-implementation-plan.md'
+          done
           ! rg -n "no dataset-owned schema|target semantics remain open|restart-safe non-reuse.*unresolved|all newly-created ancestor" \
             docs/status.md docs/architecture.md docs/design.md
 

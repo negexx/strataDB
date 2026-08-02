@@ -106,7 +106,7 @@ const MAX_EF_SCALE: f64 = 20.0;
 
 /// Widens `base_ef` using `Snapshot::explain`'s scanned/total file ratio as
 /// a coarse, file-granularity *upper bound* on selectivity — see
-/// `docs/design/phase-4-vector-index-spec.md` §4. Erring toward a
+/// `docs/design.md`. Erring toward a
 /// wider `ef` costs search time, never correctness, so an overestimate of
 /// how many rows survive is the safe direction.
 fn widen_ef(base_ef: usize, snapshot: &Snapshot, predicate: &Predicate) -> usize {
@@ -219,8 +219,7 @@ impl Snapshot {
     /// [`Snapshot::scan_with_predicate`], and [`Snapshot::row_ids_matching`]
     /// — one enforcement point for tombstone visibility, rather than three
     /// call sites each independently responsible for remembering it. Per
-    /// `docs/design/phase-0-transaction-and-format-spec.md` §8's
-    /// "Tombstone GC" paragraph: `scan` must treat a tombstoned row-id as
+    /// `docs/design.md`: `scan` must treat a tombstoned row-id as
     /// dead regardless of whether its bytes are still on disk.
     ///
     /// `columns`, when `Some`, restricts the Arrow IPC read to those columns
@@ -308,8 +307,7 @@ impl Snapshot {
 
     /// Reports which of this snapshot's files `predicate` would require
     /// scanning, without opening any file body — pure introspection over
-    /// stats already loaded in the manifest. See
-    /// `docs/design/phase-3-query-refinement-spec.md` §3.
+    /// stats already loaded in the manifest. See `docs/design.md`.
     #[must_use]
     pub fn explain(&self, predicate: &Predicate) -> ExplainResult {
         let mut scanned = Vec::new();
@@ -368,8 +366,7 @@ impl Snapshot {
     /// `Self::is_visible` into
     /// [`SegmentSet::search`](strata_index::SegmentSet::search)/
     /// [`SegmentSet::search_filtered_pruned_live`](strata_index::SegmentSet::search_filtered_pruned_live)
-    /// — see `docs/design/phase-4-vector-index-spec.md` §3-4 and the
-    /// Phase 5 design doc.
+    /// — see `docs/design.md`.
     ///
     /// # Examples
     ///

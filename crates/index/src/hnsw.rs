@@ -96,7 +96,7 @@ fn run_chunks_in_parallel<T: Send, R: Send>(
 
 /// One search result: which row-id, and its squared L2 distance to the
 /// query vector. `row_id` is the persistent, global identity from
-/// `docs/design/phase-0-transaction-and-format-spec.md` §8 — not a
+/// `docs/design.md` — not a
 /// position within any particular array, unlike `brute_force::Neighbor`.
 ///
 /// `squared_distance` is the sum of squared per-dimension differences (no
@@ -511,8 +511,8 @@ impl HnswIndex {
     /// anymore. It remains index-internal API, sound on the same terms it
     /// always was: such a row-id was never committed in *any* version, so
     /// no snapshot should ever observe it, and because row-ids are never
-    /// reused (`docs/design/phase-0-transaction-and-format-spec.md`
-    /// §8) — a soft-deleted id can never legitimately reappear.
+    /// reused (`docs/design.md`) — a soft-deleted id can never legitimately
+    /// reappear.
     ///
     /// **Do not use this to implement a user-level DELETE.** That is
     /// `crates/txn`'s versioned `Snapshot::tombstones` set, which is

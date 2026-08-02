@@ -1,7 +1,6 @@
 //! Phase 3's actual exit criterion: "EXPLAIN proves a filtered query skips
 //! untouched files." See
-//! `docs/design/phase-3-query-refinement-spec.md` §3's testing
-//! section.
+//! `docs/design.md`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 

@@ -153,8 +153,7 @@ fn an_old_snapshots_scan_never_gains_a_later_commits_rows() {
     // `scan_with_predicate` did not consult `Snapshot::tombstones` at all
     // (only `Snapshot::vector_search`'s HNSW traversal did, via
     // `is_visible`), which violated
-    // `docs/design/phase-0-transaction-and-format-spec.md` §8's
-    // "Tombstone GC" paragraph — "`scan`, `search`, and (later) conflict
+    // `docs/design.md`'s tombstone rule — "`scan`, `search`, and (later) conflict
     // detection must all treat a tombstoned row-id as dead". That gap is
     // now CLOSED: tombstone filtering lives in `read_surviving_files`, the
     // single helper all three read paths funnel through. Its coverage lives

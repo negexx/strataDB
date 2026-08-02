@@ -1,5 +1,5 @@
 //! Transaction & conflict resolution — Strata's flagship subsystem. See
-//! `docs/design/phase-0-transaction-and-format-spec.md` and
+//! `docs/design.md` and
 //! `.opencode/rules/concurrency-txn-layer.md` before editing anything here for
 //! real.
 //!

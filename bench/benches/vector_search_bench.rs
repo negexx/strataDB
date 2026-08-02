@@ -3,7 +3,7 @@
 //! `Dataset::vector_search`, correctness-gated against
 //! `strata_index::brute_force_search` before any timing is trusted — same
 //! discipline as `group_by_bench.rs` (Phase 2). See
-//! `docs/design/phase-4-vector-index-spec.md` §6.
+//! `docs/design.md`.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::path::Path;
@@ -51,7 +51,7 @@ fn load_vectors(limit: usize) -> Vec<(Vec<f32>, i64)> {
     let file = std::fs::File::open(DATASET_PATH).unwrap_or_else(|e| {
         panic!(
             "failed to open {DATASET_PATH}: {e}. Run the download step in \
-             docs/design/phase-4-implementation-plan.md's Task 7 Step 1 first."
+             docs/roadmap.md's Phase 1 performance-evidence work first."
         )
     });
     let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();

@@ -236,7 +236,7 @@ fn handle_search(args: &[String], dir: &str) -> Result<(), Box<dyn Error>> {
     // vector_search's row-ids into the user-facing id/name columns for
     // display — matches this project's "Dataset doesn't translate row-ids
     // back to column values, that's the caller's job" design (see
-    // docs/design/phase-4-vector-index-spec.md §3).
+    // docs/design.md).
     let mut display_fields = strata_txn::mvp_fixtures::mvp_schema()
         .fields()
         .iter()

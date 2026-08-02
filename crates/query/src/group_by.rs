@@ -1,5 +1,5 @@
 //! Hash-based `GROUP BY`, per
-//! `docs/design/phase-2-encodings-and-groupby-spec.md` §2.
+//! `docs/design.md`.
 //!
 //! Internals follow the query-primitives boundary in `docs/architecture.md`:
 //! a `HashMap<Row<'_>, usize>` index over the `Rows` buffer already built
@@ -147,7 +147,7 @@ impl ColumnarAccumulator {
 }
 
 /// Groups `batch` by `group_cols` and computes `aggs` per group. See
-/// `docs/design/phase-2-encodings-and-groupby-spec.md` §2.
+/// `docs/design.md`.
 ///
 /// Null values in an agg column are skipped, not treated as zero. **A group
 /// whose agg column is entirely null is not yet handled specially** (flagged

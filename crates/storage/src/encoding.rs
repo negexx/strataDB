@@ -1,5 +1,5 @@
 //! Automatic dictionary encoding, per
-//! `docs/design/phase-2-encodings-and-groupby-spec.md` §1.
+//! `docs/design.md`.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -19,7 +19,7 @@ const DICTIONARY_ENCODING_THRESHOLD: f64 = 0.4;
 /// Casts each column of `batch` to `DictionaryArray<Int32Type>` if its
 /// distinct-value ratio is below [`DICTIONARY_ENCODING_THRESHOLD`], leaving
 /// higher-cardinality columns untouched. See
-/// `docs/design/phase-2-encodings-and-groupby-spec.md` §1.
+/// `docs/design.md`.
 ///
 /// # Errors
 ///
