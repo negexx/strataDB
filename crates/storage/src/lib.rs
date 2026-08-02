@@ -26,7 +26,8 @@ pub use manifest::{
     commit_manifest, read_current, read_current_with_byte_count,
 };
 pub use row_id_high_water::{
-    HighWaterPersistenceError, ROW_ID_HIGH_WATER_PREFIX, initialize_row_id_high_water,
-    persist_row_id_high_water_at_least, read_row_id_high_water,
+    HighWaterPersistenceError, ROW_ID_HIGH_WATER_PREFIX, RowIdHighWaterRead,
+    initialize_row_id_high_water, persist_row_id_high_water_at_least, read_row_id_high_water,
+    read_row_id_high_water_with_byte_count,
 };
 pub use stats::{ColumnStats, Value, compute_stats};

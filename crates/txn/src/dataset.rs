@@ -30,9 +30,10 @@ use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use strata_index::{EfConstruction, HnswIndex, MaxConnections, MaxElements, MaxLayers};
 use strata_storage::{
-    Backend, ColumnStats, DataFileEntry, LocalFs, Manifest, SegmentEntry, Value, commit_manifest,
-    compute_stats, initialize_row_id_high_water, read_current, read_current_with_byte_count,
-    read_row_id_high_water, sync_dir, write_batch, write_bytes,
+    ColumnStats, DataFileEntry, Manifest, SegmentEntry, Value, commit_manifest, compute_stats,
+    initialize_row_id_high_water, read_current, read_current_with_byte_count,
+    read_row_id_high_water, read_row_id_high_water_with_byte_count, sync_dir, write_batch,
+    write_bytes,
 };
 
 use crate::commit_log::{CommitLog, ConflictCheck};
@@ -517,14 +518,18 @@ impl Dataset {
         // an allocation from it any more, but the ceiling is still a
         // panic-safety bound on what row-ids may reach `NodeTable` — see
         // `MAX_REASONABLE_ROW_ID_CAPACITY`.
-        let durable_high_water = read_row_id_high_water(&dir)?.ok_or_else(|| {
+        let durable_high_water = if let Some(accounting) = accounting.as_deref_mut() {
+            let loaded = read_row_id_high_water_with_byte_count(&dir)?;
+            accounting.row_id_catalog_bytes = loaded.bytes_read;
+            loaded.high_water
+        } else {
+            read_row_id_high_water(&dir)?
+        }
+        .ok_or_else(|| {
             strata_storage::StorageError::MissingRowIdHighWater(
                 dir.join(strata_storage::ROW_ID_HIGH_WATER_PREFIX),
             )
         })?;
-        if let Some(accounting) = accounting.as_deref_mut() {
-            accounting.row_id_catalog_bytes = row_id_catalog_bytes(&dir)?;
-        }
         let allocation_floor = manifest.next_row_id.max(durable_high_water);
         if allocation_floor > MAX_REASONABLE_ROW_ID_CAPACITY {
             return Err(TxnError::UnreasonableCapacity(
@@ -2218,24 +2223,6 @@ fn validate_tombstones(dir: &Path, manifest: &Manifest, owned_rows: &HashSet<u64
         }
     }
     Ok(())
-}
-
-/// Counts the immutable reservation payloads that
-/// `read_row_id_high_water` loaded during recovery. Temporary records are
-/// deliberately excluded because recovery lists them but never opens them.
-fn row_id_catalog_bytes(dir: &Path) -> Result<u128> {
-    let records = LocalFs::new(dir).list(strata_storage::ROW_ID_HIGH_WATER_PREFIX)?;
-    Ok(records
-        .into_iter()
-        .filter(|record| is_row_id_reservation_key(&record.key))
-        .map(|record| u128::from(record.size))
-        .sum())
-}
-
-fn is_row_id_reservation_key(key: &str) -> bool {
-    key.strip_prefix(strata_storage::ROW_ID_HIGH_WATER_PREFIX)
-        .and_then(|name| name.strip_suffix(".reservation"))
-        .is_some_and(|end| end.len() == 20 && end.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 /// Loads every segment `manifest` lists into a [`strata_index::SegmentSet`],

@@ -5,7 +5,9 @@ use std::sync::Arc;
 
 use arrow::array::{FixedSizeListArray, Float32Array, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use strata_storage::read_current;
+use strata_storage::{
+    read_current, read_row_id_high_water, read_row_id_high_water_with_byte_count,
+};
 use strata_txn::Dataset;
 
 fn id_schema() -> SchemaRef {
@@ -50,15 +52,9 @@ fn listed_bytes(dir: &Path, names: impl IntoIterator<Item = String>) -> u64 {
         .sum()
 }
 
-fn row_id_catalog_bytes(dir: &Path) -> u64 {
-    std::fs::read_dir(dir.join("_meta").join("row-id-high-water"))
-        .unwrap()
-        .map(|entry| entry.unwrap().metadata().unwrap().len())
-        .sum()
-}
-
 fn assert_accounting_matches_manifest_listed_files(dir: &Path) {
     let manifest = read_current(dir).unwrap().unwrap();
+    let row_id_load = read_row_id_high_water_with_byte_count(dir).unwrap();
     let (reopened, accounting) = Dataset::open_with_recovery_accounting(dir).unwrap();
     let manifest_path = dir
         .join("_versions")
@@ -76,8 +72,13 @@ fn assert_accounting_matches_manifest_listed_files(dir: &Path) {
         ))
     );
     assert_eq!(
-        accounting.row_id_catalog_bytes,
-        u128::from(row_id_catalog_bytes(dir))
+        accounting.row_id_catalog_bytes, row_id_load.bytes_read,
+        "diagnostic accounting must use the reservation bytes decoded by the loader"
+    );
+    assert_eq!(
+        read_row_id_high_water(dir).unwrap(),
+        row_id_load.high_water,
+        "the existing high-water API must retain its decoded result"
     );
     assert_eq!(
         accounting.segment_bytes,
