@@ -67,8 +67,7 @@ pub struct DataFileEntry {
 }
 
 /// One immutable index segment listed in the manifest — see
-/// `docs/superpowers/specs/2026-07-24-s1-segment-format-w3-migration-design.md`
-/// §3. Always an empty `Vec` on `Manifest` until S1 W3.2 starts writing
+/// `docs/design.md`. Always an empty `Vec` on `Manifest` until S1 W3.2 starts writing
 /// segments; `#[serde(default)]` on the field below and on `zone_map` here
 /// both make "field absent" (a manifest written before this existed) and
 /// "field present but empty" indistinguishable, which is required: an
@@ -163,8 +162,7 @@ pub struct Manifest {
     /// The commit-order-monotone envelope of every commit's captured
     /// timestamp so far — **not** necessarily equal to the max `_timestamp`
     /// any individual row carries (see
-    /// `docs/superpowers/specs/2026-07-25-s1-w2-timestamp-column-design.md`
-    /// §4 for why: `write_phase` runs outside `commit_lock`, so a row's own
+    /// `docs/design.md` for why: `write_phase` runs outside `commit_lock`, so a row's own
     /// timestamp capture and its eventual commit order can diverge under
     /// concurrency). Updated as `.max()` against each commit's own captured
     /// timestamp, inside the commit lock — which is what makes *this* field
@@ -176,8 +174,7 @@ pub struct Manifest {
     #[serde(default)]
     pub commit_time_high_water: i64,
     /// Immutable index segments as of this version — see
-    /// `docs/superpowers/specs/2026-07-24-s1-segment-format-w3-migration-design.md`
-    /// §3. Empty only for a dataset that has never committed a vector.
+    /// `docs/design.md`. Empty only for a dataset that has never committed a vector.
     /// `#[serde(default)]` so manifests written before this field existed
     /// still deserialize, same reasoning as `tombstones`/`next_attempt_id`.
     #[serde(default)]

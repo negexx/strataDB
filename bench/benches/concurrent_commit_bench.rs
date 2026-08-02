@@ -3,8 +3,7 @@
 //! non-conflicting writers vs. a single-writer baseline, and under a
 //! high-conflict-rate workload — the number that validates (or refutes)
 //! the tightly-scoped `commit_lock` design. See
-//! `docs/superpowers/specs/2026-07-21-phase-6-concurrent-write-engine-design.md`
-//! §3 and §7.
+//! `docs/design.md` for the current commit lifecycle and concurrency boundary.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::path::PathBuf;
@@ -168,8 +167,7 @@ fn bench_concurrent_non_conflicting_inserts(c: &mut Criterion) {
 /// commit" workload: here the segment build/serialize/fsync (the expensive
 /// work) runs in `write_phase`, *before* `commit_lock` is ever acquired: the
 /// in-lock step is just a manifest push, not an index mutation. See
-/// `docs/superpowers/specs/2026-07-21-phase-6-concurrent-write-engine-design.md`
-/// §3 for why that placement was a deliberate, but until now unmeasured,
+/// `docs/design.md` for why that placement remains a deliberate, but unmeasured,
 /// choice.
 fn bench_concurrent_non_conflicting_vector_inserts(c: &mut Criterion) {
     c.bench_function("concurrent_non_conflicting_vector_inserts", |b| {

@@ -1,5 +1,5 @@
 //! A point-in-time, immutable view of a [`Dataset`](crate::Dataset) — see
-//! `docs/superpowers/specs/2026-07-17-phase-5-mvcc-snapshot-isolation-design.md`.
+//! `docs/design.md`.
 //! `Snapshot` itself is never cloned — callers hold it behind
 //! [`Dataset::snapshot`](crate::dataset::Dataset::snapshot)'s `Arc<Snapshot>`,
 //! and cloning *that* `Arc` is cheap and never touches the data it points to.
@@ -29,7 +29,7 @@ use crate::live_set_cache::LiveSetCache;
 /// (`HashMap<String, ColumnStats>`), and applies the existing
 /// `should_scan_file` evaluator — S1 W4b. `crates/index` never sees a
 /// `Predicate` or a `ColumnStats`; see
-/// `docs/superpowers/specs/2026-07-26-s1-w4-zone-map-design-amendment.md` §2.
+/// `docs/design.md`.
 ///
 /// The `None` arm (a payload that isn't a `HashMap<String, ColumnStats>`)
 /// is unreachable in practice — `crates/txn` is the only code that ever

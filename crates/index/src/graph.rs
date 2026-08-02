@@ -1,6 +1,6 @@
 //! The lock-free HNSW graph: entry point, `SEARCH-LAYER`,
 //! `SELECT-NEIGHBORS-*`, `INSERT`, `K-NN-SEARCH`. See
-//! `docs/superpowers/specs/2026-07-18-lockfree-hnsw-rewrite-design.md`.
+//! `docs/design.md`.
 
 #[cfg(loom)]
 use loom::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -908,8 +908,7 @@ impl<D: Distance> Graph<D> {
 ///
 /// Generic over `NodeSource` so the identical algorithm runs over
 /// `Graph<D>` today and a segment reader from W3.2 — see
-/// `docs/superpowers/specs/2026-07-24-s1-segment-format-w3-migration-design.md`
-/// §2. `filter`/`row_id` operate in row-id space; everything else (`entry`,
+/// `docs/design.md`. `filter`/`row_id` operate in row-id space; everything else (`entry`,
 /// the returned ids, traversal) is in `source`'s local-id space — for
 /// `Graph<D>` these coincide (`row_id` is the identity), so this is not yet
 /// externally visible, but callers over a future segment must remember the
@@ -984,8 +983,7 @@ fn search_layer_generic<S: NodeSource, D: Distance>(
         // Graph::insert's own construction-time search_layer calls
         // permanently bakes truncated-candidate-set edges into the graph
         // for a one-time build-speed win, a worse trade than the intended
-        // recurring per-query one -- see design doc
-        // docs/superpowers/specs/2026-07-19-saturation-during-insert-design.md.
+        // recurring per-query one -- see the index boundary in docs/design.md.
         #[allow(clippy::items_after_statements)]
         const SATURATION_THRESHOLD_PERCENT: u32 = 95;
         #[allow(

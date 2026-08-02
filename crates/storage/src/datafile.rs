@@ -201,7 +201,7 @@ pub fn write_batch(path: &Path, batch: &RecordBatch) -> Result<WriteMetadata> {
 ///
 /// Lives here, not in the caller, so **every** chaos checkpoint in the
 /// commit protocol stays inside `strata-storage` — see
-/// `docs/superpowers/specs/2026-07-25-s1-w3-2-design-amendment.md` §5.
+/// `docs/design.md`.
 /// Truncating (`File::create`) exactly like [`write_batch`]: callers derive
 /// their filenames from a collision-free attempt id, so an existing file at
 /// `path` is a bug to overwrite, not content to append to.

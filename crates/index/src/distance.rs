@@ -30,8 +30,7 @@ impl Distance for L2 {
 /// transform is needed here — unlike `DistDot` below.
 // Not yet wired into `HnswIndex::new` (which hardcodes `Graph<L2>` to
 // preserve its pre-Task-14 public API exactly, per
-// `docs/superpowers/plans/2026-07-18-lockfree-hnsw-rewrite-plan.md` Task
-// 14's Global Constraints) — a future task selecting the metric at
+// `docs/design.md`'s current index boundary) — a future task selecting the metric at
 // construction time will consume this. Exercised today only by this
 // module's own unit tests below, hence the otherwise-unused warning.
 #[allow(dead_code)]

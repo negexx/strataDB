@@ -1,7 +1,7 @@
 //! Transaction path for `strata-txn`. Implements spec §3's commit protocol
 //! in full, including real OCC conflict detection and an atomic
 //! commit critical section (Phase 6) — see
-//! `docs/superpowers/specs/2026-07-21-phase-6-concurrent-write-engine-design.md`
+//! `docs/design.md`
 //! and `.opencode/rules/concurrency-txn-layer.md` before editing anything
 //! here. Conflict detection is write-write only, keyed by row-id, and
 //! scoped to in-process concurrency (multiple threads/tasks sharing one
@@ -59,7 +59,7 @@ pub const ROW_ID_COLUMN: &str = "_row_id";
 
 /// The hidden internal commit-time column every committed batch carries
 /// alongside its logical columns and `_row_id` — see
-/// `docs/superpowers/specs/2026-07-25-s1-w2-timestamp-column-design.md`.
+/// `docs/design.md`.
 /// Every row in one transaction shares one value: microseconds since the
 /// Unix epoch, captured once per commit. Unlike `_row_id`, this column
 /// *does* get a `should_scan_file`-visible stats entry — see
@@ -226,7 +226,7 @@ pub(crate) fn data_subdir(dir: &Path) -> PathBuf {
 /// value is never less than any value this `Dataset` has issued before —
 /// including across a wall-clock regression (an NTP step, a manual clock
 /// change), not just under concurrency. See
-/// `docs/superpowers/specs/2026-07-25-s1-w2-timestamp-column-design.md` §3.
+/// `docs/design.md`.
 ///
 /// No `Mutex` is needed here, unlike `RowIdAllocator`: there is no paired
 /// state that must advance atomically together, just one independent
@@ -1220,8 +1220,7 @@ impl Transaction {
         // Non-decreasing across versions by construction: this is a running
         // max computed under commit_lock, decoupled from any individual
         // row's own captured value — see
-        // docs/superpowers/specs/2026-07-25-s1-w2-timestamp-column-design.md
-        // §4 for why that decoupling is deliberate, not a gap.
+        // docs/design.md for why that decoupling is deliberate, not a gap.
         manifest.commit_time_high_water = manifest.commit_time_high_water.max(ts);
         // Dedup against both the current in-memory tombstone set and
         // duplicates within this same transaction's own pending_tombstones
@@ -2308,7 +2307,7 @@ pub(crate) struct VectorInsert {
 /// simply produces no entries — that's not an error, unlike a `"vector"`
 /// column present with the wrong type, which is. A commit that produces
 /// zero entries writes **no segment at all** (see `build_and_write_segment`
-/// and `docs/superpowers/specs/2026-07-25-s1-w3-2-design-amendment.md` §3c).
+/// and `docs/design.md`).
 ///
 /// Also rejects any row whose vector contains a non-finite (`NaN`/`Infinity`)
 /// component. This guard predates the segment format — it was originally
@@ -2397,7 +2396,7 @@ fn build_vector_inserts(batch: &RecordBatch, row_id_base: u64) -> Result<Vec<Vec
 /// there is no shared live graph to ask. The caller sources it from the
 /// current snapshot's `SegmentSet::established_dimension()` — available
 /// without opening any segment file. See
-/// `docs/superpowers/specs/2026-07-25-s1-w3-2-design-amendment.md` §2.
+/// `docs/design.md`.
 ///
 /// # Errors
 ///
@@ -2453,7 +2452,7 @@ const HIDDEN_COLUMNS: [&str; 2] = [ROW_ID_COLUMN, TIMESTAMP_COLUMN];
 /// Projects `batch`'s physical columns by their owned names, casting only
 /// storage-introduced encodings (such as a dictionary encoded UTF-8 column)
 /// back to the already-validated requested logical type. See
-/// `docs/superpowers/specs/2026-07-25-s1-w2-timestamp-column-design.md` §5
+/// `docs/design.md`
 /// for why matching a *second* hidden column by position was unsound (it
 /// either misfired a spurious `SchemaMismatch`, or — in the mixed-request
 /// case — silently paired the wrong physical column against the wrong
@@ -2524,7 +2523,7 @@ fn append_row_id_column(
 /// Appends a `_timestamp: Int64` column to `batch`, every row sharing the
 /// single value `ts` — microseconds since the Unix epoch, captured once per
 /// transaction by `issue_timestamp`. See
-/// `docs/superpowers/specs/2026-07-25-s1-w2-timestamp-column-design.md` §2-3.
+/// `docs/design.md`.
 fn append_timestamp_column(batch: &RecordBatch, ts: i64, num_rows: u64) -> Result<RecordBatch> {
     let num_rows = usize::try_from(num_rows)?;
     let timestamps: Vec<i64> = vec![ts; num_rows];

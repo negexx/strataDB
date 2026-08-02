@@ -1,6 +1,6 @@
 //! HNSW vector index — lock-free, from-scratch implementation (replacing
 //! `hnsw_rs` as of this rewrite). See `.opencode/rules/vector-index.md` and
-//! `docs/superpowers/specs/2026-07-18-lockfree-hnsw-rewrite-design.md`.
+//! `docs/design.md`.
 
 use crate::distance::L2;
 use crate::graph::Graph;
@@ -680,7 +680,7 @@ impl HnswIndex {
     /// *not* the dataset's global row-ids. `row_ids[local]` supplies the
     /// global row-id each ordinal stands for, and must be strictly
     /// ascending. See
-    /// `docs/superpowers/specs/2026-07-25-s1-w3-2-design-amendment.md` §3b.
+    /// `docs/design.md`.
     ///
     /// # Errors
     ///

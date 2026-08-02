@@ -2,7 +2,7 @@
 //! `crates/storage`'s file-format/manifest logic and where bytes actually
 //! live — local disk (`local::LocalFs`, this milestone) or, in a later
 //! milestone, S3-compatible object storage. See
-//! `docs/superpowers/specs/2026-07-30-phase9-object-storage-backend-design.md`.
+//! `docs/roadmap.md`.
 
 pub mod local;
 
@@ -63,8 +63,7 @@ pub trait Backend: Send + Sync {
     /// atomic create-if-absent, the primitive Strata's manifest commit path
     /// uses in place of the `rename`-based CAS local disk doesn't need but
     /// object storage does. See
-    /// `docs/superpowers/specs/2026-07-30-phase9-object-storage-backend-design.md`
-    /// §3.3.
+    /// `docs/roadmap.md`.
     ///
     /// # Errors
     /// Returns [`crate::error::StorageError::AlreadyExists`] if `key`

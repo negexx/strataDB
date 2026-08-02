@@ -2,7 +2,7 @@
 //! Recall@k and QPS comparison: the new lock-free `strata_index::graph::Graph`
 //! vs. `hnsw_rs` — the empirical evidence for the lock-free HNSW rewrite's
 //! stated success bar (match or beat `hnsw_rs`), per
-//! `docs/superpowers/specs/2026-07-18-hnsw-rs-wrap-vs-replace-decision.md`.
+//! `docs/design.md`.
 //!
 //! Both indexes are graded against `strata_index::brute_force_search` as
 //! true ground truth, not against each other — this directly answers

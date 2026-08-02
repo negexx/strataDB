@@ -1,11 +1,8 @@
 //! Abstracts element access during HNSW traversal (neighbors, vectors, the
 //! deleted flag) away from the live, mutable `Graph<D>` — so `search_layer`/
 //! `k_nn_search`'s algorithm bodies can run unchanged over either today's
-//! live graph or (starting in W3.2) an immutable on-disk segment. See
-//! `docs/superpowers/specs/2026-07-24-s1-segment-format-w3-migration-design.md`
-//! §2, as corrected by `docs/superpowers/specs/2026-07-25-s1-w3-design-amendment.md`
-//! §2 (the `is_deleted` method below is the amendment's addition — the base
-//! doc's sketch omitted it).
+//! live graph or an immutable on-disk segment. See `docs/design.md`; the
+//! `is_deleted` method below keeps traversal filtering explicit.
 //!
 //! Addressed in `u64` "local ids" universally: for a live graph the local id
 //! IS the row-id (`row_id` is the identity function); a future segment's

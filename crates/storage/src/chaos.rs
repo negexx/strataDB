@@ -2,7 +2,7 @@
 //! inert unless compiled with the `chaos-injection` feature AND the
 //! `STRATA_CHAOS_ABORT_AT` env var is set — zero cost, zero behavior change
 //! for the real `strata` binary or any other consumer. See
-//! `docs/superpowers/specs/2026-07-22-phase-7-correctness-harness-design.md` §3.
+//! `docs/phase-1-audit.md`.
 
 #[cfg(feature = "chaos-injection")]
 mod real {

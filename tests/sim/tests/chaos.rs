@@ -2,7 +2,7 @@
 //! process with a randomized crash checkpoint, then reopens the dataset
 //! and checks five invariants (no corruption, no lost commits, no phantom
 //! commits, no resurrected tombstones, row+index consistency). See
-//! `docs/superpowers/specs/2026-07-22-phase-7-correctness-harness-design.md`.
+//! `docs/phase-1-audit.md`.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::HashMap;

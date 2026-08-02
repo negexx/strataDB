@@ -1,10 +1,8 @@
 //! Constants, field offsets and shared helpers for the on-disk immutable
 //! segment format. See
-//! `docs/superpowers/specs/2026-07-24-s1-segment-format-w3-migration-design.md`
-//! §1 for the format's rationale (CSR-flat rather than a mirror of
-//! `node_layout.rs`'s mutation-era per-node blocks), and the S1 W3.2a plan
-//! (`docs/superpowers/plans/2026-07-25-s1-w3-2a-segment-write-path.md`) for
-//! the two recorded deviations: `section_len` is `[u32; 4]` so the header
+//! `docs/design.md` for the immutable-segment boundary. The format is CSR-flat
+//! rather than a mirror of `node_layout.rs`'s mutation-era per-node blocks;
+//! `section_len` is `[u32; 4]` so the header
 //! fits the specified 128 bytes, and the entry point's level is read from
 //! the `levels` section rather than assumed equal to `max_level`.
 //!

@@ -1,6 +1,6 @@
 //! A fixed-capacity, lock-free edge list: `capacity` atomic slots, each
 //! either empty or holding one neighbor's row-id. See
-//! `docs/superpowers/specs/2026-07-18-lockfree-hnsw-rewrite-design.md` §2.
+//! `docs/design.md`.
 
 #[cfg(loom)]
 use loom::sync::atomic::{AtomicU64, Ordering};

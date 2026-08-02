@@ -1,7 +1,6 @@
 //! Commit execution, conflict retry, and the contested-row-id registry
 //! for the chaos workload. See
-//! `docs/superpowers/specs/2026-07-27-chaos-worker-workload-extension-design.md`
-//! §3.1, §3.2, and §3.5 (ack-line printing).
+//! `docs/phase-1-audit.md` for the current verification boundary.
 
 use std::io::Write as _;
 
@@ -264,7 +263,7 @@ pub(crate) fn execute_multi_batch_insert(
 /// here, before any of those internal `write_str` calls happen, means they
 /// all run under the SAME held lock, so no other thread's `print_line`
 /// call can interleave until this one's guard drops. See
-/// `docs/superpowers/specs/2026-07-30-chaos-worker-real-concurrency-and-zonemap-verification-design.md`.
+/// `docs/phase-1-audit.md`.
 pub(crate) fn print_line(line: &str) {
     let stdout = std::io::stdout();
     let mut locked = stdout.lock();

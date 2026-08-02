@@ -1,8 +1,7 @@
 //! A backend-agnostic conformance suite for any [`crate::backend::Backend`]
 //! impl. Run against `LocalFs` in this milestone; run again unmodified
 //! against `S3Backend`/`InMemory` in a later milestone — see
-//! `docs/superpowers/specs/2026-07-30-phase9-object-storage-backend-design.md`
-//! §4. Not a `#[cfg(test)] mod tests` itself: it's a reusable function
+//! `docs/roadmap.md`. Not a `#[cfg(test)] mod tests` itself: it's a reusable function
 //! `mod tests` blocks in this crate call into, kept in its own file because
 //! it's meant to outlive this milestone's own tests.
 

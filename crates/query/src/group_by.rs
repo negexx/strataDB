@@ -1,8 +1,7 @@
 //! Hash-based `GROUP BY`, per
 //! `docs/design/phase-2-encodings-and-groupby-spec.md` §2.
 //!
-//! Internals per
-//! `docs/superpowers/specs/2026-07-19-group-by-phase-a-optimization-design.md`:
+//! Internals follow the query-primitives boundary in `docs/architecture.md`:
 //! a `HashMap<Row<'_>, usize>` index over the `Rows` buffer already built
 //! for the whole batch, instead of a fresh `OwnedRow` heap allocation per
 //! row, plus columnar (`Vec<T>`-per-`group_idx`) accumulator state instead
@@ -702,8 +701,8 @@ mod tests {
         // distinct group keys to force real hash collisions in the
         // implementation's lookup structure, unlike the 2-5-group
         // hand-written tests above, which never stress it meaningfully.
-        // Guards the Phase A rewrite described in
-        // docs/superpowers/specs/2026-07-19-group-by-phase-a-optimization-design.md.
+        // Guards the allocation behavior of the in-memory group-by primitive
+        // described in docs/architecture.md.
         const ROW_COUNT: usize = 5_000;
         const CARDINALITY: i64 = 2_500;
 

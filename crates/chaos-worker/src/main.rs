@@ -7,11 +7,8 @@
 //! mid-run by `strata_storage::chaos`. Per-agent op *content* (which verb,
 //! which vector, which target) is fully seed-derived and reproducible;
 //! cross-agent *interleaving* is genuine OS thread scheduling and is NOT
-//! reproducible from the seed alone -- see
-//! `docs/superpowers/specs/2026-07-30-chaos-worker-real-concurrency-and-zonemap-verification-design.md`'s
-//! "Reproducibility tradeoff" section. See also
-//! `docs/superpowers/specs/2026-07-27-chaos-worker-workload-extension-design.md`
-//! for the original op-verb/commit-execution design this builds on.
+//! reproducible from the seed alone. See `docs/phase-1-audit.md` for the
+//! current verification boundary.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod commit_ops;

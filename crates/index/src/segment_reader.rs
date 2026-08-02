@@ -11,7 +11,7 @@
 //! **Every accessor fails closed.** No indexing, no `unwrap`, no panic: an
 //! out-of-range local id yields `None` (or `u64::MAX` for
 //! [`NodeSource::row_id`], which the trait forces to be infallible). Binding
-//! per `docs/superpowers/specs/2026-07-25-s1-w3-2-design-amendment.md` §4 —
+//! per the immutable-segment boundary in `docs/design.md` —
 //! `search_layer_generic`'s admission gate calls `vector(local).is_some()`
 //! on every visited node, so a corrupt adjacency entry naming an
 //! out-of-range ordinal must be excluded there, not crash the search path.

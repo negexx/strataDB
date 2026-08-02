@@ -1,7 +1,6 @@
 //! A bounded, in-memory ring buffer of recently-committed transactions'
 //! write-sets — see
-//! `docs/superpowers/specs/2026-07-21-phase-6-concurrent-write-engine-design.md`
-//! §4. `Snapshot`s don't retain write-set history once unreferenced, so
+//! `docs/design.md`. `Snapshot`s don't retain write-set history once unreferenced, so
 //! conflict-checking "did anything land between my read-version and now
 //! touch my rows" needs its own structure independent of `Snapshot`'s
 //! lifetime.

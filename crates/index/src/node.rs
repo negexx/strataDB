@@ -1,6 +1,6 @@
 //! A graph node: its vector, one slot region per layer it participates
 //! in, and its deleted flag, all packed into a single raw allocation. See
-//! `docs/superpowers/specs/2026-07-23-single-allocation-hnsw-node-layout-design.md`.
+//! `docs/design.md`.
 
 #[cfg(loom)]
 use loom::sync::atomic::{AtomicU64, Ordering};
