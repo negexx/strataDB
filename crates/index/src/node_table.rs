@@ -1,5 +1,5 @@
 //! Row-id-indexed, demand-allocated, chunked storage — no hashing, since
-//! `crates/txn`'s row-ids are dense, monotonic `u64`s. See
+//! `crates/txn`'s row IDs are monotonically allocated `u64`s; gaps are valid. See
 //! `docs/design.md`.
 
 #[cfg(loom)]

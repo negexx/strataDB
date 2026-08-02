@@ -857,7 +857,8 @@ impl<D: Distance> Graph<D> {
     /// to serve as a live traversal waypoint for other queries (Stage 1's
     /// tombstone-flag-only scope — see design doc §1/§3). A no-op if
     /// `row_id` was never inserted.
-    // Before S1 W3.2, reachable in production through `HnswIndex::remove`,
+    // Before immutable segments became the production index architecture,
+    // this was reachable through `HnswIndex::remove`,
     // which `crates/txn`'s commit path called to undo an in-memory insert
     // whose transaction failed before durably committing. That guarantee is
     // now provided structurally (a failed commit's segment is never
@@ -907,15 +908,15 @@ impl<D: Distance> Graph<D> {
 /// traversal-time filtering, not just the deleted flag. See design doc §3.
 ///
 /// Generic over `NodeSource` so the identical algorithm runs over
-/// `Graph<D>` today and a segment reader from W3.2 — see
+/// a live `Graph<D>` and the current immutable segment reader — see
 /// `docs/design.md`. `filter`/`row_id` operate in row-id space; everything else (`entry`,
 /// the returned ids, traversal) is in `source`'s local-id space — for
 /// `Graph<D>` these coincide (`row_id` is the identity), so this is not yet
-/// externally visible, but callers over a future segment must remember the
+/// externally visible, but callers over an immutable segment must remember the
 /// two domains can differ.
 // As a method, `search_layer` kept this under the 7-argument default via
 // clippy's implicit `&self` exemption; as a free function taking `source`
-// and `distance` explicitly (so the same body can run over a future
+// and `distance` explicitly (so the same body can run over an immutable
 // segment reader, not just `Graph<D>`), those two become real parameters
 // and push the count to 8. Splitting them into a struct would just be
 // indirection around the same eight logically-independent inputs — same

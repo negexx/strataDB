@@ -67,8 +67,8 @@ pub struct DataFileEntry {
 }
 
 /// One immutable index segment listed in the manifest — see
-/// `docs/design.md`. Always an empty `Vec` on `Manifest` until S1 W3.2 starts writing
-/// segments; `#[serde(default)]` on the field below and on `zone_map` here
+/// `docs/design.md`. The segment list is empty only when no vector-bearing commit is
+/// visible; `#[serde(default)]` on the field below and on `zone_map` here
 /// both make "field absent" (a manifest written before this existed) and
 /// "field present but empty" indistinguishable, which is required: an
 /// absent/empty `zone_map` must always mean "must scan," never "may prune"
@@ -174,7 +174,7 @@ pub struct Manifest {
     #[serde(default)]
     pub commit_time_high_water: i64,
     /// Immutable index segments as of this version — see
-    /// `docs/design.md`. Empty only for a dataset that has never committed a vector.
+    /// `docs/design.md`. Empty only when no vector-bearing commit is visible.
     /// `#[serde(default)]` so manifests written before this field existed
     /// still deserialize, same reasoning as `tombstones`/`next_attempt_id`.
     #[serde(default)]

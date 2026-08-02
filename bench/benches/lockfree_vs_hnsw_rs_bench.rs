@@ -1,15 +1,12 @@
 // bench/benches/lockfree_vs_hnsw_rs_bench.rs
-//! Recall@k and QPS comparison: the new lock-free `strata_index::graph::Graph`
-//! vs. `hnsw_rs` — the empirical evidence for the lock-free HNSW rewrite's
-//! stated success bar (match or beat `hnsw_rs`), per
-//! `docs/design.md`.
+//! Measures Recall@k and QPS for the lock-free `strata_index::graph::Graph`
+//! alongside `hnsw_rs` for this benchmark workload.
 //!
 //! Both indexes are graded against `strata_index::brute_force_search` as
-//! true ground truth, not against each other — this directly answers
-//! whether Graph's recall@k is >= `hnsw_rs`'s, which "vs. `hnsw_rs`'s own
-//! results as ground truth" alone would not (two implementations can agree
-//! with each other while both being wrong, or diverge without telling you
-//! which one is closer to correct).
+//! true ground truth, not against each other, so the results report each
+//! implementation's measured recall independently (two implementations can
+//! agree with each other while both being wrong, or diverge without telling
+//! you which one is closer to correct).
 //!
 //! `load_vectors` duplicates `vector_search_bench.rs`'s loader rather than
 //! sharing it — each file under `benches/` compiles as an independent
