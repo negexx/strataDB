@@ -8299,6 +8299,24 @@ mod loom_tests {
         ]))
     }
 
+    fn loom_vector_schema() -> StdArc<arrow::datatypes::Schema> {
+        StdArc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+            arrow::datatypes::Field::new(
+                "vector",
+                arrow::datatypes::DataType::FixedSizeList(
+                    StdArc::new(arrow::datatypes::Field::new(
+                        "item",
+                        arrow::datatypes::DataType::Float32,
+                        false,
+                    )),
+                    3,
+                ),
+                true,
+            ),
+        ]))
+    }
+
     #[test]
     fn one_writer_store_races_safely_with_many_readers_load() {
         loom::model(|| {
@@ -8476,7 +8494,7 @@ mod loom_tests {
             arrow::datatypes::Field::new(
                 "vector",
                 arrow::datatypes::DataType::FixedSizeList(item(), dim),
-                false,
+                true,
             ),
         ]));
         let ids = StdArc::new(arrow::array::Int64Array::from(vec![id]));
@@ -8491,17 +8509,28 @@ mod loom_tests {
     }
 
     /// One row, no `"vector"` column — so `build_vector_inserts` yields no
-    /// entries and the commit does zero HNSW work while still claiming a
-    /// row-id and advancing the row-id counter. Used for the committers
-    /// whose only job here is to move the counter, keeping the loom model
-    /// small enough to explore.
+    /// entries. Its null `vector` has the owned 3D type, so validation
+    /// passes while the commit does zero HNSW work and still claims a row-id.
+    /// Used for the committers whose only job here is to move the counter,
+    /// keeping the loom model small enough to explore.
     fn loom_plain_batch(id: i64) -> arrow::array::RecordBatch {
-        let schema = StdArc::new(arrow::datatypes::Schema::new(vec![
-            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
-        ]));
+        let item = StdArc::new(arrow::datatypes::Field::new(
+            "item",
+            arrow::datatypes::DataType::Float32,
+            false,
+        ));
+        let vectors = StdArc::new(arrow::array::FixedSizeListArray::new(
+            item,
+            3,
+            StdArc::new(arrow::array::Float32Array::from(vec![0.0, 0.0, 0.0])),
+            Some(arrow::buffer::NullBuffer::from(vec![false])),
+        ));
         arrow::array::RecordBatch::try_new(
-            schema,
-            vec![StdArc::new(arrow::array::Int64Array::from(vec![id]))],
+            loom_vector_schema(),
+            vec![
+                StdArc::new(arrow::array::Int64Array::from(vec![id])),
+                vectors,
+            ],
         )
         .unwrap()
     }
@@ -8574,7 +8603,7 @@ mod loom_tests {
                 .tempdir()
                 .unwrap()
                 .keep();
-            let ds = crate::Dataset::create(&dir, test_schema()).unwrap();
+            let ds = crate::Dataset::create(&dir, loom_vector_schema()).unwrap();
 
             // Seed: one durable, vector-carrying commit, run to completion
             // *before* the racing pair below — see this test's doc comment
@@ -8693,10 +8722,10 @@ mod loom_tests {
 
     #[test]
     fn concurrent_first_vector_commits_at_different_dimensions_are_not_both_accepted() {
-        // The interleaving counterpart to
-        // `dataset::tests::concurrent_first_vector_commits_at_different_dimensions_are_not_both_accepted`.
-        // That deterministic test pauses the 5-d transaction on the
-        // existing `pause_after_row_id_claim` checkpoint, which fires
+        // ARCH-01 gives this dataset an owned, exact 3D vector schema.
+        // The old in-lock race model is obsolete under schema ownership.
+        // A 5D batch is now rejected before any index work begins.
+        // Historically, the model used `pause_after_row_id_claim`, which fired
         // *before* `commit_lock.lock()` — so it fixes one specific
         // schedule (T1 runs to completion while T2 sits paused right
         // outside the lock) rather than proving the property across every
@@ -8713,7 +8742,9 @@ mod loom_tests {
         // over a hand-rolled concurrency proof (see
         // `docs/phase-1-audit.md`).
         //
-        // Unlike the deterministic sibling, this model installs no
+        // The following historical explanation is retained only for the model name;
+        // it does not describe the ARCH-01 schema-validation behavior below.
+        // Unlike the deterministic sibling, this model installed no
         // checkpoint and imposes no ordering: both committers begin from
         // the same fresh, dimension-0 dataset and race straight into
         // `commit()`, so loom explores every order in which they reach
@@ -8726,11 +8757,6 @@ mod loom_tests {
         //
         // Budget: this model spawns 2 committers (+ root) = 3 of loom's
         // 5-created-threads-per-execution cap — see [`spawn_committer`]'s
-        // doc comment for the full per-model accounting. loom never frees
-        // a terminated thread's slot, so any future model added to this
-        // file needs to budget against that same hard cap independently,
-        // not against whatever headroom this or any other existing model
-        // happens to leave.
         loom::model(|| {
             let dir = tempfile::Builder::new()
                 .prefix(&format!(
@@ -8741,7 +8767,7 @@ mod loom_tests {
                 .tempdir()
                 .unwrap()
                 .keep();
-            let ds = crate::Dataset::create(&dir, test_schema()).unwrap();
+            let ds = crate::Dataset::create(&dir, loom_vector_schema()).unwrap();
             assert_eq!(
                 ds.snapshot().index.established_dimension(),
                 0,
@@ -8751,60 +8777,41 @@ mod loom_tests {
             let ds_3d = ds.clone();
             let ds_5d = ds.clone();
 
-            // No checkpoint, no artificial ordering: both transactions
-            // begin from the same dimension-0 snapshot and commit
-            // concurrently, letting loom explore every interleaving of
-            // both reaching `commit_lock`.
+            // The valid 3D transaction commits normally. The 5D transaction
+            // reaches `insert` concurrently but returns before `commit`,
+            // because schema validation rejects its non-owned batch.
             let three_d = spawn_committer(move || {
                 let mut txn = ds_3d.begin();
-                txn.insert(loom_vector_batch(0, &[1.0, 0.0, 0.0])).unwrap();
+                txn.insert(loom_vector_batch(0, &[1.0, 0.0, 0.0]))?;
                 txn.commit()
             });
             let five_d = spawn_committer(move || {
                 let mut txn = ds_5d.begin();
-                txn.insert(loom_vector_batch(1, &[9.0, 9.0, 9.0, 9.0, 9.0]))
-                    .unwrap();
+                txn.insert(loom_vector_batch(1, &[9.0, 9.0, 9.0, 9.0, 9.0]))?;
                 txn.commit()
             });
 
             let result_3d = three_d.join().unwrap();
             let result_5d = five_d.join().unwrap();
 
-            let successes = [&result_3d, &result_5d]
-                .iter()
-                .filter(|r| r.is_ok())
-                .count();
-            assert_eq!(
-                successes, 1,
-                "exactly one of two concurrent first-vector commits at different \
-                 dimensions may ever succeed, under every interleaving: \
-                 3d={result_3d:?}, 5d={result_5d:?}"
-            );
-
-            let is_dimension_mismatch = |result: &crate::Result<()>| {
-                matches!(
-                    result,
-                    Err(crate::TxnError::Index(
-                        strata_index::IndexError::DimensionMismatch { .. }
-                    ))
-                )
-            };
             assert!(
-                is_dimension_mismatch(&result_3d) || is_dimension_mismatch(&result_5d),
-                "the losing commit must fail with a dimension-mismatch error specifically, \
-                 not silently or with some other error shape: 3d={result_3d:?}, \
-                 5d={result_5d:?}"
+                result_3d.is_ok(),
+                "the owned 3-dimensional vector schema must be publishable: \
+                 3d={result_3d:?}"
+            );
+            assert!(
+                matches!(result_5d, Err(crate::TxnError::BatchSchemaMismatch { .. })),
+                "the non-owned 5-dimensional batch must be rejected before an index \
+                 dimension race: 5d={result_5d:?}"
             );
 
-            // No corrupted mixed-dimension state can result regardless of
-            // which side won: exactly one segment, and the established
-            // dimension matches whichever commit actually published.
+            // Only the owned 3D batch can publish: exactly one segment has
+            // the owned schema's established dimension.
             let snapshot = ds.snapshot();
             assert_eq!(
                 snapshot.manifest.segments.len(),
                 1,
-                "exactly one segment may ever be published, regardless of which \
-                 dimension won the race: {:?}",
+                "only the owned 3D batch may publish a segment: {:?}",
                 snapshot.manifest.segments
             );
             assert_eq!(
@@ -8812,12 +8819,11 @@ mod loom_tests {
                 1,
                 "the snapshot's segment set must stay in lockstep with the manifest"
             );
-            let winner_dimension = if result_3d.is_ok() { 3 } else { 5 };
             assert_eq!(
                 snapshot.index.established_dimension(),
-                winner_dimension,
-                "established_dimension() must match whichever commit actually won, \
-                 never a mix of the two: 3d={result_3d:?}, 5d={result_5d:?}"
+                3,
+                "the published segment must retain the owned 3D schema's dimension: \
+                 3d={result_3d:?}, 5d={result_5d:?}"
             );
 
             std::fs::remove_dir_all(&dir).ok();
@@ -8910,7 +8916,7 @@ mod loom_tests {
                 .tempdir()
                 .unwrap()
                 .keep();
-            let ds = crate::Dataset::create(&dir, test_schema()).unwrap();
+            let ds = crate::Dataset::create(&dir, loom_vector_schema()).unwrap();
 
             // Seed: one durable, vector-carrying commit, run to completion
             // *before* the racing pair below -- see this test's doc comment
@@ -9082,7 +9088,7 @@ mod loom_tests {
                 .tempdir()
                 .unwrap()
                 .keep();
-            let ds = crate::Dataset::create(&dir, test_schema()).unwrap();
+            let ds = crate::Dataset::create(&dir, loom_vector_schema()).unwrap();
 
             let ds_writer = ds.clone();
             let writer = spawn_committer(move || {
@@ -9242,7 +9248,7 @@ mod loom_tests {
         // arrays plus a `FixedSizeListArray`) per explored execution just to
         // call `.schema()` on it is pure overhead. `SchemaRef` is an
         // `Arc<Schema>`, so cloning it into the reader thread is free.
-        let schema = loom_vector_batch(0, &[0.0, 0.0, 0.0]).schema();
+        let schema = loom_vector_schema();
 
         let mut model = loom::model::Builder::new();
         model.preemption_bound = Some(3);
@@ -9256,7 +9262,7 @@ mod loom_tests {
                 .tempdir()
                 .unwrap()
                 .keep();
-            let ds = crate::Dataset::create(&dir, test_schema()).unwrap();
+            let ds = crate::Dataset::create(&dir, loom_vector_schema()).unwrap();
 
             let ds_a = ds.clone();
             let committer_a = spawn_committer(move || {

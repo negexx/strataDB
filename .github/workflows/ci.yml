@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * 0'
 
 env:
   CARGO_TERM_COLOR: always
@@ -71,13 +74,6 @@ jobs:
 
       - name: Test fast chaos tier
         run: cargo test -p strata-sim fast_tier_random_seeds_survive_random_crash_points -- --exact --nocapture
-
-      - name: Test thorough chaos tier
-        run: |
-          set -euo pipefail
-          STRATA_CHAOS_THOROUGH=1 cargo test -p strata-sim thorough_tier_satisfies_the_phase_7_exit_criterion -- --exact --ignored --nocapture \
-            2>&1 | tee /tmp/strata-chaos-thorough.log
-          grep -F "thorough tier: 2000/2000 seeds checked" /tmp/strata-chaos-thorough.log
 
       - name: Loom transaction models (strata-txn)
         run: |
@@ -181,3 +177,21 @@ jobs:
 
       - name: cargo-deny (bans, sources, advisories)
         run: cargo deny check bans sources advisories
+
+  thorough-chaos:
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.90"
+
+      - name: Test thorough chaos tier
+        run: |
+          set -euo pipefail
+          STRATA_CHAOS_THOROUGH=1 cargo test -p strata-sim thorough_tier_satisfies_the_phase_7_exit_criterion -- --exact --ignored --nocapture \
+            2>&1 | tee /tmp/strata-chaos-thorough.log
+          grep -F "thorough tier: 2000/2000 seeds checked" /tmp/strata-chaos-thorough.log
