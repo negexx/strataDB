@@ -126,11 +126,13 @@ supported maximum for segment count, latency, recall, or memory.
 
 Peak-live is the benchmark process's global allocator delta above the start of
 each K, spanning build, reopen, warmup, and measured query sweeps. It is not
-RSS, total process memory, or a retained-snapshot bound. The unfiltered K=64
-median was 47.9 us/query versus 59.2 at K=1 on this short run; this is a
-host-local observation, not evidence of monotonicity or a segment-count
-maximum. Filtered results include the warmed predicate live-set cache and are
-not a cold-filter latency claim.
+RSS, total process memory, or a retained-snapshot bound. The table is the
+K-dependent observation for this short run; its direction must be read from
+the recorded rows, not inferred as a monotonic segmentation effect. The
+unfiltered K=64 median was 47.9 us/query versus 59.2 at K=1. This is a
+host-local observation, not evidence of a segment-count maximum. Filtered
+results include the warmed predicate live-set cache and are not a cold-filter
+latency claim.
 
 An unchanged pre-improvement 256-row, 16-query command was also reproduced on
 this host with the same synthetic seed and input hash `6263e3d344dba5e7`.
@@ -207,7 +209,8 @@ Input hashes: lifecycle `97f1b4d1524e42f1`; earlier segment recall
 These measurements establish reproducible bounded evidence points for the immutable,
 manifest-listed segment path and the current lifecycle. Task 7 supports only the named 64-row,
 512-dimensional, 8-query synthetic workload across K=1, 2, 4, 8, 16, 32, and 64, with the
-recorded cache and repeat policy. It is an evidence-only operational envelope: no typed API guard
+recorded cache and repeat policy; the table records its K-dependent direction without a monotonic
+degradation claim. It is an evidence-only operational envelope: no typed API guard
 or supported maximum follows from it. The small sweep covers 40 retained manifest versions and the lifecycle records reopen time, end-of-run manifest bytes, and pinned historical snapshots.
 They do not establish a universal latency,
 memory, recovery-time, or segment-count guarantee. The manifest and segment sets grow with retained

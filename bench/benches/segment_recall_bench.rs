@@ -2,9 +2,10 @@
 //!
 //! The segmented index layout replaces one large mutable HNSW with K immutable
 //! segments; a query fans out across all K and merges. The addendum names the
-//! open risk: "a real recall-per-millisecond penalty versus one large graph."
-//! This measures that penalty directly, against Strata's own `crates/index`
-//! graph and the configured fixture or deterministic synthetic vectors.
+//! open question: how recall, latency, and throughput vary with K relative to
+//! one segment. This measures that K-dependent behavior directly, against
+//! Strata's own `crates/index` graph and the configured fixture or
+//! deterministic synthetic vectors.
 //!
 //! Method, holding Strata's production HNSW params (M=16, ef_construction=100,
 //! ef_search=32, k=10) fixed:
@@ -13,13 +14,13 @@
 //!     (modelling K un-compacted time-ordered delta segments), each its own
 //!     HNSW graph. A query searches all K for top-k, merges the K·k candidates,
 //!     takes the global top-k. ef_search is held constant *per segment*, so each
-//!     segment gets a full-quality search and the fan-out shows up as latency.
+//!     segment gets a full-quality search; the benchmark reports the resulting
+//!     K-dependent recall, latency, and throughput measurements.
 //!   - recall@10 is measured against exact brute-force ground truth (same for
 //!     every K), so it isolates the segmentation effect from ANN error.
 //!
-//! Reads as: does recall hold as segments accumulate (compaction only needs to
-//! bound *latency*), or does it collapse (compaction is load-bearing for
-//! *correctness*, a much harder constraint)?
+//! Read the table as a bounded K-dependent measurement: use its rows to assess
+//! the run's direction, without inferring monotonic behavior from segmentation.
 //!
 //! ```text
 //! cargo bench --bench segment_recall_bench
@@ -553,26 +554,35 @@ fn main() {
     println!();
     if recall_drop <= 0.02 {
         println!(
-            "VERDICT: recall holds across segmentation (drop {:.1}pp at K={}).",
-            recall_drop * 100.0,
-            last_k
+            "VERDICT: the K=1-to-K={} endpoint recall delta is {:.1}pp (within 2pp).",
+            last_k,
+            -recall_drop * 100.0
         );
-        println!("  The penalty is LATENCY, not recall — fan-out costs {latency_mult:.1}x here.");
-        println!("  This bounded sample shows a latency cost without a recall drop.");
+        println!(
+            "  Fan-out measures K-dependent behavior; read this run's direction from the table."
+        );
+        println!(
+            "  This bounded sample reports recall and latency observations for the current fixture."
+        );
         println!("  It is evidence for the current fixture, not a universal guarantee.");
     } else {
         println!(
-            "VERDICT: recall DROPS {:.1}pp by K={} — segmentation costs correctness, not just latency.",
-            recall_drop * 100.0,
-            last_k
+            "VERDICT: the K=1-to-K={} endpoint recall delta is {:.1}pp (outside 2pp).",
+            last_k,
+            -recall_drop * 100.0
         );
-        println!("  This bounded sample shows a recall decrease as segments fan out.");
+        println!(
+            "  Fan-out measures K-dependent behavior; read this run's direction from the table."
+        );
+        println!("  This bounded sample reports an endpoint difference for the current fixture.");
         println!("  It is a signal for follow-up measurement, not a universal guarantee.");
     }
     println!(
         "\nCaveats: contiguous partition (time-ordered segments); ef_search held constant per"
     );
-    println!("segment, so latency is the honest fan-out cost, not a recall/latency trade. A");
+    println!(
+        "segment; the table reports the resulting K-dependent measurements, not a recall/latency trade. A"
+    );
     println!(
         "latency-budgeted variant (shrink ef as K grows) would trade some of this recall back"
     );
