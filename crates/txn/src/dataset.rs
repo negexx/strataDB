@@ -30,9 +30,9 @@ use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use strata_index::{EfConstruction, HnswIndex, MaxConnections, MaxElements, MaxLayers};
 use strata_storage::{
-    ColumnStats, DataFileEntry, Manifest, SegmentEntry, Value, commit_manifest, compute_stats,
-    initialize_row_id_high_water, read_batch, read_current, read_row_id_high_water, sync_dir,
-    write_batch, write_bytes,
+    Backend, ColumnStats, DataFileEntry, LocalFs, Manifest, SegmentEntry, Value, commit_manifest,
+    compute_stats, initialize_row_id_high_water, read_current, read_current_with_byte_count,
+    read_row_id_high_water, sync_dir, write_batch, write_bytes,
 };
 
 use crate::commit_log::{CommitLog, ConflictCheck};
@@ -209,6 +209,33 @@ pub struct Dataset {
     /// `issue_timestamp`. Seeded from `Manifest.commit_time_high_water` on
     /// both `create` and `open`, so this floor survives a restart.
     last_issued_timestamp: Arc<AtomicI64>,
+}
+
+/// Exact on-disk payload bytes loaded during one successful
+/// [`Dataset::open_with_recovery_accounting`] recovery.
+///
+/// Each category records validation payloads, not process allocations, RSS,
+/// directory-listing metadata, or historical manifests that recovery did not
+/// open. Counts are `u128` so summing many valid `u64`-sized files cannot
+/// silently wrap the diagnostic.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RecoveryByteAccounting {
+    /// Bytes in the selected current manifest that recovery loaded and validated.
+    pub manifest_bytes: u128,
+    /// Bytes in immutable row-ID reservation records recovery loaded and validated.
+    pub row_id_catalog_bytes: u128,
+    /// Bytes in manifest-listed Arrow row files recovery loaded and validated.
+    pub row_data_bytes: u128,
+    /// Bytes in manifest-listed immutable vector segments recovery loaded and validated.
+    pub segment_bytes: u128,
+}
+
+impl RecoveryByteAccounting {
+    /// The sum of all recovery payload categories.
+    #[must_use]
+    pub const fn total_bytes(self) -> u128 {
+        self.manifest_bytes + self.row_id_catalog_bytes + self.row_data_bytes + self.segment_bytes
+    }
 }
 
 /// The single source of truth for "where does this dataset's data live,
@@ -446,8 +473,40 @@ impl Dataset {
     /// Returns [`TxnError::NotFound`] if no dataset exists at `dir`, or a
     /// storage error if the current manifest exists but fails to read.
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self> {
-        let dir = dir.into();
-        let manifest = read_current(&dir)?.ok_or_else(|| TxnError::NotFound(dir.clone()))?;
+        Self::open_inner(dir.into(), None)
+    }
+
+    /// Opens a dataset and returns exact recovery validation payload bytes.
+    ///
+    /// This opt-in diagnostic follows the same recovery and validation path
+    /// as [`Dataset::open`] without mutating the dataset or changing commit
+    /// acknowledgement semantics.
+    ///
+    /// # Errors
+    ///
+    /// As [`Dataset::open`], if recovery cannot locate or validate the
+    /// dataset's durable state.
+    pub fn open_with_recovery_accounting(
+        dir: impl Into<PathBuf>,
+    ) -> Result<(Self, RecoveryByteAccounting)> {
+        let mut accounting = RecoveryByteAccounting::default();
+        let dataset = Self::open_inner(dir.into(), Some(&mut accounting))?;
+        Ok((dataset, accounting))
+    }
+
+    fn open_inner(
+        dir: PathBuf,
+        mut accounting: Option<&mut RecoveryByteAccounting>,
+    ) -> Result<Self> {
+        let manifest = match accounting.as_deref_mut() {
+            Some(accounting) => {
+                let (manifest, bytes) = read_current_with_byte_count(&dir)?
+                    .ok_or_else(|| TxnError::NotFound(dir.clone()))?;
+                accounting.manifest_bytes = u128::from(bytes);
+                manifest
+            }
+            None => read_current(&dir)?.ok_or_else(|| TxnError::NotFound(dir.clone()))?,
+        };
         let manifest_path = dir
             .join("_versions")
             .join(format!("{:020}.manifest", manifest.version));
@@ -463,6 +522,9 @@ impl Dataset {
                 dir.join(strata_storage::ROW_ID_HIGH_WATER_PREFIX),
             )
         })?;
+        if let Some(accounting) = accounting.as_deref_mut() {
+            accounting.row_id_catalog_bytes = row_id_catalog_bytes(&dir)?;
+        }
         let allocation_floor = manifest.next_row_id.max(durable_high_water);
         if allocation_floor > MAX_REASONABLE_ROW_ID_CAPACITY {
             return Err(TxnError::UnreasonableCapacity(
@@ -470,9 +532,9 @@ impl Dataset {
                 MAX_REASONABLE_ROW_ID_CAPACITY,
             ));
         }
-        let owned_rows = validate_data_files(&dir, &manifest, &schema)?;
+        let owned_rows = validate_data_files(&dir, &manifest, &schema, accounting.as_deref_mut())?;
         validate_tombstones(&dir, &manifest, &owned_rows)?;
-        let index = load_segments(&dir, &manifest, &owned_rows)?;
+        let index = load_segments(&dir, &manifest, &owned_rows, accounting)?;
         // The manifest's tombstone list is now the only source: index-level
         // tombstone entries went away with the delta log, and never had a
         // producer on the commit path anyway.
@@ -2065,6 +2127,7 @@ fn validate_data_files(
     dir: &Path,
     manifest: &Manifest,
     logical_schema: &SchemaRef,
+    mut accounting: Option<&mut RecoveryByteAccounting>,
 ) -> Result<HashSet<u64>> {
     let data_dir = data_subdir(dir);
     let mut owned_rows = HashSet::new();
@@ -2082,6 +2145,9 @@ fn validate_data_files(
         }
         let path = safe_join(&data_dir, &entry.name)?;
         let bytes = std::fs::read(&path)?;
+        if let Some(accounting) = accounting.as_deref_mut() {
+            accounting.row_data_bytes += u128::from(bytes.len() as u64);
+        }
         let actual_len = u64::try_from(bytes.len())?;
         if actual_len != entry.byte_len {
             return Err(TxnError::Storage(
@@ -2106,7 +2172,7 @@ fn validate_data_files(
                 ),
             ));
         }
-        let batch = read_batch(&data_dir.join(&entry.name))?;
+        let batch = strata_storage::datafile::read_batch_from_bytes(&path, &bytes)?;
         validate_physical_batch_schema(dir, manifest, logical_schema, &batch, &entry.name)?;
         let actual_rows = u64::try_from(batch.num_rows())?;
         if actual_rows != entry.row_count {
@@ -2154,6 +2220,24 @@ fn validate_tombstones(dir: &Path, manifest: &Manifest, owned_rows: &HashSet<u64
     Ok(())
 }
 
+/// Counts the immutable reservation payloads that
+/// `read_row_id_high_water` loaded during recovery. Temporary records are
+/// deliberately excluded because recovery lists them but never opens them.
+fn row_id_catalog_bytes(dir: &Path) -> Result<u128> {
+    let records = LocalFs::new(dir).list(strata_storage::ROW_ID_HIGH_WATER_PREFIX)?;
+    Ok(records
+        .into_iter()
+        .filter(|record| is_row_id_reservation_key(&record.key))
+        .map(|record| u128::from(record.size))
+        .sum())
+}
+
+fn is_row_id_reservation_key(key: &str) -> bool {
+    key.strip_prefix(strata_storage::ROW_ID_HIGH_WATER_PREFIX)
+        .and_then(|name| name.strip_suffix(".reservation"))
+        .is_some_and(|end| end.len() == 20 && end.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
 /// Loads every segment `manifest` lists into a [`strata_index::SegmentSet`],
 /// in manifest order. This is what replaced delta-log replay: a segment is
 /// the durable built graph, so recovery is `O(bytes)` validation with zero
@@ -2183,6 +2267,7 @@ fn load_segments(
     dir: &Path,
     manifest: &Manifest,
     owned_rows: &HashSet<u64>,
+    mut accounting: Option<&mut RecoveryByteAccounting>,
 ) -> Result<strata_index::SegmentSet> {
     let data_dir = data_subdir(dir);
     let mut parts = Vec::with_capacity(manifest.segments.len());
@@ -2198,6 +2283,9 @@ fn load_segments(
         }
         let path = safe_join(&data_dir, &entry.name)?;
         let bytes = std::fs::read(&path)?;
+        if let Some(accounting) = accounting.as_deref_mut() {
+            accounting.segment_bytes += u128::from(bytes.len() as u64);
+        }
         // Checked before parsing so a truncated file is reported as the
         // truncation it is, rather than as whichever internal check its
         // remaining bytes happen to trip first. `SegmentEntry.byte_len`

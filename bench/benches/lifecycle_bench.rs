@@ -399,15 +399,21 @@ fn main() {
     drop(ds);
     let m = phase_start();
     let t = Instant::now();
-    let ds = Dataset::open(&dir).unwrap();
+    let (ds, recovery_bytes) = Dataset::open_with_recovery_accounting(&dir).unwrap();
     let wall = t.elapsed();
     results.push(PhaseResult {
         name: "recovery (reopen)",
         kind: "I/O + validation (segment load, no graph rebuild)",
         wall,
         detail: format!(
-            "loaded {n} rows, {:.0} rows/s",
-            n as f64 / wall.as_secs_f64()
+            "loaded {n} rows, {:.0} rows/s; recovery payload bytes: total={} manifest={} \
+             row-data={} row-id-catalog={} segments={}",
+            n as f64 / wall.as_secs_f64(),
+            recovery_bytes.total_bytes(),
+            recovery_bytes.manifest_bytes,
+            recovery_bytes.row_data_bytes,
+            recovery_bytes.row_id_catalog_bytes,
+            recovery_bytes.segment_bytes,
         ),
         mem: phase_end(m),
     });

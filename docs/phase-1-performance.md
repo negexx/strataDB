@@ -48,6 +48,41 @@ No checked-in `bench/cloud-performance/` harness or
 PERF-01 remains open for portable, real-fixture, and cloud provenance even though this bounded
 synthetic PERF-02 matrix is recorded.
 
+## Task 6 recovery-byte accounting evidence (fresh, bounded)
+
+**Run date:** 2026-08-02. **Baseline revision:**
+`698185f7901ef935dacc63e09384b643ee28e12f`; the Task 6 implementation and
+its final commit are recorded in the task report. **Runner/toolchain:** local
+Windows `10.0.26200`, `x86_64-pc-windows-msvc`; rustc `1.90.0
+(1159e78c4 2025-09-14)` and Cargo `1.90.0 (840b83a10 2025-07-30)`.
+
+The recovery diagnostic reports only payload bytes loaded and validated by a
+successful `Dataset::open_with_recovery_accounting`: the selected current
+manifest, immutable row-ID reservation records, manifest-listed Arrow row
+files, and manifest-listed immutable vector segments. It excludes process RSS,
+allocator churn, directory-listing metadata, and retained manifest versions
+that recovery did not open. The accounting regression covers empty, small
+vector-bearing, retained-history, and 16-commit bounded-larger datasets, and
+checks every category against the current manifest's actual listed files.
+
+The lifecycle smoke used the existing workload unchanged except for choosing
+the opt-in diagnostic reopen API:
+
+```text
+$env:STRATA_BENCH_SOURCE='synthetic'; $env:STRATA_BENCH_SEED='20260801';
+$env:STRATA_LIFECYCLE_ROWS='16'; $env:STRATA_LIFECYCLE_BATCH_ROWS='4';
+$env:STRATA_PINNED_SNAPSHOTS='2';
+cargo bench -p strata-bench --bench lifecycle_bench -- --noplot
+```
+
+It committed 16 deterministic 512-dimensional rows in four commits, reopened
+before the existing retained-snapshot and concurrent-commit phases, and
+reported 82,134 recovery payload bytes: 3,954 manifest, 44,328 row data, 60
+row-ID catalog, and 33,792 immutable segments. Reopen wall time was 12.68 ms;
+the same run reported two pinned historical/current snapshots and 24 concurrent
+commits. This is one warm local-filesystem synthetic observation, not a
+universal recovery, retained-history, or concurrent-operation bound.
+
 ## Earlier related measurements
 
 **Run date:** 2026-08-02

@@ -7,7 +7,7 @@
 //! see `docs/design.md` for the current storage boundary.
 
 use std::fs::File;
-use std::io::Write as _;
+use std::io::{Cursor, Read, Seek, Write as _};
 use std::path::Path;
 
 use arrow::array::RecordBatch;
@@ -329,6 +329,25 @@ fn directory_sync_error(dir: &Path, error: std::io::Error) -> StorageError {
 /// process-global and would race any other thread's panics.
 pub fn read_batch(path: &Path) -> Result<RecordBatch> {
     let file = File::open(path)?;
+    read_batch_from_reader(file, path)
+}
+
+/// Decodes the first record batch from already-loaded Arrow IPC bytes.
+///
+/// Recovery uses this after inspecting a row file's complete bytes for its
+/// manifest checksum, avoiding a second filesystem read solely for IPC
+/// validation. It is an internal storage helper; callers outside the
+/// `Dataset` recovery path should use [`read_batch`].
+///
+/// # Errors
+///
+/// As [`read_batch`], when `bytes` do not encode a valid single-batch Arrow
+/// IPC file for `path`.
+pub fn read_batch_from_bytes(path: &Path, bytes: &[u8]) -> Result<RecordBatch> {
+    read_batch_from_reader(Cursor::new(bytes), path)
+}
+
+fn read_batch_from_reader(reader: impl Read + Seek, path: &Path) -> Result<RecordBatch> {
     // `catch_unwind` is sound here: everything in the closure (`file`,
     // `reader`, `batch`) is local to this call and touches no state
     // observable outside it (`file` is dropped, closing the fd, whether
@@ -336,7 +355,7 @@ pub fn read_batch(path: &Path) -> Result<RecordBatch> {
     // through leaves nothing for a caller who catches this error and
     // retries to observe as torn.
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut reader = FileReader::try_new(file, None)?;
+        let mut reader = FileReader::try_new(reader, None)?;
         let batch = reader
             .next()
             .ok_or_else(|| StorageError::EmptyDataFile(path.to_path_buf()))??;

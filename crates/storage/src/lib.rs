@@ -23,7 +23,7 @@ pub use encoding::encode_batch;
 pub use error::{Result, StorageError};
 pub use manifest::{
     DataFileEntry, MANIFEST_FORMAT_VERSION, Manifest, ManifestEnvelope, SegmentEntry,
-    commit_manifest, read_current,
+    commit_manifest, read_current, read_current_with_byte_count,
 };
 pub use row_id_high_water::{
     HighWaterPersistenceError, ROW_ID_HIGH_WATER_PREFIX, initialize_row_id_high_water,
