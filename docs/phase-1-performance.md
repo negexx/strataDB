@@ -3,8 +3,8 @@
 ## Task 5 manifest-growth evidence (fresh, bounded)
 
 **Run date:** 2026-08-02
-**Source revision:** `7f164c81e1a593f744f49a52511f0ed6a32648ab` plus the uncommitted Task 5
-benchmark reporting change in `bench/benches/manifest_growth_bench.rs`.
+**Source revision:** `472368e0d5c6119e46c41f11840ed0f6772c52e7` (committed Task 5
+benchmark reporting revision).
 **Lockfile SHA-256:** `2e6dfa6a8a1c8afd17085660894361256c319f876f5440e19b2902d9d336bb39`.
 **Runner:** Microsoft Windows `10.0.26200`, `x86_64-pc-windows-msvc`.
 **Toolchain:** `rustc 1.90.0 (1159e78c4 2025-09-14)`; Cargo `1.90.0
