@@ -8412,18 +8412,9 @@ mod loom_tests {
             let ds_a = ds.clone();
             let ds_b = ds.clone();
 
-            // Both transactions begin (and capture their shared, fixed base
-            // snapshot version) before either thread starts, mirroring the
-            // deterministic `losing_transactions_vectors_never_become_searchable_when_it_conflicts`
-            // test above. This guarantees the two transactions are actually
-            // concurrent (design doc §7's intent) instead of allowing loom
-            // to explore a schedule where thread A's begin()-through-commit()
-            // runs to completion before thread B's begin() even executes —
-            // under that schedule B would legitimately observe A's commit
-            // as "nothing changed since I began" and its delete(0) on an
-            // already-tombstoned row would be an idempotent no-op success,
-            // not a real conflict. See task-7-report.md for the full
-            // root-cause diagnosis.
+            // Both transactions capture the same base snapshot before their
+            // commits are spawned. Under the current write-write contract,
+            // one commit succeeds and the other reports a typed conflict.
             let mut txn_a = ds_a.begin();
             txn_a.delete(0).unwrap();
             let mut txn_b = ds_b.begin();
@@ -8740,38 +8731,10 @@ mod loom_tests {
 
     #[test]
     fn concurrent_first_vector_commits_at_different_dimensions_are_not_both_accepted() {
-        // ARCH-01 gives this dataset an owned, exact 3D vector schema.
-        // The old in-lock race model is obsolete under schema ownership.
-        // A 5D batch is now rejected before any index work begins.
-        // Historically, the model used `pause_after_row_id_claim`, which fired
-        // *before* `commit_lock.lock()` — so it fixes one specific
-        // schedule (T1 runs to completion while T2 sits paused right
-        // outside the lock) rather than proving the property across every
-        // interleaving. It cannot tell "the in-lock re-check reads
-        // `established_dimension()` from a snapshot loaded *inside*
-        // `commit_lock`" apart from "the dimension merely happens to
-        // already be established by the time the lock is acquired" — a
-        // future refactor that hoisted `let latest_snapshot =
-        // self.current.load_full();` to above `commit_lock.lock()` would
-        // still pass that test while silently reopening the exact race
-        // `Transaction::commit`'s in-lock dimension check exists to close.
-        // Only loom's exhaustive interleaving exploration can rule that
-        // out, which is the whole reason this project chose Rust + loom
-        // over a hand-rolled concurrency proof (see
-        // `docs/phase-1-audit.md`).
-        //
-        // The following historical explanation is retained only for the model name;
-        // it does not describe the ARCH-01 schema-validation behavior below.
-        // Unlike the deterministic sibling, this model installed no
-        // checkpoint and imposes no ordering: both committers begin from
-        // the same fresh, dimension-0 dataset and race straight into
-        // `commit()`, so loom explores every order in which they reach
-        // and release `commit_lock`. Under every one of those orders,
-        // exactly one commit must publish (establishing the dataset's
-        // dimension) and the other must be rejected by the in-lock check
-        // — never both succeeding (which would durably brick
-        // `vector_search`, per Finding 1) and never both failing (which
-        // would mean no dimension was ever established at all).
+        // The model name is retained for CI compatibility. ARCH-01 rejects
+        // the non-owned 5D batch during `insert`, before index work or
+        // `commit_lock`; this model verifies typed schema rejection and 3D
+        // publication, not an index dimension race.
         //
         // Budget: root + create + 2 committers = 4 of loom's
         // 5-created-threads-per-execution cap — see [`spawn_committer`]'s
