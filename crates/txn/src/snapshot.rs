@@ -143,6 +143,12 @@ impl Snapshot {
     }
 
     fn validate_projection_schema(&self, requested: &SchemaRef) -> Result<()> {
+        if requested.metadata() != self.schema.metadata() {
+            return Err(TxnError::BatchSchemaMismatch {
+                expected: format!("owned schema metadata {:?}", self.schema.metadata()),
+                actual: format!("requested schema metadata {:?}", requested.metadata()),
+            });
+        }
         for field in requested.fields() {
             let expected = match field.name().as_str() {
                 ROW_ID_COLUMN => {

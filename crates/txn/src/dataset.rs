@@ -3135,6 +3135,40 @@ mod tests {
     }
 
     #[test]
+    fn scan_rejects_projection_with_altered_owned_schema_metadata() {
+        // Break caught: validating only projection fields let callers replace
+        // dataset-owned schema metadata in the returned RecordBatch.
+        let dir = temp_dir("projection-schema-metadata");
+        let schema = Arc::new(Schema::new_with_metadata(
+            vec![Field::new("id", DataType::Int64, false)],
+            HashMap::from([("owner".to_string(), "dataset".to_string())]),
+        ));
+        let ds = Dataset::create(&dir, Arc::clone(&schema)).unwrap();
+        let mut txn = ds.begin();
+        txn.insert(
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(vec![7]))],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+
+        let altered = Arc::new(Schema::new_with_metadata(
+            vec![Field::new("id", DataType::Int64, false)],
+            HashMap::from([("owner".to_string(), "caller".to_string())]),
+        ));
+
+        assert!(matches!(
+            ds.snapshot().scan(&altered),
+            Err(TxnError::BatchSchemaMismatch { .. })
+        ));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn recovery_rejects_a_row_file_whose_crc_no_longer_matches() {
         // Break caught: accepting bytes changed after the manifest checksum
         // was recorded would make a durable catalog point at unverified rows.
