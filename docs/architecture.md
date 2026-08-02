@@ -58,9 +58,10 @@ conditional-CAS protocol.
 captured view. `Transaction` writes and `Snapshot` reads are separate APIs; the current engine does not
 provide a full read/write snapshot-transaction interface.
 
-Rows are append-only physical records. `delete` adds a tombstone. `update` tombstones the old physical
-row and inserts replacement data with a new physical row ID. Logical identity, absent-target semantics,
-and update cardinality remain Phase 1 contract work.
+Rows are append-only physical records. `delete` and `update` must target one live physical row in the
+transaction's base snapshot and are revalidated under the commit lock. `update` tombstones that old
+physical row and inserts exactly one replacement with a new physical row ID; invalid, absent, or
+already-dead targets return typed errors. Logical identity remains deferred.
 
 Each vector-carrying commit creates an immutable HNSW segment. Search asks applicable segments for local
 candidates, merges them into global top-k, and applies live/tombstone filtering. This provides a coherent

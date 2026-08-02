@@ -49,12 +49,12 @@ introducing Phase 3 compaction or lifecycle behavior.
 ## Implementation status after approved remediation slices
 
 The branch implements the approved COR-01 through COR-04, CONC-01 and CONC-03, DUR-01 through
-DUR-03, IDX-01 and IDX-02, and ARCH-01 through ARCH-03 slices, with targeted regression, loom,
-chaos, and recovery evidence recorded in the implementation plan. The supported
+DUR-03, IDX-01 and IDX-02, and ARCH-01 through ARCH-03 slices. Completed targeted tests provide
+implementation and recovery evidence for those slices; the supported
 `Dataset`/`Snapshot`/`Transaction` facade is now the documented engine boundary, while subordinate
-packages are marked non-publishable. Full-branch verification and the current performance matrix
-remain open until the remaining Phase 1 gates are completed; this does not change the audit verdict
-from Partial and blocked.
+packages are marked non-publishable. Task 7's CI-visible regression, loom, chaos, and fuzz-provenance
+gates and Task 8's current segmented performance and operating-bound evidence remain open. This
+does not change the audit verdict from Partial and blocked.
 
 VER-04 through VER-06, PERF-01 through PERF-05, and the later/deferred findings remain separately
 tracked unless the final review proves a dependency for a Phase 1 fix.
