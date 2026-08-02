@@ -86,6 +86,7 @@ jobs:
             exit 1
           fi
           models=(
+            dataset::loom_tests::one_writer_store_races_safely_with_many_readers_load
             dataset::loom_tests::two_threads_deleting_the_same_row_exactly_one_conflicts
             dataset::loom_tests::two_threads_deleting_disjoint_rows_both_succeed
             dataset::loom_tests::a_failed_commits_segment_is_never_searchable_under_concurrent_commits
