@@ -33,3 +33,8 @@ name = "chaos_checkpoint_helper"
 # targets" warning on every build).
 path = "tests/bin/chaos_checkpoint_helper.rs"
 required-features = ["chaos-injection"]
+
+[[test]]
+name = "chaos_checkpoint_actually_aborts"
+path = "tests/chaos_checkpoint_actually_aborts.rs"
+required-features = ["chaos-injection"]
