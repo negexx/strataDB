@@ -20,6 +20,10 @@ The [Phase 1 audit](phase-1-audit.md) is complete. Phase 1 remains Partial and b
 - pending CI execution/provenance and fuzz evidence; and
 - incomplete portable/real-fixture segmented performance and operating-bound evidence.
 
+The [Phase 1 closeout ledger](phase-1-closeout-ledger.md), synchronized at merged PR #50 commit
+`8cd7696fdcf34f6253fb11f9e110f6632bc872de`, assigns each remaining finding an acceptance assertion
+and future evidence location. It is tracking material, not a phase-exit claim.
+
 Targeted implementation and regression evidence now covers future tombstones, live update/delete
 targets and one-row replacement cardinality, restart-safe physical row-ID high-water allocation,
 dataset-owned schema and recovery integrity checks, and the supported `Dataset`/`Snapshot`/

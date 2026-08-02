@@ -9,6 +9,15 @@ future fixes can still refer to the original evidence without maintaining seven 
 Line numbers are deliberately omitted because they are unstable; use the finding ID plus current
 source/tests as the anchor.
 
+## Closeout baseline and ledger
+
+The closeout branch is synchronized through merged PR #50,
+`8cd7696fdcf34f6253fb11f9e110f6632bc872de` (`Merge Phase 1 audit remediation`). The
+[Phase 1 closeout ledger](phase-1-closeout-ledger.md) is the mechanically scannable, row-per-finding
+record of current state, dependencies, acceptance assertions, and the future evidence required before
+this audit's verdict can change. It does not close Phase 1 or replace this audit as the controlling
+finding register.
+
 ## Approved remediation design
 
 The Phase 1 remediation keeps Strata's supported boundary at one process using one shared

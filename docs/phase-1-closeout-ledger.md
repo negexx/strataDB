@@ -1,0 +1,74 @@
+# Phase 1 closeout ledger
+
+**Baseline:** merged PR #50, `8cd7696fdcf34f6253fb11f9e110f6632bc872de`
+(`Merge Phase 1 audit remediation`).
+
+**Branch:** `codex/phase-1-close-all-gaps` descends from that baseline. The isolated closeout
+worktree was clean before this documentation task; the separate root checkout's unrelated edits are
+outside this ledger and this task's scope.
+
+## Reading this ledger
+
+This is the mechanically scannable closeout record required by the approved
+[closeout design](phase-1-closeout-design.md) and [implementation plan](phase-1-closeout-plan.md).
+The [Phase 1 audit](phase-1-audit.md) remains the controlling finding register. `Implemented +
+regression-covered` means the remediation slices recorded by that audit exist; it does **not** mean
+that whole-branch verification, CI provenance, or Phase 1 closure has happened. `Evidence open`
+means the named acceptance assertion still needs fresh evidence at the listed location.
+
+All rows preserve the actual supported boundary: embedded, single-node operation in one process
+using one shared `Dataset` handle; immutable snapshot reads plus write-write OCC; and only bounded
+current segment/history evidence on named platform/fixture conditions. There is no claim of
+cross-process coordination, serializability, a read/write snapshot transaction API, universal
+durability, a universal ANN bound, or lifecycle reclamation.
+
+## In-scope Phase 1 findings
+
+| ID | Current state | Controlling source | Dependency | Acceptance assertion | Future evidence location |
+|---|---|---|---|---|---|
+| COR-01 | Implemented + regression-covered; final branch verification remains. | [audit](phase-1-audit.md#complete-legacy-id-mapping) | CONC-01, IDX-01; live-target contract. | A delete cannot tombstone a physical row absent or dead in its base snapshot, nor hide a later acknowledged insert. | Transaction regressions and fresh Task 2/whole-branch test output. |
+| COR-02 | Implemented + regression-covered; final branch verification remains. | [audit](phase-1-audit.md#complete-legacy-id-mapping) | CONC-03; durable allocator high-water. | An abandoned pre-publication row-ID claim is never reused after in-process retry or restart. | Row-ID regressions, scoped transaction loom output, and whole-branch verification. |
+| COR-03 | Implemented + regression-covered within named local filesystem conditions; final branch verification remains. | [audit](phase-1-audit.md#task-1-durability-recovery-boundary) | DUR-01, DUR-02; ordered directory synchronization. | A failed directory synchronization returns an error rather than acknowledging a durable write or creation. | Storage/transaction fault-injection regressions and CI run logs. |
+| COR-04 | Implemented + regression-covered; final branch verification remains. | [audit](phase-1-audit.md#complete-legacy-id-mapping) | DUR-03; recovery catalog integrity. | Recovery rejects a manifest whose filename/version and payload/version disagree. | Recovery-corruption regression output and whole-branch verification. |
+| CONC-01 | Implemented + regression-covered; final branch verification remains. | [audit](phase-1-audit.md#complete-legacy-id-mapping) | COR-01, IDX-01. | Concurrent or future tombstones cannot remove row/vector visibility for an insert they did not validly target. | Transaction regressions and scoped loom output. |
+| CONC-03 | Implemented + regression-covered; final branch verification remains. | [audit](phase-1-audit.md#complete-legacy-id-mapping) | COR-02; durable allocator high-water. | A concurrent or failed reservation cannot expose overlapping/reused physical row IDs. | `row_id` loom model and restart regression output. |
+| DUR-01 | Implemented + regression-covered within named local filesystem conditions; final branch verification remains. | [audit](phase-1-audit.md#task-1-durability-recovery-boundary) | COR-03; directory-sync error propagation. | Commit/create acknowledgement is fail-closed when the required directory flush fails. | Directory-durability fault-injection tests and CI logs. |
+| DUR-02 | Implemented + regression-covered within the immediate-parent anchor boundary; final branch verification remains. | [audit](phase-1-audit.md#task-1-durability-recovery-boundary) | COR-03; caller-provided parent anchor. | Creation synchronizes only the dataset and pre-existing immediate parent; errors remain unacknowledged and recovery follows the documented `open`-before-retry procedure. | Create-boundary regressions and Windows/POSIX CI output. |
+| DUR-03 | Implemented + regression-covered for manifest/row/segment integrity; final branch verification remains. | [audit](phase-1-audit.md#finding-register) | COR-04, IDX-02; format/integrity envelope. | Recovery rejects identity, checksum, schema, row ownership, tombstone, and segment/vector ownership inconsistencies; authenticated tamper resistance is not claimed. | Storage/transaction recovery-corruption regressions and whole-branch verification. |
+| IDX-01 | Implemented + regression-covered; final branch verification remains. | [audit](phase-1-audit.md#complete-legacy-id-mapping) | COR-01, CONC-01; live target validation. | An invalid tombstone cannot hide either a row or its vector from a later snapshot. | Transaction/vector regressions and scoped loom output. |
+| IDX-02 | Implemented + regression-covered; final branch verification remains. | [audit](phase-1-audit.md#complete-legacy-id-mapping) | DUR-03; recovery ownership validation. | Recovery rejects duplicate cross-segment row/vector identities and vector IDs without validated row ownership. | Recovery-corruption regression output and whole-branch verification. |
+| ARCH-01 | Implemented + regression-covered; final branch verification remains. | [audit](phase-1-audit.md#complete-legacy-id-mapping) | Persisted dataset-owned Arrow schema. | Inserts and updates validate the persisted logical schema before allocation/I/O; renamed or positional reinterpretation is rejected. | Dataset schema regressions and whole-branch verification. |
+| ARCH-02 | Implemented + regression-covered through the COR-05 target contract; final branch verification remains. | [audit](phase-1-audit.md#finding-register) | COR-05; base-snapshot liveness and singular update shape. | Delete/update name one live physical row, are revalidated under the commit lock, and update inserts exactly one replacement or returns a typed error. | Target/cardinality/stale-conflict regressions and transaction test output. |
+| ARCH-03 | Implemented + regression-covered; final branch verification remains. | [audit](phase-1-audit.md#complete-legacy-id-mapping) | Commit-history retention semantics. | Aged-out history reports typed `InsufficientHistory` with retained-range context, never fabricated contested row IDs. | Commit-log/history regressions and whole-branch verification. |
+| ARCH-04 | Claim correction is implemented; bounded evidence remains required. | [audit](phase-1-audit.md#complete-legacy-id-mapping) | IDX-04, VER-07; canonical wording. | Active documentation limits snapshot, durability, and recall statements to the supported shared-handle and measured scopes. | Stale-claim scan plus canonical-doc review in Task 9/final verification. |
+| ARCH-05 | Supported facade boundary is implemented; metadata/doc gate remains fresh-evidence work. | [decisions](decisions.md#0009---supported-engine-facade-and-package-boundary) | `Dataset`/`Snapshot`/`Transaction` facade; non-publishable subordinate packages. | Low-level storage/index/query use is documented as internal and cannot be represented as carrying facade guarantees. | `cargo metadata`, rustdoc, stale-claim scan, and CI facade-boundary gate. |
+| VER-01 | Evidence open: regression inventory must be demonstrated fresh. | [audit](phase-1-audit.md#finding-register) | Every in-scope counterexample above. | Each known Phase 1 counterexample has a direct regression or named executable gate, with a fresh successful run. | This ledger's linked test/gate rows and Task 9 whole-branch verification output. |
+| VER-02 | Gate configured; fresh exact-model CI execution/provenance remains open. | [audit](phase-1-audit.md#complete-legacy-id-mapping) | CONC-02; crate-scoped transaction/cache/index loom builds. | Every named transaction, cache, row-ID, and index loom model is discovered and run by exact name without workspace-wide `RUSTFLAGS`. | `.github/workflows/ci.yml` loom jobs and Task 2 fresh local/CI logs. |
+| VER-03 | Gate configured; fresh full chaos evidence remains open. | [audit](phase-1-audit.md#complete-legacy-id-mapping) | DUR-04; checkpoint, fast chaos, and thorough chaos. | Checkpoint abort executes, fast tier reports its deterministic range, and thorough chaos prints a successful `2000/2000` seed result without self-skipping. | `.github/workflows/ci.yml` and Task 3 fresh checkpoint/chaos logs. |
+| VER-04 | Evidence open. | [audit](phase-1-audit.md#complete-legacy-id-mapping) | Separate fuzz workspace and recovery parser inputs. | Declared fuzz targets are discoverable/buildable and focused recovery parsers have deterministic smoke coverage. | `fuzz/` targets, `.github/workflows/ci.yml`, and Task 4 fuzz-build/smoke logs. |
+| VER-05 | Evidence open. | [audit](phase-1-audit.md#complete-legacy-id-mapping) | Pinned action/toolchain and retained runner metadata. | CI records immutable action/toolchain provenance, runner architecture/OS, lockfile hash, commands, and retained logs/artifacts. | `.github/workflows/ci.yml` and Task 4 retained CI artifacts. |
+| VER-06 | Evidence open; bounded Windows synthetic results exist but are not portable/real-fixture evidence. | [phase-1 performance](phase-1-performance.md) | PERF-01 provenance matrix and compatible fixture availability. | Evidence identifies host CPU/RAM/filesystem/cache policy, source/fixture, seed/hash, toolchain, and portable/real-fixture coverage. | `docs/phase-1-performance.md` and Task 5/8 benchmark artifacts. |
+| PERF-01 | Evidence open; one bounded Windows synthetic point is recorded. | [phase-1 performance](phase-1-performance.md#reproduction-matrix) | VER-06; reproducible platform/fixture provenance. | Comparable measurements carry complete runner/toolchain/filesystem/source/seed/hash/cache/repetition provenance and distinguish synthetic from real-fixture runs. | Task 5 artifacts and updated `docs/phase-1-performance.md`. |
+| PERF-02 | Evidence open; 40-commit manifest sample is recorded. | [phase-1 performance](phase-1-performance.md#bounded-results) | PERF-01 provenance; retained-history measurement matrix. | Measured manifest bytes and timings at multiple retained-history points describe a bounded envelope without an asymptotic claim. | Task 5 manifest-growth logs, summaries, and performance record. |
+| PERF-03 | Evidence open; bounded reopen timing is recorded, but direct recovery-byte accounting is absent. | [closeout design](phase-1-closeout-design.md#lane-c-perf-01-through-perf-05-evidence) | Typed recovery accounting and multi-scale lifecycle measurements. | Reopen evidence reports bytes actually inspected/loaded plus ingest, commit, retained-history, and concurrent-commit behavior at bounded scales. | Task 6 tests/benchmark artifacts and updated performance record. |
+| PERF-04 | Evidence open; K=1...64 synthetic fan-out sample is recorded without a supported maximum. | [phase-1 performance](phase-1-performance.md#bounded-results) | PERF-01 provenance; current immutable segment path. | The named segment envelope measures recall, latency, throughput, and filtered/unfiltered search, then documents a supported bound or typed operational guard. | Task 7 benchmark artifacts and updated performance record. |
+| PERF-05 | Evidence open; four pinned snapshots and allocator bytes are recorded, not retained-resource footprint/RSS bounds. | [phase-1 performance](phase-1-performance.md#bounded-results) | Snapshot/cache footprint accounting and bounded retention matrix. | Evidence accounts for retained snapshots, cache entries, and manifest/data/segment footprint at 0/1/4/16/64 pins; RSS is supplemental only. | Task 8 regressions/benchmark artifacts and updated performance record. |
+
+## Explicitly deferred work
+
+| Deferred item | Placement | Boundary retained by this closeout |
+|---|---|---|
+| PERF-06, PERF-07 | Phase 2/3 query and layout work | No projection-pushdown/sub-file-pruning performance closure is implied by the Phase 1 evidence. |
+| IDX-03 | Phase 2 ANN/API work | Underfilled `k`/fixed-`ef_search` contract work is not a Phase 1 closeout task. |
+| ARCH-06, ARCH-07, ARCH-08 | Phase 2/6 API, backend, and client work | Subordinate-type leakage, full backend threading, and CLI snapshot-label semantics remain later stabilization work. |
+| DUR-06 | Phase 3 lifecycle work | Failed commits/crashes can leave unreachable files; no cleanup guarantee exists. |
+| DUR-07 | Phase 3/4/6 boundary work | Local filesystem platform/key and durable-delete contract work is deferred. |
+| DUR-08 | Phase 4 cross-process work | Independent openers have no shared durable conditional publication protocol. |
+| Compaction, vacuum, retention, orphan cleanup, and indefinite orphan/manifest/segment growth | Phase 3 operational lifecycle | No reclamation, bounded history, or segment-count bound is implemented or claimed. |
+
+## Phase 1 status safeguard
+
+This ledger is a planning and evidence index. It must remain synchronized with the audit, status,
+roadmap, current source/tests, CI logs, and benchmark artifacts. Phase 1 remains **Partial -
+blocked** until every in-scope row has its acceptance assertion supported by fresh implementation,
+regression, and required evidence artifacts.
