@@ -47,10 +47,9 @@ enum ChunkOutcome<R> {
 ///
 /// Uses `std::thread::Builder::spawn_scoped` (which returns `io::Result`),
 /// not `Scope::spawn` (which unwraps internally and panics if the OS
-/// refuses to create the thread) -- `docs/phase-1-audit.md`
-/// documents `ERROR_NO_SYSTEM_RESOURCES` under thread pressure as a real,
-/// observed risk in this project's own dev environment, and this runs on
-/// the commit path. A refused spawn is reported as [`ChunkOutcome::SpawnFailed`]
+/// refuses to create the thread) -- operating systems can refuse thread
+/// creation under resource pressure, and this runs on the commit path. A
+/// refused spawn is reported as [`ChunkOutcome::SpawnFailed`]
 /// rather than panicking or silently dropping the chunk.
 ///
 /// Real OS threads are unsupported here under `--cfg loom`: `Graph::insert`

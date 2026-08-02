@@ -116,9 +116,8 @@ jobs:
 
       - name: Loom tests (strata-index)
         # Scoped to this one crate rather than a workspace-wide
-        # `RUSTFLAGS=--cfg loom cargo test` -- see
-        # `docs/phase-1-audit.md` for why that would break
-        # other crates in the dependency graph. This is the only CI-visible
+        # `RUSTFLAGS=--cfg loom cargo test`; AGENTS.md explains why that
+        # would break other crates in the dependency graph. This is the only CI-visible
         # regression gate for the empty-graph race and the publication-
         # barrier fix (`EntryPoint::claim_if_empty`,
         # `Node::is_published`/`mark_published`) -- both are proven solely

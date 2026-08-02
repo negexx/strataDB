@@ -2683,8 +2683,7 @@ mod tests {
 mod loom_tests {
     use super::*;
 
-    /// See `docs/phase-1-audit.md`'s note on loom's tiny
-    /// default coroutine stack (32 KiB on a 64-bit target -- `generator`'s
+    /// Loom's default coroutine stack is tiny (32 KiB on a 64-bit target -- `generator`'s
     /// own default, not the megabytes a real OS thread gets): a coroutine
     /// stack overflow surfaces as silent memory corruption sensitive to
     /// unrelated code-shape changes elsewhere in the binary, NOT a clean

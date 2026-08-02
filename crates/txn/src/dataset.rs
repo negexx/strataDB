@@ -8131,7 +8131,7 @@ mod tests {
 /// `strata-index` (and every other dependency) compiled normally, which
 /// sidesteps the conflict without touching `crates/index`.
 ///
-/// **Research note (Task 7), updated by the Task 10 fix below:** `arc-swap`
+/// **Research note:** `arc-swap`
 /// (resolved to 1.9.2 in `Cargo.lock`) has no documented `loom` integration
 /// or feature flag — confirmed against docs.rs/arc-swap/1.9.2, crates.io's
 /// listed features (only an optional `serde` feature), and the crate's own
@@ -8249,8 +8249,8 @@ mod loom_tests {
     /// sits at 4 of 5 (root + create + the two racing committers);
     /// `a_failed_commits_segment_is_never_visible_to_a_concurrent_reader` sits
     /// at 4 of 5 (root + combined create/seed + failing + a reader racing it directly, rather
-    /// than another committer — the seed was added by Task 10 to make its
-    /// search assertion non-vacuous, see that test's own doc comment);
+    /// than another committer — the seed makes its search assertion non-vacuous,
+    /// as documented in that test's own doc comment);
     /// `a_commits_row_and_its_segment_become_visible_as_one_atomic_step` sits
     /// at 4 of 5 (root + create + a committer + a reader racing it directly);
     /// `a_reader_never_sees_one_in_flight_commits_row_while_observing_an_unrelated_commits_row_id_counter`
@@ -8493,7 +8493,7 @@ mod loom_tests {
     /// One row, one vector of `vector.len()` dimensions, in the shape
     /// `build_vector_inserts` expects. Dimension is inferred from the
     /// slice rather than fixed, so this same helper serves both the
-    /// 3-dimensional residue model below and the dimension-race model,
+    /// 3-dimensional residue model below and the schema-bound vector model,
     /// which needs two different dimensions in the same run. Defined
     /// locally rather than reusing `dataset::tests`' `vector_batch` (fixed
     /// at 3 dimensions and not `pub(crate)`) so this module stays
@@ -8734,7 +8734,7 @@ mod loom_tests {
         // The model name is retained for CI compatibility. ARCH-01 rejects
         // the non-owned 5D batch during `insert`, before index work or
         // `commit_lock`; this model verifies typed schema rejection and 3D
-        // publication, not an index dimension race.
+        // publication in the schema-bound vector model.
         //
         // Budget: root + create + 2 committers = 4 of loom's
         // 5-created-threads-per-execution cap — see [`spawn_committer`]'s
@@ -8815,7 +8815,7 @@ mod loom_tests {
     fn a_failed_commits_segment_is_never_visible_to_a_concurrent_reader() {
         // Base design §5, loom Model 1 -- "failed commit is invisible."
         //
-        // **Fixed by Task 10.** Review found that, before `SnapshotCell`
+        // **Loom visibility.** Before `SnapshotCell`
         // (see its doc comment above `struct Dataset`, and the module doc
         // comment above `mod loom_tests`), the reader thread below performed
         // zero loom-instrumented operations: `Dataset::snapshot()` was a
@@ -8841,7 +8841,7 @@ mod loom_tests {
         // (iii) after A's Err/return, B must observe neither A's row-id nor
         // A's segment file.
         //
-        // **Seed commit, added by Task 10.** Review also found the original
+        // **Seed commit.** The original
         // `hits.is_empty()` assertion vacuous: with no vector-carrying
         // commit landing before the racing pair, B's snapshot has zero
         // segments under every interleaving and `vector_search` returns
@@ -8998,7 +8998,7 @@ mod loom_tests {
         // Base design §5, loom Model 2 -- "row + segment publish
         // atomically."
         //
-        // **Fixed by Task 10.** Same underlying gap as Model 1 above: before
+        // **Loom visibility.** Same underlying gap as Model 1 above: before
         // `SnapshotCell` (see the module doc comment above `mod loom_tests`
         // and `struct SnapshotCell`'s own doc comment), B's
         // `Dataset::snapshot()` was a bare `arc_swap::ArcSwap::load_full`

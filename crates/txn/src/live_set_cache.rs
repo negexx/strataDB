@@ -437,7 +437,7 @@ mod tests {
 /// Run with:
 /// `cargo rustc -p strata-txn --lib --profile test -- --cfg loom` then the
 /// resulting test binary directly (never a workspace-wide
-/// `RUSTFLAGS=--cfg loom`) — see `docs/phase-1-audit.md`.
+/// `RUSTFLAGS=--cfg loom`) — see `AGENTS.md`.
 #[cfg(all(test, loom))]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod loom_tests {
