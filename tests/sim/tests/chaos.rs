@@ -584,15 +584,15 @@ fn fast_tier_random_seeds_survive_random_crash_points() {
     }
 }
 
-/// The actual Phase 7 exit criterion: "thousands of randomized
-/// concurrent-agent runs, zero invariant violations." It remains ignored,
-/// and CI must explicitly set `STRATA_CHAOS_THOROUGH=1` before running it.
-/// It is NOT part of default `cargo test --workspace`
-/// (see the design doc §5 for why: each iteration's real process spawn +
-/// real fsyncs make thousands of them too slow for the normal dev loop).
-/// Intended for a scheduled/on-demand CI job. Run it explicitly with
+/// `thorough_tier_satisfies_the_phase_7_exit_criterion` is a retained legacy
+/// test name for Task 7/Phase 1's 2,000-seed evidence: "thousands of
+/// randomized concurrent-agent runs, zero invariant violations." It remains
+/// ignored and is not part of default `cargo test --workspace` or every PR
+/// (each iteration's real process spawn and fsyncs make thousands too slow for the normal dev
+/// loop). Scheduled/on-demand CI and manual runs must explicitly set
+/// `STRATA_CHAOS_THOROUGH=1`. Run it explicitly with
 /// `STRATA_CHAOS_THOROUGH=1 cargo test -p strata-sim
-/// thorough_tier_satisfies_the_phase_7_exit_criterion -- --exact --ignored`.
+/// thorough_tier_satisfies_the_phase_7_exit_criterion -- --exact --ignored --nocapture`.
 #[test]
 #[ignore = "runs 2,000 real crash/recovery seeds; invoke explicitly with STRATA_CHAOS_THOROUGH=1"]
 fn thorough_tier_satisfies_the_phase_7_exit_criterion() {

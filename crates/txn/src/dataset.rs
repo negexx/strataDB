@@ -715,7 +715,7 @@ pub struct Transaction {
 /// Gated on `cfg(test)` alone, unlike
 /// [`Transaction::inject_manifest_commit_failure`]'s `cfg(any(test,
 /// loom))` — not an oversight. `--cfg loom` is layered *on top of* the test
-/// profile (see `docs/phase-1-audit.md`'s `cargo rustc
+/// profile (see `AGENTS.md`'s `cargo rustc
 /// -p strata-txn --lib --profile test -- --cfg loom` recipe), so `test` is
 /// set in a loom build too and these still compile there. The wider gate on
 /// the injector exists because a loom model uses it; nothing here needs to
@@ -8741,7 +8741,7 @@ mod loom_tests {
         loom::model(|| {
             let dir = tempfile::Builder::new()
                 .prefix(&format!(
-                    "strata-loom-dimension-race-{}-{:?}-",
+                    "strata-loom-schema-bound-vector-{}-{:?}-",
                     std::process::id(),
                     loom::thread::current().id()
                 ))
@@ -8782,8 +8782,8 @@ mod loom_tests {
             );
             assert!(
                 matches!(result_5d, Err(crate::TxnError::BatchSchemaMismatch { .. })),
-                "the non-owned 5-dimensional batch must be rejected before an index \
-                 dimension race: 5d={result_5d:?}"
+                "the non-owned 5-dimensional batch must be rejected before index \
+                 construction: 5d={result_5d:?}"
             );
 
             // Only the owned 3D batch can publish: exactly one segment has

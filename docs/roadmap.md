@@ -17,7 +17,7 @@ in [documentation history](history/README.md). Current implementation claims liv
 
 The [Phase 1 audit](phase-1-audit.md) is complete. Phase 1 remains Partial and blocked by:
 
-- missing CI-visible loom/chaos/regression gates; and
+- pending CI execution/provenance and fuzz evidence; and
 - missing current segmented performance and operating-bound measurements.
 
 Targeted implementation and regression evidence now covers future tombstones, live update/delete

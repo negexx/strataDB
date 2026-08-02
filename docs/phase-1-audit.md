@@ -52,9 +52,12 @@ The branch implements the approved COR-01 through COR-04, CONC-01 and CONC-03, D
 DUR-03, IDX-01 and IDX-02, and ARCH-01 through ARCH-03 slices. Completed targeted tests provide
 implementation and recovery evidence for those slices; the supported
 `Dataset`/`Snapshot`/`Transaction` facade is now the documented engine boundary, while subordinate
-packages are marked non-publishable. Task 7's CI-visible regression, loom, chaos, and fuzz-provenance
-gates and Task 8's current segmented performance and operating-bound evidence remain open. This
-does not change the audit verdict from Partial and blocked.
+packages are marked non-publishable. Task 7 now configures exact transaction and cache loom
+discovery, plus an index whole-binary loom run; checkpoint-abort and fast-chaos gates; and
+scheduled/manual thorough-chaos execution.
+Local targeted evidence exists, but full Linux CI execution/provenance and thorough 2000/2000 output
+remain pending. Task 8's current segmented performance and operating-bound evidence also remains open.
+This does not change the audit verdict from Partial and blocked.
 
 VER-04 through VER-06, PERF-01 through PERF-05, and the later/deferred findings remain separately
 tracked unless the final review proves a dependency for a Phase 1 fix.
@@ -156,8 +159,8 @@ consolidated register above; IDs marked "merged" retain the same evidence under 
 | ARCH-07 | Preserved as later Phase 2/6 work: backend abstraction is not threaded through all I/O. |
 | ARCH-08 | Preserved as later Phase 2 client work: CLI snapshot labels can disagree with displayed rows. |
 | VER-01 | Preserved: known counterexamples lack direct regression gates. Phase 1 blocker. |
-| VER-02 | Merged with CONC-02: transaction/cache loom is not CI-visible. Phase 1 blocker. |
-| VER-03 | Merged with DUR-04: chaos/checkpoint suites can report success without exercising intended assertions. Phase 1 blocker. |
+| VER-02 | Merged with CONC-02: Task 7 configures transaction/cache exact-model and index whole-binary loom CI gates; CI execution/provenance remains pending. Phase 1 blocker. |
+| VER-03 | Merged with DUR-04: Task 7 configures checkpoint-abort and fast-chaos CI gates plus scheduled/manual thorough chaos; CI execution/provenance and 2000/2000 output remain pending. Phase 1 blocker. |
 | VER-04 | Preserved as Phase 1 evidence gap: fuzz targets are not build-gated and do not cover all recovery parsers. |
 | VER-05 | Preserved as Phase 1 reproducibility hardening: CI action/tool provenance is mutable. |
 | VER-06 | Preserved as Phase 1 measurement evidence blocker: benchmark inputs/results lack portable provenance. |

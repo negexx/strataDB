@@ -56,9 +56,9 @@ jobs:
         run: cargo test --workspace
 
       - name: Test (parallel-insert feature)
-        # `insert_batch_parallel`'s clustered-data recall hazard fix (see
-        # `docs/architecture.md`) is only exercised end-to-end
-        # through `crates/txn`'s commit path when this feature is on --
+        # `insert_batch_parallel`'s clustered-data recall hazard fix is
+        # exercised end-to-end through `crates/txn`'s commit path only when
+        # this feature is on --
         # `cargo test --workspace` above never enables it, since it's off
         # by default (`crates/txn/Cargo.toml`).
         run: cargo test -p strata-txn --features parallel-insert

@@ -3,7 +3,8 @@
 //! calling an aborting function in-process would kill this very test
 //! binary. This is a `tests/` integration test (not a unit test in
 //! `chaos.rs`) specifically so it can build itself as its own tiny binary
-//! and exec that binary as a child — see Step 3's helper.
+//! and exec that binary as a child — see the `chaos_checkpoint_helper` Cargo
+//! helper-bin target.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::process::Command;
