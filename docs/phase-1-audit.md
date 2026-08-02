@@ -56,8 +56,9 @@ packages are marked non-publishable. Task 7 now configures exact transaction and
 discovery, plus an index whole-binary loom run; checkpoint-abort and fast-chaos gates; and
 scheduled/manual thorough-chaos execution.
 Local targeted evidence exists, but full Linux CI execution/provenance and thorough 2000/2000 output
-remain pending. Task 8's current segmented performance and operating-bound evidence also remains open.
-This does not change the audit verdict from Partial and blocked.
+remain pending. Task 8 now records bounded Windows synthetic segmented/lifecycle evidence with
+reproduction metadata; the optional real fixture, portable host matrix, and universal operating
+bounds remain open. This does not change the audit verdict from Partial and blocked.
 
 VER-04 through VER-06, PERF-01 through PERF-05, and the later/deferred findings remain separately
 tracked unless the final review proves a dependency for a Phase 1 fix.
@@ -143,11 +144,11 @@ consolidated register above; IDs marked "merged" retain the same evidence under 
 | IDX-02 | Preserved explicitly: recovery does not reject ambiguous cross-segment row/vector identity or vector IDs without row ownership. Phase 1 recovery blocker. |
 | IDX-03 | Preserved explicitly: fixed `ef_search` can underfill `k`, including an unbounded API request above 32. Phase 1 contract decision and Phase 2 API work. |
 | IDX-04 | Merged with ARCH-04 and VER-07: recall experiment was overgeneralized. Current decisions now bound the claim to its workload. |
-| PERF-01 | Preserved: no current retained performance matrix for the segmented implementation. Phase 1 evidence blocker. |
-| PERF-02 | Preserved: manifest publication grows with retained history. Measure and document a bound; incremental manifests/GC remain Phase 3. |
-| PERF-03 | Preserved: recovery cost grows with retained versions and resident segment bytes. Phase 1 bound/evidence blocker; lifecycle work later. |
-| PERF-04 | Preserved: one segment per vector commit increases unpruned fan-out. Measure supported maximum; compaction remains Phase 3. |
-| PERF-05 | Preserved: eager snapshot-pinned segment residency lacks a current memory bound. Phase 1 evidence blocker; reclamation later. |
+| PERF-01 | Bounded Windows synthetic retained-version/segment matrix is recorded in `docs/phase-1-performance.md`; real-fixture, CPU/RAM, and portable-host evidence remain open. |
+| PERF-02 | A 40-commit sample records manifest bytes at versions 1/10/20/40; it is evidence, not a universal bound. Incremental manifests/GC remain Phase 3. |
+| PERF-03 | A bounded lifecycle reopen point records recovery time; the separately reported manifest bytes are end-of-run after concurrent commits. Multi-scale recovery bounds and lifecycle work remain open. |
+| PERF-04 | A bounded Dataset/Snapshot fan-out sample covers K=1…64 synthetic segments; it does not establish a supported maximum. Compaction remains Phase 3. |
+| PERF-05 | A bounded sample retains four historical/current snapshots and reports live allocator bytes; RSS and a universal residency bound remain open. |
 | PERF-06 | Preserved as later Phase 2/3 query/layout work: public scans lack projection pushdown and sub-file pruning; establish an honest baseline. |
 | PERF-07 | Preserved as documentation/query work: projection avoids some array construction but not dominant file-body reads; benchmark and correct the claim. |
 | ARCH-01 | Preserved: dataset-owned schema is missing. Phase 1 blocker. |
@@ -163,7 +164,7 @@ consolidated register above; IDs marked "merged" retain the same evidence under 
 | VER-03 | Merged with DUR-04: Task 7 configures checkpoint-abort and fast-chaos CI gates plus scheduled/manual thorough chaos; CI execution/provenance and 2000/2000 output remain pending. Phase 1 blocker. |
 | VER-04 | Preserved as Phase 1 evidence gap: fuzz targets are not build-gated and do not cover all recovery parsers. |
 | VER-05 | Preserved as Phase 1 reproducibility hardening: CI action/tool provenance is mutable. |
-| VER-06 | Preserved as Phase 1 measurement evidence blocker: benchmark inputs/results lack portable provenance. |
+| VER-06 | Preserved as Phase 1 measurement evidence blocker: bounded Windows synthetic inputs/results are recorded, but portable host/fixture provenance is still missing. |
 | VER-07 | Merged with ARCH-04 and DUR-05: current docs now qualify intended guarantees and retain Partial status. |
 
 ## Evidence that must be preserved

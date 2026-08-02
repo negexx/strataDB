@@ -18,7 +18,7 @@ in [documentation history](history/README.md). Current implementation claims liv
 The [Phase 1 audit](phase-1-audit.md) is complete. Phase 1 remains Partial and blocked by:
 
 - pending CI execution/provenance and fuzz evidence; and
-- missing current segmented performance and operating-bound measurements.
+- incomplete portable/real-fixture segmented performance and operating-bound evidence.
 
 Targeted implementation and regression evidence now covers future tombstones, live update/delete
 targets and one-row replacement cardinality, restart-safe physical row-ID high-water allocation,

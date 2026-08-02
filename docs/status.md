@@ -24,7 +24,7 @@ single-process/shared-`Dataset` boundary.
 | Python | Proposed | PyO3 scaffolding exports only `placeholder_version`; no database API exists. |
 | Durability/recovery | Partial | File/directory durability, immutable row-ID high-water, manifest integrity, and crash/reopen evidence exist within named local bounds; full branch verification remains. |
 | Schema/migrations | Partial | Dataset-owned schema and strict validation are implemented; schema evolution and migration remain deferred. |
-| Loom/chaos/fuzz/bench evidence | Partial | Useful tooling exists, but important models and opt-in suites are not all CI-visible or retained as current evidence. |
+| Loom/chaos/fuzz/bench evidence | Partial | Exact loom/checkpoint/chaos gates are configured; bounded Windows synthetic segmented/lifecycle evidence is recorded, while CI execution/provenance, fuzz evidence, and portable real-fixture bounds remain. |
 | Compaction/GC | Proposed | No compaction, vacuum, orphan cleanup, or bounded history implementation. |
 | Cross-process coordination | Proposed | Independent openers do not share transaction state or durable conditional publication. |
 | Branching/object storage | Proposed | No branch/merge or object-store backend is implemented. |
