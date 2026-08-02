@@ -178,6 +178,59 @@ jobs:
       - name: cargo-deny (bans, sources, advisories)
         run: cargo deny check bans sources advisories
 
+  fuzz-and-provenance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install supported Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.90"
+
+      - name: Build declared fuzz targets and run parser smoke inputs
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          {
+            set -x
+            printf 'runner.os=%s\nrunner.arch=%s\n' "$RUNNER_OS" "$RUNNER_ARCH"
+            uname -a
+            rustup show active-toolchain
+            rustc -Vv
+            cargo -Vv
+            sha256sum Cargo.lock fuzz/Cargo.lock
+
+            rustup toolchain install nightly --profile minimal
+            rustc +nightly -Vv
+            cargo +nightly -Vv
+            cargo +nightly install cargo-fuzz --version 0.13.2 --locked
+            cargo +nightly fuzz --version
+
+            cd fuzz
+            targets="$(cargo +nightly fuzz list | sort)"
+            test "$targets" = $'datafile_parse\nmanifest_parse'
+            cargo +nightly fuzz build manifest_parse
+            cargo +nightly fuzz build datafile_parse
+            sha256sum Cargo.lock
+
+            for input in corpus/datafile_parse/*.arrow; do
+              test -f "$input"
+              cargo +nightly fuzz run datafile_parse "$input" -- -runs=1 -seed=24740
+            done
+            printf '%s\n' '{"version":0}' > "$RUNNER_TEMP/manifest-parse-smoke.json"
+            cargo +nightly fuzz run manifest_parse "$RUNNER_TEMP/manifest-parse-smoke.json" -- -runs=1 -seed=24740
+          } 2>&1 | tee artifacts/fuzz-provenance.log
+
+      - name: Retain fuzz provenance
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-provenance-${{ github.run_id }}
+          path: artifacts/fuzz-provenance.log
+          if-no-files-found: error
+          retention-days: 14
+
   thorough-chaos:
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     runs-on: ubuntu-latest
