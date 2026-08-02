@@ -25,7 +25,7 @@ use std::sync::Mutex;
 // to avoid an unused-import warning in the loom build.
 #[cfg(not(loom))]
 use arc_swap::ArcSwap;
-use arrow::array::{Array, ArrayRef, RecordBatch, UInt64Array};
+use arrow::array::{Array, ArrayRef, RecordBatch, RecordBatchOptions, UInt64Array};
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use strata_index::{EfConstruction, HnswIndex, MaxConnections, MaxElements, MaxLayers};
@@ -1955,8 +1955,25 @@ fn validate_data_file_row_ids(
                 format!("empty file {} has row IDs", entry.name),
             ));
         };
-        let expected = first.checked_add(u64::try_from(offset)?).ok_or_else(|| {
-            TxnError::ManifestOverflow(format!("row_id_range {first} + {offset}"))
+        let offset = u64::try_from(offset).map_err(|_| {
+            corrupt_catalog(
+                dir,
+                manifest,
+                format!(
+                    "data file {} row_id_range offset {offset} cannot be represented as u64",
+                    entry.name
+                ),
+            )
+        })?;
+        let expected = first.checked_add(offset).ok_or_else(|| {
+            corrupt_catalog(
+                dir,
+                manifest,
+                format!(
+                    "data file {} row_id_range [{first}, ..] overflows at offset {offset}",
+                    entry.name
+                ),
+            )
         })?;
         if row_id != expected {
             return Err(corrupt_catalog(
@@ -1977,6 +1994,55 @@ fn validate_data_file_row_ids(
         }
     }
     Ok(())
+}
+
+fn catalog_row_id_range(
+    dir: &Path,
+    manifest: &Manifest,
+    entry: &DataFileEntry,
+) -> Result<Option<(u64, u64)>> {
+    match entry.row_count {
+        0 => {
+            if entry.row_id_range.is_some() {
+                return Err(corrupt_catalog(
+                    dir,
+                    manifest,
+                    format!("empty data file {} has a row_id_range", entry.name),
+                ));
+            }
+            Ok(None)
+        }
+        count => {
+            let Some((first, last)) = entry.row_id_range else {
+                return Err(corrupt_catalog(
+                    dir,
+                    manifest,
+                    format!("non-empty data file {} is missing row_id_range", entry.name),
+                ));
+            };
+            let expected_last = first.checked_add(count - 1).ok_or_else(|| {
+                corrupt_catalog(
+                    dir,
+                    manifest,
+                    format!(
+                        "data file {} row_id_range [{first}, {last}] overflows for row_count {count}",
+                        entry.name
+                    ),
+                )
+            })?;
+            if last != expected_last {
+                return Err(corrupt_catalog(
+                    dir,
+                    manifest,
+                    format!(
+                        "data file {} has row_id_range [{first}, {last}] incompatible with row_count {count}",
+                        entry.name
+                    ),
+                ));
+            }
+            Ok(Some((first, last)))
+        }
+    }
 }
 
 fn validate_data_files(
@@ -2038,41 +2104,7 @@ fn validate_data_files(
                 ),
             ));
         }
-        let expected_range = match entry.row_count {
-            0 => {
-                if entry.row_id_range.is_some() {
-                    return Err(corrupt_catalog(
-                        dir,
-                        manifest,
-                        format!("empty data file {} has a row_id_range", entry.name),
-                    ));
-                }
-                None
-            }
-            count => {
-                let Some((first, last)) = entry.row_id_range else {
-                    return Err(corrupt_catalog(
-                        dir,
-                        manifest,
-                        format!("non-empty data file {} is missing row_id_range", entry.name),
-                    ));
-                };
-                let expected_last = first.checked_add(count - 1).ok_or_else(|| {
-                    TxnError::ManifestOverflow(format!("row_id_range {first} + {count} - 1"))
-                })?;
-                if last != expected_last {
-                    return Err(corrupt_catalog(
-                        dir,
-                        manifest,
-                        format!(
-                            "data file {} has row_id_range [{first}, {last}] incompatible with row_count {count}",
-                            entry.name
-                        ),
-                    ));
-                }
-                Some((first, last))
-            }
-        };
+        let expected_range = catalog_row_id_range(dir, manifest, entry)?;
         validate_data_file_row_ids(
             dir,
             manifest,
@@ -2438,7 +2470,12 @@ pub(crate) fn cast_batch_to_schema(batch: &RecordBatch, schema: &SchemaRef) -> R
         };
         columns.push(casted);
     }
-    Ok(RecordBatch::try_new(Arc::clone(schema), columns)?)
+    let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+    Ok(RecordBatch::try_new_with_options(
+        Arc::clone(schema),
+        columns,
+        &options,
+    )?)
 }
 
 /// Appends a `_row_id: UInt64` column to `batch`, assigning
@@ -2504,7 +2541,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use arrow::array::Int64Array;
+    use arrow::array::{Int64Array, RecordBatchOptions};
     use arrow::datatypes::{DataType, Field, Schema};
     use strata_storage::read_batch;
 
@@ -2949,6 +2986,92 @@ mod tests {
     }
 
     #[test]
+    fn empty_schema_reopen_scan_preserves_committed_row_count() {
+        // Break caught: projecting an empty logical schema discarded every
+        // physical column, leaving Arrow unable to preserve the rows that
+        // were committed solely through Strata's hidden identity columns.
+        let dir = temp_dir("empty-schema-reopen-scan");
+        let schema = Arc::new(Schema::empty());
+        let ds = Dataset::create(&dir, Arc::clone(&schema)).unwrap();
+        let batch = RecordBatch::try_new_with_options(
+            Arc::clone(&schema),
+            Vec::new(),
+            &RecordBatchOptions::new().with_row_count(Some(3)),
+        )
+        .unwrap();
+
+        let mut txn = ds.begin();
+        txn.insert(batch).unwrap();
+        txn.commit().unwrap();
+        drop(ds);
+
+        let reopened = Dataset::open(&dir).unwrap();
+        let scanned = reopened.snapshot().scan(&schema).unwrap();
+        assert_eq!(scanned.num_columns(), 0);
+        assert_eq!(
+            scanned.num_rows(),
+            3,
+            "a zero-column projection must retain every committed row after reopen"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn insert_rejects_swapped_owned_field_order() {
+        // Break caught: matching logical fields by name instead of the
+        // owned schema's exact ordered identity would permit callers to
+        // relabel values when two columns share a physical type.
+        let dir = temp_dir("swapped-owned-field-order");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("first", DataType::Int64, false),
+            Field::new("second", DataType::Int64, false),
+        ]));
+        let ds = Dataset::create(&dir, Arc::clone(&schema)).unwrap();
+        let swapped = Arc::new(Schema::new(vec![
+            Field::new("second", DataType::Int64, false),
+            Field::new("first", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            swapped,
+            vec![
+                Arc::new(Int64Array::from(vec![2])),
+                Arc::new(Int64Array::from(vec![1])),
+            ],
+        )
+        .unwrap();
+
+        let result = ds.begin().insert(batch);
+        assert!(
+            matches!(result, Err(TxnError::BatchSchemaMismatch { .. })),
+            "the owned schema's field order is part of batch identity: {result:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn insert_rejects_nullability_mismatch_against_owned_schema() {
+        // Break caught: accepting a nullable input for a non-nullable owned
+        // field would change the dataset contract without changing its name
+        // or Arrow data type.
+        let dir = temp_dir("owned-schema-nullability");
+        let schema = test_schema();
+        let ds = Dataset::create(&dir, schema).unwrap();
+        let nullable = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let batch = RecordBatch::try_new(nullable, vec![Arc::new(Int64Array::from(vec![Some(1)]))])
+            .unwrap();
+
+        let result = ds.begin().insert(batch);
+        assert!(
+            matches!(result, Err(TxnError::BatchSchemaMismatch { .. })),
+            "nullability is part of the owned schema contract: {result:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn delete_and_update_reject_unowned_dead_duplicate_and_non_single_row_targets() {
         let dir = temp_dir("strict-targets");
         let schema = test_schema();
@@ -2970,6 +3093,19 @@ mod tests {
         )
         .unwrap();
         seed.commit().unwrap();
+
+        let visible = ds.snapshot().scan(&schema).unwrap();
+        assert_eq!(visible.num_rows(), 1);
+        assert_eq!(
+            visible
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            1,
+            "rejecting a future delete target must not tombstone the later row that claims it"
+        );
 
         let mut delete = ds.begin();
         delete.delete(0).unwrap();
@@ -3222,6 +3358,37 @@ mod tests {
         assert!(
             matches!(error, TxnError::Storage(strata_storage::StorageError::CorruptManifest(_, ref reason)) if reason.contains("row_id")),
             "recovery must reject a row-id range that disagrees with physical row IDs: {error:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn recovery_classifies_overflowing_catalog_row_id_range_as_corrupt_manifest() {
+        // Break caught: an overflow is caused exclusively by hostile catalog
+        // metadata here, so surfacing it as an internal allocation error hid
+        // the corrupted manifest from callers.
+        let dir = temp_dir("recovery-overflowing-row-id-range");
+        let ds = Dataset::create(&dir, test_schema()).unwrap();
+        let mut txn = ds.begin();
+        txn.insert(
+            RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![4, 5]))])
+                .unwrap(),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+
+        let mut corrupt = (*ds.snapshot().manifest).clone();
+        corrupt.version += 1;
+        corrupt.data_files[0].row_id_range = Some((u64::MAX, u64::MAX));
+        commit_manifest(&dir, &corrupt).unwrap();
+
+        let Err(error) = Dataset::open(&dir) else {
+            panic!("recovery must reject an overflowing catalog row-id range");
+        };
+        assert!(
+            matches!(error, TxnError::Storage(strata_storage::StorageError::CorruptManifest(_, ref reason)) if reason.contains("row_id_range") && reason.contains("overflow")),
+            "catalog row-id range overflow must be typed corruption with field context: {error:?}"
         );
 
         std::fs::remove_dir_all(&dir).ok();
