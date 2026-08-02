@@ -207,12 +207,20 @@ jobs:
             cargo +nightly install cargo-fuzz --version 0.13.2 --locked
             cargo +nightly fuzz --version
 
+            fuzz_lock_sha_before="$(sha256sum fuzz/Cargo.lock | awk '{print $1}')"
+            printf 'fuzz.Cargo.lock.sha256.before=%s\n' "$fuzz_lock_sha_before"
             cd fuzz
             targets="$(cargo +nightly fuzz list | sort)"
             test "$targets" = $'datafile_parse\nmanifest_parse'
             cargo +nightly fuzz build manifest_parse
             cargo +nightly fuzz build datafile_parse
             sha256sum Cargo.lock
+            fuzz_lock_sha_after="$(sha256sum Cargo.lock | awk '{print $1}')"
+            printf 'fuzz.Cargo.lock.sha256.after=%s\n' "$fuzz_lock_sha_after"
+            if ! test "$fuzz_lock_sha_before" = "$fuzz_lock_sha_after"; then
+              echo "::error::cargo +nightly fuzz build modified checked-in fuzz/Cargo.lock (before=$fuzz_lock_sha_before after=$fuzz_lock_sha_after)"
+              exit 1
+            fi
 
             for input in corpus/datafile_parse/*.arrow; do
               test -f "$input"
