@@ -67,6 +67,14 @@ pub enum TxnError {
     InvalidUpdateShape { actual_rows: usize },
     #[error("conflict: {contested_row_ids:?} were modified by another transaction")]
     Conflict { contested_row_ids: Vec<u64> },
+    #[error(
+        "commit history for base version {base_version} was evicted; retained history starts at version {oldest_retained_version} and the latest version is {latest_version}"
+    )]
+    InsufficientHistory {
+        base_version: u64,
+        oldest_retained_version: u64,
+        latest_version: u64,
+    },
     /// The row-id range a transaction claimed does not match the rows it
     /// actually laid out — spec §8's "gaps are safe, reuse is forbidden"
     /// invariant. `claimed_end` is one past the last claimed row-id

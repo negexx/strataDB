@@ -1001,11 +1001,12 @@ impl Transaction {
     /// # Errors
     ///
     /// Returns [`TxnError::Conflict`] — naming every contested row-id — if
-    /// another transaction that committed after this one began wrote any
-    /// row in this transaction's write-set, or (conservatively, with this
-    /// transaction's entire write-set as the contested rows) if the
-    /// bounded in-memory commit log has already evicted history needed to
-    /// prove cleanliness.
+    /// another transaction that committed after this one began wrote any row
+    /// in this transaction's write-set. Returns
+    /// [`TxnError::InsufficientHistory`] when the bounded in-memory commit
+    /// log has evicted history needed to prove cleanliness; that conservative
+    /// rejection reports retained-version context and never invents contested
+    /// row IDs.
     ///
     /// Returns [`TxnError::NonFiniteVectorComponent`] if any pending batch's
     /// vector column contains a `NaN`/`Infinity` component — checked, and
@@ -1093,11 +1094,15 @@ impl Transaction {
             ConflictCheck::Conflict(contested_row_ids) => {
                 return Err(TxnError::Conflict { contested_row_ids });
             }
-            ConflictCheck::InsufficientHistory => {
+            ConflictCheck::InsufficientHistory {
+                oldest_retained_version,
+            } => {
                 self.insufficient_history_conflicts
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Err(TxnError::Conflict {
-                    contested_row_ids: self.write_set.clone(),
+                return Err(TxnError::InsufficientHistory {
+                    base_version: self.base_version,
+                    oldest_retained_version,
+                    latest_version,
                 });
             }
         }
@@ -7710,7 +7715,7 @@ mod tests {
     // small range (capacity + 2), matching the existing cast-allow precedent
     // on `cluster_vectors` above.
     #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-    fn a_transaction_whose_history_has_aged_out_of_the_commit_log_conflicts_conservatively() {
+    fn a_transaction_whose_history_has_aged_out_of_the_commit_log_reports_retained_range() {
         // Uses TEST_COMMIT_LOG_CAPACITY (not the real, much larger
         // production COMMIT_LOG_CAPACITY) via
         // create_with_commit_log_capacity — see that constant's doc
@@ -7752,22 +7757,19 @@ mod tests {
         );
 
         let result = txn.commit();
-        // InsufficientHistory surfaces as `TxnError::Conflict` whose
-        // `contested_row_ids` is the transaction's *entire* write_set (see
-        // the `ConflictCheck::InsufficientHistory` arm in `commit`), not the
-        // intersection a real row-level conflict would report. Asserting
-        // that explicitly distinguishes the aged-out-history path from a
-        // genuine write/write overlap: the fillers below wrote only rows
-        // >= 100, disjoint from row 0, so a real conflict could never name
-        // row 0 as contested — only InsufficientHistory does.
-        let Err(TxnError::Conflict { contested_row_ids }) = result else {
-            panic!("expected a conservative conflict once history aged out, got {result:?}");
+        // The disjoint fillers never touched row 0, so this must expose the
+        // lost retained-history range rather than inventing a row conflict.
+        let Err(TxnError::InsufficientHistory {
+            base_version,
+            oldest_retained_version,
+            latest_version,
+        }) = result
+        else {
+            panic!("expected insufficient history once history aged out, got {result:?}");
         };
-        assert_eq!(
-            contested_row_ids,
-            vec![0u64],
-            "InsufficientHistory must report the transaction's whole write_set as contested"
-        );
+        assert_eq!(base_version, 1);
+        assert_eq!(oldest_retained_version, 4);
+        assert_eq!(latest_version, 11);
         assert_eq!(
             ds.insufficient_history_conflict_count(),
             1,

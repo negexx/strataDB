@@ -171,10 +171,12 @@ fn commit_with_retry_once(
     match attempt() {
         Ok(()) => RetryOutcome::Committed,
         Err(TxnError::RowNotLive { .. }) => RetryOutcome::Dropped,
-        Err(TxnError::Conflict { .. }) => match attempt() {
+        Err(TxnError::Conflict { .. } | TxnError::InsufficientHistory { .. }) => match attempt() {
             Ok(()) => RetryOutcome::Committed,
             Err(TxnError::RowNotLive { .. }) => RetryOutcome::Dropped,
-            Err(TxnError::Conflict { .. }) => RetryOutcome::Dropped,
+            Err(TxnError::Conflict { .. } | TxnError::InsufficientHistory { .. }) => {
+                RetryOutcome::Dropped
+            }
             Err(e) => panic!("unexpected commit error on {context} retry: {e}"),
         },
         Err(e) => panic!("unexpected commit error on {context}: {e}"),
@@ -437,6 +439,28 @@ mod tests {
                 if calls == 1 {
                     Err(TxnError::Conflict {
                         contested_row_ids: vec![1],
+                    })
+                } else {
+                    Ok(())
+                }
+            },
+            "test",
+        );
+        assert_eq!(outcome, RetryOutcome::Committed);
+        assert_eq!(calls, 2, "must retry exactly once, not more");
+    }
+
+    #[test]
+    fn commit_with_retry_once_retries_and_commits_after_insufficient_history() {
+        let mut calls = 0;
+        let outcome = commit_with_retry_once(
+            || {
+                calls += 1;
+                if calls == 1 {
+                    Err(TxnError::InsufficientHistory {
+                        base_version: 3,
+                        oldest_retained_version: 5,
+                        latest_version: 12,
                     })
                 } else {
                     Ok(())
