@@ -45,6 +45,18 @@ pub enum TxnError {
     CorruptSegment(String),
     #[error("schema mismatch casting a data file: expected {expected} columns, found {actual}")]
     SchemaMismatch { expected: usize, actual: usize },
+    #[error(
+        "batch schema does not match the dataset-owned schema: expected {expected:?}, found {actual:?}"
+    )]
+    BatchSchemaMismatch { expected: String, actual: String },
+    #[error("row {row_id} is not owned by the transaction's base snapshot")]
+    RowNotFound { row_id: u64 },
+    #[error("row {row_id} is already tombstoned in the transaction's base snapshot")]
+    RowNotLive { row_id: u64 },
+    #[error("row {row_id} is already targeted by this transaction")]
+    DuplicateTarget { row_id: u64 },
+    #[error("an update replacement must contain exactly one row, found {actual_rows}")]
+    InvalidUpdateShape { actual_rows: usize },
     #[error("conflict: {contested_row_ids:?} were modified by another transaction")]
     Conflict { contested_row_ids: Vec<u64> },
     /// The row-id range a transaction claimed does not match the rows it

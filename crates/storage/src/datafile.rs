@@ -36,9 +36,16 @@ impl WriteMetadata {
     fn from_bytes(bytes: &[u8]) -> Self {
         Self {
             byte_len: bytes.len() as u64,
-            crc32c: crc32c::crc32c(bytes),
+            crc32c: crc32c_checksum(bytes),
         }
     }
+}
+
+/// CRC32C of durable catalog content. This is shared with transaction
+/// recovery so manifest metadata and the inspected bytes use one algorithm.
+#[must_use]
+pub fn crc32c_checksum(bytes: &[u8]) -> u32 {
+    crc32c::crc32c(bytes)
 }
 
 /// Test-only controls for modelling directory-sync outcomes without mocking

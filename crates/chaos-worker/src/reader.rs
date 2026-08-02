@@ -414,7 +414,8 @@ mod tests {
     #[test]
     fn spawn_and_stop_against_a_real_but_empty_dataset_does_not_panic() {
         let dir = temp_dir("spawn-empty");
-        let dataset = Arc::new(Dataset::create(&dir).unwrap());
+        let dataset =
+            Arc::new(Dataset::create(&dir, strata_txn::mvp_fixtures::mvp_schema()).unwrap());
 
         let (handle, done) = spawn(Arc::clone(&dataset), 42);
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -439,10 +440,12 @@ mod tests {
         // resolve_live_set filter path. Real pruning coverage needs
         // multiple segments, which only Task 8's chaos runs produce.
         let dir = temp_dir("check-once-real-data");
-        let dataset = Dataset::create(&dir).unwrap();
+        let dataset = Dataset::create(&dir, strata_txn::mvp_fixtures::mvp_schema()).unwrap();
         let mut txn = dataset.begin();
-        txn.insert(strata_txn::mvp_fixtures::mvp_row(1, "agent0", [1.0, 0.0, 0.0]).unwrap());
-        txn.insert(strata_txn::mvp_fixtures::mvp_row(2, "agent1", [0.0, 1.0, 0.0]).unwrap());
+        txn.insert(strata_txn::mvp_fixtures::mvp_row(1, "agent0", [1.0, 0.0, 0.0]).unwrap())
+            .unwrap();
+        txn.insert(strata_txn::mvp_fixtures::mvp_row(2, "agent1", [0.0, 1.0, 0.0]).unwrap())
+            .unwrap();
         txn.commit().unwrap();
 
         let predicate = Predicate::Eq(
@@ -466,10 +469,12 @@ mod tests {
         // merge coverage still needs multiple segments, which only a real
         // chaos run produces (see the module doc).
         let dir = temp_dir("check-once-multi-batch");
-        let dataset = Dataset::create(&dir).unwrap();
+        let dataset = Dataset::create(&dir, strata_txn::mvp_fixtures::mvp_schema()).unwrap();
         let mut txn = dataset.begin();
-        txn.insert(strata_txn::mvp_fixtures::mvp_row(1, "agent0", [1.0, 0.0, 0.0]).unwrap());
-        txn.insert(strata_txn::mvp_fixtures::mvp_row(2, "agent0", [0.0, 1.0, 0.0]).unwrap());
+        txn.insert(strata_txn::mvp_fixtures::mvp_row(1, "agent0", [1.0, 0.0, 0.0]).unwrap())
+            .unwrap();
+        txn.insert(strata_txn::mvp_fixtures::mvp_row(2, "agent0", [0.0, 1.0, 0.0]).unwrap())
+            .unwrap();
         txn.commit().unwrap();
 
         let predicate = Predicate::Eq(
@@ -502,10 +507,12 @@ mod tests {
         // filtering, calling assert_pruned_is_subset_of_reference), not
         // re-proving the arithmetic.
         let dir = temp_dir("check-once-id-range");
-        let dataset = Dataset::create(&dir).unwrap();
+        let dataset = Dataset::create(&dir, strata_txn::mvp_fixtures::mvp_schema()).unwrap();
         let mut txn = dataset.begin();
-        txn.insert(strata_txn::mvp_fixtures::mvp_row(1, "agent0", [1.0, 0.0, 0.0]).unwrap());
-        txn.insert(strata_txn::mvp_fixtures::mvp_row(2, "agent0", [0.0, 1.0, 0.0]).unwrap());
+        txn.insert(strata_txn::mvp_fixtures::mvp_row(1, "agent0", [1.0, 0.0, 0.0]).unwrap())
+            .unwrap();
+        txn.insert(strata_txn::mvp_fixtures::mvp_row(2, "agent0", [0.0, 1.0, 0.0]).unwrap())
+            .unwrap();
         txn.commit().unwrap();
 
         let predicate = Predicate::Eq(
@@ -530,9 +537,10 @@ mod tests {
         // only -- not relevant to the default workspace test invocation
         // this test actually runs under.
         let dir = temp_dir("check-once-single-row");
-        let dataset = Dataset::create(&dir).unwrap();
+        let dataset = Dataset::create(&dir, strata_txn::mvp_fixtures::mvp_schema()).unwrap();
         let mut txn = dataset.begin();
-        txn.insert(strata_txn::mvp_fixtures::mvp_row(1, "agent0", [1.0, 0.0, 0.0]).unwrap());
+        txn.insert(strata_txn::mvp_fixtures::mvp_row(1, "agent0", [1.0, 0.0, 0.0]).unwrap())
+            .unwrap();
         txn.commit().unwrap();
 
         let predicate = Predicate::Eq(

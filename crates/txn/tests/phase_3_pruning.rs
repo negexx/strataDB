@@ -28,19 +28,19 @@ fn explain_skips_files_whose_stats_cannot_match_and_scans_only_the_rest() {
         .tempdir()
         .unwrap()
         .keep();
-    let ds = Dataset::create(&dir).unwrap();
+    let ds = Dataset::create(&dir, schema()).unwrap();
 
     // Three commits, three disjoint id ranges -> three files.
     let mut txn = ds.begin();
-    txn.insert(batch(vec![1, 2, 3]));
+    txn.insert(batch(vec![1, 2, 3])).unwrap();
     txn.commit().unwrap();
 
     let mut txn = ds.begin();
-    txn.insert(batch(vec![50, 51, 52]));
+    txn.insert(batch(vec![50, 51, 52])).unwrap();
     txn.commit().unwrap();
 
     let mut txn = ds.begin();
-    txn.insert(batch(vec![100, 101, 102]));
+    txn.insert(batch(vec![100, 101, 102])).unwrap();
     txn.commit().unwrap();
 
     // A predicate that can only match the middle file's range. Both reads
@@ -94,18 +94,18 @@ fn explain_and_scan_with_predicate_agree_on_a_range_predicate_not_just_equality(
         .tempdir()
         .unwrap()
         .keep();
-    let ds = Dataset::create(&dir).unwrap();
+    let ds = Dataset::create(&dir, schema()).unwrap();
 
     let mut txn = ds.begin();
-    txn.insert(batch(vec![1, 2, 3]));
+    txn.insert(batch(vec![1, 2, 3])).unwrap();
     txn.commit().unwrap();
 
     let mut txn = ds.begin();
-    txn.insert(batch(vec![50, 51, 52]));
+    txn.insert(batch(vec![50, 51, 52])).unwrap();
     txn.commit().unwrap();
 
     let mut txn = ds.begin();
-    txn.insert(batch(vec![100, 101, 102]));
+    txn.insert(batch(vec![100, 101, 102])).unwrap();
     txn.commit().unwrap();
 
     // Gt(id, 60): only the [100,102] file can possibly satisfy this. Both
@@ -144,7 +144,7 @@ fn compound_and_predicate_prunes_files_and_filters_rows_together() {
         Field::new("id", DataType::Int64, false),
         Field::new("category", DataType::Utf8, false),
     ]));
-    let ds = Dataset::create(&dir).unwrap();
+    let ds = Dataset::create(&dir, Arc::clone(&schema)).unwrap();
 
     // File A: id range [1,3] - below the id>=40 threshold, prunable by the
     // id leaf alone.
@@ -158,7 +158,8 @@ fn compound_and_predicate_prunes_files_and_filters_rows_together() {
             ],
         )
         .unwrap(),
-    );
+    )
+    .unwrap();
     txn.commit().unwrap();
 
     // File B: id range [50,52], category all "y" - the one file that truly
@@ -173,7 +174,8 @@ fn compound_and_predicate_prunes_files_and_filters_rows_together() {
             ],
         )
         .unwrap(),
-    );
+    )
+    .unwrap();
     txn.commit().unwrap();
 
     // File C: id range [60,62] - satisfies id>=40, so the id leaf ALONE
@@ -190,7 +192,8 @@ fn compound_and_predicate_prunes_files_and_filters_rows_together() {
             ],
         )
         .unwrap(),
-    );
+    )
+    .unwrap();
     txn.commit().unwrap();
 
     let id_leaf_only = Predicate::GtEq("id".to_string(), Value::Int64(40));

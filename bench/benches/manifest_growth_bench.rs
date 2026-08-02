@@ -79,8 +79,8 @@ fn main() {
 
     let dir = std::env::temp_dir().join(format!("strata-manifest-growth-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    let ds = Dataset::create(&dir).unwrap();
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let ds = Dataset::create(&dir, Arc::clone(&schema)).unwrap();
 
     let mut timings: Vec<Duration> = Vec::with_capacity(commits);
     let overall = Instant::now();
@@ -92,7 +92,7 @@ fn main() {
         )
         .unwrap();
         let mut txn = ds.begin();
-        txn.insert(batch);
+        txn.insert(batch).unwrap();
         let started = Instant::now();
         txn.commit().unwrap();
         timings.push(started.elapsed());

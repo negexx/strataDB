@@ -95,7 +95,7 @@ fn build_dataset(dir: &Path, rows: &[(Vec<f32>, i64)]) -> Dataset {
             false,
         ),
     ]));
-    let ds = Dataset::create(dir).unwrap();
+    let ds = Dataset::create(dir, Arc::clone(&schema)).unwrap();
 
     let ids: Vec<i64> = rows.iter().map(|(_, cat)| *cat).collect();
     let id_arr = Arc::new(Int64Array::from(ids));
@@ -111,7 +111,7 @@ fn build_dataset(dir: &Path, rows: &[(Vec<f32>, i64)]) -> Dataset {
     let batch = RecordBatch::try_new(schema.clone(), vec![id_arr, vec_arr]).unwrap();
 
     let mut txn = ds.begin();
-    txn.insert(batch);
+    txn.insert(batch).unwrap();
     txn.commit().unwrap();
     ds
 }

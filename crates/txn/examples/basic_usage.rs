@@ -12,8 +12,6 @@ use strata_txn::Dataset;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir =
         std::env::temp_dir().join(format!("strata-example-basic-usage-{}", std::process::id()));
-    let dataset = Dataset::create(&dir)?;
-
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new(
@@ -22,6 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             false,
         ),
     ]));
+    let dataset = Dataset::create(&dir, Arc::clone(&schema))?;
     let ids = Arc::new(Int64Array::from(vec![1, 2, 3]));
     let item_field = Arc::new(Field::new("item", DataType::Float32, false));
     let values = Arc::new(Float32Array::from(vec![
@@ -35,7 +34,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let batch = RecordBatch::try_new(schema.clone(), vec![ids, vectors])?;
 
     let mut txn = dataset.begin();
-    txn.insert(batch);
+    txn.insert(batch)?;
     txn.commit()?;
 
     println!("committed version: {}", dataset.current_version());

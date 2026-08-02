@@ -135,7 +135,7 @@ fn main() {
 
     let dataset = Arc::new(
         strata_txn::Dataset::open(dir)
-            .or_else(|_| strata_txn::Dataset::create(dir))
+            .or_else(|_| strata_txn::Dataset::create(dir, strata_txn::mvp_fixtures::mvp_schema()))
             .expect("failed to open or create dataset"),
     );
 

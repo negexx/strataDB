@@ -52,7 +52,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
 
     match cmd.as_str() {
         "create" => {
-            strata_txn::Dataset::create(dir)?;
+            strata_txn::Dataset::create(dir, strata_txn::mvp_fixtures::mvp_schema())?;
             println!("created dataset at {dir}");
         }
         "insert" => {
@@ -63,7 +63,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
             let v2: f32 = args.get(7).ok_or("missing <v2>")?.parse()?;
             let ds = strata_txn::Dataset::open(dir)?;
             let mut txn = ds.begin();
-            txn.insert(strata_txn::mvp_fixtures::mvp_row(id, name, [v0, v1, v2])?);
+            txn.insert(strata_txn::mvp_fixtures::mvp_row(id, name, [v0, v1, v2])?)?;
             txn.commit()?;
             println!("committed version {}", ds.current_version());
         }
@@ -114,7 +114,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
                     i64::try_from(i)?,
                     "loop",
                     [i as f32, 0.0, 0.0],
-                )?);
+                )?)?;
                 txn.commit()?;
                 println!("committed {}", ds.current_version());
                 std::io::stdout().flush()?;
@@ -383,10 +383,11 @@ mod tests {
             .unwrap()
             .keep();
         let dir_str = dir.to_str().unwrap().to_string();
-        strata_txn::Dataset::create(&dir_str).unwrap();
+        strata_txn::Dataset::create(&dir_str, strata_txn::mvp_fixtures::mvp_schema()).unwrap();
         let ds = strata_txn::Dataset::open(&dir_str).unwrap();
         let mut txn = ds.begin();
-        txn.insert(strata_txn::mvp_fixtures::mvp_row(1, "alice", [1.0, 2.0, 3.0]).unwrap());
+        txn.insert(strata_txn::mvp_fixtures::mvp_row(1, "alice", [1.0, 2.0, 3.0]).unwrap())
+            .unwrap();
         txn.commit().unwrap();
 
         let args = vec![

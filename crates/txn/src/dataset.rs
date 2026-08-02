@@ -9,6 +9,7 @@
 //! visibility and read-set tracking are explicit non-goals for this slice,
 //! not gaps.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64};
@@ -30,7 +31,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use strata_index::{EfConstruction, HnswIndex, MaxConnections, MaxElements, MaxLayers};
 use strata_storage::{
     ColumnStats, DataFileEntry, Manifest, SegmentEntry, Value, commit_manifest, compute_stats,
-    read_current, sync_dir, write_batch, write_bytes,
+    read_batch, read_current, sync_dir, write_batch, write_bytes,
 };
 
 use crate::commit_log::{CommitLog, ConflictCheck};
@@ -328,13 +329,12 @@ impl Dataset {
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let dir = std::env::temp_dir()
     ///     .join(format!("strata-doctest-create-{}", std::process::id()));
-    /// let dataset = Dataset::create(&dir)?;
-    ///
     /// let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    /// let dataset = Dataset::create(&dir, Arc::clone(&schema))?;
     /// let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))])?;
     ///
     /// let mut txn = dataset.begin();
-    /// txn.insert(batch);
+    /// txn.insert(batch)?;
     /// txn.commit()?;
     ///
     /// assert_eq!(dataset.current_version(), 1);
@@ -349,8 +349,8 @@ impl Dataset {
     /// `dir`, [`TxnError::NotFound`] if its immediate parent is absent, or an
     /// I/O/storage error if the bounded directory-sync or initial-manifest
     /// publication path fails.
-    pub fn create(dir: impl Into<PathBuf>) -> Result<Self> {
-        Self::create_with_commit_log_capacity(dir, COMMIT_LOG_CAPACITY)
+    pub fn create(dir: impl Into<PathBuf>, schema: SchemaRef) -> Result<Self> {
+        Self::create_with_commit_log_capacity(dir, schema, COMMIT_LOG_CAPACITY)
     }
 
     /// Same as [`Dataset::create`], but with an explicit `CommitLog`
@@ -368,14 +368,16 @@ impl Dataset {
     /// capacity is exactly as rigorous as testing it at the real one.
     fn create_with_commit_log_capacity(
         dir: impl Into<PathBuf>,
+        schema: SchemaRef,
         commit_log_capacity: usize,
     ) -> Result<Self> {
+        validate_dataset_schema(&schema)?;
         let dir = dir.into();
         if read_current(&dir)?.is_some() {
             return Err(TxnError::AlreadyExists(dir));
         }
         sync_dataset_directory_anchor(&dir)?;
-        let manifest = Manifest::empty();
+        let manifest = Manifest::empty_with_schema(schema.as_ref());
         commit_manifest(&dir, &manifest)?;
         let last_issued_timestamp = Arc::new(AtomicI64::new(manifest.commit_time_high_water));
         let row_ids = Arc::new(RowIdAllocator::new(manifest.next_row_id));
@@ -383,6 +385,7 @@ impl Dataset {
         let snapshot = Snapshot {
             dir: dir.clone(),
             version: manifest.version,
+            schema,
             manifest: Arc::new(manifest),
             // A brand-new dataset has committed no vectors, so it has no
             // segments — not an empty graph. `vector_search` on it returns
@@ -416,12 +419,14 @@ impl Dataset {
     /// # Examples
     ///
     /// ```
+    /// use std::sync::Arc;
+    /// use arrow::datatypes::Schema;
     /// use strata_txn::Dataset;
     ///
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let dir = std::env::temp_dir()
     ///     .join(format!("strata-doctest-open-{}", std::process::id()));
-    /// Dataset::create(&dir)?; // must exist first — `open` errors on a missing dataset
+    /// Dataset::create(&dir, Arc::new(Schema::empty()))?; // must exist first — `open` errors on a missing dataset
     ///
     /// let reopened = Dataset::open(&dir)?;
     /// assert_eq!(reopened.current_version(), 0);
@@ -437,6 +442,11 @@ impl Dataset {
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self> {
         let dir = dir.into();
         let manifest = read_current(&dir)?.ok_or_else(|| TxnError::NotFound(dir.clone()))?;
+        let manifest_path = dir
+            .join("_versions")
+            .join(format!("{:020}.manifest", manifest.version));
+        let schema = manifest.schema(&manifest_path)?;
+        validate_dataset_schema(&schema)?;
         // The capacity guard used to live inside the old delta-replay open
         // path, which sized an `HnswIndex` from `next_row_id`. Nothing sizes
         // an allocation from it any more, but the ceiling is still a
@@ -448,7 +458,9 @@ impl Dataset {
                 MAX_REASONABLE_ROW_ID_CAPACITY,
             ));
         }
-        let index = load_segments(&dir, &manifest)?;
+        let owned_rows = validate_data_files(&dir, &manifest, &schema)?;
+        validate_tombstones(&dir, &manifest, &owned_rows)?;
+        let index = load_segments(&dir, &manifest, &owned_rows)?;
         // The manifest's tombstone list is now the only source: index-level
         // tombstone entries went away with the delta log, and never had a
         // producer on the commit path anyway.
@@ -480,6 +492,7 @@ impl Dataset {
         let snapshot = Snapshot {
             dir: dir.clone(),
             version: manifest.version,
+            schema,
             manifest: Arc::new(manifest),
             index,
             tombstones: Arc::new(tombstones),
@@ -510,6 +523,12 @@ impl Dataset {
         self.snapshot().version
     }
 
+    /// The immutable logical schema supplied when this dataset was created.
+    #[must_use]
+    pub fn schema(&self) -> SchemaRef {
+        self.snapshot().schema()
+    }
+
     #[must_use]
     pub fn data_dir(&self) -> PathBuf {
         data_subdir(&self.dir)
@@ -529,6 +548,8 @@ impl Dataset {
         Transaction {
             dir: self.dir.clone(),
             base_version: snapshot.version,
+            base_snapshot: Arc::clone(&snapshot),
+            schema: snapshot.schema(),
             pending: Vec::new(),
             pending_tombstones: Vec::new(),
             write_set: Vec::new(),
@@ -562,6 +583,23 @@ impl Dataset {
         self.insufficient_history_conflicts
             .load(std::sync::atomic::Ordering::Relaxed)
     }
+}
+
+fn validate_dataset_schema(schema: &SchemaRef) -> Result<()> {
+    let mut names = HashSet::with_capacity(schema.fields().len());
+    for field in schema.fields() {
+        let name = field.name();
+        if HIDDEN_COLUMNS.contains(&name.as_str()) {
+            return Err(TxnError::ReservedColumnName(name.to_string()));
+        }
+        if !names.insert(name.clone()) {
+            return Err(TxnError::BatchSchemaMismatch {
+                expected: "unique dataset field names".to_string(),
+                actual: format!("duplicate field name {name:?}"),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Creates `dir/data` after checking that `dir`'s immediate parent already
@@ -598,6 +636,12 @@ pub struct Transaction {
     /// cloning the whole `Manifest` at `begin()` time (as earlier Phase 6
     /// commits did) was pure waste: every field but `version` went unused.
     base_version: u64,
+    /// The ownership and liveness view captured at `begin`. Delete and
+    /// update validate against this immutable base before they buffer any
+    /// tombstone or replacement.
+    base_snapshot: Arc<Snapshot>,
+    /// Dataset-owned logical schema captured from `base_snapshot`.
+    schema: SchemaRef,
     pending: Vec<RecordBatch>,
     /// Row-ids queued for tombstoning by [`Transaction::delete`]/
     /// [`Transaction::update`], applied at commit time (see
@@ -760,12 +804,12 @@ impl Transaction {
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let dir = std::env::temp_dir()
     ///     .join(format!("strata-doctest-insert-{}", std::process::id()));
-    /// let dataset = Dataset::create(&dir)?;
     /// let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    /// let dataset = Dataset::create(&dir, Arc::clone(&schema))?;
     /// let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1]))])?;
     ///
     /// let mut txn = dataset.begin();
-    /// txn.insert(batch);
+    /// txn.insert(batch)?;
     /// assert_eq!(dataset.current_version(), 0, "not visible until commit");
     /// txn.commit()?;
     /// assert_eq!(dataset.current_version(), 1);
@@ -777,17 +821,31 @@ impl Transaction {
     /// Buffers a batch of rows for this transaction. Nothing is visible to
     /// any other reader — including a fresh `Dataset::open` in another
     /// process — until [`Transaction::commit`] succeeds. See spec §2.
-    pub fn insert(&mut self, batch: RecordBatch) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TxnError::BatchSchemaMismatch`] when `batch` does not
+    /// exactly match the schema owned by this dataset.
+    pub fn insert(&mut self, batch: RecordBatch) -> Result<()> {
+        self.validate_batch(&batch)?;
         self.pending.push(batch);
+        Ok(())
     }
 
     /// Tombstones `row_id`, making it invisible to every snapshot taken
     /// after this transaction commits — see spec §2. Buffered, not
     /// applied until [`Transaction::commit`] succeeds, same as
     /// [`Transaction::insert`].
-    pub fn delete(&mut self, row_id: u64) {
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed target error if `row_id` is not live and owned by the
+    /// transaction's base snapshot, or was already targeted by this transaction.
+    pub fn delete(&mut self, row_id: u64) -> Result<()> {
+        self.validate_target(row_id)?;
         self.pending_tombstones.push(row_id);
         self.write_set.push(row_id);
+        Ok(())
     }
 
     /// Test-only: makes this transaction's [`Self::commit`] fail at its
@@ -837,9 +895,47 @@ impl Transaction {
     /// write-set bookkeeping (used by conflict detection) obviously
     /// correct at the call site rather than relying on the caller to
     /// remember both.
-    pub fn update(&mut self, row_id: u64, batch: RecordBatch) {
-        self.delete(row_id);
-        self.insert(batch);
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TxnError::InvalidUpdateShape`] unless `batch` contains
+    /// exactly one row, or a typed schema/target error when either input is
+    /// invalid for this dataset and transaction.
+    pub fn update(&mut self, row_id: u64, batch: RecordBatch) -> Result<()> {
+        self.validate_batch(&batch)?;
+        if batch.num_rows() != 1 {
+            return Err(TxnError::InvalidUpdateShape {
+                actual_rows: batch.num_rows(),
+            });
+        }
+        self.validate_target(row_id)?;
+        self.pending_tombstones.push(row_id);
+        self.write_set.push(row_id);
+        self.pending.push(batch);
+        Ok(())
+    }
+
+    fn validate_batch(&self, batch: &RecordBatch) -> Result<()> {
+        if batch.schema_ref().as_ref() != self.schema.as_ref() {
+            return Err(TxnError::BatchSchemaMismatch {
+                expected: format!("{:?}", self.schema),
+                actual: format!("{:?}", batch.schema_ref()),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_target(&self, row_id: u64) -> Result<()> {
+        if self.pending_tombstones.contains(&row_id) {
+            return Err(TxnError::DuplicateTarget { row_id });
+        }
+        if !self.base_snapshot.owns_row(row_id) {
+            return Err(TxnError::RowNotFound { row_id });
+        }
+        if !self.base_snapshot.is_visible(row_id) {
+            return Err(TxnError::RowNotLive { row_id });
+        }
+        Ok(())
     }
 
     /// Commits per spec §3's write/durability steps (3-5), with Phase 6's
@@ -880,12 +976,12 @@ impl Transaction {
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let dir = std::env::temp_dir()
     ///     .join(format!("strata-doctest-commit-{}", std::process::id()));
-    /// let dataset = Dataset::create(&dir)?;
     /// let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    /// let dataset = Dataset::create(&dir, Arc::clone(&schema))?;
     /// let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2]))])?;
     ///
     /// let mut txn = dataset.begin();
-    /// txn.insert(batch);
+    /// txn.insert(batch)?;
     /// txn.commit()?; // durable and visible to every reader from this point on
     ///
     /// assert_eq!(dataset.data_files().len(), 1);
@@ -994,6 +1090,18 @@ impl Transaction {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Err(TxnError::Conflict {
                     contested_row_ids: self.write_set.clone(),
+                });
+            }
+        }
+
+        // The base snapshot check in delete/update gives callers immediate,
+        // typed feedback. This second check runs under the publication lock
+        // against the latest snapshot, closing the gap to a concurrent
+        // tombstone even if a bounded history implementation changes later.
+        for &row_id in &self.write_set {
+            if !latest_snapshot.owns_live_row(row_id) {
+                return Err(TxnError::Conflict {
+                    contested_row_ids: vec![row_id],
                 });
             }
         }
@@ -1179,6 +1287,7 @@ impl Transaction {
         let snapshot = Snapshot {
             dir: self.dir,
             version: new_version,
+            schema: Arc::clone(&self.schema),
             manifest: Arc::new(manifest),
             index,
             tombstones: Arc::new(tombstones),
@@ -1532,10 +1641,18 @@ impl Transaction {
 
             let encoded = strata_storage::encode_batch(&with_timestamp)?;
             let file_name = format!("{attempt_id:020}-{i}.arrow");
-            write_batch(&data_dir.join(&file_name), &encoded)?;
+            let metadata = write_batch(&data_dir.join(&file_name), &encoded)?;
+            let row_id_range = match num_rows {
+                0 => None,
+                _ => Some((row_id_base, row_id_base + num_rows - 1)),
+            };
 
             data_files.push(DataFileEntry {
                 name: file_name,
+                byte_len: metadata.byte_len,
+                crc32c: metadata.crc32c,
+                row_count: num_rows,
+                row_id_range,
                 stats,
             });
             all_inserts.extend(inserts);
@@ -1721,6 +1838,256 @@ const PARALLEL_INSERT_THREADS: usize = 4;
 /// delta-replay open path, which no longer exists).
 const MAX_REASONABLE_ROW_ID_CAPACITY: u64 = 1_000_000_000;
 
+fn manifest_catalog_path(dir: &Path, version: u64) -> PathBuf {
+    dir.join("_versions")
+        .join(format!("{version:020}.manifest"))
+}
+
+fn corrupt_catalog(dir: &Path, manifest: &Manifest, reason: impl Into<String>) -> TxnError {
+    TxnError::Storage(strata_storage::StorageError::CorruptManifest(
+        manifest_catalog_path(dir, manifest.version),
+        reason.into(),
+    ))
+}
+
+fn stored_type_matches_owned_schema(stored: &DataType, owned: &DataType) -> bool {
+    stored == owned || matches!(stored, DataType::Dictionary(_, value) if value.as_ref() == owned)
+}
+
+fn validate_physical_batch_schema(
+    dir: &Path,
+    manifest: &Manifest,
+    logical_schema: &SchemaRef,
+    batch: &RecordBatch,
+    file_name: &str,
+) -> Result<()> {
+    let physical = batch.schema_ref();
+    let expected_len = logical_schema.fields().len() + HIDDEN_COLUMNS.len();
+    if physical.fields().len() != expected_len {
+        return Err(corrupt_catalog(
+            dir,
+            manifest,
+            format!(
+                "data file {file_name} has {} schema fields; expected {expected_len}",
+                physical.fields().len()
+            ),
+        ));
+    }
+
+    for (stored, owned) in physical.fields().iter().zip(logical_schema.fields()) {
+        if stored.name() != owned.name()
+            || stored.is_nullable() != owned.is_nullable()
+            || stored.metadata() != owned.metadata()
+            || !stored_type_matches_owned_schema(stored.data_type(), owned.data_type())
+        {
+            return Err(corrupt_catalog(
+                dir,
+                manifest,
+                format!(
+                    "data file {file_name} does not preserve owned field {:?}",
+                    owned.name()
+                ),
+            ));
+        }
+    }
+
+    let hidden = &physical.fields()[logical_schema.fields().len()..];
+    let expected_hidden = [
+        (ROW_ID_COLUMN, DataType::UInt64),
+        (TIMESTAMP_COLUMN, DataType::Int64),
+    ];
+    for (stored, (name, data_type)) in hidden.iter().zip(expected_hidden) {
+        let type_matches = if name == TIMESTAMP_COLUMN {
+            stored_type_matches_owned_schema(stored.data_type(), &data_type)
+        } else {
+            stored.data_type() == &data_type
+        };
+        if stored.name() != name || !type_matches || stored.is_nullable() {
+            return Err(corrupt_catalog(
+                dir,
+                manifest,
+                format!("data file {file_name} has an invalid physical {name} column"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_data_file_row_ids(
+    dir: &Path,
+    manifest: &Manifest,
+    entry: &DataFileEntry,
+    batch: &RecordBatch,
+    expected_range: Option<(u64, u64)>,
+    owned_rows: &mut HashSet<u64>,
+) -> Result<()> {
+    let row_id_idx = batch.schema_ref().index_of(ROW_ID_COLUMN)?;
+    let row_ids = batch
+        .column(row_id_idx)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .ok_or_else(|| {
+            corrupt_catalog(
+                dir,
+                manifest,
+                format!("data file {} has non-UInt64 _row_id", entry.name),
+            )
+        })?;
+    if row_ids.null_count() != 0 {
+        return Err(corrupt_catalog(
+            dir,
+            manifest,
+            format!("data file {} has null _row_id values", entry.name),
+        ));
+    }
+    for (offset, &row_id) in row_ids.values().iter().enumerate() {
+        let Some((first, _)) = expected_range else {
+            return Err(corrupt_catalog(
+                dir,
+                manifest,
+                format!("empty file {} has row IDs", entry.name),
+            ));
+        };
+        let expected = first.checked_add(u64::try_from(offset)?).ok_or_else(|| {
+            TxnError::ManifestOverflow(format!("row_id_range {first} + {offset}"))
+        })?;
+        if row_id != expected {
+            return Err(corrupt_catalog(
+                dir,
+                manifest,
+                format!(
+                    "data file {} has row_id {row_id} at offset {offset}; expected {expected}",
+                    entry.name
+                ),
+            ));
+        }
+        if !owned_rows.insert(row_id) {
+            return Err(corrupt_catalog(
+                dir,
+                manifest,
+                format!("row_id {row_id} is owned by more than one data file"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_data_files(
+    dir: &Path,
+    manifest: &Manifest,
+    logical_schema: &SchemaRef,
+) -> Result<HashSet<u64>> {
+    let data_dir = data_subdir(dir);
+    let mut owned_rows = HashSet::new();
+    for entry in &manifest.data_files {
+        let path = safe_join(&data_dir, &entry.name)?;
+        let bytes = std::fs::read(&path)?;
+        let actual_len = u64::try_from(bytes.len())?;
+        if actual_len != entry.byte_len {
+            return Err(TxnError::Storage(
+                strata_storage::StorageError::CorruptDataFile(
+                    path,
+                    format!(
+                        "byte_len is {actual_len} on disk but catalog records {}",
+                        entry.byte_len
+                    ),
+                ),
+            ));
+        }
+        let actual_crc = strata_storage::crc32c_checksum(&bytes);
+        if actual_crc != entry.crc32c {
+            return Err(TxnError::Storage(
+                strata_storage::StorageError::CorruptDataFile(
+                    path,
+                    format!(
+                        "crc32c is {actual_crc} on disk but catalog records {}",
+                        entry.crc32c
+                    ),
+                ),
+            ));
+        }
+        let batch = read_batch(&data_dir.join(&entry.name))?;
+        validate_physical_batch_schema(dir, manifest, logical_schema, &batch, &entry.name)?;
+        let actual_rows = u64::try_from(batch.num_rows())?;
+        if actual_rows != entry.row_count {
+            return Err(TxnError::Storage(
+                strata_storage::StorageError::CorruptDataFile(
+                    data_dir.join(&entry.name),
+                    format!(
+                        "row_count is {actual_rows} on disk but catalog records {}",
+                        entry.row_count
+                    ),
+                ),
+            ));
+        }
+        let expected_range = match entry.row_count {
+            0 => {
+                if entry.row_id_range.is_some() {
+                    return Err(corrupt_catalog(
+                        dir,
+                        manifest,
+                        format!("empty data file {} has a row_id_range", entry.name),
+                    ));
+                }
+                None
+            }
+            count => {
+                let Some((first, last)) = entry.row_id_range else {
+                    return Err(corrupt_catalog(
+                        dir,
+                        manifest,
+                        format!("non-empty data file {} is missing row_id_range", entry.name),
+                    ));
+                };
+                let expected_last = first.checked_add(count - 1).ok_or_else(|| {
+                    TxnError::ManifestOverflow(format!("row_id_range {first} + {count} - 1"))
+                })?;
+                if last != expected_last {
+                    return Err(corrupt_catalog(
+                        dir,
+                        manifest,
+                        format!(
+                            "data file {} has row_id_range [{first}, {last}] incompatible with row_count {count}",
+                            entry.name
+                        ),
+                    ));
+                }
+                Some((first, last))
+            }
+        };
+        validate_data_file_row_ids(
+            dir,
+            manifest,
+            entry,
+            &batch,
+            expected_range,
+            &mut owned_rows,
+        )?;
+    }
+    Ok(owned_rows)
+}
+
+fn validate_tombstones(dir: &Path, manifest: &Manifest, owned_rows: &HashSet<u64>) -> Result<()> {
+    let mut seen = HashSet::with_capacity(manifest.tombstones.len());
+    for &row_id in &manifest.tombstones {
+        if !owned_rows.contains(&row_id) {
+            return Err(corrupt_catalog(
+                dir,
+                manifest,
+                format!("tombstone row_id {row_id} has no row-file owner"),
+            ));
+        }
+        if !seen.insert(row_id) {
+            return Err(corrupt_catalog(
+                dir,
+                manifest,
+                format!("tombstone row_id {row_id} appears more than once"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Loads every segment `manifest` lists into a [`strata_index::SegmentSet`],
 /// in manifest order. This is what replaced delta-log replay: a segment is
 /// the durable built graph, so recovery is `O(bytes)` validation with zero
@@ -1746,11 +2113,23 @@ const MAX_REASONABLE_ROW_ID_CAPACITY: u64 = 1_000_000_000;
 /// the corruption the original race could produce — would pass every one
 /// of them; only this cross-segment check catches it), or
 /// [`TxnError::Index`] if a segment fails its own header/body validation.
-fn load_segments(dir: &Path, manifest: &Manifest) -> Result<strata_index::SegmentSet> {
+fn load_segments(
+    dir: &Path,
+    manifest: &Manifest,
+    owned_rows: &HashSet<u64>,
+) -> Result<strata_index::SegmentSet> {
     let data_dir = data_subdir(dir);
     let mut parts = Vec::with_capacity(manifest.segments.len());
     let mut established_dimension: Option<u32> = None;
+    let mut segment_names = HashSet::with_capacity(manifest.segments.len());
+    let mut vector_rows = HashSet::new();
     for entry in &manifest.segments {
+        if !segment_names.insert(&entry.name) {
+            return Err(TxnError::CorruptSegment(format!(
+                "segment {} appears more than once in the manifest",
+                entry.name
+            )));
+        }
         let path = safe_join(&data_dir, &entry.name)?;
         let bytes = std::fs::read(&path)?;
         // Checked before parsing so a truncated file is reported as the
@@ -1828,6 +2207,19 @@ fn load_segments(dir: &Path, manifest: &Manifest) -> Result<strata_index::Segmen
             }
             Some(_) => {}
             None => established_dimension = Some(entry.dimension),
+        }
+        for row_id in reader.row_ids() {
+            if !owned_rows.contains(&row_id) {
+                return Err(TxnError::CorruptSegment(format!(
+                    "segment {} row_id {row_id} has no row-file owner",
+                    entry.name
+                )));
+            }
+            if !vector_rows.insert(row_id) {
+                return Err(TxnError::CorruptSegment(format!(
+                    "duplicate vector row_id {row_id} across manifest segments"
+                )));
+            }
         }
         let zone_map: Arc<dyn std::any::Any + Send + Sync> = Arc::new(entry.zone_map.clone());
         parts.push((Arc::new(reader), zone_map));
@@ -1990,15 +2382,14 @@ pub(crate) fn safe_join(data_dir: &Path, name: &str) -> Result<PathBuf> {
 /// Hidden columns every committed batch carries alongside its logical
 /// (user) columns: `_row_id` and `_timestamp`, both unconditionally
 /// (since W2).
-/// `cast_batch_to_schema` matches these by *name*, not position; every
-/// other (visible) column is still matched positionally against `schema`'s
-/// fields, so the caller's `schema` must still list its visible fields in
-/// the same order the data was inserted in.
+/// `cast_batch_to_schema` matches every requested field by its owned name,
+/// never by physical position. This preserves projections and reordering
+/// without allowing a caller to relabel one stored field as another.
 const HIDDEN_COLUMNS: [&str; 2] = [ROW_ID_COLUMN, TIMESTAMP_COLUMN];
 
-/// Casts `batch`'s physical columns to `schema`'s logical field types,
-/// reattaching any hidden column (`_row_id`, `_timestamp`) `schema`
-/// explicitly requests. See
+/// Projects `batch`'s physical columns by their owned names, casting only
+/// storage-introduced encodings (such as a dictionary encoded UTF-8 column)
+/// back to the already-validated requested logical type. See
 /// `docs/superpowers/specs/2026-07-25-s1-w2-timestamp-column-design.md` §5
 /// for why matching a *second* hidden column by position was unsound (it
 /// either misfired a spurious `SchemaMismatch`, or — in the mixed-request
@@ -2007,63 +2398,21 @@ const HIDDEN_COLUMNS: [&str; 2] = [ROW_ID_COLUMN, TIMESTAMP_COLUMN];
 ///
 /// # Errors
 ///
-/// Returns [`TxnError::SchemaMismatch`] if the number of *visible* columns
-/// `schema` requests doesn't match the number of visible physical columns
-/// in `batch`, an [`TxnError::Arrow`] if `schema` requests a hidden column
-/// not present in `batch`, or an [`TxnError::Arrow`]/[`TxnError`] wrapping
-/// a cast failure if a column's physical type can't convert to its
-/// requested logical type.
+/// Returns a typed schema error if a requested owned field is missing from
+/// the physical batch, or an Arrow error if a storage encoding cannot be
+/// decoded back to the owned type.
 pub(crate) fn cast_batch_to_schema(batch: &RecordBatch, schema: &SchemaRef) -> Result<RecordBatch> {
     let physical_schema = batch.schema_ref();
-
-    let mut hidden_physical: std::collections::HashMap<&str, ArrayRef> =
-        std::collections::HashMap::new();
-    let mut visible_physical: Vec<ArrayRef> = Vec::new();
-    for (field, column) in physical_schema.fields().iter().zip(batch.columns()) {
-        if HIDDEN_COLUMNS.contains(&field.name().as_str()) {
-            hidden_physical.insert(field.name().as_str(), Arc::clone(column));
-        } else {
-            visible_physical.push(Arc::clone(column));
-        }
-    }
-
-    let visible_requested = schema
-        .fields()
-        .iter()
-        .filter(|f| !HIDDEN_COLUMNS.contains(&f.name().as_str()))
-        .count();
-    if visible_requested != visible_physical.len() {
-        return Err(TxnError::SchemaMismatch {
-            expected: visible_requested,
-            actual: visible_physical.len(),
-        });
-    }
-
-    let mut visible_iter = visible_physical.into_iter();
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
     for field in schema.fields() {
-        let column = if HIDDEN_COLUMNS.contains(&field.name().as_str()) {
-            hidden_physical
-                .get(field.name().as_str())
-                .cloned()
-                .ok_or_else(|| {
-                    TxnError::Arrow(arrow::error::ArrowError::SchemaError(format!(
-                        "requested hidden column '{}' not present in this batch",
-                        field.name()
-                    )))
-                })?
-        } else {
-            // `visible_requested == visible_physical.len()` was already
-            // checked above, so this iterator has exactly as many elements
-            // as there are non-hidden fields in `schema` — it cannot run
-            // dry before this loop does.
-            match visible_iter.next() {
-                Some(column) => column,
-                None => unreachable!(
-                    "visible column count was checked equal to visible field count above"
-                ),
-            }
-        };
+        let index =
+            physical_schema
+                .index_of(field.name())
+                .map_err(|_| TxnError::BatchSchemaMismatch {
+                    expected: format!("physical field named {:?}", field.name()),
+                    actual: format!("{physical_schema:?}"),
+                })?;
+        let column = Arc::clone(batch.column(index));
         let casted = if column.data_type() == field.data_type() {
             column
         } else {
@@ -2154,7 +2503,7 @@ mod tests {
         let parent = root.join("missing-parent");
         let dir = parent.join("dataset");
 
-        let result = Dataset::create(&dir);
+        let result = Dataset::create(&dir, test_schema());
 
         assert!(
             matches!(result, Err(TxnError::NotFound(ref missing)) if missing == &parent),
@@ -2179,7 +2528,7 @@ mod tests {
         let dir = parent.join("dataset");
         let recorder = strata_storage::datafile::test_support::record_directory_syncs();
 
-        Dataset::create(&dir).unwrap();
+        Dataset::create(&dir, test_schema()).unwrap();
 
         let expected = vec![
             dir.clone(),
@@ -2207,7 +2556,7 @@ mod tests {
             std::io::ErrorKind::Other,
         );
 
-        let result = Dataset::create(&dir);
+        let result = Dataset::create(&dir, test_schema());
         let Err(error) = result else {
             panic!("Dataset::create must fail when its parent directory sync fails");
         };
@@ -2238,7 +2587,7 @@ mod tests {
             std::io::ErrorKind::Other,
         );
 
-        let first = Dataset::create(&dir);
+        let first = Dataset::create(&dir, test_schema());
         let Err(error) = first else {
             panic!("the pre-publication immediate-parent sync must fail");
         };
@@ -2253,7 +2602,7 @@ mod tests {
         drop(fault);
 
         let recorder = strata_storage::datafile::test_support::record_directory_syncs();
-        Dataset::create(&dir).unwrap();
+        Dataset::create(&dir, test_schema()).unwrap();
 
         let expected = vec![
             dir.clone(),
@@ -2283,7 +2632,7 @@ mod tests {
             std::io::ErrorKind::Other,
         );
 
-        let result = Dataset::create(&dir);
+        let result = Dataset::create(&dir, test_schema());
         let Err(error) = result else {
             panic!("Dataset::create must return the final directory-sync failure");
         };
@@ -2523,20 +2872,209 @@ mod tests {
         Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]))
     }
 
+    fn fixture_data_file(name: impl Into<String>) -> DataFileEntry {
+        DataFileEntry {
+            name: name.into(),
+            byte_len: 0,
+            crc32c: 0,
+            row_count: 0,
+            row_id_range: None,
+            stats: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn dataset_schema_is_persisted_and_rejects_renamed_or_castable_batches() {
+        let dir = temp_dir("owned-schema");
+        let schema = test_schema();
+        let ds = Dataset::create(&dir, Arc::clone(&schema)).unwrap();
+
+        assert_eq!(ds.schema(), schema);
+        assert_eq!(Dataset::open(&dir).unwrap().schema(), schema);
+
+        let renamed = Arc::new(Schema::new(vec![Field::new(
+            "renamed",
+            DataType::Int64,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(renamed, vec![Arc::new(Int64Array::from(vec![1]))]).unwrap();
+        let mut txn = ds.begin();
+        assert!(matches!(
+            txn.insert(batch),
+            Err(TxnError::BatchSchemaMismatch { .. })
+        ));
+        assert!(
+            txn.pending.is_empty(),
+            "schema validation must precede buffering or I/O"
+        );
+
+        let castable = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            castable,
+            vec![Arc::new(arrow::array::Int32Array::from(vec![1]))],
+        )
+        .unwrap();
+        assert!(matches!(
+            txn.insert(batch),
+            Err(TxnError::BatchSchemaMismatch { .. })
+        ));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn delete_and_update_reject_unowned_dead_duplicate_and_non_single_row_targets() {
+        let dir = temp_dir("strict-targets");
+        let schema = test_schema();
+        let ds = Dataset::create(&dir, Arc::clone(&schema)).unwrap();
+
+        let mut future = ds.begin();
+        assert!(matches!(
+            future.delete(0),
+            Err(TxnError::RowNotFound { row_id: 0 })
+        ));
+
+        let mut seed = ds.begin();
+        seed.insert(
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(vec![1]))],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        seed.commit().unwrap();
+
+        let mut delete = ds.begin();
+        delete.delete(0).unwrap();
+        assert!(matches!(
+            delete.delete(0),
+            Err(TxnError::DuplicateTarget { row_id: 0 })
+        ));
+        delete.commit().unwrap();
+
+        let mut dead = ds.begin();
+        assert!(matches!(
+            dead.delete(0),
+            Err(TxnError::RowNotLive { row_id: 0 })
+        ));
+        let empty = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(Vec::<i64>::new()))],
+        )
+        .unwrap();
+        assert!(matches!(
+            dead.update(0, empty),
+            Err(TxnError::InvalidUpdateShape { actual_rows: 0 })
+        ));
+        let multiple = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![2, 3]))],
+        )
+        .unwrap();
+        assert!(matches!(
+            dead.update(9, multiple),
+            Err(TxnError::InvalidUpdateShape { actual_rows: 2 })
+        ));
+        assert!(dead.pending.is_empty());
+        assert!(dead.pending_tombstones.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn committed_data_file_metadata_describes_the_physical_rows() {
+        let dir = temp_dir("data-file-metadata");
+        let schema = test_schema();
+        let ds = Dataset::create(&dir, Arc::clone(&schema)).unwrap();
+        let mut txn = ds.begin();
+        txn.insert(
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![4, 5]))]).unwrap(),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+
+        let entry = ds.data_files().pop().unwrap();
+        assert!(entry.byte_len > 0);
+        assert_ne!(entry.crc32c, 0);
+        assert_eq!(entry.row_count, 2);
+        assert_eq!(entry.row_id_range, Some((0, 1)));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn recovery_rejects_data_file_metadata_that_disagrees_with_the_file() {
+        let dir = temp_dir("recovery-row-file-metadata");
+        let schema = test_schema();
+        let ds = Dataset::create(&dir, Arc::clone(&schema)).unwrap();
+        let mut txn = ds.begin();
+        txn.insert(
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![4]))]).unwrap(),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+
+        let mut corrupt = (*ds.snapshot().manifest).clone();
+        corrupt.version += 1;
+        corrupt.data_files[0].row_count = 2;
+        commit_manifest(&dir, &corrupt).unwrap();
+
+        let result = Dataset::open(&dir);
+        let Err(error) = result else {
+            panic!("recovery must reject a row count that does not describe the actual IPC file");
+        };
+        assert!(
+            matches!(error, TxnError::Storage(strata_storage::StorageError::CorruptDataFile(_, ref reason)) if reason.contains("row_count")),
+            "recovery must reject a row count that does not describe the actual IPC file: {error:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn recovery_rejects_a_segment_vector_without_a_data_file_owner() {
+        let dir = temp_dir("recovery-vector-owner");
+        let batch = vector_batch(vec![1i64], cluster_vectors(1, [0.0, 0.0, 0.0], 0.0));
+        let ds = Dataset::create(&dir, batch.schema()).unwrap();
+        let mut txn = ds.begin();
+        txn.insert(batch).unwrap();
+        txn.commit().unwrap();
+
+        let mut corrupt = (*ds.snapshot().manifest).clone();
+        corrupt.version += 1;
+        corrupt.data_files.clear();
+        commit_manifest(&dir, &corrupt).unwrap();
+
+        let result = Dataset::open(&dir);
+        let Err(error) = result else {
+            panic!("every vector row-id must be owned by a validated data file");
+        };
+        assert!(
+            matches!(error, TxnError::CorruptSegment(ref reason) if reason.contains("no row-file owner")),
+            "every vector row-id must be owned by a validated data file: {error:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn every_row_in_one_transaction_shares_the_identical_timestamp() {
         let dir = temp_dir("timestamp-shared-per-txn");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, test_schema()).unwrap();
 
         let mut txn = ds.begin();
         txn.insert(
             RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![1, 2]))])
                 .unwrap(),
-        );
+        )
+        .unwrap();
         txn.insert(
             RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![3, 4]))])
                 .unwrap(),
-        );
+        )
+        .unwrap();
         txn.commit().unwrap();
 
         let snapshot = ds.snapshot();
@@ -2566,12 +3104,13 @@ mod tests {
     #[test]
     fn a_delete_only_commit_still_advances_commit_time_high_water() {
         let dir = temp_dir("timestamp-delete-only-advances");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, test_schema()).unwrap();
 
         let mut txn = ds.begin();
         txn.insert(
             RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![1]))]).unwrap(),
-        );
+        )
+        .unwrap();
         txn.commit().unwrap();
         let after_insert = ds.snapshot().manifest.commit_time_high_water;
         assert!(after_insert > 0);
@@ -2582,7 +3121,7 @@ mod tests {
         // (`>=`), matching the spec's own "non-decreasing" wording, not
         // strictly increasing.
         let mut txn = ds.begin();
-        txn.delete(0);
+        txn.delete(0).unwrap();
         txn.commit().unwrap();
         let after_delete = ds.snapshot().manifest.commit_time_high_water;
         assert!(
@@ -2596,7 +3135,7 @@ mod tests {
     #[test]
     fn commit_time_high_water_is_non_decreasing_across_several_commits() {
         let dir = temp_dir("timestamp-high-water-monotonic");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, test_schema()).unwrap();
 
         let mut last = 0i64;
         for i in 0..5 {
@@ -2604,7 +3143,8 @@ mod tests {
             txn.insert(
                 RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![i]))])
                     .unwrap(),
-            );
+            )
+            .unwrap();
             txn.commit().unwrap();
             let current = ds.snapshot().manifest.commit_time_high_water;
             assert!(
@@ -2633,7 +3173,7 @@ mod tests {
         // sleep-raced schedule - only the wall-clock *value* gap uses a
         // short sleep below, not the interleaving itself.
         let dir = temp_dir("timestamp-high-water-concurrent-non-regression");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, test_schema()).unwrap();
 
         let (claim_point, claimed) = checkpoint_pair();
 
@@ -2644,7 +3184,8 @@ mod tests {
         let mut slow = ds.begin();
         slow.insert(
             RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![1]))]).unwrap(),
-        );
+        )
+        .unwrap();
         slow.pause_after_row_id_claim(claim_point);
         let slow_thread = std::thread::spawn(move || slow.commit());
 
@@ -2662,7 +3203,8 @@ mod tests {
         let mut fast = ds.begin();
         fast.insert(
             RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![2]))]).unwrap(),
-        );
+        )
+        .unwrap();
         fast.commit().unwrap();
         let high_water_after_fast = ds.snapshot().manifest.commit_time_high_water;
         assert!(high_water_after_fast > 0);
@@ -2688,12 +3230,13 @@ mod tests {
     #[test]
     fn timestamp_gets_a_stats_entry_with_min_equal_to_max() {
         let dir = temp_dir("timestamp-file-pruning");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, test_schema()).unwrap();
 
         let mut txn = ds.begin();
         txn.insert(
             RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![1]))]).unwrap(),
-        );
+        )
+        .unwrap();
         txn.commit().unwrap();
 
         let files = ds.data_files();
@@ -2715,19 +3258,21 @@ mod tests {
         use strata_storage::Value;
 
         let dir = temp_dir("timestamp-real-file-pruning");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, test_schema()).unwrap();
 
         let mut txn = ds.begin();
         txn.insert(
             RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![1]))]).unwrap(),
-        );
+        )
+        .unwrap();
         txn.commit().unwrap();
         let ts_after_commit_1 = ds.snapshot().manifest.commit_time_high_water;
 
         let mut txn = ds.begin();
         txn.insert(
             RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![2]))]).unwrap(),
-        );
+        )
+        .unwrap();
         txn.commit().unwrap();
 
         let snapshot = ds.snapshot();
@@ -2755,7 +3300,7 @@ mod tests {
     #[test]
     fn insert_rejects_a_batch_whose_schema_reuses_a_reserved_column_name() {
         let dir = temp_dir("timestamp-reserved-column-name-rejected");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, test_schema()).unwrap();
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
@@ -2771,11 +3316,10 @@ mod tests {
         .unwrap();
 
         let mut txn = ds.begin();
-        txn.insert(batch);
-        let result = txn.commit();
+        let result = txn.insert(batch);
         assert!(
-            matches!(result, Err(TxnError::ReservedColumnName(ref name)) if name == ROW_ID_COLUMN),
-            "expected ReservedColumnName(_row_id), got {result:?}"
+            matches!(result, Err(TxnError::BatchSchemaMismatch { .. })),
+            "owned-schema validation must reject reserved-field batches before buffering: {result:?}"
         );
 
         // Nothing must have been written - the dataset stays at version 0.
@@ -2801,7 +3345,7 @@ mod tests {
         use arrow::array::StringArray;
         let dir = temp_dir("scan-dict-encoded");
         let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)]));
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, Arc::clone(&schema)).unwrap();
 
         let names: Vec<&str> = (0..100)
             .map(|i| if i % 2 == 0 { "alice" } else { "bob" })
@@ -2812,7 +3356,7 @@ mod tests {
         )
         .unwrap();
         let mut txn = ds.begin();
-        txn.insert(batch);
+        txn.insert(batch).unwrap();
         txn.commit().unwrap();
 
         // Confirm the file really was dictionary-encoded, so this test
@@ -2844,7 +3388,7 @@ mod tests {
     #[test]
     fn create_then_open_recovers_same_version() {
         let dir = temp_dir("create-open");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, test_schema()).unwrap();
         assert_eq!(ds.current_version(), 0);
 
         let reopened = Dataset::open(&dir).unwrap();
@@ -2874,14 +3418,14 @@ mod tests {
         let schema = test_schema();
 
         {
-            let ds = Dataset::create(&dir).unwrap();
+            let ds = Dataset::create(&dir, test_schema()).unwrap();
             let batch = RecordBatch::try_new(
                 schema.clone(),
                 vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
             )
             .unwrap();
             let mut txn = ds.begin();
-            txn.insert(batch);
+            txn.insert(batch).unwrap();
             txn.commit().unwrap();
             // `ds` (and with it, its in-memory write_attempt_counter) is
             // dropped at the end of this block — the next session has no
@@ -2893,7 +3437,7 @@ mod tests {
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![4]))])
             .unwrap();
         let mut txn = reopened.begin();
-        txn.insert(batch);
+        txn.insert(batch).unwrap();
         txn.commit().unwrap();
 
         let scanned = reopened.snapshot().scan(&schema).unwrap();
@@ -2916,95 +3460,21 @@ mod tests {
     }
 
     #[test]
-    fn opening_a_legacy_pre_attempt_id_manifest_does_not_destroy_its_data_files() {
-        // Regression test for a bug found via an external optimization
-        // report's audit (Section 2 of the pipeline docs): before this
-        // fix, `write_attempt_counter` seeded straight from
-        // `manifest.next_attempt_id` (see `Dataset::open` above) -- correct
-        // for any manifest produced by the current commit path, since that
-        // path always persists `next_attempt_id >= 1` after its very first
-        // commit. But a manifest written BEFORE `next_attempt_id` existed
-        // as a field deserializes it as 0 via `#[serde(default)]`, even
-        // though `data_files` may already hold legacy, VERSION-prefixed
-        // filenames (`{version:020}-{i}.arrow`, from before the
-        // attempt-id naming scheme replaced version-based naming). Seeding
-        // the counter at 0 in that case means the next commit's first
-        // *fetch_add* returns 0 (harmless -- legacy version 0 has no data
-        // file), but its *second* commit uses attempt id 1, colliding
-        // byte-for-byte with the legacy version-1 data file's name.
-        // `write_batch` uses `File::create`, which truncates -- silently
-        // destroying that already-durable file.
-        //
-        // This test simulates that legacy manifest directly (bypassing the
-        // normal create/commit path, which can no longer produce this
-        // shape) via `strata_storage::commit_manifest`, matching the
-        // existing hostile-manifest test pattern in this file.
+    fn opening_a_legacy_manifest_requires_explicit_migration() {
         let dir = temp_dir("legacy-manifest-migration");
-        let versions_dir_data = dir.join("data");
-        std::fs::create_dir_all(&versions_dir_data).unwrap();
-
-        // Simulate two legacy commits' worth of already-durable data files,
-        // named the OLD way: prefixed by their own commit's version number.
-        let legacy_batch_v1 = arrow::array::Int64Array::from(vec![1, 2, 3]);
-        let file_v1 = versions_dir_data.join(format!("{:020}-0.arrow", 1u64));
-        strata_storage::write_batch(
-            &file_v1,
-            &RecordBatch::try_new(test_schema(), vec![Arc::new(legacy_batch_v1)]).unwrap(),
-        )
-        .unwrap();
-
-        // A legacy manifest: data_files references the version-1 file, but
-        // (matching every manifest written before this field existed)
-        // carries no next_attempt_id -- it deserializes to 0.
-        let legacy_manifest = Manifest {
-            version: 1,
-            data_files: vec![DataFileEntry {
-                name: format!("{:020}-0.arrow", 1u64),
-                stats: std::collections::HashMap::new(),
-            }],
-            next_row_id: 3,
-            tombstones: Vec::new(),
-            next_attempt_id: 0, // <-- the exact legacy-deserialize shape
-            commit_time_high_water: 0,
-            segments: Vec::new(),
-        };
+        let mut legacy_manifest = Manifest::empty();
+        legacy_manifest.schema_ipc.clear();
         strata_storage::commit_manifest(&dir, &legacy_manifest).unwrap();
 
-        // Open (must migrate the attempt-id counter away from 0) and commit
-        // twice -- the second commit is the one that would use attempt id 1
-        // under the old, buggy seeding.
-        let reopened = Dataset::open(&dir).unwrap();
-        let schema = test_schema();
-        for value in [4i64, 5i64] {
-            let batch = RecordBatch::try_new(
-                schema.clone(),
-                vec![Arc::new(Int64Array::from(vec![value]))],
-            )
-            .unwrap();
-            let mut txn = reopened.begin();
-            txn.insert(batch);
-            txn.commit().unwrap();
-        }
-
-        // The legacy file must survive untouched, AND all rows (legacy +
-        // both new commits) must be visible -- neither silently destroyed
-        // nor silently double-counted via a reused manifest entry name.
+        let result = Dataset::open(&dir);
         assert!(
-            file_v1.exists(),
-            "the legacy version-1 data file must not have been overwritten"
-        );
-        let scanned = reopened.snapshot().scan(&schema).unwrap();
-        let ids = scanned
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        let mut got: Vec<i64> = (0..ids.len()).map(|i| ids.value(i)).collect();
-        got.sort_unstable();
-        assert_eq!(
-            got,
-            vec![1, 2, 3, 4, 5],
-            "legacy rows plus both post-migration commits must all be present"
+            matches!(
+                result,
+                Err(TxnError::Storage(
+                    strata_storage::StorageError::LegacyFormatNeedsMigration(_)
+                ))
+            ),
+            "a manifest without the owned schema/integrity envelope must require migration"
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -3014,7 +3484,7 @@ mod tests {
     fn insert_then_commit_then_scan_round_trips() {
         let dir = temp_dir("insert-scan");
         let schema = test_schema();
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, test_schema()).unwrap();
 
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -3022,7 +3492,7 @@ mod tests {
         )
         .unwrap();
         let mut txn = ds.begin();
-        txn.insert(batch.clone());
+        txn.insert(batch.clone()).unwrap();
         txn.commit().unwrap();
 
         assert_eq!(ds.current_version(), 1);
@@ -3034,8 +3504,8 @@ mod tests {
     #[test]
     fn create_twice_errors() {
         let dir = temp_dir("create-twice");
-        let _ds = Dataset::create(&dir).unwrap();
-        let result = Dataset::create(&dir);
+        let _ds = Dataset::create(&dir, test_schema()).unwrap();
+        let result = Dataset::create(&dir, test_schema());
         assert!(matches!(result, Err(TxnError::AlreadyExists(_))));
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3044,13 +3514,13 @@ mod tests {
     fn commit_computes_and_stores_column_stats() {
         let dir = temp_dir("commit-stats");
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, Arc::clone(&schema)).unwrap();
 
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![30, 10, 20]))])
                 .unwrap();
         let mut txn = ds.begin();
-        txn.insert(batch);
+        txn.insert(batch).unwrap();
         txn.commit().unwrap();
 
         let entry = &ds.data_files()[0];
@@ -3082,6 +3552,7 @@ mod tests {
         let dir = temp_dir("unreasonable-capacity");
         let hostile = Manifest {
             version: 0,
+            schema_ipc: Manifest::empty_with_schema(test_schema().as_ref()).schema_ipc,
             data_files: Vec::new(),
             next_row_id: u64::MAX,
             tombstones: Vec::new(),
@@ -3110,6 +3581,7 @@ mod tests {
         // practice) to simulate a hostile/corrupted manifest.
         let hostile = Manifest {
             version: u64::MAX,
+            schema_ipc: Manifest::empty_with_schema(test_schema().as_ref()).schema_ipc,
             data_files: Vec::new(),
             next_row_id: 0,
             tombstones: Vec::new(),
@@ -3124,7 +3596,7 @@ mod tests {
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1]))]).unwrap();
         let mut txn = ds.begin();
-        txn.insert(batch);
+        txn.insert(batch).unwrap();
         let result = txn.commit();
 
         // `Dataset` doesn't implement `Debug` (its HNSW index can't), so
@@ -3144,12 +3616,12 @@ mod tests {
 
         let dir = temp_dir("encode-on-commit");
         let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)]));
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, Arc::clone(&schema)).unwrap();
 
         let names: Vec<&str> = vec!["x"; 20]; // single distinct value, well under threshold
         let batch = RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(names))]).unwrap();
         let mut txn = ds.begin();
-        txn.insert(batch);
+        txn.insert(batch).unwrap();
         txn.commit().unwrap();
 
         // Read the raw written file back directly (bypassing Dataset::scan's
@@ -3173,7 +3645,7 @@ mod tests {
 
         let dir = temp_dir("explain-skip");
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, test_schema()).unwrap();
 
         // Two commits, disjoint id ranges -> two files with non-overlapping stats.
         let low = RecordBatch::try_new(
@@ -3182,7 +3654,7 @@ mod tests {
         )
         .unwrap();
         let mut txn = ds.begin();
-        txn.insert(low);
+        txn.insert(low).unwrap();
         txn.commit().unwrap();
 
         let high = RecordBatch::try_new(
@@ -3191,7 +3663,7 @@ mod tests {
         )
         .unwrap();
         let mut txn = ds.begin();
-        txn.insert(high);
+        txn.insert(high).unwrap();
         txn.commit().unwrap();
 
         let predicate = Predicate::Eq("id".to_string(), Value::Int64(2));
@@ -3227,7 +3699,7 @@ mod tests {
     fn row_ids_are_assigned_sequentially_and_monotonically_across_commits() {
         let dir = temp_dir("row-id-sequential");
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, test_schema()).unwrap();
 
         let first = RecordBatch::try_new(
             schema.clone(),
@@ -3235,13 +3707,13 @@ mod tests {
         )
         .unwrap();
         let mut txn = ds.begin();
-        txn.insert(first);
+        txn.insert(first).unwrap();
         txn.commit().unwrap();
 
         let second =
             RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![40, 50]))]).unwrap();
         let mut txn = ds.begin();
-        txn.insert(second);
+        txn.insert(second).unwrap();
         txn.commit().unwrap();
 
         let data_dir = ds.data_dir();
@@ -3268,13 +3740,13 @@ mod tests {
     fn row_id_column_never_leaks_into_scan_output() {
         let dir = temp_dir("row-id-hidden");
         let schema = test_schema(); // just "id", no _row_id
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, test_schema()).unwrap();
 
         let batch =
             RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1, 2]))])
                 .unwrap();
         let mut txn = ds.begin();
-        txn.insert(batch);
+        txn.insert(batch).unwrap();
         txn.commit().unwrap();
 
         let scanned = ds.snapshot().scan(&schema).unwrap();
@@ -3291,12 +3763,13 @@ mod tests {
     #[test]
     fn cast_batch_to_schema_reattaches_neither_hidden_column_by_default() {
         let dir = temp_dir("cast-hidden-neither");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, test_schema()).unwrap();
         let mut txn = ds.begin();
         txn.insert(
             RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![1, 2]))])
                 .unwrap(),
-        );
+        )
+        .unwrap();
         txn.commit().unwrap();
 
         let batch = ds.snapshot().scan(&test_schema()).unwrap();
@@ -3312,12 +3785,13 @@ mod tests {
     #[test]
     fn cast_batch_to_schema_reattaches_row_id_only() {
         let dir = temp_dir("cast-hidden-row-id-only");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, test_schema()).unwrap();
         let mut txn = ds.begin();
         txn.insert(
             RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![1, 2]))])
                 .unwrap(),
-        );
+        )
+        .unwrap();
         txn.commit().unwrap();
 
         let schema = Arc::new(Schema::new(vec![
@@ -3339,12 +3813,13 @@ mod tests {
     #[test]
     fn cast_batch_to_schema_reattaches_timestamp_only() {
         let dir = temp_dir("cast-hidden-timestamp-only");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, test_schema()).unwrap();
         let mut txn = ds.begin();
         txn.insert(
             RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![1, 2]))])
                 .unwrap(),
-        );
+        )
+        .unwrap();
         txn.commit().unwrap();
 
         let schema = Arc::new(Schema::new(vec![
@@ -3372,12 +3847,13 @@ mod tests {
     #[test]
     fn cast_batch_to_schema_reattaches_both_hidden_columns() {
         let dir = temp_dir("cast-hidden-both");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, test_schema()).unwrap();
         let mut txn = ds.begin();
         txn.insert(
             RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![1, 2]))])
                 .unwrap(),
-        );
+        )
+        .unwrap();
         txn.commit().unwrap();
 
         let schema = Arc::new(Schema::new(vec![
@@ -3410,7 +3886,7 @@ mod tests {
 
         let dir = temp_dir("scan-with-predicate");
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, test_schema()).unwrap();
 
         let low = RecordBatch::try_new(
             schema.clone(),
@@ -3418,7 +3894,7 @@ mod tests {
         )
         .unwrap();
         let mut txn = ds.begin();
-        txn.insert(low);
+        txn.insert(low).unwrap();
         txn.commit().unwrap();
 
         let high = RecordBatch::try_new(
@@ -3427,7 +3903,7 @@ mod tests {
         )
         .unwrap();
         let mut txn = ds.begin();
-        txn.insert(high);
+        txn.insert(high).unwrap();
         txn.commit().unwrap();
 
         let predicate = Predicate::Eq("id".to_string(), Value::Int64(2));
@@ -3472,14 +3948,14 @@ mod tests {
     #[test]
     fn vector_search_without_predicate_finds_the_true_nearest_neighbor() {
         let dir = temp_dir("vector-search-unfiltered");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, vector_test_schema()).unwrap();
 
         let batch = vector_batch(
             vec![1, 2, 3],
             vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [10.0, 10.0, 10.0]],
         );
         let mut txn = ds.begin();
-        txn.insert(batch);
+        txn.insert(batch).unwrap();
         txn.commit().unwrap();
 
         let results = ds
@@ -3538,13 +4014,13 @@ mod tests {
         const N: i64 = 301;
 
         let dir = temp_dir("large-commit-parallel-insert");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, test_schema()).unwrap();
 
         let ids: Vec<i64> = (0..N).collect();
         let vectors: Vec<[f32; 3]> = (0..N).map(|i| [i as f32 * 1000.0, 0.0, 0.0]).collect();
 
         let mut txn = ds.begin();
-        txn.insert(vector_batch(ids, vectors));
+        txn.insert(vector_batch(ids, vectors)).unwrap();
         txn.commit().unwrap();
 
         assert_eq!(
@@ -3632,14 +4108,14 @@ mod tests {
         // can make a query miss its own exact match even at generous
         // production parameters.
         let dir = temp_dir("large-single-commit");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, vector_test_schema()).unwrap();
 
         let ids: Vec<i64> = (0..N).collect();
         let vectors: Vec<[f32; 3]> = (0..CLUSTERS)
             .flat_map(|c| cluster_vectors(PER_CLUSTER, [c as f32 * 2000.0, 0.0, 0.0], 0.5))
             .collect();
         let mut txn = ds.begin();
-        txn.insert(vector_batch(ids, vectors.clone()));
+        txn.insert(vector_batch(ids, vectors.clone())).unwrap();
         txn.commit().unwrap();
 
         let snapshot = ds.snapshot();
@@ -3679,7 +4155,7 @@ mod tests {
         use strata_storage::Value;
 
         let dir = temp_dir("vector-search-filtered");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, vector_test_schema()).unwrap();
 
         // Two well-separated 15-point clusters, mirroring
         // crates/index/src/hnsw.rs's own flaky-test fix (commit 733579f):
@@ -3698,7 +4174,7 @@ mod tests {
         vectors.extend(far_cluster);
         let batch = vector_batch(ids, vectors);
         let mut txn = ds.begin();
-        txn.insert(batch);
+        txn.insert(batch).unwrap();
         txn.commit().unwrap();
 
         // Sanity check: without the predicate, the true nearest neighbors
@@ -3734,8 +4210,6 @@ mod tests {
         use strata_storage::Value;
 
         let dir = temp_dir("vector-search-filtered-compound");
-        let ds = Dataset::create(&dir).unwrap();
-
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("category", DataType::Utf8, false),
@@ -3745,6 +4219,7 @@ mod tests {
                 false,
             ),
         ]));
+        let ds = Dataset::create(&dir, Arc::clone(&schema)).unwrap();
 
         // Three 10-point clusters at increasing distance from the query
         // point (the origin): near (id=1, category="a", irrelevant noise),
@@ -3783,7 +4258,7 @@ mod tests {
         let batch = RecordBatch::try_new(schema, vec![id_arr, cat_arr, vec_arr]).unwrap();
 
         let mut txn = ds.begin();
-        txn.insert(batch);
+        txn.insert(batch).unwrap();
         txn.commit().unwrap();
 
         let snapshot = ds.snapshot();
@@ -3847,7 +4322,7 @@ mod tests {
         use strata_storage::Value;
 
         let dir = temp_dir("vector-search-two-predicates-one-snapshot");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, vector_test_schema()).unwrap();
 
         let near_cluster = cluster_vectors(15, [0.0, 0.0, 0.0], 0.01);
         let far_cluster = cluster_vectors(15, [1000.0, 0.0, 0.0], 0.01);
@@ -3857,7 +4332,7 @@ mod tests {
         vectors.extend(far_cluster);
         let batch = vector_batch(ids, vectors);
         let mut txn = ds.begin();
-        txn.insert(batch);
+        txn.insert(batch).unwrap();
         txn.commit().unwrap();
 
         let snapshot = ds.snapshot();
@@ -3940,7 +4415,7 @@ mod tests {
     #[test]
     fn single_batch_commit_populates_the_segments_zone_map() {
         let dir = temp_dir("zone-map-single-batch");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, zone_map_test_schema()).unwrap();
 
         let batch = zone_map_batch(
             vec![30, 10, 20],
@@ -3948,7 +4423,7 @@ mod tests {
             cluster_vectors(3, [0.0, 0.0, 0.0], 0.01),
         );
         let mut txn = ds.begin();
-        txn.insert(batch);
+        txn.insert(batch).unwrap();
         txn.commit().unwrap();
 
         let snapshot = ds.snapshot();
@@ -3985,7 +4460,7 @@ mod tests {
     #[test]
     fn multi_batch_commit_merges_zone_map_across_every_batch_not_just_the_first() {
         let dir = temp_dir("zone-map-multi-batch-merge");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, zone_map_test_schema()).unwrap();
 
         let mut txn = ds.begin();
         // First batch: mid-range values (45..=60). Neither the true global
@@ -3996,19 +4471,22 @@ mod tests {
             vec![50, 60],
             vec!["m1", "m2"],
             cluster_vectors(2, [0.0, 0.0, 0.0], 0.01),
-        ));
+        ))
+        .unwrap();
         // Second batch: carries the true global min (10).
         txn.insert(zone_map_batch(
             vec![10, 55],
             vec!["m3", "m4"],
             cluster_vectors(2, [100.0, 100.0, 100.0], 0.01),
-        ));
+        ))
+        .unwrap();
         // Third batch: carries the true global max (90).
         txn.insert(zone_map_batch(
             vec![90, 45],
             vec!["m5", "m6"],
             cluster_vectors(2, [200.0, 200.0, 200.0], 0.01),
-        ));
+        ))
+        .unwrap();
         txn.commit().unwrap();
 
         let snapshot = ds.snapshot();
@@ -4038,8 +4516,6 @@ mod tests {
         // nothing to the merged range — the correct fail-safe direction),
         // but that reasoning should be encoded as a test, not left implicit.
         let dir = temp_dir("zone-map-multi-batch-float64-merge");
-        let ds = Dataset::create(&dir).unwrap();
-
         let schema = Arc::new(Schema::new(vec![
             Field::new("score", DataType::Float64, false),
             Field::new(
@@ -4048,6 +4524,7 @@ mod tests {
                 false,
             ),
         ]));
+        let ds = Dataset::create(&dir, Arc::clone(&schema)).unwrap();
         let make_batch = |scores: Vec<f64>, vectors: Vec<[f32; 3]>| -> RecordBatch {
             let score_arr = Arc::new(arrow::array::Float64Array::from(scores));
             let item_field = Arc::new(Field::new("item", DataType::Float32, false));
@@ -4066,17 +4543,20 @@ mod tests {
         txn.insert(make_batch(
             vec![50.5, 60.5],
             cluster_vectors(2, [0.0, 0.0, 0.0], 0.01),
-        ));
+        ))
+        .unwrap();
         // Second batch: carries the true global min (10.25).
         txn.insert(make_batch(
             vec![10.25, 55.0],
             cluster_vectors(2, [100.0, 100.0, 100.0], 0.01),
-        ));
+        ))
+        .unwrap();
         // Third batch: carries the true global max (90.75).
         txn.insert(make_batch(
             vec![90.75, 45.0],
             cluster_vectors(2, [200.0, 200.0, 200.0], 0.01),
-        ));
+        ))
+        .unwrap();
         txn.commit().unwrap();
 
         let snapshot = ds.snapshot();
@@ -4099,22 +4579,20 @@ mod tests {
     }
 
     #[test]
-    fn column_absent_from_one_batch_is_dropped_from_the_merged_zone_map() {
+    fn insert_rejects_a_batch_missing_an_owned_column() {
         let dir = temp_dir("zone-map-column-absent-in-one-batch");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, zone_map_test_schema()).unwrap();
 
         let mut txn = ds.begin();
         txn.insert(zone_map_batch(
             vec![1, 2],
             vec!["a", "b"],
             cluster_vectors(2, [0.0, 0.0, 0.0], 0.01),
-        ));
+        ))
+        .unwrap();
 
-        // Second batch's schema has no "category" column at all - a batch
-        // is free to carry a different schema than an earlier one in the
-        // same transaction (`Transaction::insert` enforces no cross-batch
-        // schema consistency; that's only checked later, at read time, by
-        // `cast_batch_to_schema`).
+        // The dataset owns its schema. A batch that omits one owned column
+        // must be rejected before it can allocate a row ID or write a file.
         let schema_without_category = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new(
@@ -4123,38 +4601,39 @@ mod tests {
                 false,
             ),
         ]));
-        let vectors = cluster_vectors(2, [100.0, 100.0, 100.0], 0.01);
-        let flat: Vec<f32> = vectors.iter().flatten().copied().collect();
-        let id_arr = Arc::new(Int64Array::from(vec![3, 4]));
+        let id_arr = Arc::new(Int64Array::from(Vec::<i64>::new()));
         let item_field = Arc::new(Field::new("item", DataType::Float32, false));
-        let values = Arc::new(arrow::array::Float32Array::from(flat));
+        let values = Arc::new(arrow::array::Float32Array::from(Vec::<f32>::new()));
         let vec_arr = Arc::new(arrow::array::FixedSizeListArray::new(
             item_field, 3, values, None,
         ));
         let batch_without_category =
             RecordBatch::try_new(schema_without_category, vec![id_arr, vec_arr]).unwrap();
-        txn.insert(batch_without_category);
-        txn.commit().unwrap();
-
-        let snapshot = ds.snapshot();
-        let zone_map = &snapshot.manifest.segments[0].zone_map;
-        assert!(
-            !zone_map.contains_key("category"),
-            "a column missing from one batch must be absent from the merged zone map \
-             entirely, not partially represented: {zone_map:?}"
-        );
-        assert!(
-            zone_map.contains_key("id"),
-            "a column present in every batch must still survive the merge: {zone_map:?}"
+        assert!(matches!(
+            txn.insert(batch_without_category),
+            Err(TxnError::BatchSchemaMismatch { .. })
+        ));
+        assert_eq!(
+            txn.pending.len(),
+            1,
+            "the rejected batch must not be buffered"
         );
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn column_with_mismatched_type_across_batches_is_dropped_from_the_merged_zone_map() {
+    fn insert_rejects_a_batch_with_a_mismatched_owned_column_type() {
         let dir = temp_dir("zone-map-type-mismatch-across-batches");
-        let ds = Dataset::create(&dir).unwrap();
+        let schema_int_code = Arc::new(Schema::new(vec![
+            Field::new("code", DataType::Int64, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 3),
+                false,
+            ),
+        ]));
+        let ds = Dataset::create(&dir, Arc::clone(&schema_int_code)).unwrap();
 
         let item_field = Arc::new(Field::new("item", DataType::Float32, false));
         let vector_field = || {
@@ -4168,10 +4647,6 @@ mod tests {
         let mut txn = ds.begin();
 
         // First batch: "code" is Int64.
-        let schema_int_code = Arc::new(Schema::new(vec![
-            Field::new("code", DataType::Int64, false),
-            vector_field(),
-        ]));
         let vectors_a = cluster_vectors(2, [0.0, 0.0, 0.0], 0.01);
         let flat_a: Vec<f32> = vectors_a.iter().flatten().copied().collect();
         let code_arr_a = Arc::new(Int64Array::from(vec![1, 2]));
@@ -4183,13 +4658,9 @@ mod tests {
             None,
         ));
         let batch_a = RecordBatch::try_new(schema_int_code, vec![code_arr_a, vec_arr_a]).unwrap();
-        txn.insert(batch_a);
+        txn.insert(batch_a).unwrap();
 
-        // Second batch: same column name "code", genuinely a different
-        // type (Utf8) this time - realistically constructible because
-        // `Transaction::insert`/the commit path enforce no dataset-wide
-        // fixed schema across a commit's own batches (only within a single
-        // batch), each batch is encoded to its own independent data file.
+        // Same owned column name, but a different logical type.
         let schema_utf8_code = Arc::new(Schema::new(vec![
             Field::new("code", DataType::Utf8, false),
             vector_field(),
@@ -4202,16 +4673,14 @@ mod tests {
             item_field, 3, values_b, None,
         ));
         let batch_b = RecordBatch::try_new(schema_utf8_code, vec![code_arr_b, vec_arr_b]).unwrap();
-        txn.insert(batch_b);
-
-        txn.commit().unwrap();
-
-        let snapshot = ds.snapshot();
-        let zone_map = &snapshot.manifest.segments[0].zone_map;
-        assert!(
-            !zone_map.contains_key("code"),
-            "a column whose Value variant disagrees across batches must be dropped from the \
-             merged zone map entirely, never partially or wrongly represented: {zone_map:?}"
+        assert!(matches!(
+            txn.insert(batch_b),
+            Err(TxnError::BatchSchemaMismatch { .. })
+        ));
+        assert_eq!(
+            txn.pending.len(),
+            1,
+            "the rejected batch must not be buffered"
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -4220,7 +4689,7 @@ mod tests {
     #[test]
     fn segment_zone_map_survives_dataset_reopen() {
         let dir = temp_dir("zone-map-reopen-roundtrip");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, zone_map_test_schema()).unwrap();
 
         let batch = zone_map_batch(
             vec![30, 10, 20],
@@ -4228,7 +4697,7 @@ mod tests {
             cluster_vectors(3, [0.0, 0.0, 0.0], 0.01),
         );
         let mut txn = ds.begin();
-        txn.insert(batch);
+        txn.insert(batch).unwrap();
         txn.commit().unwrap();
 
         let zone_map_before = ds.snapshot().manifest.segments[0].zone_map.clone();
@@ -4253,7 +4722,7 @@ mod tests {
     #[test]
     fn timestamps_and_the_high_water_mark_survive_reopen() {
         let dir = temp_dir("timestamp-survives-reopen");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, test_schema()).unwrap();
 
         let mut txn = ds.begin();
         txn.insert(
@@ -4262,7 +4731,8 @@ mod tests {
                 vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
             )
             .unwrap(),
-        );
+        )
+        .unwrap();
         txn.commit().unwrap();
 
         let high_water_before_close = ds.snapshot().manifest.commit_time_high_water;
@@ -4321,7 +4791,8 @@ mod tests {
         let mut txn = reopened.begin();
         txn.insert(
             RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![4]))]).unwrap(),
-        );
+        )
+        .unwrap();
         txn.commit().unwrap();
         // Smoke check only - this assertion holds regardless of whether the
         // restart floor was seeded correctly, since a fresh post-reopen
@@ -4348,8 +4819,6 @@ mod tests {
         use strata_storage::Value;
 
         let dir = temp_dir("timestamp-compound-vector-search");
-        let ds = Dataset::create(&dir).unwrap();
-
         let schema = Arc::new(Schema::new(vec![
             Field::new("category", DataType::Utf8, false),
             Field::new(
@@ -4358,6 +4827,7 @@ mod tests {
                 false,
             ),
         ]));
+        let ds = Dataset::create(&dir, Arc::clone(&schema)).unwrap();
 
         // Three commits, three clusters at increasing distance from the
         // query point (the origin): near (id 0..10, category "a", commit 1
@@ -4398,7 +4868,8 @@ mod tests {
                 ],
             )
             .unwrap(),
-        );
+        )
+        .unwrap();
         txn.commit().unwrap();
 
         let mut txn = ds.begin();
@@ -4418,7 +4889,8 @@ mod tests {
                 ],
             )
             .unwrap(),
-        );
+        )
+        .unwrap();
         txn.commit().unwrap();
         let ts_after_commit_2 = ds.snapshot().manifest.commit_time_high_water;
 
@@ -4439,7 +4911,8 @@ mod tests {
                 ],
             )
             .unwrap(),
-        );
+        )
+        .unwrap();
         txn.commit().unwrap();
 
         let snapshot = ds.snapshot();
@@ -4528,11 +5001,12 @@ mod tests {
         use strata_storage::Value;
 
         let dir = temp_dir("timestamp-restart-floor-seeding");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, test_schema()).unwrap();
         let mut txn = ds.begin();
         txn.insert(
             RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![1]))]).unwrap(),
-        );
+        )
+        .unwrap();
         txn.commit().unwrap();
         drop(ds);
 
@@ -4558,7 +5032,8 @@ mod tests {
         let mut txn = reopened.begin();
         txn.insert(
             RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![2]))]).unwrap(),
-        );
+        )
+        .unwrap();
         txn.commit().unwrap();
 
         let schema = Arc::new(Schema::new(vec![
@@ -4600,7 +5075,7 @@ mod tests {
                 false,
             ),
         ]));
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, Arc::clone(&schema)).unwrap();
 
         let ids = Arc::new(Int64Array::from(vec![1, 2]));
         let item_field = Arc::new(Field::new("item", DataType::Float32, false));
@@ -4614,7 +5089,7 @@ mod tests {
         let batch = RecordBatch::try_new(schema, vec![ids, vectors]).unwrap();
 
         let mut txn = ds.begin();
-        txn.insert(batch);
+        txn.insert(batch).unwrap();
         txn.commit().unwrap();
         drop(ds);
 
@@ -4656,30 +5131,36 @@ mod tests {
         // is in play. This is the direct regression test for "post-reopen
         // results match pre-reopen results" across multiple segments.
         let dir = temp_dir("multi-segment-reopen");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, vector_test_schema()).unwrap();
 
         // Three well-separated commits, each its own segment (one
         // vector-carrying commit -> one segment, per
         // `build_and_write_segment`'s doc comment).
         let mut txn_a = ds.begin();
-        txn_a.insert(vector_batch(
-            vec![1i64, 2i64, 3i64],
-            cluster_vectors(3, [0.0, 0.0, 0.0], 0.01),
-        ));
+        txn_a
+            .insert(vector_batch(
+                vec![1i64, 2i64, 3i64],
+                cluster_vectors(3, [0.0, 0.0, 0.0], 0.01),
+            ))
+            .unwrap();
         txn_a.commit().unwrap();
 
         let mut txn_b = ds.begin();
-        txn_b.insert(vector_batch(
-            vec![4i64, 5i64, 6i64],
-            cluster_vectors(3, [500.0, 500.0, 500.0], 0.01),
-        ));
+        txn_b
+            .insert(vector_batch(
+                vec![4i64, 5i64, 6i64],
+                cluster_vectors(3, [500.0, 500.0, 500.0], 0.01),
+            ))
+            .unwrap();
         txn_b.commit().unwrap();
 
         let mut txn_c = ds.begin();
-        txn_c.insert(vector_batch(
-            vec![7i64, 8i64, 9i64],
-            cluster_vectors(3, [900.0, 900.0, 900.0], 0.01),
-        ));
+        txn_c
+            .insert(vector_batch(
+                vec![7i64, 8i64, 9i64],
+                cluster_vectors(3, [900.0, 900.0, 900.0], 0.01),
+            ))
+            .unwrap();
         txn_c.commit().unwrap();
 
         assert_eq!(ds.snapshot().manifest.segments.len(), 3);
@@ -4768,7 +5249,7 @@ mod tests {
         // threshold. See the accompanying report for the computed
         // neighbor list.
         let dir = temp_dir("recall-parity-overlapping-segments");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, vector_test_schema()).unwrap();
 
         let count = 20usize;
         let spacing = 60.0f32;
@@ -4791,7 +5272,7 @@ mod tests {
             let ids: Vec<i64> = (base..base + i64::try_from(count).unwrap()).collect();
 
             let mut txn = ds.begin();
-            txn.insert(vector_batch(ids, vectors.clone()));
+            txn.insert(vector_batch(ids, vectors.clone())).unwrap();
             txn.commit().unwrap();
 
             let range_start = u64::try_from(all_points.len()).unwrap();
@@ -4903,13 +5384,14 @@ mod tests {
         // path, since `load_segments`'s `byte_len` cross-check runs *before*
         // `SegmentReader::from_bytes` ever sees the bytes.
         let dir = temp_dir("truncated-segment-on-reopen");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, vector_test_schema()).unwrap();
 
         let mut txn = ds.begin();
         txn.insert(vector_batch(
             vec![1i64, 2i64],
             cluster_vectors(2, [0.0, 0.0, 0.0], 0.01),
-        ));
+        ))
+        .unwrap();
         txn.commit().unwrap();
 
         let segment_name = ds.snapshot().manifest.segments[0].name.clone();
@@ -4943,11 +5425,11 @@ mod tests {
         // file for the offending batch is written to disk, leaving no
         // trace: no manifest advance, no orphaned-but-referenced files.
         let dir = temp_dir("non-finite-vector-rejected");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, vector_test_schema()).unwrap();
 
         let batch = vector_batch(vec![1, 2], vec![[0.0, 0.0, 0.0], [f32::NAN, 1.0, 1.0]]);
         let mut txn = ds.begin();
-        txn.insert(batch);
+        txn.insert(batch).unwrap();
         let result = txn.commit();
 
         match result {
@@ -4977,7 +5459,7 @@ mod tests {
     fn row_ids_stay_disjoint_across_multiple_pending_batches_in_one_transaction() {
         let dir = temp_dir("row-id-multi-batch-txn");
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, test_schema()).unwrap();
 
         let first = RecordBatch::try_new(
             schema.clone(),
@@ -4989,8 +5471,8 @@ mod tests {
                 .unwrap();
 
         let mut txn = ds.begin();
-        txn.insert(first);
-        txn.insert(second);
+        txn.insert(first).unwrap();
+        txn.insert(second).unwrap();
         txn.commit().unwrap();
 
         let data_dir = ds.data_dir();
@@ -5016,7 +5498,7 @@ mod tests {
     #[test]
     fn scan_errors_instead_of_traversing_outside_data_dir_on_an_unsafe_manifest_entry() {
         let dir = temp_dir("path-traversal");
-        Dataset::create(&dir).unwrap();
+        Dataset::create(&dir, test_schema()).unwrap();
 
         // Simulate a hostile manifest: hand-craft a DataFileEntry whose name
         // tries to escape data/ via a parent-directory component. No real
@@ -5025,23 +5507,19 @@ mod tests {
         // manifest, which is exactly the threat model this guards against.
         let hostile = Manifest {
             version: 1,
-            data_files: vec![DataFileEntry {
-                name: "../../etc/passwd".to_string(),
-                stats: std::collections::HashMap::new(),
-            }],
+            data_files: vec![fixture_data_file("../../etc/passwd")],
             next_row_id: 0,
             tombstones: Vec::new(),
             next_attempt_id: 0,
             commit_time_high_water: 0,
             segments: Vec::new(),
+            ..Manifest::empty()
         };
         strata_storage::commit_manifest(&dir, &hostile).unwrap();
-        let ds = Dataset::open(&dir).unwrap();
-
-        let result = ds.snapshot().scan(&test_schema());
+        let result = Dataset::open(&dir);
         assert!(
             matches!(result, Err(TxnError::UnsafeManifestPath(_))),
-            "expected UnsafeManifestPath, got {result:?}"
+            "expected UnsafeManifestPath"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -5057,7 +5535,7 @@ mod tests {
         // use — so the assertion here is on `open`'s own return value, not
         // a later `scan`.
         let dir = temp_dir("segment-path-traversal");
-        Dataset::create(&dir).unwrap();
+        Dataset::create(&dir, test_schema()).unwrap();
 
         // Simulate a hostile manifest: hand-craft a SegmentEntry whose name
         // tries to escape data/ via a parent-directory component. No real
@@ -5082,6 +5560,7 @@ mod tests {
                 byte_len: 0,
                 zone_map: std::collections::HashMap::new(),
             }],
+            ..Manifest::empty()
         };
         strata_storage::commit_manifest(&dir, &hostile).unwrap();
 
@@ -5107,19 +5586,19 @@ mod tests {
         // at different dimensions in the same manifest, so the only way to
         // exercise this branch is to fabricate one directly.
         let dir_a = temp_dir("cross-segment-dimension-a");
-        let ds_a = Dataset::create(&dir_a).unwrap();
+        let ds_a = Dataset::create(&dir_a, vector_test_schema()).unwrap();
         let mut txn = ds_a.begin();
         txn.insert(vector_batch(
             vec![1, 2],
             vec![[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]],
-        ));
+        ))
+        .unwrap();
         txn.commit().unwrap();
 
         // A second, wholly separate dataset, committed to independently,
         // whose vectors are 5-dimensional rather than A's 3 — producing a
         // real, valid, self-consistent 5-d `.seg` file and `SegmentEntry`.
         let dir_b = temp_dir("cross-segment-dimension-b");
-        let ds_b = Dataset::create(&dir_b).unwrap();
         let schema_b = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new(
@@ -5128,6 +5607,7 @@ mod tests {
                 false,
             ),
         ]));
+        let ds_b = Dataset::create(&dir_b, Arc::clone(&schema_b)).unwrap();
         let item_field = Arc::new(Field::new("item", DataType::Float32, false));
         let flat: Vec<f32> = vec![
             0.0, 0.0, 0.0, 0.0, 0.0, // row 1
@@ -5145,7 +5625,7 @@ mod tests {
         )
         .unwrap();
         let mut txn_b = ds_b.begin();
-        txn_b.insert(batch_b);
+        txn_b.insert(batch_b).unwrap();
         txn_b.commit().unwrap();
 
         let manifest_b = ds_b.snapshot().manifest.as_ref().clone();
@@ -5192,7 +5672,7 @@ mod tests {
     fn scan_errors_on_column_count_mismatch_between_physical_file_and_caller_schema() {
         let dir = temp_dir("schema-mismatch");
         let write_schema = test_schema(); // single "id" column
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, Arc::clone(&write_schema)).unwrap();
 
         let batch = RecordBatch::try_new(
             write_schema,
@@ -5200,7 +5680,7 @@ mod tests {
         )
         .unwrap();
         let mut txn = ds.begin();
-        txn.insert(batch);
+        txn.insert(batch).unwrap();
         txn.commit().unwrap();
 
         // Caller asks to scan with a schema declaring 2 columns, but the
@@ -5214,14 +5694,8 @@ mod tests {
         ]));
         let result = ds.snapshot().scan(&mismatched_schema);
         assert!(
-            matches!(
-                result,
-                Err(TxnError::SchemaMismatch {
-                    expected: 2,
-                    actual: 1
-                })
-            ),
-            "expected SchemaMismatch, got {result:?}"
+            matches!(result, Err(TxnError::BatchSchemaMismatch { .. })),
+            "expected BatchSchemaMismatch, got {result:?}"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -5237,11 +5711,11 @@ mod tests {
         // column so this also exercises row_ids_matching's file-pruning
         // branch on the vector_search path, not just explain().
         let dir = temp_dir("vector-search-file-pruning");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, vector_test_schema()).unwrap();
 
         let low = vector_batch(vec![1, 1], vec![[0.0, 0.0, 0.0], [0.01, 0.01, 0.01]]);
         let mut txn = ds.begin();
-        txn.insert(low);
+        txn.insert(low).unwrap();
         txn.commit().unwrap();
 
         let high = vector_batch(
@@ -5249,7 +5723,7 @@ mod tests {
             vec![[1000.0, 1000.0, 1000.0], [1000.01, 1000.01, 1000.01]],
         );
         let mut txn = ds.begin();
-        txn.insert(high);
+        txn.insert(high).unwrap();
         txn.commit().unwrap();
 
         // Sanity: the id=1 file's stats don't overlap id=2's, so explain()
@@ -5292,7 +5766,7 @@ mod tests {
     #[test]
     fn committing_a_transaction_with_zero_pending_batches_still_advances_the_version() {
         let dir = temp_dir("empty-commit");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, test_schema()).unwrap();
         let txn = ds.begin();
         txn.commit().unwrap();
 
@@ -5328,7 +5802,7 @@ mod tests {
         // into "we write an empty segment and nobody noticed" (amendment
         // §3c).
         let dir = temp_dir("no-vector-column-no-segment");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, test_schema()).unwrap();
 
         let batch = RecordBatch::try_new(
             test_schema(),
@@ -5336,7 +5810,7 @@ mod tests {
         )
         .unwrap();
         let mut txn = ds.begin();
-        txn.insert(batch);
+        txn.insert(batch).unwrap();
         txn.commit().unwrap();
 
         assert_eq!(
@@ -5367,7 +5841,7 @@ mod tests {
         // And a delete-only commit likewise: nothing to insert, so no
         // segment is built at all.
         let mut deleting = ds.begin();
-        deleting.delete(0);
+        deleting.delete(0).unwrap();
         deleting.commit().unwrap();
         assert!(
             ds.snapshot().manifest.segments.is_empty(),
@@ -5387,13 +5861,13 @@ mod tests {
     fn scan_errors_cleanly_when_a_manifest_listed_file_is_missing_from_disk() {
         let dir = temp_dir("scan-missing-file");
         let schema = test_schema();
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, test_schema()).unwrap();
 
         let batch =
             RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1, 2]))])
                 .unwrap();
         let mut txn = ds.begin();
-        txn.insert(batch);
+        txn.insert(batch).unwrap();
         txn.commit().unwrap();
 
         let data_dir = ds.data_dir();
@@ -5412,7 +5886,7 @@ mod tests {
         use arrow::array::StringArray;
         let dir = temp_dir("mixed-encoding-scan");
         let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)]));
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, Arc::clone(&schema)).unwrap();
 
         // First commit: high-cardinality (all-distinct) -> stays plain Utf8.
         let owned: Vec<String> = (0..20).map(|i| format!("name-{i}")).collect();
@@ -5421,7 +5895,7 @@ mod tests {
             RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(high_card))])
                 .unwrap();
         let mut txn = ds.begin();
-        txn.insert(batch1);
+        txn.insert(batch1).unwrap();
         txn.commit().unwrap();
 
         // Second commit: low-cardinality (2 distinct values over 20 rows) ->
@@ -5433,7 +5907,7 @@ mod tests {
             RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(low_card))])
                 .unwrap();
         let mut txn = ds.begin();
-        txn.insert(batch2);
+        txn.insert(batch2).unwrap();
         txn.commit().unwrap();
 
         // Confirm the two files really do have different physical
@@ -5712,15 +6186,15 @@ mod tests {
     #[test]
     fn delete_tombstones_a_row_and_it_becomes_invisible() {
         let dir = temp_dir("delete-basic");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, vector_test_schema()).unwrap();
 
         let batch = vector_batch(vec![1i64], cluster_vectors(1, [0.0, 0.0, 0.0], 0.0));
         let mut txn = ds.begin();
-        txn.insert(batch);
+        txn.insert(batch).unwrap();
         txn.commit().unwrap();
 
         let mut txn = ds.begin();
-        txn.delete(0);
+        txn.delete(0).unwrap();
         txn.commit().unwrap();
 
         assert!(!ds.snapshot().is_visible(0));
@@ -5729,29 +6203,28 @@ mod tests {
     #[test]
     fn redeleting_an_already_tombstoned_row_does_not_duplicate_it_in_the_persisted_manifest() {
         let dir = temp_dir("tombstone-dedup-cross-txn");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, vector_test_schema()).unwrap();
 
         let batch = vector_batch(vec![1i64], cluster_vectors(1, [0.0, 0.0, 0.0], 0.0));
         let mut setup = ds.begin();
-        setup.insert(batch);
+        setup.insert(batch).unwrap();
         setup.commit().unwrap();
 
         let mut txn_a = ds.begin();
-        txn_a.delete(0);
+        txn_a.delete(0).unwrap();
         txn_a.commit().unwrap();
         assert_eq!(ds.snapshot().manifest.tombstones.len(), 1);
 
-        // A second, later transaction re-deleting the same already-tombstoned
-        // row is Clean (no write-set overlap with anything that committed in
-        // between) and must not grow the persisted tombstones list, even
-        // though it's a genuinely separate commit.
+        // A later transaction cannot re-target an already tombstoned row.
         let mut txn_b = ds.begin();
-        txn_b.delete(0);
-        txn_b.commit().unwrap();
+        assert!(matches!(
+            txn_b.delete(0),
+            Err(TxnError::RowNotLive { row_id: 0 })
+        ));
         assert_eq!(
             ds.snapshot().manifest.tombstones.len(),
             1,
-            "re-deleting an already-tombstoned row in a later transaction must not duplicate it"
+            "a rejected re-delete must not change persisted tombstones"
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -5760,22 +6233,25 @@ mod tests {
     #[test]
     fn deleting_the_same_row_twice_in_one_transaction_does_not_duplicate_persisted_tombstone() {
         let dir = temp_dir("tombstone-dedup-intra-txn");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, vector_test_schema()).unwrap();
 
         let batch = vector_batch(vec![1i64], cluster_vectors(1, [0.0, 0.0, 0.0], 0.0));
         let mut setup = ds.begin();
-        setup.insert(batch);
+        setup.insert(batch).unwrap();
         setup.commit().unwrap();
 
         let mut txn = ds.begin();
-        txn.delete(0);
-        txn.delete(0); // duplicate delete() call within the same transaction
+        txn.delete(0).unwrap();
+        assert!(matches!(
+            txn.delete(0),
+            Err(TxnError::DuplicateTarget { row_id: 0 })
+        ));
         txn.commit().unwrap();
 
         assert_eq!(
             ds.snapshot().manifest.tombstones.len(),
             1,
-            "calling delete() twice on the same row within one transaction must not duplicate it"
+            "a duplicate delete must not duplicate the persisted tombstone"
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -5784,16 +6260,16 @@ mod tests {
     #[test]
     fn update_tombstones_old_row_and_makes_new_row_visible() {
         let dir = temp_dir("update-basic");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, vector_test_schema()).unwrap();
 
         let batch = vector_batch(vec![1i64], cluster_vectors(1, [0.0, 0.0, 0.0], 0.0));
         let mut txn = ds.begin();
-        txn.insert(batch);
+        txn.insert(batch).unwrap();
         txn.commit().unwrap();
 
         let replacement = vector_batch(vec![1i64], cluster_vectors(1, [5.0, 5.0, 5.0], 0.0));
         let mut txn = ds.begin();
-        txn.update(0, replacement);
+        txn.update(0, replacement).unwrap();
         txn.commit().unwrap();
 
         let snapshot = ds.snapshot();
@@ -5804,15 +6280,15 @@ mod tests {
     #[test]
     fn tombstones_persist_across_reopen() {
         let dir = temp_dir("delete-persists");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, vector_test_schema()).unwrap();
 
         let batch = vector_batch(vec![1i64], cluster_vectors(1, [0.0, 0.0, 0.0], 0.0));
         let mut txn = ds.begin();
-        txn.insert(batch);
+        txn.insert(batch).unwrap();
         txn.commit().unwrap();
 
         let mut txn = ds.begin();
-        txn.delete(0);
+        txn.delete(0).unwrap();
         txn.commit().unwrap();
         drop(ds);
 
@@ -5823,16 +6299,16 @@ mod tests {
     #[test]
     fn concurrent_delete_of_the_same_row_conflicts() {
         let dir = temp_dir("commit-lock-conflict");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, vector_test_schema()).unwrap();
         let batch = vector_batch(vec![1i64], cluster_vectors(1, [0.0, 0.0, 0.0], 0.0));
         let mut setup = ds.begin();
-        setup.insert(batch);
+        setup.insert(batch).unwrap();
         setup.commit().unwrap();
 
         let mut txn_a = ds.begin();
-        txn_a.delete(0);
+        txn_a.delete(0).unwrap();
         let mut txn_b = ds.begin();
-        txn_b.delete(0);
+        txn_b.delete(0).unwrap();
 
         txn_a.commit().unwrap();
         let result = txn_b.commit();
@@ -5849,16 +6325,16 @@ mod tests {
     #[test]
     fn concurrent_delete_of_disjoint_rows_both_commit() {
         let dir = temp_dir("commit-lock-no-conflict");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, vector_test_schema()).unwrap();
         let batch = vector_batch(vec![1i64, 2i64], cluster_vectors(2, [0.0, 0.0, 0.0], 0.01));
         let mut setup = ds.begin();
-        setup.insert(batch);
+        setup.insert(batch).unwrap();
         setup.commit().unwrap();
 
         let mut txn_a = ds.begin();
-        txn_a.delete(0);
+        txn_a.delete(0).unwrap();
         let mut txn_b = ds.begin();
-        txn_b.delete(1);
+        txn_b.delete(1).unwrap();
 
         txn_a.commit().unwrap();
         txn_b.commit().unwrap();
@@ -5877,17 +6353,17 @@ mod tests {
         // against version 0; txn_a commits (version 1); txn_b's disjoint
         // write must land at version 2, not also attempt version 1.
         let dir = temp_dir("commit-version-source");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, vector_test_schema()).unwrap();
         let batch = vector_batch(vec![1i64, 2i64], cluster_vectors(2, [0.0, 0.0, 0.0], 0.01));
         let mut setup = ds.begin();
-        setup.insert(batch);
+        setup.insert(batch).unwrap();
         setup.commit().unwrap();
         assert_eq!(ds.current_version(), 1);
 
         let mut txn_a = ds.begin();
-        txn_a.delete(0);
+        txn_a.delete(0).unwrap();
         let mut txn_b = ds.begin();
-        txn_b.delete(1);
+        txn_b.delete(1).unwrap();
 
         txn_a.commit().unwrap();
         assert_eq!(ds.current_version(), 2);
@@ -5907,19 +6383,23 @@ mod tests {
         // lost update the conflict check can't catch, because there is no
         // write-write overlap to detect).
         let dir = temp_dir("concurrent-insert-data-files");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, test_schema()).unwrap();
         let schema = test_schema();
 
         let mut txn_a = ds.begin();
-        txn_a.insert(
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1]))])
-                .unwrap(),
-        );
+        txn_a
+            .insert(
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1]))])
+                    .unwrap(),
+            )
+            .unwrap();
         let mut txn_b = ds.begin();
-        txn_b.insert(
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![2]))])
-                .unwrap(),
-        );
+        txn_b
+            .insert(
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![2]))])
+                    .unwrap(),
+            )
+            .unwrap();
 
         txn_a.commit().unwrap();
         txn_b.commit().unwrap();
@@ -5942,7 +6422,7 @@ mod tests {
             Field::new("id", DataType::Int64, false),
             Field::new("name", DataType::Utf8, false),
         ]));
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, Arc::clone(&schema)).unwrap();
 
         let batch = RecordBatch::try_new(
             schema,
@@ -5955,7 +6435,7 @@ mod tests {
         )
         .unwrap();
         let mut txn = ds.begin();
-        txn.insert(batch);
+        txn.insert(batch).unwrap();
         txn.commit().unwrap();
 
         let entry = &ds.data_files()[0];
@@ -5979,7 +6459,7 @@ mod tests {
     #[test]
     fn explain_on_a_dataset_with_no_data_files_reports_zero_scanned_and_skipped() {
         let dir = temp_dir("explain-empty-dataset");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, test_schema()).unwrap();
 
         let predicate =
             strata_query::Predicate::Eq("id".to_string(), strata_storage::Value::Int64(1));
@@ -5995,7 +6475,7 @@ mod tests {
     fn scan_with_predicate_on_a_dataset_with_no_data_files_returns_an_empty_batch() {
         let dir = temp_dir("scan-with-predicate-empty-dataset");
         let schema = test_schema();
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, test_schema()).unwrap();
 
         let predicate =
             strata_query::Predicate::Eq("id".to_string(), strata_storage::Value::Int64(1));
@@ -6012,12 +6492,12 @@ mod tests {
     fn explain_reports_every_file_skipped_when_the_predicate_matches_none() {
         let dir = temp_dir("explain-all-pruned");
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, test_schema()).unwrap();
 
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))]).unwrap();
         let mut txn = ds.begin();
-        txn.insert(batch);
+        txn.insert(batch).unwrap();
         txn.commit().unwrap();
 
         let predicate =
@@ -6038,7 +6518,7 @@ mod tests {
             .tempdir()
             .unwrap()
             .keep();
-        Dataset::create(&dir).unwrap();
+        Dataset::create(&dir, crate::mvp_fixtures::mvp_schema()).unwrap();
         let dataset = Dataset::open(&dir).unwrap();
 
         // Commit 3 separate single-row batches first, establishing history.
@@ -6047,7 +6527,8 @@ mod tests {
         // internal system row-id the commit path assigns automatically.
         for i in 0..3i64 {
             let mut txn = dataset.begin();
-            txn.insert(crate::mvp_fixtures::mvp_row(i, "row", [i as f32, 0.0, 0.0]).unwrap());
+            txn.insert(crate::mvp_fixtures::mvp_row(i, "row", [i as f32, 0.0, 0.0]).unwrap())
+                .unwrap();
             txn.commit().unwrap();
         }
 
@@ -6061,7 +6542,8 @@ mod tests {
         // reprocessed old entries into a wrong count — that's the actual
         // discriminating power this assertion has.
         let mut txn = dataset.begin();
-        txn.insert(crate::mvp_fixtures::mvp_row(3, "row", [3.0, 0.0, 0.0]).unwrap());
+        txn.insert(crate::mvp_fixtures::mvp_row(3, "row", [3.0, 0.0, 0.0]).unwrap())
+            .unwrap();
         txn.commit().unwrap();
 
         let snapshot = dataset.snapshot();
@@ -6078,39 +6560,16 @@ mod tests {
     }
 
     #[test]
-    fn commit_rejects_inconsistent_batch_dimensions_without_publishing_any_segment() {
-        // Regression test for the hazard the Phase 5 final whole-branch
-        // review flagged: Transaction::commit applies Insert deltas to the
-        // shared, ever-growing Arc<HnswIndex> in pending-batch order, so a
-        // later pending batch's dimension mismatch was only ever caught
-        // after an earlier batch's deltas had already mutated the shared
-        // graph -- even though commit() returns Err and the manifest never
-        // advances. See validate_vector_dimensions's doc comment.
+    fn insert_rejects_non_owned_vector_dimensions_before_publication() {
         let dir = temp_dir("inconsistent-batch-dimensions");
-        let ds = Dataset::create(&dir).unwrap();
+        let schema = crate::mvp_fixtures::mvp_schema();
+        let ds = Dataset::create(&dir, Arc::clone(&schema)).unwrap();
 
-        // Establish a real baseline: one successful 3-d commit, via the
-        // existing mvp_fixtures shape (FixedSizeList<Float32, 3>).
-        let mut seed_txn = ds.begin();
-        seed_txn.insert(crate::mvp_fixtures::mvp_row(0, "seed", [0.0, 0.0, 0.0]).unwrap());
-        seed_txn.commit().unwrap();
-
+        let mut seed = ds.begin();
+        seed.insert(crate::mvp_fixtures::mvp_row(0, "seed", [0.0, 0.0, 0.0]).unwrap())
+            .unwrap();
+        seed.commit().unwrap();
         let snapshot_before = ds.snapshot();
-        let version_before = snapshot_before.version;
-        let established_before = snapshot_before.index.established_dimension();
-        let segments_before = snapshot_before.manifest.segments.len();
-        assert_eq!(
-            established_before, 3,
-            "the seed commit must have established dimension 3"
-        );
-
-        // Build a second, valid 3-d batch (via mvp_fixtures) and an
-        // inconsistent 5-d batch (hand-built, since mvp_fixtures is fixed
-        // at 3 dimensions) -- the exact scenario the review flagged: Insert
-        // deltas apply to the graph in pending-batch order, so without
-        // pre-validation the 3-d batch's insert (row-id 1) would succeed
-        // before the 5-d batch's insert (row-id 2) fails.
-        let batch_3d = crate::mvp_fixtures::mvp_row(1, "still-3d", [1.0, 0.0, 0.0]).unwrap();
 
         let schema_5d = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
@@ -6137,117 +6596,24 @@ mod tests {
         .unwrap();
 
         let mut txn = ds.begin();
-        txn.insert(batch_3d);
-        txn.insert(batch_5d);
-        let result = txn.commit();
-
-        assert!(
-            result.is_err(),
-            "a transaction whose pending batches have inconsistent vector dimensions \
-             must fail at commit()"
-        );
-
-        // Sanity checks on the durable/externally-visible side of the
-        // invariant: version never advances, and established_dimension is
-        // unchanged. NEITHER of these two assertions alone actually
-        // distinguishes fixed-from-buggy in this specific scenario --
-        // established_dimension() is already 3 both before and after,
-        // with or without the fix, because the seed commit already set it
-        // to 3 and the first (still-3-d) pending batch's vector matches
-        // that already-established value either way, so it never changes
-        // what established_dimension() reads even when wrongly applied.
-        // Kept here only as baseline sanity checks, not as the regression
-        // assertion -- see below for the one that actually discriminates.
-        let snapshot_after = ds.snapshot();
+        assert!(matches!(
+            txn.insert(batch_5d),
+            Err(TxnError::BatchSchemaMismatch { .. })
+        ));
+        assert_eq!(txn.pending.len(), 0);
+        assert_eq!(ds.snapshot().version, snapshot_before.version);
         assert_eq!(
-            snapshot_after.version, version_before,
-            "a rejected commit must not advance the visible version at all"
-        );
-        assert_eq!(
-            snapshot_after.index.established_dimension(),
-            established_before,
-            "sanity check only -- see the row-id-1-leak assertion below for the actual \
-             regression this test exists to catch"
-        );
-
-        // The assertion that actually discriminates fixed-from-buggy. Before
-        // W3.2a this checked that row-id 1 (the mismatched transaction's
-        // first, individually-valid 3-d batch) had not been inserted into a
-        // *shared* graph. There is no shared graph now, so the equivalent
-        // property is that the rejected commit published no segment at all:
-        // the manifest's segment list is unchanged, and so is the snapshot's
-        // in-memory view of it. A half-built segment reaching the manifest
-        // would show up here as a segment count of 2.
-        assert_eq!(
-            snapshot_after.manifest.segments.len(),
-            segments_before,
-            "a rejected commit must publish no segment: {:?}",
-            snapshot_after.manifest.segments
-        );
-        assert_eq!(
-            snapshot_after.index.len(),
-            segments_before,
-            "the snapshot's segment set must stay in lockstep with the manifest"
-        );
-        let leaked = snapshot_after
-            .index
-            .search(&[1.0, 0.0, 0.0], 2, 200, |_| true)
-            .unwrap();
-        assert!(
-            leaked.iter().all(|m| m.row_id != 1),
-            "row-id 1 must not be searchable -- a rejected commit must apply zero \
-             of its vectors, not just the ones after the first failure: {leaked:?}"
+            ds.snapshot().manifest.segments.len(),
+            snapshot_before.manifest.segments.len()
         );
 
         std::fs::remove_dir_all(&dir).ok();
     }
-
     #[test]
-    fn concurrent_first_vector_commits_at_different_dimensions_are_not_both_accepted() {
-        // Regression test for the CRITICAL finding on this task: before
-        // `write_phase` existed, the authoritative dimension check ran
-        // *inside* `commit_lock`, via the in-lock apply loop's call into the
-        // shared graph's `compare_exchange`-based dimension establishment —
-        // so a second concurrent committer at a different dimension got a
-        // clean `DimensionMismatch` and aborted, no matter how the two
-        // transactions interleaved. Moving `validate_vector_dimensions` into
-        // `write_phase` (which runs *before* `commit_lock` is acquired)
-        // dropped that: both of two transactions beginning before either
-        // commits can read `established_dimension() == 0` and pass. Without
-        // an in-lock re-check, both could publish -- a 3-d segment and a
-        // 5-d segment both durably listed in the manifest -- and every
-        // future `vector_search` would then hit `DimensionMismatch` on
-        // whichever segment doesn't match the query's dimension, forever
-        // (nothing at `Dataset::open` used to cross-check dimensions across
-        // segments either -- see the cheap `load_segments` fix alongside
-        // this test).
-        //
-        // Deterministic, not loom: both transactions begin from the same
-        // (empty, dimension-0) snapshot before either commits, then commit
-        // sequentially -- this is the interleaving that exposes the race,
-        // fixed by test order rather than explored, exactly like
-        // `losing_transactions_vectors_never_become_searchable_when_it_conflicts`
-        // below.
-        let dir = temp_dir("concurrent-first-vector-dimension-race");
-        let ds = Dataset::create(&dir).unwrap();
-        assert_eq!(
-            ds.snapshot().index.established_dimension(),
-            0,
-            "precondition: nothing has been committed yet, so no dimension is established"
-        );
-
-        // T2: a 5-dimensional vector, hand-built since mvp_fixtures is fixed
-        // at 3 dimensions. `pause_after_row_id_claim` stops it right after
-        // `write_phase` returns -- its row-id is claimed, its data file and
-        // its 5-d segment are already built and fsynced, and its pre-lock
-        // `validate_vector_dimensions` call has already run and passed
-        // (against `established_dimension() == 0`, since nothing has
-        // committed yet) -- but *before* it acquires `commit_lock`. This is
-        // what makes the race real rather than something the existing
-        // pre-lock check alone would already catch: if T2 ran commit() to
-        // completion before T1 even started, T2's own pre-lock check would
-        // see dimension 0 and pass, same as before this task's cutover, and
-        // this test would prove nothing about the in-lock re-check.
+    fn insert_rejects_non_owned_vector_schema_before_allocation() {
+        let dir = temp_dir("non-owned-vector-schema");
+        let schema = crate::mvp_fixtures::mvp_schema();
+        let ds = Dataset::create(&dir, Arc::clone(&schema)).unwrap();
         let schema_5d = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new(
@@ -6271,86 +6637,18 @@ mod tests {
             ],
         )
         .unwrap();
-        let (claim_point, claimed) = checkpoint_pair();
-        let mut txn_5d = ds.begin();
-        txn_5d.insert(batch_5d);
-        txn_5d.pause_after_row_id_claim(claim_point);
-        let txn_5d_thread = std::thread::spawn(move || txn_5d.commit());
 
-        // Step 1: T2 has claimed its row-id and fsynced its 5-d segment,
-        // but holds no lock and has published nothing.
-        claimed.wait();
-
-        // Step 2: T1 (3-dimensional, via mvp_fixtures) begins and commits to
-        // completion while T2 sits paused -- establishing the dataset's
-        // dimension at 3 and publishing the dataset's only segment so far.
-        let mut txn_3d = ds.begin();
-        txn_3d.insert(crate::mvp_fixtures::mvp_row(0, "three-d", [1.0, 0.0, 0.0]).unwrap());
-        txn_3d.commit().unwrap();
-        assert_eq!(ds.snapshot().index.established_dimension(), 3);
-        assert_eq!(ds.snapshot().manifest.segments.len(), 1);
-
-        // Step 3: release T2. It now acquires `commit_lock`, re-reads the
-        // *latest* snapshot (established dimension 3, thanks to T1), and
-        // must be rejected by the in-lock re-check this task's fix adds --
-        // not silently accepted alongside T1's segment.
-        claimed.release();
-        let result = txn_5d_thread.join().unwrap();
-        match result {
-            Err(TxnError::Index(strata_index::IndexError::DimensionMismatch {
-                query_len,
-                expected,
-            })) => {
-                assert_eq!(query_len, 5, "the rejected commit's own vector dimension");
-                assert_eq!(expected, 3, "the dimension T1 already established");
-            }
-            other => panic!(
-                "expected TxnError::Index(DimensionMismatch {{ query_len: 5, expected: 3 }}), \
-                 got {other:?}"
-            ),
-        }
-
-        // The dataset must be left exactly as T1's successful commit alone
-        // would leave it -- not bricked, not carrying a trace of T2.
-        let snapshot = ds.snapshot();
-        assert_eq!(
-            snapshot.manifest.segments.len(),
-            1,
-            "T2's rejected commit must not have published a second segment: {:?}",
-            snapshot.manifest.segments
-        );
-        assert_eq!(
-            snapshot.index.len(),
-            1,
-            "the snapshot's segment set must stay in lockstep with the manifest"
-        );
-        assert_eq!(
-            snapshot.index.established_dimension(),
-            3,
-            "T2's rejection must not have disturbed the established dimension"
-        );
-
-        // The dataset must still be fully usable afterward -- not bricked,
-        // unlike the pre-fix failure mode where a second, different-
-        // dimension segment would make every future query error out.
-        let results = snapshot
-            .vector_search(&[1.0, 0.0, 0.0], 1, None)
-            .expect("vector_search must still work after T2's rejection, not error out");
-        assert_eq!(results.len(), 1);
-        assert_eq!(
-            // Row-ids are claimed in `write_phase`, before `commit_lock`,
-            // strictly in claim order -- not commit order. T2 (5-d) claimed
-            // first (row-id 0, which no successful commit ever consumes, so
-            // it stays a permanent gap), so T1's row lands at row-id 1, not
-            // 0.
-            results[0].row_id,
-            1,
-            "T1's row must still be the only match"
-        );
+        let mut txn = ds.begin();
+        assert!(matches!(
+            txn.insert(batch_5d),
+            Err(TxnError::BatchSchemaMismatch { .. })
+        ));
+        assert_eq!(txn.pending.len(), 0);
+        assert_eq!(ds.current_version(), 0);
+        assert!(ds.snapshot().manifest.data_files.is_empty());
 
         std::fs::remove_dir_all(&dir).ok();
     }
-
     #[test]
     fn losing_transactions_vectors_never_become_searchable_when_it_conflicts() {
         // Deterministic, not loom: both transactions begin from the same
@@ -6362,10 +6660,10 @@ mod tests {
         // use `update`, not `delete`, since a delete-only transaction has
         // nothing to insert and can't trigger this bug at all.
         let dir = temp_dir("abort-leaves-no-graph-trace");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, vector_test_schema()).unwrap();
         let setup_batch = vector_batch(vec![1i64], cluster_vectors(1, [0.0, 0.0, 0.0], 0.0));
         let mut setup = ds.begin();
-        setup.insert(setup_batch);
+        setup.insert(setup_batch).unwrap();
         setup.commit().unwrap();
 
         // Distinctive, far-apart, never-elsewhere-used coordinates so a
@@ -6375,9 +6673,9 @@ mod tests {
         let loser_batch = vector_batch(vec![3i64], cluster_vectors(1, [900.0, 900.0, 900.0], 0.0));
 
         let mut txn_winner = ds.begin();
-        txn_winner.update(0, winner_batch);
+        txn_winner.update(0, winner_batch).unwrap();
         let mut txn_loser = ds.begin();
-        txn_loser.update(0, loser_batch);
+        txn_loser.update(0, loser_batch).unwrap();
 
         txn_winner.commit().unwrap();
         let result = txn_loser.commit();
@@ -6436,7 +6734,7 @@ mod tests {
         // discards before it ever reaches a manifest. This test remains the
         // regression test for the property, now guaranteed by construction.
         let dir = temp_dir("failed-commit-no-dangling-search-hit");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, vector_test_schema()).unwrap();
 
         // Seed: one durable row (system row-id 0), far from the residue's
         // distinctive coordinates. Establishes the graph's dimension and
@@ -6445,7 +6743,8 @@ mod tests {
         seed.insert(vector_batch(
             vec![1i64],
             cluster_vectors(1, [0.0, 0.0, 0.0], 0.0),
-        ));
+        ))
+        .unwrap();
         seed.commit().unwrap();
 
         // T1: insert a vector at distinctive, never-reused coordinates, then
@@ -6453,10 +6752,12 @@ mod tests {
         // been built and fsynced in write_phase). Its row-id (1) is
         // allocated but never committed.
         let mut failing = ds.begin();
-        failing.insert(vector_batch(
-            vec![2i64],
-            cluster_vectors(1, [900.0, 900.0, 900.0], 0.0),
-        ));
+        failing
+            .insert(vector_batch(
+                vec![2i64],
+                cluster_vectors(1, [900.0, 900.0, 900.0], 0.0),
+            ))
+            .unwrap();
         failing.inject_manifest_commit_failure();
         let failing_result = failing.commit();
         assert!(
@@ -6476,10 +6777,12 @@ mod tests {
         // row-id 1 — the condition that used to make the residue pass
         // `is_visible`, and the one this test still reproduces.
         let mut later = ds.begin();
-        later.insert(vector_batch(
-            vec![3i64],
-            cluster_vectors(1, [500.0, 500.0, 500.0], 0.0),
-        ));
+        later
+            .insert(vector_batch(
+                vec![3i64],
+                cluster_vectors(1, [500.0, 500.0, 500.0], 0.0),
+            ))
+            .unwrap();
         later.commit().unwrap();
 
         let snapshot = ds.snapshot();
@@ -6580,7 +6883,7 @@ mod tests {
         // deterministic with `Checkpoint`s rather than raced with sleeps: a
         // sleep-based version would pass vacuously whenever it missed.
         let dir = temp_dir("in-flight-commit-not-visible-to-reader");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, vector_test_schema()).unwrap();
 
         // Seed row-id 0: establishes the graph's dimension and gives the
         // row-id counter a meaningful pre-existing value.
@@ -6588,7 +6891,8 @@ mod tests {
         seed.insert(vector_batch(
             vec![1i64],
             cluster_vectors(1, [0.0, 0.0, 0.0], 0.0),
-        ));
+        ))
+        .unwrap();
         seed.commit().unwrap();
 
         let (claim_point, claimed) = checkpoint_pair();
@@ -6600,7 +6904,8 @@ mod tests {
         slow.insert(vector_batch(
             vec![2i64],
             cluster_vectors(1, [900.0, 900.0, 900.0], 0.0),
-        ));
+        ))
+        .unwrap();
         slow.pause_after_row_id_claim(claim_point);
         slow.pause_before_manifest_commit(publish_point);
         let slow_thread = std::thread::spawn(move || slow.commit());
@@ -6617,10 +6922,12 @@ mod tests {
         // insert-only transaction has an empty write-set, so
         // this cannot conflict with the slow one.
         let mut other = ds.begin();
-        other.insert(vector_batch(
-            vec![3i64],
-            cluster_vectors(1, [500.0, 500.0, 500.0], 0.0),
-        ));
+        other
+            .insert(vector_batch(
+                vec![3i64],
+                cluster_vectors(1, [500.0, 500.0, 500.0], 0.0),
+            ))
+            .unwrap();
         other.commit().unwrap();
 
         // Step 3: release the slow transaction into `commit_lock` and stop
@@ -6720,17 +7027,22 @@ mod tests {
         // create_with_commit_log_capacity — see that constant's doc
         // comment for why this is exactly as rigorous a test.
         let dir = temp_dir("commit-log-wraparound-e2e");
-        let ds = Dataset::create_with_commit_log_capacity(&dir, TEST_COMMIT_LOG_CAPACITY).unwrap();
+        let ds = Dataset::create_with_commit_log_capacity(
+            &dir,
+            vector_test_schema(),
+            TEST_COMMIT_LOG_CAPACITY,
+        )
+        .unwrap();
         let batch = vector_batch(vec![1i64], cluster_vectors(1, [0.0, 0.0, 0.0], 0.0));
         let mut setup = ds.begin();
-        setup.insert(batch);
+        setup.insert(batch).unwrap();
         setup.commit().unwrap();
 
         // txn begins here, before every filler commit below — its
         // base_version stays fixed at whatever ds.current_version()
         // is right now.
         let mut txn = ds.begin();
-        txn.delete(0);
+        txn.delete(0).unwrap();
 
         // Commit enough disjoint no-op-ish filler transactions to push the
         // CommitLog's oldest retained entry past txn's read-version.
@@ -6740,7 +7052,7 @@ mod tests {
                 cluster_vectors(1, [f32::from(i as i16), 0.0, 0.0], 0.0),
             );
             let mut filler_txn = ds.begin();
-            filler_txn.insert(filler);
+            filler_txn.insert(filler).unwrap();
             filler_txn.commit().unwrap();
         }
 
@@ -6791,7 +7103,12 @@ mod tests {
         // the bounded CommitLog — this must succeed even when its
         // base_version has aged out of the ring buffer.
         let dir = temp_dir("commit-log-wraparound-insert-only-e2e");
-        let ds = Dataset::create_with_commit_log_capacity(&dir, TEST_COMMIT_LOG_CAPACITY).unwrap();
+        let ds = Dataset::create_with_commit_log_capacity(
+            &dir,
+            vector_test_schema(),
+            TEST_COMMIT_LOG_CAPACITY,
+        )
+        .unwrap();
 
         // txn begins here, before every filler commit below — its
         // base_version stays fixed at whatever ds.current_version()
@@ -6799,7 +7116,7 @@ mod tests {
         let mut txn = ds.begin();
         let insert_only_batch =
             vector_batch(vec![99_999], cluster_vectors(1, [500.0, 500.0, 500.0], 0.0));
-        txn.insert(insert_only_batch);
+        txn.insert(insert_only_batch).unwrap();
 
         // Commit enough disjoint filler transactions to push the
         // CommitLog's oldest retained entry past txn's read-version.
@@ -6809,7 +7126,7 @@ mod tests {
                 cluster_vectors(1, [f32::from(i as i16), 0.0, 0.0], 0.0),
             );
             let mut filler_txn = ds.begin();
-            filler_txn.insert(filler);
+            filler_txn.insert(filler).unwrap();
             filler_txn.commit().unwrap();
         }
 
@@ -6840,23 +7157,26 @@ mod tests {
         // exists on disk and that a reopen reproduces everything -- against
         // the very next observation, with no later commit involved.
         let dir = temp_dir("failed-commit-io-orphan");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, vector_test_schema()).unwrap();
 
         let mut seed = ds.begin();
         seed.insert(vector_batch(
             vec![1i64],
             cluster_vectors(1, [0.0, 0.0, 0.0], 0.0),
-        ));
+        ))
+        .unwrap();
         seed.commit().unwrap();
         let version_before = ds.snapshot().version;
         let segments_before = ds.snapshot().manifest.segments.len();
         assert_eq!(segments_before, 1, "the seed commit produced one segment");
 
         let mut failing = ds.begin();
-        failing.insert(vector_batch(
-            vec![2i64],
-            cluster_vectors(1, [900.0, 900.0, 900.0], 0.0),
-        ));
+        failing
+            .insert(vector_batch(
+                vec![2i64],
+                cluster_vectors(1, [900.0, 900.0, 900.0], 0.0),
+            ))
+            .unwrap();
         failing.inject_manifest_commit_failure();
         // (a)
         let result = failing.commit();
@@ -6880,7 +7200,8 @@ mod tests {
         next.insert(vector_batch(
             vec![3i64],
             cluster_vectors(1, [500.0, 500.0, 500.0], 0.0),
-        ));
+        ))
+        .unwrap();
         next.commit().unwrap();
         assert_eq!(ds.snapshot().manifest.segments.len(), segments_before + 1);
 
@@ -6897,13 +7218,15 @@ mod tests {
         // six-point list, including the orphaned `.seg` file's on-disk
         // existence and survival across a reopen.
         let dir = temp_dir("failed-commit-conflict-orphan");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, vector_test_schema()).unwrap();
 
         let mut setup = ds.begin();
-        setup.insert(vector_batch(
-            vec![1i64],
-            cluster_vectors(1, [0.0, 0.0, 0.0], 0.0),
-        ));
+        setup
+            .insert(vector_batch(
+                vec![1i64],
+                cluster_vectors(1, [0.0, 0.0, 0.0], 0.0),
+            ))
+            .unwrap();
         setup.commit().unwrap();
 
         // Both begin from the same snapshot, then commit sequentially, so
@@ -6913,15 +7236,19 @@ mod tests {
         // delete-only transaction inserts nothing and would build no
         // segment at all.
         let mut winner = ds.begin();
-        winner.update(
-            0,
-            vector_batch(vec![2i64], cluster_vectors(1, [500.0, 500.0, 500.0], 0.0)),
-        );
+        winner
+            .update(
+                0,
+                vector_batch(vec![2i64], cluster_vectors(1, [500.0, 500.0, 500.0], 0.0)),
+            )
+            .unwrap();
         let mut loser = ds.begin();
-        loser.update(
-            0,
-            vector_batch(vec![3i64], cluster_vectors(1, [900.0, 900.0, 900.0], 0.0)),
-        );
+        loser
+            .update(
+                0,
+                vector_batch(vec![3i64], cluster_vectors(1, [900.0, 900.0, 900.0], 0.0)),
+            )
+            .unwrap();
 
         winner.commit().unwrap();
         let version_before = ds.snapshot().version;
@@ -6955,13 +7282,14 @@ mod tests {
         // survive it, because nothing shared was ever touched; this test is
         // what proves that rather than assuming it.
         let dir = temp_dir("failed-commit-panic-orphan");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, vector_test_schema()).unwrap();
 
         let mut seed = ds.begin();
         seed.insert(vector_batch(
             vec![1i64],
             cluster_vectors(1, [0.0, 0.0, 0.0], 0.0),
-        ));
+        ))
+        .unwrap();
         seed.commit().unwrap();
         let version_before = ds.snapshot().version;
         let segments_before = ds.snapshot().manifest.segments.len();
@@ -6978,10 +7306,12 @@ mod tests {
         // path. `AssertUnwindSafe` records that reasoning explicitly.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut panicking = ds.begin();
-            panicking.insert(vector_batch(
-                vec![2i64],
-                cluster_vectors(1, [900.0, 900.0, 900.0], 0.0),
-            ));
+            panicking
+                .insert(vector_batch(
+                    vec![2i64],
+                    cluster_vectors(1, [900.0, 900.0, 900.0], 0.0),
+                ))
+                .unwrap();
             panicking.inject_panic_before_manifest_commit();
             panicking.commit()
         }));
@@ -7009,7 +7339,8 @@ mod tests {
         next.insert(vector_batch(
             vec![3i64],
             cluster_vectors(1, [500.0, 500.0, 500.0], 0.0),
-        ));
+        ))
+        .unwrap();
         next.commit().unwrap();
         assert_eq!(ds.snapshot().manifest.segments.len(), segments_before + 1);
         let after = ds
@@ -7038,7 +7369,7 @@ mod tests {
         // commits, which is the design doc's literal proof criterion, not
         // just a consequence observed at the end.
         let dir = temp_dir("n-commits-n-segments");
-        let ds = Dataset::create(&dir).unwrap();
+        let ds = Dataset::create(&dir, vector_test_schema()).unwrap();
 
         let centers = [
             [0.0_f32, 0.0, 0.0],
@@ -7052,7 +7383,8 @@ mod tests {
             txn.insert(vector_batch(
                 vec![i64::try_from(i).unwrap()],
                 cluster_vectors(1, *center, 0.0),
-            ));
+            ))
+            .unwrap();
             txn.commit().unwrap();
             assert_eq!(
                 ds.snapshot().manifest.segments.len(),
@@ -7311,7 +7643,7 @@ mod loom_tests {
                 .tempdir()
                 .unwrap()
                 .keep();
-            let ds = crate::Dataset::create(&dir).unwrap();
+            let ds = crate::Dataset::create(&dir, test_schema()).unwrap();
             let schema = StdArc::new(arrow::datatypes::Schema::new(vec![
                 arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
             ]));
@@ -7325,7 +7657,7 @@ mod loom_tests {
             let ds_setup = ds.clone();
             spawn_committer(move || {
                 let mut setup = ds_setup.begin();
-                setup.insert(batch);
+                setup.insert(batch).unwrap();
                 setup.commit()
             })
             .join()
@@ -7348,9 +7680,9 @@ mod loom_tests {
             // not a real conflict. See task-7-report.md for the full
             // root-cause diagnosis.
             let mut txn_a = ds_a.begin();
-            txn_a.delete(0);
+            txn_a.delete(0).unwrap();
             let mut txn_b = ds_b.begin();
-            txn_b.delete(0);
+            txn_b.delete(0).unwrap();
 
             let thread_a = spawn_committer(move || txn_a.commit());
             let thread_b = spawn_committer(move || txn_b.commit());
@@ -7381,7 +7713,7 @@ mod loom_tests {
                 .tempdir()
                 .unwrap()
                 .keep();
-            let ds = crate::Dataset::create(&dir).unwrap();
+            let ds = crate::Dataset::create(&dir, test_schema()).unwrap();
             let schema = StdArc::new(arrow::datatypes::Schema::new(vec![
                 arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
             ]));
@@ -7395,7 +7727,7 @@ mod loom_tests {
             let ds_setup = ds.clone();
             spawn_committer(move || {
                 let mut setup = ds_setup.begin();
-                setup.insert(batch);
+                setup.insert(batch).unwrap();
                 setup.commit()
             })
             .join()
@@ -7406,12 +7738,12 @@ mod loom_tests {
             let ds_b = ds.clone();
             let thread_a = spawn_committer(move || {
                 let mut txn = ds_a.begin();
-                txn.delete(0);
+                txn.delete(0).unwrap();
                 txn.commit()
             });
             let thread_b = spawn_committer(move || {
                 let mut txn = ds_b.begin();
-                txn.delete(1);
+                txn.delete(1).unwrap();
                 txn.commit()
             });
 
@@ -7543,7 +7875,7 @@ mod loom_tests {
                 .tempdir()
                 .unwrap()
                 .keep();
-            let ds = crate::Dataset::create(&dir).unwrap();
+            let ds = crate::Dataset::create(&dir, test_schema()).unwrap();
 
             // Seed: one durable, vector-carrying commit, run to completion
             // *before* the racing pair below — see this test's doc comment
@@ -7554,7 +7886,7 @@ mod loom_tests {
             let ds_seed = ds.clone();
             spawn_committer(move || {
                 let mut seed = ds_seed.begin();
-                seed.insert(loom_vector_batch(0, &[0.0, 0.0, 0.0]));
+                seed.insert(loom_vector_batch(0, &[0.0, 0.0, 0.0])).unwrap();
                 seed.commit()
             })
             .join()
@@ -7566,13 +7898,14 @@ mod loom_tests {
 
             let failing = spawn_committer(move || {
                 let mut txn = ds_failing.begin();
-                txn.insert(loom_vector_batch(1, &[900.0, 900.0, 900.0]));
+                txn.insert(loom_vector_batch(1, &[900.0, 900.0, 900.0]))
+                    .unwrap();
                 txn.inject_manifest_commit_failure();
                 txn.commit()
             });
             let succeeding = spawn_committer(move || {
                 let mut txn = ds_ok.begin();
-                txn.insert(loom_plain_batch(2));
+                txn.insert(loom_plain_batch(2)).unwrap();
                 txn.commit()
             });
 
@@ -7602,7 +7935,7 @@ mod loom_tests {
             let ds_final = ds.clone();
             spawn_committer(move || {
                 let mut final_txn = ds_final.begin();
-                final_txn.insert(loom_plain_batch(3));
+                final_txn.insert(loom_plain_batch(3)).unwrap();
                 final_txn.commit()
             })
             .join()
@@ -7709,7 +8042,7 @@ mod loom_tests {
                 .tempdir()
                 .unwrap()
                 .keep();
-            let ds = crate::Dataset::create(&dir).unwrap();
+            let ds = crate::Dataset::create(&dir, test_schema()).unwrap();
             assert_eq!(
                 ds.snapshot().index.established_dimension(),
                 0,
@@ -7725,12 +8058,13 @@ mod loom_tests {
             // both reaching `commit_lock`.
             let three_d = spawn_committer(move || {
                 let mut txn = ds_3d.begin();
-                txn.insert(loom_vector_batch(0, &[1.0, 0.0, 0.0]));
+                txn.insert(loom_vector_batch(0, &[1.0, 0.0, 0.0])).unwrap();
                 txn.commit()
             });
             let five_d = spawn_committer(move || {
                 let mut txn = ds_5d.begin();
-                txn.insert(loom_vector_batch(1, &[9.0, 9.0, 9.0, 9.0, 9.0]));
+                txn.insert(loom_vector_batch(1, &[9.0, 9.0, 9.0, 9.0, 9.0]))
+                    .unwrap();
                 txn.commit()
             });
 
@@ -7877,7 +8211,7 @@ mod loom_tests {
                 .tempdir()
                 .unwrap()
                 .keep();
-            let ds = crate::Dataset::create(&dir).unwrap();
+            let ds = crate::Dataset::create(&dir, test_schema()).unwrap();
 
             // Seed: one durable, vector-carrying commit, run to completion
             // *before* the racing pair below -- see this test's doc comment
@@ -7888,7 +8222,7 @@ mod loom_tests {
             let ds_seed = ds.clone();
             spawn_committer(move || {
                 let mut seed = ds_seed.begin();
-                seed.insert(loom_vector_batch(0, &[0.0, 0.0, 0.0]));
+                seed.insert(loom_vector_batch(0, &[0.0, 0.0, 0.0])).unwrap();
                 seed.commit()
             })
             .join()
@@ -7900,7 +8234,8 @@ mod loom_tests {
             let ds_failing = ds.clone();
             let failing = spawn_committer(move || {
                 let mut txn = ds_failing.begin();
-                txn.insert(loom_vector_batch(1, &[900.0, 900.0, 900.0]));
+                txn.insert(loom_vector_batch(1, &[900.0, 900.0, 900.0]))
+                    .unwrap();
                 txn.inject_manifest_commit_failure();
                 txn.commit()
             });
@@ -8048,12 +8383,13 @@ mod loom_tests {
                 .tempdir()
                 .unwrap()
                 .keep();
-            let ds = crate::Dataset::create(&dir).unwrap();
+            let ds = crate::Dataset::create(&dir, test_schema()).unwrap();
 
             let ds_writer = ds.clone();
             let writer = spawn_committer(move || {
                 let mut txn = ds_writer.begin();
-                txn.insert(loom_vector_batch(1, &[900.0, 900.0, 900.0]));
+                txn.insert(loom_vector_batch(1, &[900.0, 900.0, 900.0]))
+                    .unwrap();
                 txn.commit()
             });
 
@@ -8221,19 +8557,21 @@ mod loom_tests {
                 .tempdir()
                 .unwrap()
                 .keep();
-            let ds = crate::Dataset::create(&dir).unwrap();
+            let ds = crate::Dataset::create(&dir, test_schema()).unwrap();
 
             let ds_a = ds.clone();
             let committer_a = spawn_committer(move || {
                 let mut txn = ds_a.begin();
-                txn.insert(loom_vector_batch(1, &[900.0, 900.0, 900.0]));
+                txn.insert(loom_vector_batch(1, &[900.0, 900.0, 900.0]))
+                    .unwrap();
                 txn.commit()
             });
 
             let ds_b = ds.clone();
             let committer_b = spawn_committer(move || {
                 let mut txn = ds_b.begin();
-                txn.insert(loom_vector_batch(2, &[100.0, 100.0, 100.0]));
+                txn.insert(loom_vector_batch(2, &[100.0, 100.0, 100.0]))
+                    .unwrap();
                 txn.commit()
             });
 

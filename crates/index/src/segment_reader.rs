@@ -391,7 +391,16 @@ impl SegmentReader {
     #[must_use]
     pub fn row_id_at(&self, local: u64) -> Option<u64> {
         let idx = usize::try_from(local).ok()?;
-        self.row_ids().get(idx).copied()
+        self.row_id_slice().get(idx).copied()
+    }
+
+    /// Iterates the global row IDs represented by this already-validated
+    /// immutable segment. Recovery uses this to ensure every vector has one
+    /// corresponding row-file owner and no vector ID is duplicated across
+    /// segments.
+    #[must_use]
+    pub fn row_ids(&self) -> impl ExactSizeIterator<Item = u64> + '_ {
+        self.row_id_slice().iter().copied()
     }
 
     /// `(row_id_min, row_id_max)`, both inclusive, as recorded in the
@@ -424,7 +433,7 @@ impl SegmentReader {
         self.params
     }
 
-    fn row_ids(&self) -> &[u64] {
+    fn row_id_slice(&self) -> &[u64] {
         self.bytes
             .as_slice()
             .get(self.row_ids_off..self.row_ids_off + self.node_count * 8)
@@ -810,5 +819,13 @@ mod tests {
         let mut out = Vec::new();
         reader.neighbors_into(0, 0, &mut out);
         assert!(out.is_empty(), "a lone node has no neighbors");
+    }
+
+    #[test]
+    fn row_id_iteration_exposes_each_validated_segment_owner_once() {
+        let row_ids = vec![7, 11, 19];
+        let (_index, reader) = round_trip(row_ids.len(), &row_ids);
+
+        assert_eq!(reader.row_ids().collect::<Vec<_>>(), row_ids);
     }
 }

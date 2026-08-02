@@ -228,13 +228,13 @@ fn main() {
     // ---- Phase 1: ingest + commit (write path: encode data file, build +
     // serialize + fsync an index segment, publish both atomically).
     // Batched to model real ingestion. --------------------------------
-    let ds = Dataset::create(&dir).unwrap();
+    let ds = Dataset::create(&dir, schema()).unwrap();
     let m = phase_start();
     let t = Instant::now();
     let mut commits = 0;
     for chunk in rows.chunks(batch_sz) {
         let mut txn = ds.begin();
-        txn.insert(batch_of(chunk));
+        txn.insert(batch_of(chunk)).unwrap();
         txn.commit().unwrap();
         commits += 1;
     }
@@ -433,7 +433,7 @@ fn main() {
                         vector: r.vector.clone(),
                     };
                     let mut txn = ds.begin();
-                    txn.insert(batch_of(std::slice::from_ref(&one)));
+                    txn.insert(batch_of(std::slice::from_ref(&one))).unwrap();
                     txn.commit().unwrap();
                 }
             });
