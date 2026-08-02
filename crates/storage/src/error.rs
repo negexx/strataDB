@@ -28,6 +28,8 @@ pub enum StorageError {
     CorruptManifest(PathBuf, String),
     #[error("dataset at {0} uses a legacy manifest format and requires migration")]
     LegacyFormatNeedsMigration(PathBuf),
+    #[error("dataset at {0} is missing its durable row-id high-water catalog")]
+    MissingRowIdHighWater(PathBuf),
     #[error("corrupt data file at {0}: {1}")]
     CorruptDataFile(PathBuf, String),
     #[error("directory durability is unsupported for {0}")]

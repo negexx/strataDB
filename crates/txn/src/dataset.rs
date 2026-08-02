@@ -458,7 +458,11 @@ impl Dataset {
         // an allocation from it any more, but the ceiling is still a
         // panic-safety bound on what row-ids may reach `NodeTable` — see
         // `MAX_REASONABLE_ROW_ID_CAPACITY`.
-        let durable_high_water = read_row_id_high_water(&dir)?.unwrap_or(0);
+        let durable_high_water = read_row_id_high_water(&dir)?.ok_or_else(|| {
+            strata_storage::StorageError::MissingRowIdHighWater(
+                dir.join(strata_storage::ROW_ID_HIGH_WATER_PREFIX),
+            )
+        })?;
         let allocation_floor = manifest.next_row_id.max(durable_high_water);
         if allocation_floor > MAX_REASONABLE_ROW_ID_CAPACITY {
             return Err(TxnError::UnreasonableCapacity(
@@ -2611,6 +2615,28 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    fn recovery_rejects_a_current_dataset_missing_its_row_id_high_water_catalog() {
+        let dir = temp_dir("missing-row-id-high-water");
+        Dataset::create(&dir, test_schema()).unwrap();
+        std::fs::remove_file(
+            dir.join("_meta")
+                .join("row-id-high-water")
+                .join("00000000000000000000.reservation"),
+        )
+        .unwrap();
+
+        let result = Dataset::open(&dir);
+
+        assert!(matches!(
+            result,
+            Err(TxnError::Storage(
+                strata_storage::StorageError::MissingRowIdHighWater(path)
+            )) if path == dir.join(strata_storage::ROW_ID_HIGH_WATER_PREFIX)
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[cfg(feature = "test-fault-injection")]
     #[test]
     fn a_pre_publish_reservation_failure_writes_no_row_file_and_leaves_the_range_reusable() {
@@ -4209,6 +4235,7 @@ mod tests {
             commit_time_high_water: 0,
             segments: Vec::new(),
         };
+        strata_storage::initialize_row_id_high_water(&dir).unwrap();
         strata_storage::commit_manifest(&dir, &hostile).unwrap();
 
         let result = Dataset::open(&dir);
@@ -4238,6 +4265,7 @@ mod tests {
             commit_time_high_water: 0,
             segments: Vec::new(),
         };
+        strata_storage::initialize_row_id_high_water(&dir).unwrap();
         strata_storage::commit_manifest(&dir, &hostile).unwrap();
         let ds = Dataset::open(&dir).unwrap();
 
