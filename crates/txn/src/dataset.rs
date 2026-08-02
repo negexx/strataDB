@@ -2,7 +2,7 @@
 //! in full, including real OCC conflict detection and an atomic
 //! commit critical section (Phase 6) — see
 //! `docs/design.md`
-//! and `.opencode/rules/concurrency-txn-layer.md` before editing anything
+//! and `docs/phase-1-audit.md` before editing anything
 //! here. Conflict detection is write-write only, keyed by row-id, and
 //! scoped to in-process concurrency (multiple threads/tasks sharing one
 //! `Dataset` handle) — see the design doc §1 for why cross-process
@@ -715,7 +715,7 @@ pub struct Transaction {
 /// Gated on `cfg(test)` alone, unlike
 /// [`Transaction::inject_manifest_commit_failure`]'s `cfg(any(test,
 /// loom))` — not an oversight. `--cfg loom` is layered *on top of* the test
-/// profile (see `.opencode/rules/concurrency-txn-layer.md`'s `cargo rustc
+/// profile (see `docs/phase-1-audit.md`'s `cargo rustc
 /// -p strata-txn --lib --profile test -- --cfg loom` recipe), so `test` is
 /// set in a loom build too and these still compile there. The wider gate on
 /// the injector exists because a loom model uses it; nothing here needs to
@@ -1380,7 +1380,7 @@ impl Transaction {
         // difference against this function's dominant work (fsync,
         // JSON serialization) is immaterial, and isn't worth the
         // reduced auditability of proving a weaker ordering correct
-        // per site. See `.opencode/rules/concurrency-txn-layer.md`.
+        // per site. See `docs/design.md`.
         //
         // Row-ids are *not* handed out this way. `RowIdAllocator::claim`
         // needs a *checked* add — an allocation that would run past
@@ -1484,7 +1484,7 @@ impl Transaction {
         }
         // Gated behind the `parallel-insert` feature (off by default --
         // see that feature's own doc comment in Cargo.toml and
-        // `.opencode/rules/vector-index.md`). When enabled, parallelizes
+        // `docs/architecture.md`). When enabled, parallelizes
         // across up to `PARALLEL_INSERT_THREADS` worker threads once
         // `rows` is large enough to be worth it (see
         // `insert_batch_parallel`'s own doc comment for the chunking
@@ -1763,7 +1763,7 @@ fn merge_zone_map_stats(
 }
 
 // HNSW parameter defaults — tuned via benchmarks, not guessed, per
-// .opencode/rules/vector-index.md.
+// docs/architecture.md.
 const HNSW_MAX_NB_CONNECTION: usize = 16;
 const HNSW_MAX_LAYER: usize = 16;
 // ef_construction is the build-cost dial: the insert-time saturation
@@ -8711,7 +8711,7 @@ mod loom_tests {
         // Only loom's exhaustive interleaving exploration can rule that
         // out, which is the whole reason this project chose Rust + loom
         // over a hand-rolled concurrency proof (see
-        // `.opencode/rules/concurrency-txn-layer.md`).
+        // `docs/phase-1-audit.md`).
         //
         // Unlike the deterministic sibling, this model installs no
         // checkpoint and imposes no ordering: both committers begin from

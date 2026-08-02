@@ -1,7 +1,6 @@
 //! Transaction & conflict resolution — Strata's flagship subsystem. See
-//! `docs/design.md` and
-//! `.opencode/rules/concurrency-txn-layer.md` before editing anything here for
-//! real.
+//! `docs/design.md` and `docs/phase-1-audit.md` before editing anything here
+//! for real.
 //!
 //! `Dataset`, `Snapshot`, and `Transaction` are the supported engine surface;
 //! storage, index, and query crates are internal implementation layers.

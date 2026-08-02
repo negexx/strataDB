@@ -151,7 +151,7 @@ impl LiveSetCache {
     /// with the same key that's a self-deadlock on the (non-reentrant)
     /// per-key `Mutex`; with a different key it's a slot-before-`slots`
     /// lock-order inversion against this method's own `slots`-then-slot
-    /// order below (see `.opencode/rules/concurrency-txn-layer.md`'s
+    /// order below (see `docs/design.md`'s
     /// requirement to document lock order at the acquisition site).
     pub(crate) fn get_or_try_compute<E>(
         &self,
@@ -437,7 +437,7 @@ mod tests {
 /// Run with:
 /// `cargo rustc -p strata-txn --lib --profile test -- --cfg loom` then the
 /// resulting test binary directly (never a workspace-wide
-/// `RUSTFLAGS=--cfg loom`) — see `.opencode/rules/concurrency-txn-layer.md`.
+/// `RUSTFLAGS=--cfg loom`) — see `docs/phase-1-audit.md`.
 #[cfg(all(test, loom))]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod loom_tests {

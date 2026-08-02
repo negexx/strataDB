@@ -674,17 +674,11 @@ mod tests {
     }
 
     #[test]
-    fn deleting_an_already_tombstoned_row_is_a_harmless_idempotent_commit() {
-        // NOT a test of the retry-then-drop path: this single-threaded
-        // scenario has no second concurrent transaction, so
-        // execute_delete's second call here cannot produce an actual
-        // TxnError::Conflict -- it just re-tombstones an already-dead
-        // row-id, which the design doc's own note says is harmless. This
-        // pins that specific claim down. Genuine conflict-drop coverage
-        // (a real TxnError::Conflict, retried once, then dropped) can
-        // only come from real concurrent interleaving -- that's exercised
-        // by Task 8's chaos-tier runs (many agents, real scheduling, a
-        // shared contested pool), not by a unit test here.
+    fn deleting_an_already_tombstoned_row_drops_under_the_strict_target_contract() {
+        // The approved strict-target contract rejects an already-dead row
+        // with RowNotLive rather than treating re-delete as idempotent.
+        // execute_delete maps that typed terminal target error to Dropped;
+        // this single-threaded case is therefore not an OCC retry scenario.
         let dir = temp_dir("execute-delete-idempotent-retombstone");
         let dataset = dataset(&dir);
         let insert_outcome = execute_insert(&dataset, 1, "agent0", [1.0, 2.0, 3.0]);
@@ -697,8 +691,8 @@ mod tests {
 
         let second = execute_delete(&dataset, row_id);
         assert!(
-            matches!(second, ExecOutcome::CommittedDelete { .. }),
-            "re-deleting an already-tombstoned row-id must commit cleanly, not error or drop: {second:?}"
+            matches!(second, ExecOutcome::Dropped),
+            "the strict target contract drops an already-tombstoned row-id: {second:?}"
         );
 
         std::fs::remove_dir_all(&dir).ok();

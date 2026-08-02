@@ -585,8 +585,9 @@ fn fast_tier_random_seeds_survive_random_crash_points() {
 }
 
 /// The actual Phase 7 exit criterion: "thousands of randomized
-/// concurrent-agent runs, zero invariant violations." Opt-in via
-/// `STRATA_CHAOS_THOROUGH=1` — NOT part of default `cargo test --workspace`
+/// concurrent-agent runs, zero invariant violations." It remains ignored,
+/// and CI must explicitly set `STRATA_CHAOS_THOROUGH=1` before running it.
+/// It is NOT part of default `cargo test --workspace`
 /// (see the design doc §5 for why: each iteration's real process spawn +
 /// real fsyncs make thousands of them too slow for the normal dev loop).
 /// Intended for a scheduled/on-demand CI job. Run it explicitly with
@@ -597,10 +598,11 @@ fn fast_tier_random_seeds_survive_random_crash_points() {
 fn thorough_tier_satisfies_the_phase_7_exit_criterion() {
     const NUM_SEEDS: u64 = 2000;
 
-    if std::env::var("STRATA_CHAOS_THOROUGH").is_err() {
-        eprintln!("skipping thorough tier: set STRATA_CHAOS_THOROUGH=1 to run it");
-        return;
-    }
+    assert_eq!(
+        std::env::var("STRATA_CHAOS_THOROUGH").as_deref(),
+        Ok("1"),
+        "thorough chaos requires STRATA_CHAOS_THOROUGH=1"
+    );
 
     // Bounded concurrency: run seeds in fixed-size batches of scoped
     // threads. Deliberately NOT unbounded rayon-across-all-cores — dozens

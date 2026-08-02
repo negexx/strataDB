@@ -20,7 +20,7 @@ pub struct ObjectMeta {
 
 /// Fully synchronous, object-safe. `put`/`put_if_absent` return only once
 /// the write is durable — no async buffering, ever, matching
-/// `.opencode/rules/concurrency-txn-layer.md`'s durability invariant
+/// `docs/design.md`'s durability invariant
 /// regardless of which `Backend` impl is in play.
 ///
 /// # Key contract

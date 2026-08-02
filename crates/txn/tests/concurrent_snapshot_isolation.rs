@@ -228,7 +228,7 @@ fn cluster_vectors(count: usize, center: [f32; 3], spacing: f32) -> Vec<[f32; 3]
 fn an_old_snapshots_vector_search_never_leaks_a_later_commits_rows() {
     // A later commit's INSERTS never leak into an old snapshot's
     // `vector_search` results. Since S1 (`crates/index`'s segmented
-    // immutable index — see `.opencode/rules/vector-index.md`), a
+    // immutable index — see `docs/architecture.md`), a
     // `Snapshot`'s index is its OWN `SegmentSet`: an immutable list of
     // segments fixed at the instant that snapshot was published
     // (`Snapshot.index`, `crates/txn/src/snapshot.rs`). A later commit
@@ -405,7 +405,7 @@ fn an_old_snapshots_vector_search_still_sees_a_row_a_later_commit_tombstones() {
     // (`crates/txn/src/snapshot.rs`), where `tombstones` is captured from `Manifest.tombstones` as
     // of THAT snapshot's own version.
     //
-    // Deletion never rewrites a segment (`.opencode/rules/vector-index.md`) — a deleted row's vector
+    // Deletion never rewrites a segment (`docs/architecture.md`) — a deleted row's vector
     // stays physically present in its segment forever; only the manifest's tombstone set (and
     // therefore what `is_visible` filters) changes.
     let dir = tempfile::Builder::new()
