@@ -29,7 +29,7 @@ for the current blockers.
 - Predicate pruning, filtered ANN primitives, and in-memory group-by.
 - Real-process crash/reopen tests, targeted loom models, fuzz targets, and benchmarks.
 
-These are usable slices, not a finished database API. There is no complete schema catalog, planner,
+These are usable slices, not a finished database API. There is no schema-evolution/migration workflow, planner,
 stable Python API, stable administration CLI, point lookup, compaction, vacuum, orphan cleanup, time
 travel, or cross-process protocol.
 
@@ -45,7 +45,8 @@ travel, or cross-process protocol.
    is rejected conservatively.
 4. A clean commit creates and publishes a manifest containing data files, tombstones, and segment
    metadata, then installs a replacement immutable snapshot. The manifest is the intended visibility
-   boundary; directory durability and end-to-end integrity remain Phase 1 blockers.
+   boundary; directory durability and end-to-end integrity are limited to the named local filesystem
+   evidence and typed fail-closed paths documented in `docs/status.md`.
 
 Publication is lock-serialized inside one `Dataset` handle. Independent handles/processes do not share
 the lock, allocator, history, or in-memory snapshot, so the implementation is not a cross-process

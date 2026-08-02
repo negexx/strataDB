@@ -1,5 +1,8 @@
-//! Columnar file format, manifest/versioning. See
-//! `docs/design/phase-0-transaction-and-format-spec.md`.
+//! Internal columnar storage, manifest/versioning, and local durability.
+//!
+//! `Dataset`, `Snapshot`, and `Transaction` in `strata-txn` are the supported
+//! engine facade. Direct storage use is an implementation surface and does
+//! not carry the facade's schema, conflict, or recovery guarantees.
 
 pub mod backend;
 pub mod chaos;

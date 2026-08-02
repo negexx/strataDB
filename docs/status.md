@@ -15,15 +15,15 @@ single-process/shared-`Dataset` boundary.
 |---|---|---|
 | Local storage/manifests | Implemented | Arrow files, manifests, statistics, and local filesystem persistence work. Lifecycle management does not. |
 | Transactions/conflicts | Partial | Shared-handle write-write OCC and typed row-ID conflicts exist; no serializability claim. |
-| Row/index publication | Partial | One manifest/snapshot transition exists; target validation, identity, integrity, and durability blockers remain. |
+| Row/index publication | Partial | Manifest/snapshot publication now validates target, row, segment, and vector identity; final branch verification and current evidence remain. |
 | Snapshot/query reads | Partial | Immutable scan, predicate, explain, and vector-search reads exist; no read/write transaction API. |
 | Query operators/pruning | Partial | Predicates, file/segment pruning, filtered ANN, and group-by primitives exist; no complete planner. |
 | Immutable vector segments | Implemented | Manifest-listed HNSW segments load and fan out across snapshots. Growth is unbounded without lifecycle work. |
-| Update/delete identity | Partial | Tombstone-plus-replacement behavior exists; logical identity, target semantics, and cardinality remain open. |
+| Update/delete identity | Implemented within the supported facade | Physical live-target validation and one-row replacement cardinality are typed; logical identity remains deferred. |
 | CLI | Partial | Fixed-assumption MVP inspection/demo commands; not a stable administration surface. |
 | Python | Proposed | PyO3 scaffolding exports only `placeholder_version`; no database API exists. |
-| Durability/recovery | Partial | File fsync and crash/reopen evidence exist. Dataset creation fails closed for ordered local directory-sync errors, but manifest integrity, broader recovery proof, and filesystem-specific evidence remain incomplete. |
-| Schema/migrations | Partial | Caller batch shape and reserved columns are checked; no dataset-owned schema catalog or migration workflow. |
+| Durability/recovery | Partial | File/directory durability, immutable row-ID high-water, manifest integrity, and crash/reopen evidence exist within named local bounds; full branch verification remains. |
+| Schema/migrations | Partial | Dataset-owned schema and strict validation are implemented; schema evolution and migration remain deferred. |
 | Loom/chaos/fuzz/bench evidence | Partial | Useful tooling exists, but important models and opt-in suites are not all CI-visible or retained as current evidence. |
 | Compaction/GC | Proposed | No compaction, vacuum, orphan cleanup, or bounded history implementation. |
 | Cross-process coordination | Proposed | Independent openers do not share transaction state or durable conditional publication. |

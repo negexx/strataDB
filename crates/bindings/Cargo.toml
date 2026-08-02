@@ -3,6 +3,7 @@ name = "strata-bindings"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+publish = false
 
 [lib]
 name = "strata_ext"

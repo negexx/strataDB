@@ -3,6 +3,7 @@ name = "strata-txn"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+publish = false
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }

@@ -12,10 +12,11 @@ tombstones, statistics, and immutable vector segments visible in a snapshot. Loc
 operations are behind the `Backend`/`LocalFs` boundary, although some paths remain local-disk-specific.
 The manifest is intended to be the single publication boundary for row and index visibility.
 
-The current design does not provide compaction, vacuum, orphan cleanup, bounded segment growth,
-time-travel retention, or a schema catalog. Directory durability, manifest identity, and end-to-end
-row/file integrity remain Phase 1 work; see the audit rather than treating the format as corruption
-proof.
+The current design does not provide compaction, vacuum, orphan cleanup, bounded segment growth, or
+time-travel retention. Dataset-owned schema, manifest identity, row/file integrity, and durable
+row-ID high-water checks are implemented within the named local bounds; schema evolution and
+universal power-loss claims remain deferred. See the audit rather than treating the format as
+corruption proof.
 
 ## Transactions and snapshots
 
@@ -30,7 +31,8 @@ allocator, history, or in-memory snapshot, and cross-process conditional publica
 
 Rows are append-only physical records. Delete adds a tombstone. Update tombstones the old physical row
 and inserts replacement data with a new physical row ID. Future tombstones, target validation,
-cardinality, logical identity, and restart-safe non-reuse are unresolved contract items.
+cardinality, and restart-safe physical-ID non-reuse are enforced within the supported facade.
+Logical identity remains a later contract item.
 
 ## Immutable vector segments
 

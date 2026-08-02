@@ -96,6 +96,20 @@ jobs:
       - name: Clippy (directory durability fault injection)
         run: cargo clippy -p strata-txn --all-targets --features test-fault-injection -- -D warnings
 
+      - name: Verify facade and package boundaries
+        run: |
+          set -euo pipefail
+          test ! -d docs/superpowers
+          cargo metadata --no-deps --format-version 1 > /tmp/strata-metadata.json
+          jq -e '
+            all(.packages[];
+              ((.name | IN("strata-storage", "strata-index", "strata-query", "strata-txn", "strata-cli", "strata-bindings", "strata-chaos-worker")) | not)
+              or (.publish == false)
+            )
+          ' /tmp/strata-metadata.json
+          ! rg -n "no dataset-owned schema|target semantics remain open|restart-safe non-reuse.*unresolved|all newly-created ancestor" \
+            docs/status.md docs/architecture.md docs/design.md
+
       - name: Format check
         run: cargo fmt --check
 
