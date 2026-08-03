@@ -79,3 +79,17 @@ This ledger is a planning and evidence index. It must remain synchronized with t
 roadmap, current source/tests, CI logs, and benchmark artifacts. Phase 1 remains **Partial -
 blocked** until every in-scope row has its acceptance assertion supported by fresh implementation,
 regression, and required evidence artifacts.
+
+## Closeout verification evidence matrix
+
+This matrix records the latest bounded outcomes on the closeout branch. A passed local command is
+not substituted for the still-required Linux/CI or portable evidence.
+
+| Gate | Exact command or recipe | Current outcome | Limitation / retained location |
+|---|---|---|---|
+| Format/check/test/clippy | `cargo fmt --check`; `cargo check --workspace`; `cargo test --workspace`; `cargo clippy --workspace --all-targets -- -D warnings` | Passed on Windows at pre-benchmark-fix revision `05c0d9a`; benchmark-only fix `1f879ac` passed targeted benchmark checks | `cargo doc --workspace --no-deps` passed with two existing rustdoc warnings; `cargo deny check bans sources advisories` passed with duplicate-dependency warnings. Canonical commands/results are summarized here. |
+| Transaction loom | Crate-scoped `cargo rustc -p strata-txn --lib --profile test -- --cfg loom`, then the nine named models in the CI workflow | Nine named Windows models passed, including the writer/readers, cache, row-ID, publication, and conflict models | `dataset::loom_tests::a_reader_never_sees_one_in_flight_commits_row_while_observing_an_unrelated_commits_row_id_counter` remains a Windows timeout and needs Linux/CI evidence; the workflow recipe is `.github/workflows/ci.yml`. |
+| Index loom | `cargo rustc -p strata-index --lib --profile test -- --cfg loom`, then the produced binary with `--test-threads=1` | All 26 index loom/unit models passed on Windows in 409.99s | Exhaustive local evidence only; CI execution/provenance remains part of VER-02/VER-05. |
+| Checkpoint/chaos | Checkpoint abort test; `cargo test -p strata-sim --test chaos fast_tier_random_seeds_survive_random_crash_points -- --exact --nocapture`; scheduled/manual thorough recipe in `.github/workflows/ci.yml` | Checkpoint and fast chaos passed | Thorough local run reached `600/2000` seeds after about 900.6s, exited without `thorough tier: 2000/2000 seeds checked`; this remains blocked. |
+| Fuzz/provenance | `cargo +nightly fuzz list`; `cargo +nightly fuzz build manifest_parse`; `cargo +nightly fuzz build datafile_parse` | Targets listed and both built; `fuzz/Cargo.lock` SHA-256 remained `6C24BE74570A953D693F829B1EF1F41BD88210D6B54C75A7C840132193F40674` before/after | Windows smoke launch failed with `0xc0000135` (`STATUS_DLL_NOT_FOUND`); Linux CI smoke/artifact provenance and mutable action/nightly references remain open. |
+| Performance evidence | Task 5/6/7/8 commands in `docs/phase-1-performance.md`, with source revisions `472368e`, `4b39f16`, `1f879ac`, and Task 8 commit range `d88b2f9..0f8a1a2` | Bounded Windows synthetic matrices and repeated lifecycle evidence recorded | CPU/RAM inventory, cloud/portable/real-fixture, RSS/process-memory, and universal operating bounds remain open; no supported segment maximum is claimed. |

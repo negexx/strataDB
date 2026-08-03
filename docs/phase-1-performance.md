@@ -38,8 +38,9 @@ $env:STRATA_GROWTH_COMMITS='160'; $env:STRATA_GROWTH_WARMUP_RUNS='1'; $env:STRAT
 | 80 | 5,528.159 ms | 5,636.349 ms | 20,328 | 20,331 |
 | 160 | 14,075.935 ms | 14,250.955 ms | 40,475 | 40,489 |
 
-The full per-repetition raw output, timing variances, manifest checkpoint bytes, command exit codes,
-and failed CPU/RAM-provenance attempts are in the Task 5 report. These are host-local observations
+The table above is the retained canonical summary of the per-repetition measurements, timing
+variances, manifest checkpoint bytes, command exit codes, and failed CPU/RAM-provenance attempts;
+no separate Task 5 report artifact is checked in. These are host-local observations
 over this exact synthetic envelope, not a universal or asymptotic bound. They do not establish
 portable performance, a retained-history limit, or real-fixture behavior.
 
@@ -50,9 +51,9 @@ synthetic PERF-02 matrix is recorded.
 
 ## Task 6 recovery-byte accounting evidence (fresh, bounded)
 
-**Run date:** 2026-08-02. **Baseline revision:**
-`698185f7901ef935dacc63e09384b643ee28e12f`; the Task 6 implementation and
-its final commit are recorded in the task report. **Runner/toolchain:** local
+**Run date:** 2026-08-02. **Implementation revision:** `4b39f16`; the
+deterministic Task 6 regression and its evidence are recorded in this canonical
+performance record. **Runner/toolchain:** local
 Windows `10.0.26200`, `x86_64-pc-windows-msvc`; rustc `1.90.0
 (1159e78c4 2025-09-14)` and Cargo `1.90.0 (840b83a10 2025-07-30)`.
 
@@ -87,7 +88,8 @@ universal recovery, retained-history, or concurrent-operation bound.
 
 **Run date:** 2026-08-03. **Runner/toolchain:** local Windows `10.0.26200`,
 `x86_64-pc-windows-msvc`; rustc `1.90.0 (1159e78c4 2025-09-14)` and Cargo
-`1.90.0 (840b83a10 2025-07-30)`. The benchmark used default workspace
+`1.90.0 (840b83a10 2025-07-30)`. **Benchmark source revision:** `1f879ac`.
+The benchmark used default workspace
 features, no benchmark-specific feature flags, and the local Windows temporary
 filesystem. OS/filesystem caches were not flushed.
 
@@ -116,20 +118,20 @@ supported maximum for segment count, latency, recall, or memory.
 
 | K | Unfiltered recall@10 median / p95 | Unfiltered us/query median / p95 | Unfiltered QPS median / p95 | Filtered recall@10 median / p95 | Filtered us/query median / p95 | Filtered QPS median / p95 | Build+reopen s | Peak-live delta |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 1.0000 / 1.0000 | 59.2 / 61.1 | 16,894 / 17,422 | 1.0000 / 1.0000 | 59.2 / 59.8 | 16,892 / 17,050 | 0.084 | 1.0 MiB |
-| 2 | 1.0000 / 1.0000 | 90.7 / 91.9 | 11,033 / 11,186 | 1.0000 / 1.0000 | 74.6 / 75.6 | 13,411 / 13,594 | 0.125 | 0.8 MiB |
-| 4 | 1.0000 / 1.0000 | 83.4 / 83.4 | 11,991 / 11,998 | 1.0000 / 1.0000 | 43.6 / 43.7 | 22,943 / 23,022 | 0.322 | 0.7 MiB |
-| 8 | 1.0000 / 1.0000 | 57.5 / 58.8 | 17,390 / 17,774 | 1.0000 / 1.0000 | 30.9 / 31.0 | 32,416 / 32,560 | 0.584 | 0.7 MiB |
-| 16 | 1.0000 / 1.0000 | 38.7 / 39.4 | 25,852 / 26,316 | 1.0000 / 1.0000 | 28.3 / 29.3 | 35,401 / 36,731 | 1.085 | 0.6 MiB |
-| 32 | 1.0000 / 1.0000 | 34.6 / 37.5 | 29,076 / 31,521 | 1.0000 / 1.0000 | 32.5 / 33.7 | 30,826 / 32,000 | 2.206 | 0.6 MiB |
-| 64 | 1.0000 / 1.0000 | 47.9 / 49.1 | 20,905 / 21,453 | 1.0000 / 1.0000 | 78.6 / 83.2 | 12,766 / 13,507 | 4.903 | 1.1 MiB |
+| 1 | 1.0000 / 1.0000 | 34.7 / 35.9 | 28,843 / 29,851 | 1.0000 / 1.0000 | 35.8 / 37.1 | 27,947 / 28,923 | 0.053 | 1.2 MiB |
+| 2 | 1.0000 / 1.0000 | 47.5 / 47.9 | 21,065 / 21,243 | 1.0000 / 1.0000 | 37.5 / 37.8 | 26,636 / 26,783 | 0.099 | 1.0 MiB |
+| 4 | 1.0000 / 1.0000 | 43.8 / 45.3 | 22,860 / 23,669 | 1.0000 / 1.0000 | 23.2 / 23.7 | 43,099 / 44,004 | 0.224 | 0.9 MiB |
+| 8 | 1.0000 / 1.0000 | 31.9 / 33.5 | 31,399 / 32,935 | 1.0000 / 1.0000 | 17.4 / 17.6 | 57,413 / 57,887 | 0.360 | 0.9 MiB |
+| 16 | 1.0000 / 1.0000 | 20.0 / 20.7 | 49,961 / 51,613 | 1.0000 / 1.0000 | 14.1 / 14.3 | 70,739 / 71,365 | 0.942 | 0.9 MiB |
+| 32 | 1.0000 / 1.0000 | 16.9 / 17.7 | 59,488 / 62,598 | 1.0000 / 1.0000 | 15.3 / 15.4 | 65,388 / 65,681 | 1.473 | 0.9 MiB |
+| 64 | 1.0000 / 1.0000 | 16.0 / 16.4 | 62,591 / 64,205 | 1.0000 / 1.0000 | 22.8 / 23.9 | 43,972 / 46,189 | 3.181 | 1.4 MiB |
 
-Peak-live is the benchmark process's global allocator delta above the start of
-each K, spanning build, reopen, warmup, and measured query sweeps. It is not
+Peak-live is the benchmark process's global allocator peak growth above the
+start-of-K sample, spanning build, reopen, warmup, and measured query sweeps. It is not
 RSS, total process memory, or a retained-snapshot bound. The table is the
 K-dependent observation for this short run; its direction must be read from
 the recorded rows, not inferred as a monotonic segmentation effect. The
-unfiltered K=64 median was 47.9 us/query versus 59.2 at K=1. This is a
+unfiltered K=64 median was 16.0 us/query versus 34.7 at K=1. This is a
 host-local observation, not evidence of a segment-count maximum. Filtered
 results include the warmed predicate live-set cache and are not a cold-filter
 latency claim.
