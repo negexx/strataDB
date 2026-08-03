@@ -62,14 +62,15 @@ DUR-03, IDX-01 and IDX-02, and ARCH-01 through ARCH-03 slices. Completed targete
 implementation and recovery evidence for those slices; the supported
 `Dataset`/`Snapshot`/`Transaction` facade is now the documented engine boundary, while subordinate
 packages are marked non-publishable. Task 7 now configures exact transaction and cache loom
-discovery, plus an index whole-binary loom run; checkpoint-abort and fast-chaos gates; and
+discovery, plus eight exact index loom models; checkpoint-abort and fast-chaos gates; and
 scheduled/manual thorough-chaos execution.
 Fresh Ubuntu WSL exact-model transaction loom evidence and Ubuntu WSL thorough-chaos evidence
 (`2000/2000` seeds with zero violations) now exist. Fuzz build/smoke now also passes locally;
-retained CI execution/log-retention provenance and platform portability remain open. Task 8 now records bounded
-Windows synthetic segmented/lifecycle evidence with reproduction metadata; the optional real fixture,
-portable host matrix, and universal operating bounds remain open. This does not change the audit
-verdict from Partial and blocked.
+the merged PR #53 CI run also passed the declared fuzz-and-provenance job and retained
+`fuzz-provenance-30841989478-attempt-1`. Loom/chaos CI provenance and platform portability remain
+open. Task 8 now records bounded Windows synthetic segmented/lifecycle evidence with reproduction
+metadata; the optional real fixture, portable host matrix, and universal operating bounds remain
+open. This does not change the audit verdict from Partial and blocked.
 
 VER-04 through VER-06, PERF-01 through PERF-05, and the later/deferred findings remain separately
 tracked unless the final review proves a dependency for a Phase 1 fix.
@@ -173,8 +174,8 @@ consolidated register above; IDs marked "merged" retain the same evidence under 
 | VER-01 | Known counterexamples have targeted regression gates; complete branch verification remains. |
 | VER-02 | Merged with CONC-02: fresh Ubuntu WSL execution passed the nine production transaction models plus the separate compact semantic guard; CI execution/provenance remains pending. Phase 1 blocker. |
 | VER-03 | Merged with DUR-04: fresh Ubuntu WSL thorough chaos reached `2000/2000` seeds with zero violations; CI execution/provenance and portability remain pending. Phase 1 blocker. |
-| VER-04 | Ubuntu WSL completed both declared nightly ASAN targets and deterministic parser smoke inputs with a stable fuzz lock hash; retained CI execution/artifact evidence remains open. |
-| VER-05 | The evidence workflow now pins action SHAs and nightly `2026-07-25`; retained CI execution/provenance artifacts remain open. |
+| VER-04 | Ubuntu WSL completed both declared nightly ASAN targets and deterministic parser smoke inputs with a stable fuzz lock hash; merged PR #53 also passed the declared fuzz-and-provenance job and retained `fuzz-provenance-30841989478-attempt-1`. Broader fuzz campaign and platform evidence remain open. |
+| VER-05 | The evidence workflow now pins action SHAs and nightly `2026-07-25`; the merged PR #53 fuzz job retained its execution/provenance artifact. Loom/chaos and broader platform/provenance evidence remain open. |
 | VER-06 | Preserved as Phase 1 measurement evidence blocker: bounded Windows synthetic inputs/results are recorded, but portable host/fixture provenance is still missing. |
 | VER-07 | Merged with ARCH-04 and DUR-05: current docs now qualify intended guarantees and retain Partial status. |
 
