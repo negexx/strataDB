@@ -40,8 +40,8 @@
 )]
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -49,6 +49,7 @@ use std::time::{Duration, Instant};
 use arrow::array::{FixedSizeListArray, Float32Array, Float64Array, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use strata_bench::{ManifestListedFile, SnapshotFootprint, pinned_snapshot_footprint_diagnostics};
 use strata_query::{AggFunc, Predicate};
 use strata_storage::{Value, read_current_with_byte_count};
 use strata_txn::{Dataset, Snapshot};
@@ -337,30 +338,9 @@ struct PinnedSnapshotDiagnostics {
     cache_budget_bytes: usize,
 }
 
-struct ManifestListedFile {
-    name: String,
-    byte_len: u64,
-}
-
-struct SnapshotFootprint {
-    version: u64,
-    manifest_payload_bytes: u64,
-    row_data_files: Vec<ManifestListedFile>,
-    immutable_segment_files: Vec<ManifestListedFile>,
-}
-
 struct PinnedSnapshot {
     snapshot: Arc<Snapshot>,
     footprint: SnapshotFootprint,
-}
-
-struct PinnedSnapshotFootprintDiagnostics {
-    logical_manifest_payload: u128,
-    unique_manifest_payload: u128,
-    logical_row_data: u128,
-    unique_row_data: u128,
-    logical_immutable_segments: u128,
-    unique_immutable_segments: u128,
 }
 
 fn capture_pinned_snapshot(dir: &Path, snapshot: Arc<Snapshot>) -> PinnedSnapshot {
@@ -379,68 +359,14 @@ fn capture_pinned_snapshot(dir: &Path, snapshot: Arc<Snapshot>) -> PinnedSnapsho
             row_data_files: manifest
                 .data_files
                 .into_iter()
-                .map(|file| ManifestListedFile {
-                    name: file.name,
-                    byte_len: file.byte_len,
-                })
+                .map(|file| ManifestListedFile::new(file.name, file.byte_len))
                 .collect(),
             immutable_segment_files: manifest
                 .segments
                 .into_iter()
-                .map(|segment| ManifestListedFile {
-                    name: segment.name,
-                    byte_len: segment.byte_len,
-                })
+                .map(|segment| ManifestListedFile::new(segment.name, segment.byte_len))
                 .collect(),
         },
-    }
-}
-
-fn unique_file_bytes<'a>(files: impl Iterator<Item = &'a ManifestListedFile>) -> u128 {
-    let mut unique = BTreeMap::new();
-    for file in files {
-        unique.entry(&file.name).or_insert(file.byte_len);
-    }
-    unique.values().map(|bytes| u128::from(*bytes)).sum()
-}
-
-fn pinned_snapshot_footprint_diagnostics(
-    pinned: &[PinnedSnapshot],
-) -> PinnedSnapshotFootprintDiagnostics {
-    PinnedSnapshotFootprintDiagnostics {
-        logical_manifest_payload: pinned
-            .iter()
-            .map(|snapshot| u128::from(snapshot.footprint.manifest_payload_bytes))
-            .sum(),
-        unique_manifest_payload: {
-            let mut unique = BTreeMap::new();
-            for snapshot in pinned {
-                unique
-                    .entry(snapshot.footprint.version)
-                    .or_insert(snapshot.footprint.manifest_payload_bytes);
-            }
-            unique.values().map(|bytes| u128::from(*bytes)).sum()
-        },
-        logical_row_data: pinned
-            .iter()
-            .flat_map(|snapshot| snapshot.footprint.row_data_files.iter())
-            .map(|file| u128::from(file.byte_len))
-            .sum(),
-        unique_row_data: unique_file_bytes(
-            pinned
-                .iter()
-                .flat_map(|snapshot| snapshot.footprint.row_data_files.iter()),
-        ),
-        logical_immutable_segments: pinned
-            .iter()
-            .flat_map(|snapshot| snapshot.footprint.immutable_segment_files.iter())
-            .map(|file| u128::from(file.byte_len))
-            .sum(),
-        unique_immutable_segments: unique_file_bytes(
-            pinned
-                .iter()
-                .flat_map(|snapshot| snapshot.footprint.immutable_segment_files.iter()),
-        ),
     }
 }
 
@@ -475,7 +401,69 @@ fn mib(bytes: i64) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
 }
 
+fn requested_pin_counts() -> Vec<usize> {
+    std::env::var("STRATA_PINNED_SNAPSHOTS")
+        .unwrap_or_else(|_| "1".to_owned())
+        .split(',')
+        .map(|value| {
+            value.trim().parse().unwrap_or_else(|error| {
+                panic!("invalid STRATA_PINNED_SNAPSHOTS value {value:?}: {error}")
+            })
+        })
+        .collect()
+}
+
+fn lifecycle_run_count(name: &str, default: usize) -> usize {
+    std::env::var(name).ok().map_or(default, |value| {
+        value
+            .parse()
+            .unwrap_or_else(|error| panic!("invalid {name} value {value:?}: {error}"))
+    })
+}
+
+fn run_lifecycle_measurements() {
+    let warmups = lifecycle_run_count("STRATA_LIFECYCLE_WARMUP_RUNS", 1);
+    let repetitions = lifecycle_run_count("STRATA_LIFECYCLE_REPETITIONS", 5);
+    let executable = std::env::current_exe().expect("lifecycle benchmark executable path");
+    for pin_count in requested_pin_counts() {
+        for warmup in 1..=warmups {
+            let status = Command::new(&executable)
+                .env("STRATA_LIFECYCLE_RUN_ONCE", "1")
+                .env("STRATA_PINNED_SNAPSHOTS", pin_count.to_string())
+                .env(
+                    "STRATA_LIFECYCLE_MEASUREMENT",
+                    format!("excluded warmup {warmup}/{warmups}; pins={pin_count}"),
+                )
+                .status()
+                .expect("start lifecycle warmup");
+            assert!(
+                status.success(),
+                "lifecycle warmup {warmup}/{warmups} for pin count {pin_count} failed: {status}"
+            );
+        }
+        for repetition in 1..=repetitions {
+            let status = Command::new(&executable)
+                .env("STRATA_LIFECYCLE_RUN_ONCE", "1")
+                .env("STRATA_PINNED_SNAPSHOTS", pin_count.to_string())
+                .env(
+                    "STRATA_LIFECYCLE_MEASUREMENT",
+                    format!("measured repetition {repetition}/{repetitions}; pins={pin_count}"),
+                )
+                .status()
+                .expect("start lifecycle measurement");
+            assert!(
+                status.success(),
+                "lifecycle repetition {repetition}/{repetitions} for pin count {pin_count} failed: {status}"
+            );
+        }
+    }
+}
+
 fn main() {
+    if std::env::var_os("STRATA_LIFECYCLE_RUN_ONCE").is_none() {
+        run_lifecycle_measurements();
+        return;
+    }
     let rows_n: usize = std::env::var("STRATA_LIFECYCLE_ROWS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -576,7 +564,11 @@ fn main() {
             .unwrap();
     }
     let pinned_diagnostics = pinned_snapshot_diagnostics(&pinned);
-    let pinned_footprint = pinned_snapshot_footprint_diagnostics(&pinned);
+    let pinned_footprints: Vec<_> = pinned
+        .iter()
+        .map(|snapshot| snapshot.footprint.clone())
+        .collect();
+    let pinned_footprint = pinned_snapshot_footprint_diagnostics(&pinned_footprints);
     let snapshot_wall = snapshot_time.elapsed();
     let snapshot_mem = phase_end(snapshot_start);
     results.push(PhaseResult {
@@ -834,6 +826,10 @@ fn main() {
         mib((n * VECTOR_DIM * 4) as i64)
     );
     println!("input source           : {source}");
+    println!(
+        "measurement             : {}",
+        std::env::var("STRATA_LIFECYCLE_MEASUREMENT").unwrap_or_else(|_| "single run".to_owned())
+    );
     println!("input hash             : {:016x}", rows_hash(&rows));
     println!("newest manifest bytes  : {manifest_bytes}");
     println!("\nSLOWEST phase        : {slowest}");

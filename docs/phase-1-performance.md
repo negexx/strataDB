@@ -163,24 +163,34 @@ manifest-listed row-data and immutable-segment entries before a later commit
 can occur. After the final set is constructed, the benchmark sums those
 per-handle records and also deduplicates their physical manifest/file
 identities. The current operational snapshot needed for the rest of the
-lifecycle is deliberately excluded from the retained-handle count. Each point
-was one direct lifecycle smoke run with zero excluded warmups and one measured
-repetition; the command was:
+lifecycle is deliberately excluded from the retained-handle count. On
+2026-08-03, each point ran one excluded warmup and five measured repetitions
+(30 isolated lifecycle processes total); deterministic input and the requested
+pin count were passed to every child process. The command was:
 
 ```text
 $env:STRATA_BENCH_SOURCE='synthetic'; $env:STRATA_BENCH_SEED='20260801'
 $env:STRATA_LIFECYCLE_ROWS='64'; $env:STRATA_LIFECYCLE_BATCH_ROWS='1'
-$env:STRATA_PINNED_SNAPSHOTS='<0|1|4|16|64>'
+$env:STRATA_PINNED_SNAPSHOTS='0,1,4,16,64'
+$env:STRATA_LIFECYCLE_WARMUP_RUNS='1'; $env:STRATA_LIFECYCLE_REPETITIONS='5'
 cargo bench -p strata-bench --bench lifecycle_bench -- --noplot
 ```
 
-| Retained handles / distinct snapshots | Direct manifest payload bytes (logical / unique) | Direct manifest-listed row-data bytes (logical / unique) | Direct manifest-listed immutable-segment bytes (logical / unique) |
+Each child labels itself as either `excluded warmup 1/1` or `measured
+repetition N/5`, and prints direct accounting separately from cache/allocator
+observations. The direct row-data and immutable-segment values below were
+identical across the five measured repetitions for their pin count. Manifest
+payload is also read and reported exactly for every retained snapshot in every
+child, but varies slightly with serialized per-run metadata; it is deliberately
+not collapsed into a fabricated cross-run aggregate.
+
+| Retained handles / distinct snapshots | Measured repetitions | Direct manifest payload bytes | Direct manifest-listed row-data bytes (logical / unique) | Direct manifest-listed immutable-segment bytes (logical / unique) |
 |---:|---:|---:|---:|
-| 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 |
-| 1 / 1 | 1,761 / 1,761 | 4,362 / 4,362 | 2,240 / 2,240 |
-| 4 / 4 | 11,384 / 11,384 | 43,620 / 17,448 | 22,400 / 8,960 |
-| 16 / 16 | 115,298 / 115,298 | 593,232 / 69,792 | 304,640 / 35,840 |
-| 64 / 64 | 1,589,930 / 1,589,930 | 9,072,960 / 279,168 | 4,659,200 / 143,360 |
+| 0 / 0 | 5 | 0 / 0 in every repetition | 0 / 0 | 0 / 0 |
+| 1 / 1 | 5 | per-repetition exact payload | 4,362 / 4,362 | 2,240 / 2,240 |
+| 4 / 4 | 5 | per-repetition exact payload | 43,620 / 17,448 | 22,400 / 8,960 |
+| 16 / 16 | 5 | per-repetition exact payload | 593,232 / 69,792 | 304,640 / 35,840 |
+| 64 / 64 | 5 | per-repetition exact payload | 9,072,960 / 279,168 | 4,659,200 / 143,360 |
 
 The manifest payload byte count is the exact serialized payload read and
 validated for each pinned snapshot; row-data and immutable-segment bytes are
@@ -191,44 +201,25 @@ pinned set. Thus logical totals describe retained references, while unique
 totals describe the distinct raw file payloads they retain; neither is process
 RSS, allocator residency, filesystem block allocation, or a universal bound.
 
-| Retained handles / distinct snapshots | Snapshot/cache-warming wall | Cache entries | Cache charged bytes (approx.) | Aggregate cache budget | Allocator live delta (approx.) | Allocator peak-live (approx.) |
-|---:|---:|---:|---:|---:|---:|---:|
-| 0 / 0 | 6.20 us | 0 | 0 | 0 | 8 B | 0.0 MiB |
-| 1 / 1 | 36.80 us | 1 | 272 B | 64 MiB | 364 B | 0.0 MiB |
-| 4 / 4 | 382.80 us | 4 | 1,088 B | 256 MiB | 1,664 B | 0.0 MiB |
-| 16 / 16 | 1.93 ms | 16 | 4,352 B | 1 GiB | 5,988 B | 0.0 MiB |
-| 64 / 64 | 23.85 ms | 64 | 17,408 B | 4 GiB | 23,076 B | 0.0 MiB |
+| Retained handles / distinct snapshots | Measured repetitions | Cache entries per repetition | Cache charged bytes (approx., per repetition) | Aggregate cache budget (per repetition) |
+|---:|---:|---:|---:|---:|
+| 0 / 0 | 5 | 0 | 0 | 0 |
+| 1 / 1 | 5 | 1 | 272 B | 64 MiB |
+| 4 / 4 | 5 | 4 | 1,088 B | 256 MiB |
+| 16 / 16 | 5 | 16 | 4,352 B | 1 GiB |
+| 64 / 64 | 5 | 64 | 17,408 B | 4 GiB |
 
 `charged bytes` is the live-set cache's admission-control accounting (entry
 overhead, predicate-key bytes, and `LiveSet` payload). It is intentionally
 approximate: it excludes hash-map buckets, synchronization/`Arc` headers, and
 allocator metadata; aggregate budget is a soft per-snapshot cap, not retained
-usage. The allocator columns are phase allocation/cache-warming observations
-in this benchmark process, not RSS, exact resident memory, or a process-wide
-memory bound. No RSS sample was taken; any future RSS value is supplemental
-only.
-
-The direct reopen accounting and post-concurrent-commit newest-manifest bytes
-were:
-
-| Retained handles | Reopen wall | Recovery total | Recovery manifest | Row data | Row-ID catalog | Segments | Newest manifest after concurrent commits |
-|---:|---:|---:|---:|---:|---:|---:|---:|
-| 0 | 64.64 ms | 471,313 B | 48,005 B | 279,168 B | 780 B | 143,360 B | 65,621 B |
-| 1 | 56.16 ms | 471,315 B | 48,007 B | 279,168 B | 780 B | 143,360 B | 65,626 B |
-| 4 | 71.19 ms | 471,322 B | 48,014 B | 279,168 B | 780 B | 143,360 B | 65,632 B |
-| 16 | 27.38 ms | 471,319 B | 48,011 B | 279,168 B | 780 B | 143,360 B | 65,625 B |
-| 64 | 42.21 ms | 471,322 B | 48,014 B | 279,168 B | 780 B | 143,360 B | 65,634 B |
-
-Recovery categories are exact payload bytes opened and validated for the
-selected current manifest and its listed files; they exclude directory
-metadata, allocator/RSS effects, and retained historical manifests not opened
-by that recovery. The minor manifest-byte differences are per-run serialized
-metadata, not a retained-handle effect. The lifecycle explicitly drops the
-retained handles, operational snapshot, and dataset before removing its
-temporary directory. The focused transaction regression warms a historical
-snapshot's cache, verifies a later commit cannot alter that immutable view,
-then verifies the historical snapshot (and therefore its per-snapshot cache)
-becomes unreachable when its final handle drops.
+usage. Snapshot/cache wall time and allocator deltas remain per-process
+approximate observations and are intentionally not summarized as a memory
+bound. No RSS sample was taken; any future RSS value is supplemental only.
+The lifecycle explicitly drops the retained handles, operational snapshot, and
+dataset before removing its temporary directory. The focused transaction
+regression performs this creation/warming/immutability/release lifecycle for
+exactly 0, 1, 4, 16, and 64 pins.
 
 This is bounded local synthetic evidence only. It does not establish a
 portable or real-fixture result, an exact RSS/process-memory bound, a cache
@@ -261,8 +252,10 @@ cargo bench -p strata-bench --bench manifest_growth_bench -- --noplot
 $env:STRATA_BENCH_SOURCE='synthetic'
 $env:STRATA_BENCH_SEED='20260801'
 $env:STRATA_LIFECYCLE_ROWS='64'
-$env:STRATA_LIFECYCLE_BATCH_ROWS='8'
-$env:STRATA_PINNED_SNAPSHOTS='4'
+$env:STRATA_LIFECYCLE_BATCH_ROWS='1'
+$env:STRATA_PINNED_SNAPSHOTS='0,1,4,16,64'
+$env:STRATA_LIFECYCLE_WARMUP_RUNS='1'
+$env:STRATA_LIFECYCLE_REPETITIONS='5'
 cargo bench -p strata-bench --bench lifecycle_bench -- --noplot
 
 $env:STRATA_BENCH_SOURCE='synthetic'
