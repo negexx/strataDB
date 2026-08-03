@@ -1719,12 +1719,19 @@ impl Transaction {
             let num_rows = u64::try_from(batch.num_rows())?;
 
             let inserts = build_vector_inserts(batch, row_id_base)?;
-            let with_row_id = append_row_id_column(batch, row_id_base, num_rows)?;
+            // Encode user columns before appending hidden columns. The hidden
+            // physical columns are not useful dictionary-encoding candidates:
+            // `_row_id` is unique and `_timestamp` is repeated.
+            let encoded = if batch.num_columns() == 0 {
+                batch.clone()
+            } else {
+                strata_storage::encode_batch(batch)?
+            };
+            let with_row_id = append_row_id_column(&encoded, row_id_base, num_rows)?;
             let with_timestamp = append_timestamp_column(&with_row_id, ts, num_rows)?;
 
-            let encoded = strata_storage::encode_batch(&with_timestamp)?;
             let file_name = format!("{attempt_id:020}-{i}.arrow");
-            let metadata = write_batch(&data_dir.join(&file_name), &encoded)?;
+            let metadata = write_batch(&data_dir.join(&file_name), &with_timestamp)?;
             let row_id_range = match num_rows {
                 0 => None,
                 _ => Some((row_id_base, row_id_base + num_rows - 1)),
@@ -4131,6 +4138,48 @@ mod tests {
             .map(|i| scanned_names.value(i))
             .collect();
         assert_eq!(got, names);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn hidden_columns_are_not_dictionary_encoded_on_disk() {
+        let dir = temp_dir("hidden-cols-not-dict-encoded");
+        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)]));
+        let ds = Dataset::create(&dir, schema.clone()).unwrap();
+
+        let names: Vec<&str> = (0..100)
+            .map(|i| if i % 2 == 0 { "alice" } else { "bob" })
+            .collect();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow::array::StringArray::from(names))],
+        )
+        .unwrap();
+        let mut txn = ds.begin();
+        txn.insert(batch).unwrap();
+        txn.commit().unwrap();
+
+        let on_disk = read_batch(&ds.data_dir().join(&ds.data_files()[0].name)).unwrap();
+        let on_disk_schema = on_disk.schema_ref();
+        assert!(matches!(
+            on_disk_schema.field_with_name("name").unwrap().data_type(),
+            DataType::Dictionary(_, _)
+        ));
+        assert_eq!(
+            on_disk_schema
+                .field_with_name(ROW_ID_COLUMN)
+                .unwrap()
+                .data_type(),
+            &DataType::UInt64
+        );
+        assert_eq!(
+            on_disk_schema
+                .field_with_name(TIMESTAMP_COLUMN)
+                .unwrap()
+                .data_type(),
+            &DataType::Int64
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

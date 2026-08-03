@@ -162,8 +162,13 @@ pub fn should_scan_file(stats: &HashMap<String, ColumnStats>, predicate: &Predic
             // A mismatched Value variant (e.g. a Utf8 predicate value against an
             // Int64 column's stats) can't be proven to miss - fail open rather
             // than trust derived PartialOrd's cross-variant ordering, which
-            // compares by declaration order, not value semantics.
-            if std::mem::discriminant(v) != std::mem::discriminant(&col_stats.min) {
+            // compares by declaration order, not value semantics. Both min and
+            // max must match the predicate value's variant: compute_stats
+            // always produces same-variant min/max, so a mismatch on either
+            // means the stats entry is untrustworthy and we must scan.
+            if std::mem::discriminant(v) != std::mem::discriminant(&col_stats.min)
+                || std::mem::discriminant(v) != std::mem::discriminant(&col_stats.max)
+            {
                 return true;
             }
             match predicate {
@@ -582,6 +587,45 @@ mod tests {
             &stats,
             &Predicate::Eq("id".to_string(), Value::Utf8("x".to_string()))
         ));
+    }
+
+    #[test]
+    fn should_scan_file_fails_open_when_max_variant_mismatches_min() {
+        let mut stats = HashMap::new();
+        // A pathological stats entry whose min and max are different Value
+        // variants. compute_stats never produces this, but the guard must
+        // not assume max matches min just because min matched the predicate
+        // value's variant - a mismatched max means the stats can't be
+        // trusted, so every predicate must fail open (scan).
+        stats.insert(
+            "id".to_string(),
+            ColumnStats {
+                min: Value::Int64(100),
+                max: Value::Utf8("zzz".to_string()),
+            },
+        );
+        // Lt(id, 50): min is Int64(100) so the min-only guard would proceed
+        // and compute `50 > 100` = false -> falsely prune. The max variant
+        // mismatch must force fail-open instead.
+        assert!(
+            should_scan_file(&stats, &Predicate::Lt("id".to_string(), Value::Int64(50))),
+            "a max variant mismatching the predicate value's variant must \
+             fail open - the min-only discriminant guard would falsely prune \
+             via the untrustworthy min comparison"
+        );
+        // GtEq(id, 250): min matches, so the min-only guard proceeds and
+        // compares `250 <= max`. With max = Utf8, derived PartialOrd orders
+        // Int64 < Utf8 by declaration order, so `250 <= Utf8` is always true
+        // -> scans by accident. Still, the guard must fail open explicitly
+        // rather than rely on that accident.
+        assert!(
+            should_scan_file(
+                &stats,
+                &Predicate::GtEq("id".to_string(), Value::Int64(250))
+            ),
+            "a max variant mismatching the predicate value's variant must \
+             fail open regardless of which leaf comparison is involved"
+        );
     }
 
     #[test]

@@ -62,12 +62,20 @@ enum AggValue {
 /// type-specialized vector, indexed by `group_idx`, instead of one small
 /// `Accumulator` instance existing per group. Same identity values and
 /// update/finish math as the scalar accumulator this replaces.
+///
+/// Every non-`Count` variant carries a per-group `count` of how many
+/// non-null values it received. A group whose `count` is still zero at
+/// `finish_all` time (an all-null group) emits `None` -- a null result cell
+/// -- instead of the identity-element sentinel the old design wrote into a
+/// non-nullable column (`Sum`?0.0, `Min`?+?, `Max`?-?, `Avg`?NaN). `Count`
+/// needs no such tracking: a count of zero is a meaningful value, not a
+/// sentinel, so it always emits `Some`.
 #[derive(Debug)]
 enum ColumnarAccumulator {
     Count(Vec<u64>),
-    Sum(Vec<f64>),
-    Min(Vec<f64>),
-    Max(Vec<f64>),
+    Sum { sum: Vec<f64>, count: Vec<u64> },
+    Min { min: Vec<f64>, count: Vec<u64> },
+    Max { max: Vec<f64>, count: Vec<u64> },
     Avg { sum: Vec<f64>, count: Vec<u64> },
 }
 
@@ -75,9 +83,18 @@ impl ColumnarAccumulator {
     fn new(func: AggFunc) -> Self {
         match func {
             AggFunc::Count => Self::Count(Vec::new()),
-            AggFunc::Sum => Self::Sum(Vec::new()),
-            AggFunc::Min => Self::Min(Vec::new()),
-            AggFunc::Max => Self::Max(Vec::new()),
+            AggFunc::Sum => Self::Sum {
+                sum: Vec::new(),
+                count: Vec::new(),
+            },
+            AggFunc::Min => Self::Min {
+                min: Vec::new(),
+                count: Vec::new(),
+            },
+            AggFunc::Max => Self::Max {
+                max: Vec::new(),
+                count: Vec::new(),
+            },
             AggFunc::Avg => Self::Avg {
                 sum: Vec::new(),
                 count: Vec::new(),
@@ -93,11 +110,16 @@ impl ColumnarAccumulator {
     fn push_identity(&mut self) {
         match self {
             Self::Count(v) => v.push(0),
-            Self::Sum(v) => v.push(0.0),
-            Self::Min(v) => v.push(f64::INFINITY),
-            Self::Max(v) => v.push(f64::NEG_INFINITY),
-            Self::Avg { sum, count } => {
+            Self::Sum { sum, count } | Self::Avg { sum, count } => {
                 sum.push(0.0);
+                count.push(0);
+            }
+            Self::Min { min, count } => {
+                min.push(f64::INFINITY);
+                count.push(0);
+            }
+            Self::Max { max, count } => {
+                max.push(f64::NEG_INFINITY);
                 count.push(0);
             }
         }
@@ -106,20 +128,28 @@ impl ColumnarAccumulator {
     fn update(&mut self, group_idx: usize, value: f64) {
         match self {
             Self::Count(v) => v[group_idx] += 1,
-            Self::Sum(v) => v[group_idx] += value,
-            Self::Min(v) => v[group_idx] = v[group_idx].min(value),
-            Self::Max(v) => v[group_idx] = v[group_idx].max(value),
-            Self::Avg { sum, count } => {
+            Self::Sum { sum, count } | Self::Avg { sum, count } => {
                 sum[group_idx] += value;
+                count[group_idx] += 1;
+            }
+            Self::Min { min, count } => {
+                min[group_idx] = min[group_idx].min(value);
+                count[group_idx] += 1;
+            }
+            Self::Max { max, count } => {
+                max[group_idx] = max[group_idx].max(value);
                 count[group_idx] += 1;
             }
         }
     }
 
     /// Consumes the whole vector at once, mapping every group's finished
-    /// value -- same per-variant math as the scalar accumulator's
-    /// `finish()` this replaces.
-    fn finish_all(self) -> Vec<AggValue> {
+    /// value. Returns `Option<AggValue>`: `None` for a group whose
+    /// accumulator never received a non-null update (an all-null group),
+    /// so `finish_agg_column` can emit a null cell instead of the
+    /// identity-element sentinel. `Count` always returns `Some` -- a
+    /// count of zero is meaningful, not a sentinel.
+    fn finish_all(self) -> Vec<Option<AggValue>> {
         match self {
             Self::Count(v) => v
                 .into_iter()
@@ -127,19 +157,35 @@ impl ColumnarAccumulator {
                     // Counts cannot realistically exceed i64::MAX in an in-memory batch.
                     #[allow(clippy::cast_possible_wrap)]
                     let n = n as i64;
-                    AggValue::Int(n)
+                    Some(AggValue::Int(n))
                 })
                 .collect(),
-            Self::Sum(v) | Self::Min(v) | Self::Max(v) => {
-                v.into_iter().map(AggValue::Float).collect()
-            }
+            Self::Sum { sum, count } => sum
+                .into_iter()
+                .zip(count)
+                .map(|(s, c)| (c != 0).then_some(AggValue::Float(s)))
+                .collect(),
+            Self::Min { min, count } => min
+                .into_iter()
+                .zip(count)
+                .map(|(m, c)| (c != 0).then_some(AggValue::Float(m)))
+                .collect(),
+            Self::Max { max, count } => max
+                .into_iter()
+                .zip(count)
+                .map(|(m, c)| (c != 0).then_some(AggValue::Float(m)))
+                .collect(),
             Self::Avg { sum, count } => sum
                 .into_iter()
                 .zip(count)
                 .map(|(s, c)| {
-                    #[allow(clippy::cast_precision_loss)]
-                    let c = c as f64;
-                    AggValue::Float(s / c)
+                    if c == 0 {
+                        None
+                    } else {
+                        #[allow(clippy::cast_precision_loss)]
+                        let c = c as f64;
+                        Some(AggValue::Float(s / c))
+                    }
                 })
                 .collect(),
         }
@@ -189,15 +235,33 @@ pub fn group_by(
     // (e.g. Utf8) to Float64 just to support Count would be wrong: arrow's
     // cast kernel would try to *parse* strings as numbers, erroring or
     // nulling out perfectly valid non-numeric values for no reason.
+    //
+    // `agg_input_nullable` tracks each agg's input column nullability so the
+    // result column can be made nullable when the input is ? an all-null
+    // group then emits a null cell instead of a sentinel.
+    let mut agg_input_nullable: Vec<bool> = Vec::with_capacity(aggs.len());
     let agg_arrays: Vec<(ArrayRef, AggFunc)> = aggs
         .iter()
         .map(|(name, func)| {
             let idx = schema.index_of(name)?;
             let arr = batch.column(idx);
+            agg_input_nullable.push(schema.field(idx).is_nullable());
             if matches!(func, AggFunc::Count) {
                 return Ok((Arc::clone(arr), *func));
             }
-            if !arr.data_type().is_numeric() {
+            // Unwrap dictionary encoding to its value type for the numeric
+            // check: `Dictionary(Int32, Int64).is_numeric()` is false (it
+            // inspects the key type, not the value type), so a
+            // dictionary-encoded numeric column (as encoding.rs produces for
+            // low-cardinality numeric input) would be wrongly rejected here
+            // without this unwrap. `arrow::compute::cast` handles
+            // dictionary?Float64 directly, so no separate dictionary?value
+            // cast is needed.
+            let value_type = match arr.data_type() {
+                DataType::Dictionary(_, value_type) => value_type.as_ref(),
+                other => other,
+            };
+            if !value_type.is_numeric() {
                 return Err(ArrowError::InvalidArgumentError(format!(
                     "column {name} is not numeric, cannot apply {func:?}"
                 )));
@@ -271,7 +335,14 @@ pub fn group_by(
         }
     }
 
-    build_result_batch(group_cols, aggs, &converter, group_key_rows, state)
+    build_result_batch(
+        group_cols,
+        aggs,
+        &converter,
+        group_key_rows,
+        state,
+        &agg_input_nullable,
+    )
 }
 
 fn build_result_batch(
@@ -280,6 +351,7 @@ fn build_result_batch(
     converter: &RowConverter,
     group_key_rows: Vec<Row<'_>>,
     state: Vec<ColumnarAccumulator>,
+    agg_input_nullable: &[bool],
 ) -> Result<RecordBatch, ArrowError> {
     let group_columns = converter.convert_rows(group_key_rows)?;
 
@@ -300,8 +372,8 @@ fn build_result_batch(
         .map(|(name, arr)| Field::new(*name, arr.data_type().clone(), true))
         .collect();
     let mut columns: Vec<ArrayRef> = group_columns;
-    for ((name, func), acc) in aggs.iter().zip(state) {
-        let (field, array) = finish_agg_column(acc.finish_all(), name, *func);
+    for (((name, func), acc), input_nullable) in aggs.iter().zip(state).zip(agg_input_nullable) {
+        let (field, array) = finish_agg_column(acc.finish_all(), name, *func, *input_nullable);
         fields.push(field);
         columns.push(array);
     }
@@ -314,17 +386,23 @@ fn build_result_batch(
 /// array, per [`AggFunc`]: `Count` produces `Int64`, every other `AggFunc`
 /// produces `Float64` — both `unreachable!()` arms below hold because
 /// `ColumnarAccumulator::finish_all()` guarantees that mapping.
-fn finish_agg_column(values: Vec<AggValue>, name: &str, func: AggFunc) -> (Field, ArrayRef) {
+fn finish_agg_column(
+    values: Vec<Option<AggValue>>,
+    name: &str,
+    func: AggFunc,
+    input_nullable: bool,
+) -> (Field, ArrayRef) {
     let field_name = format!("{name}_{func:?}").to_lowercase();
     if matches!(func, AggFunc::Count) {
         let counts: Vec<i64> = values
             .into_iter()
             .map(|v| match v {
-                AggValue::Int(n) => n,
+                Some(AggValue::Int(n)) => n,
                 // ColumnarAccumulator::finish_all()'s Count arm guarantees this.
-                AggValue::Float(_) => {
+                Some(AggValue::Float(_)) => {
                     unreachable!("Count aggregation should produce Int, not Float")
                 }
+                None => unreachable!("Count aggregation never produces None"),
             })
             .collect();
         (
@@ -332,18 +410,20 @@ fn finish_agg_column(values: Vec<AggValue>, name: &str, func: AggFunc) -> (Field
             Arc::new(Int64Array::from(counts)),
         )
     } else {
-        let floats: Vec<f64> = values
+        let floats: Vec<Option<f64>> = values
             .into_iter()
             .map(|v| match v {
-                AggValue::Float(f) => f,
-                // ColumnarAccumulator::finish_all()'s non-Count arms guarantee this.
-                AggValue::Int(_) => {
+                Some(AggValue::Float(f)) => Some(f),
+                None => None,
+                // ColumnarAccumulator::finish_all()'s non-Count arms
+                // guarantee Float (or None), never Int.
+                Some(AggValue::Int(_)) => {
                     unreachable!("Non-Count aggregation should produce Float, not Int")
                 }
             })
             .collect();
         (
-            Field::new(field_name, DataType::Float64, false),
+            Field::new(field_name, DataType::Float64, input_nullable),
             Arc::new(Float64Array::from(floats)),
         )
     }
@@ -547,7 +627,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::float_cmp)]
-    fn null_values_are_skipped_and_an_all_null_group_yields_the_documented_sentinels() {
+    fn null_values_are_skipped_and_an_all_null_group_yields_null_not_sentinels() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("k", DataType::Utf8, false),
             Field::new("v", DataType::Int64, true),
@@ -583,8 +663,29 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
 
-        let mut got: Vec<(String, f64, i64)> = (0..result.num_rows())
-            .map(|i| (keys.value(i).to_string(), sums.value(i), counts.value(i)))
+        // The Sum result column must be nullable, since a nullable input can
+        // produce an all-null group whose sum is itself null (not the 0.0
+        // sentinel the old identity-element approach emitted).
+        assert!(
+            result.schema_ref().field(1).is_nullable(),
+            "Sum over a nullable column must produce a nullable result column"
+        );
+        // Count's result is always non-nullable: a count of zero is a valid,
+        // meaningful value, not a sentinel.
+        assert!(
+            !result.schema_ref().field(2).is_nullable(),
+            "Count result column must stay non-nullable"
+        );
+
+        let mut got: Vec<(String, Option<f64>, i64)> = (0..result.num_rows())
+            .map(|i| {
+                let sum = if sums.is_null(i) {
+                    None
+                } else {
+                    Some(sums.value(i))
+                };
+                (keys.value(i).to_string(), sum, counts.value(i))
+            })
             .collect();
         // f64 isn't Ord, so sort by the (unique) group key rather than the
         // whole tuple.
@@ -593,10 +694,76 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                ("x".to_string(), 10.0, 1), // null skipped: sum=10, count=1
-                ("y".to_string(), 0.0, 0),  // all-null group: Sum's identity is 0.0, Count is 0
+                ("x".to_string(), Some(10.0), 1), // null skipped: sum=10, count=1
+                ("y".to_string(), None, 0),       // all-null group: sum is null, count is 0
             ]
         );
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn all_null_group_yields_null_for_every_non_count_agg_func() {
+        // Min, Max, and Avg over an all-null group must each emit null,
+        // not their old identity-element sentinels (Min?+?, Max?-?, Avg?NaN).
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Utf8, false),
+            Field::new("v", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["x", "x", "y"])),
+                Arc::new(Int64Array::from(vec![Some(10), Some(20), None])), // group x: 10, 20; group y: null
+            ],
+        )
+        .unwrap();
+
+        for func in [AggFunc::Min, AggFunc::Max, AggFunc::Avg] {
+            let result = group_by(&batch, &["k"], &[("v", func)]).unwrap();
+            let values = result
+                .column(1)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap();
+            assert!(
+                result.schema_ref().field(1).is_nullable(),
+                "{func:?} over a nullable column must produce a nullable result column"
+            );
+
+            let mut got: Vec<(String, Option<f64>)> = (0..result.num_rows())
+                .map(|i| {
+                    let v = if values.is_null(i) {
+                        None
+                    } else {
+                        Some(values.value(i))
+                    };
+                    let keys = result
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap();
+                    (keys.value(i).to_string(), v)
+                })
+                .collect();
+            got.sort_by(|a, b| a.0.cmp(&b.0));
+
+            assert_eq!(
+                got,
+                vec![
+                    (
+                        "x".to_string(),
+                        Some(match func {
+                            AggFunc::Min => 10.0,
+                            AggFunc::Max => 20.0,
+                            AggFunc::Avg => 15.0,
+                            _ => unreachable!(),
+                        })
+                    ),
+                    ("y".to_string(), None), // all-null group: null, not a sentinel
+                ],
+                "{func:?}: all-null group must yield null, not a sentinel"
+            );
+        }
     }
 
     #[test]
@@ -691,6 +858,57 @@ mod tests {
             result.column(0).null_count(),
             1,
             "the null value must form its own group, not be dropped or merged"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn dictionary_encoded_numeric_agg_column_is_accepted_and_aggregated_correctly() {
+        // A dictionary-encoded numeric column (e.g. a flag with values 0/1),
+        // as encoding.rs would produce for a low-cardinality numeric column.
+        // Dictionary(Int32, Int64).is_numeric() is false (it inspects the key
+        // type, not the value type), so before the fix this was wrongly
+        // rejected as "not numeric" for Sum/Min/Max/Avg.
+        let dict_type = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Int64));
+        let plain = Int64Array::from(vec![0, 1, 0, 1, 1]);
+        let flags = arrow::compute::cast(&plain, &dict_type).unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Utf8, false),
+            Field::new("flag", dict_type, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["x", "x", "y", "y", "y"])),
+                flags,
+            ],
+        )
+        .unwrap();
+
+        let result = group_by(&batch, &["k"], &[("flag", AggFunc::Sum)]).unwrap();
+        assert_eq!(result.num_rows(), 2);
+
+        let keys = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let sums = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+
+        let mut got: Vec<(String, f64)> = (0..result.num_rows())
+            .map(|i| (keys.value(i).to_string(), sums.value(i)))
+            .collect();
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            got,
+            vec![
+                ("x".to_string(), 1.0), // 0 + 1
+                ("y".to_string(), 2.0), // 0 + 1 + 1
+            ]
         );
     }
 
