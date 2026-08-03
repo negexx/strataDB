@@ -81,11 +81,13 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOC: Counting = Counting;
 
-fn reset_peak() {
-    PEAK.store(LIVE.load(Ordering::Relaxed), Ordering::Relaxed);
+fn reset_peak() -> i64 {
+    let start_live = LIVE.load(Ordering::Relaxed);
+    PEAK.store(start_live, Ordering::Relaxed);
+    start_live
 }
-fn peak_over_now() -> i64 {
-    PEAK.load(Ordering::Relaxed) - LIVE.load(Ordering::Relaxed)
+fn peak_over_start(start_live: i64) -> i64 {
+    PEAK.load(Ordering::Relaxed) - start_live
 }
 
 // ---- dataset -------------------------------------------------------------
@@ -446,7 +448,7 @@ fn main() {
         if k_seg > n {
             continue;
         }
-        reset_peak();
+        let start_live = reset_peak();
         // Contiguous partition — models time-ordered delta segments.
         let per = n.div_ceil(k_seg);
         let dir = std::env::temp_dir().join(format!(
@@ -506,7 +508,7 @@ fn main() {
             unfiltered: summarize_search(&unfiltered_samples),
             filtered: summarize_search(&filtered_samples),
             build_seconds: build_s,
-            peak_live_bytes: peak_over_now(),
+            peak_live_bytes: peak_over_start(start_live),
         });
         drop(snapshot);
         drop(dataset);
@@ -597,5 +599,15 @@ fn segment_recall_self_test() {
             p95: 5.0,
         },
         "five measured repetitions use the middle sample for the median and nearest-rank p95"
+    );
+
+    // This fails if the diagnostic subtracts live bytes at the end of the K
+    // run instead of the live bytes sampled when that K began.
+    LIVE.store(120, Ordering::Relaxed);
+    PEAK.store(180, Ordering::Relaxed);
+    assert_eq!(
+        peak_over_start(100),
+        80,
+        "peak growth must be measured above the K-run start sample"
     );
 }
