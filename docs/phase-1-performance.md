@@ -44,10 +44,11 @@ no separate Task 5 report artifact is checked in. These are host-local observati
 over this exact synthetic envelope, not a universal or asymptotic bound. They do not establish
 portable performance, a retained-history limit, or real-fixture behavior.
 
-No checked-in `bench/cloud-performance/` harness or
-`.github/workflows/cloud-performance-before-after.yml` workflow exists on this branch. Consequently
-PERF-01 remains open for portable, real-fixture, and cloud provenance even though this bounded
-synthetic PERF-02 matrix is recorded.
+The checked-in `bench/cloud-performance/` harness and
+`.github/workflows/cloud-performance-before-after.yml` workflow now provide a reproducible cloud
+comparison path. They do not themselves close PERF-01: a retained before/after artifact, portable
+runner provenance, and compatible real-fixture evidence are still required before the claim can
+advance.
 
 ## Task 6 recovery-byte accounting evidence (fresh, bounded)
 
