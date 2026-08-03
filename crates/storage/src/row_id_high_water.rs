@@ -30,6 +30,16 @@ pub enum HighWaterPersistenceError {
     PossiblyPublished { end: u64, source: StorageError },
 }
 
+/// A decoded row-ID high-water value together with the reservation payload
+/// bytes read to validate it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RowIdHighWaterRead {
+    /// Greatest valid durable reservation record, when one was present.
+    pub high_water: Option<u64>,
+    /// Exact bytes returned by `Backend::get` for decoded reservation records.
+    pub bytes_read: u128,
+}
+
 impl HighWaterPersistenceError {
     /// Returns the durable-or-possibly-durable floor that must not be reused.
     #[must_use]
@@ -78,8 +88,24 @@ pub fn initialize_row_id_high_water(dataset_dir: &Path) -> Result<()> {
 /// Returns a storage error when the collection cannot be read or a named
 /// record is malformed or fails its checksum validation.
 pub fn read_row_id_high_water(dataset_dir: &Path) -> Result<Option<u64>> {
+    Ok(read_row_id_high_water_with_byte_count(dataset_dir)?.high_water)
+}
+
+/// Returns the greatest valid durable reservation record and the exact bytes
+/// read to decode and validate the reservation records.
+///
+/// Temporary files left by an interrupted write are deliberately ignored:
+/// they were never linked into the immutable record namespace. Any malformed
+/// named record is corruption, not a value that can be silently skipped.
+///
+/// # Errors
+///
+/// Returns a storage error when the collection cannot be read or a named
+/// record is malformed or fails its checksum validation.
+pub fn read_row_id_high_water_with_byte_count(dataset_dir: &Path) -> Result<RowIdHighWaterRead> {
     let backend = LocalFs::new(dataset_dir);
     let mut greatest = None;
+    let mut bytes_read = 0;
 
     for meta in backend.list(ROW_ID_HIGH_WATER_PREFIX)? {
         let Some(end) = end_from_key(&meta.key) else {
@@ -94,6 +120,9 @@ pub fn read_row_id_high_water(dataset_dir: &Path) -> Result<Option<u64>> {
 
         let path = dataset_dir.join(&meta.key);
         let bytes = backend.get(&meta.key)?;
+        #[cfg(feature = "test-fault-injection")]
+        test_support::run_after_row_id_read_hook(&bytes);
+        bytes_read += u128::from(bytes.len() as u64);
         let recorded_end = decode_record(&path, &bytes)?;
         if recorded_end != end {
             return Err(corrupt_record(
@@ -106,7 +135,10 @@ pub fn read_row_id_high_water(dataset_dir: &Path) -> Result<Option<u64>> {
         greatest = Some(greatest.map_or(end, |current: u64| current.max(end)));
     }
 
-    Ok(greatest)
+    Ok(RowIdHighWaterRead {
+        high_water: greatest,
+        bytes_read,
+    })
 }
 
 /// Persists a high-water mark no lower than `requested_end`.
@@ -272,8 +304,35 @@ pub mod test_support {
     use std::marker::PhantomData;
     use std::rc::Rc;
 
+    #[cfg(feature = "test-fault-injection")]
+    type AfterRowIdReadHook = Box<dyn FnOnce(&[u8])>;
+
     thread_local! {
         static BEFORE_PUBLISH_FAILURE: RefCell<Option<io::ErrorKind>> = const { RefCell::new(None) };
+    }
+
+    #[cfg(feature = "test-fault-injection")]
+    thread_local! {
+        static AFTER_ROW_ID_READ_HOOK: RefCell<Option<AfterRowIdReadHook>> = const { RefCell::new(None) };
+    }
+
+    /// Installs a one-shot, thread-local hook that runs after a row-ID
+    /// reservation payload has been read from the backend.
+    ///
+    /// This seam exists only for dependent-crate tests that need to mutate
+    /// the catalog after recovery has received bytes but before it returns
+    /// its decoded accounting.
+    #[cfg(feature = "test-fault-injection")]
+    pub fn set_after_row_id_read_hook(hook: impl FnOnce(&[u8]) + 'static) {
+        AFTER_ROW_ID_READ_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    #[cfg(feature = "test-fault-injection")]
+    pub(super) fn run_after_row_id_read_hook(bytes: &[u8]) {
+        let hook = AFTER_ROW_ID_READ_HOOK.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook(bytes);
+        }
     }
 
     /// Thread-affine scoped pre-publication failure injection for the real
@@ -337,6 +396,25 @@ mod tests {
 
         let records = LocalFs::new(&dir).list(ROW_ID_HIGH_WATER_PREFIX).unwrap();
         assert_eq!(records.len(), 2, "lower requests must not replace records");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_with_byte_count_reports_loaded_records_without_changing_legacy_value() {
+        // Break caught: recovery accounting derived from a second catalog
+        // listing could report metadata that was not part of the loader's
+        // actual decoded reservation payloads.
+        let dir = dataset_dir("read-with-byte-count");
+
+        assert_eq!(persist_row_id_high_water_at_least(&dir, 3).unwrap(), 3);
+        assert_eq!(persist_row_id_high_water_at_least(&dir, 9).unwrap(), 9);
+
+        let loaded = read_row_id_high_water_with_byte_count(&dir).unwrap();
+
+        assert_eq!(loaded.high_water, Some(9));
+        assert_eq!(loaded.bytes_read, 24);
+        assert_eq!(read_row_id_high_water(&dir).unwrap(), loaded.high_water);
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

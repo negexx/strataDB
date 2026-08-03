@@ -95,6 +95,23 @@ pub(crate) struct LiveSetCache {
     byte_budget: usize,
 }
 
+/// A best-effort observation of one snapshot's live-set cache.
+///
+/// `charged_bytes` is the cache's soft admission-control charge, not an
+/// allocator measurement: it excludes `HashMap` buckets, mutexes, `Arc`
+/// headers, and allocator metadata. Concurrent misses may make the fields
+/// describe slightly different instants; benchmark callers sample while no
+/// query is concurrently populating the cache.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LiveSetCacheAccounting {
+    /// Number of predicate slots retained by this snapshot.
+    pub entry_count: usize,
+    /// Approximate bytes charged to retained slots and successful live sets.
+    pub charged_bytes: usize,
+    /// The per-snapshot soft admission-control budget.
+    pub byte_budget: usize,
+}
+
 /// Whether a lookup found (or was allowed to create) a slot to compute
 /// into, or the cache is at its byte budget and this call should bypass
 /// caching entirely for this one predicate.
@@ -211,6 +228,15 @@ impl LiveSetCache {
             .fetch_add(live_set.byte_size(), Ordering::Relaxed);
         *guard = Some(Arc::clone(&live_set));
         Ok(live_set)
+    }
+
+    pub(crate) fn accounting(&self) -> LiveSetCacheAccounting {
+        let entry_count = self.lock_slots().len();
+        LiveSetCacheAccounting {
+            entry_count,
+            charged_bytes: self.bytes.load(Ordering::Relaxed),
+            byte_budget: self.byte_budget,
+        }
     }
 }
 

@@ -23,10 +23,13 @@ pub use encoding::encode_batch;
 pub use error::{Result, StorageError};
 pub use manifest::{
     DataFileEntry, MANIFEST_FORMAT_VERSION, Manifest, ManifestEnvelope, SegmentEntry,
-    commit_manifest, read_current,
+    commit_manifest, read_current, read_current_with_byte_count,
 };
+#[cfg(feature = "test-fault-injection")]
+pub use row_id_high_water::test_support::set_after_row_id_read_hook;
 pub use row_id_high_water::{
-    HighWaterPersistenceError, ROW_ID_HIGH_WATER_PREFIX, initialize_row_id_high_water,
-    persist_row_id_high_water_at_least, read_row_id_high_water,
+    HighWaterPersistenceError, ROW_ID_HIGH_WATER_PREFIX, RowIdHighWaterRead,
+    initialize_row_id_high_water, persist_row_id_high_water_at_least, read_row_id_high_water,
+    read_row_id_high_water_with_byte_count,
 };
 pub use stats::{ColumnStats, Value, compute_stats};

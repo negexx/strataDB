@@ -15,10 +15,10 @@ jobs:
   windows-directory-durability:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master at 2026-08-03
         with:
           toolchain: "1.90"
           components: clippy, rustfmt
@@ -41,10 +41,10 @@ jobs:
   ci:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master at 2026-08-03
         with:
           toolchain: "1.90"
           components: clippy, rustfmt
@@ -86,6 +86,7 @@ jobs:
             exit 1
           fi
           models=(
+            dataset::loom_tests::one_writer_store_races_safely_with_many_readers_load
             dataset::loom_tests::two_threads_deleting_the_same_row_exactly_one_conflicts
             dataset::loom_tests::two_threads_deleting_disjoint_rows_both_succeed
             dataset::loom_tests::a_failed_commits_segment_is_never_searchable_under_concurrent_commits
@@ -99,6 +100,9 @@ jobs:
             "$bin" --list --format terse | grep -Fx "${model}: test"
             "$bin" --exact "$model" --test-threads=1
           done
+          semantic_model=dataset::loom_tests::immutable_snapshot_membership_controls_visibility_despite_claimed_high_water
+          "$bin" --list --format terse | grep -Fx "${semantic_model}: test"
+          "$bin" --exact "$semantic_model" --test-threads=1
 
       - name: Loom live-set-cache model (strata-txn)
         run: |
@@ -172,25 +176,109 @@ jobs:
         run: cargo doc --workspace --no-deps
 
       - name: Install cargo-deny
-        uses: taiki-e/install-action@cargo-deny
+        uses: taiki-e/install-action@f1d783a3a0ed7012c43e2889fbe3519390e9025b # cargo-deny
+        with:
+          tool: cargo-deny
 
       - name: cargo-deny (bans, sources, advisories)
         run: cargo deny check bans sources advisories
 
+  fuzz-and-provenance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install supported Rust toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master at 2026-08-03
+        with:
+          toolchain: "1.90"
+
+      - name: Build declared fuzz targets and run parser smoke inputs
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          {
+            set -x
+            printf 'runner.os=%s\nrunner.arch=%s\n' "$RUNNER_OS" "$RUNNER_ARCH"
+            uname -a
+            rustup show active-toolchain
+            rustc -Vv
+            cargo -Vv
+            sha256sum Cargo.lock fuzz/Cargo.lock
+
+            rustup toolchain install nightly-2026-07-25 --profile minimal
+            rustc +nightly-2026-07-25 -Vv
+            cargo +nightly-2026-07-25 -Vv
+            cargo +nightly-2026-07-25 install cargo-fuzz --version 0.13.2 --locked
+            cargo +nightly-2026-07-25 fuzz --version
+
+            fuzz_lock_sha_before="$(sha256sum fuzz/Cargo.lock | awk '{print $1}')"
+            printf 'fuzz.Cargo.lock.sha256.before=%s\n' "$fuzz_lock_sha_before"
+            cd fuzz
+            targets="$(cargo +nightly-2026-07-25 fuzz list | sort)"
+            test "$targets" = $'datafile_parse\nmanifest_parse'
+            CARGO_BUILD_JOBS=1 cargo +nightly-2026-07-25 fuzz build manifest_parse
+            CARGO_BUILD_JOBS=1 cargo +nightly-2026-07-25 fuzz build datafile_parse
+            sha256sum Cargo.lock
+            fuzz_lock_sha_after="$(sha256sum Cargo.lock | awk '{print $1}')"
+            printf 'fuzz.Cargo.lock.sha256.after=%s\n' "$fuzz_lock_sha_after"
+            if ! test "$fuzz_lock_sha_before" = "$fuzz_lock_sha_after"; then
+              echo "::error::cargo +nightly-2026-07-25 fuzz build modified checked-in fuzz/Cargo.lock (before=$fuzz_lock_sha_before after=$fuzz_lock_sha_after)"
+              exit 1
+            fi
+
+            for input in corpus/datafile_parse/*.arrow; do
+              test -f "$input"
+              CARGO_BUILD_JOBS=1 cargo +nightly-2026-07-25 fuzz run datafile_parse "$input" -- -runs=1 -seed=24740
+            done
+            printf '%s\n' '{"version":0}' > "$RUNNER_TEMP/manifest-parse-smoke.json"
+            CARGO_BUILD_JOBS=1 cargo +nightly-2026-07-25 fuzz run manifest_parse "$RUNNER_TEMP/manifest-parse-smoke.json" -- -runs=1 -seed=24740
+          } 2>&1 | tee artifacts/fuzz-provenance.log
+
+      - name: Retain fuzz provenance
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fuzz-provenance-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: artifacts/fuzz-provenance.log
+          if-no-files-found: error
+          retention-days: 14
+
   thorough-chaos:
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     runs-on: ubuntu-latest
+    timeout-minutes: 360
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master at 2026-08-03
         with:
           toolchain: "1.90"
 
       - name: Test thorough chaos tier
         run: |
           set -euo pipefail
-          STRATA_CHAOS_THOROUGH=1 cargo test -p strata-sim thorough_tier_satisfies_the_phase_7_exit_criterion -- --exact --ignored --nocapture \
-            2>&1 | tee /tmp/strata-chaos-thorough.log
-          grep -F "thorough tier: 2000/2000 seeds checked" /tmp/strata-chaos-thorough.log
+          mkdir -p artifacts
+          {
+            set -x
+            printf 'runner.os=%s\nrunner.arch=%s\n' "$RUNNER_OS" "$RUNNER_ARCH"
+            uname -a
+            rustup show active-toolchain
+            rustc -Vv
+            cargo -Vv
+            sha256sum Cargo.lock
+
+            CARGO_BUILD_JOBS=1 STRATA_CHAOS_THOROUGH=1 cargo test -p strata-sim thorough_tier_satisfies_the_phase_7_exit_criterion -- --exact --ignored --nocapture
+          } 2>&1 | tee artifacts/strata-chaos-thorough.log
+          grep -F "thorough tier: 2000/2000 seeds checked" artifacts/strata-chaos-thorough.log
+
+      - name: Retain thorough chaos log
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: thorough-chaos-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: artifacts/strata-chaos-thorough.log
+          if-no-files-found: error
+          retention-days: 14

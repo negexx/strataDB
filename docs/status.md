@@ -5,6 +5,10 @@ are evidence pointers; [roadmap](roadmap.md) owns phase ordering.
 
 ## Overall state
 
+The closeout baseline is merged PR #50 commit `8cd7696fdcf34f6253fb11f9e110f6632bc872de`. The
+[Phase 1 closeout ledger](phase-1-closeout-ledger.md) tracks the remaining finding-level acceptance
+and evidence obligations; it does not change this Partial/blocked state.
+
 **Phase 1: Partial — blocked.** The [seven-lane Sol audit](phase-1-audit.md) found correctness,
 durability, schema, API-boundary, verification, and performance-evidence blockers inside the supported
 single-process/shared-`Dataset` boundary.
@@ -24,7 +28,7 @@ single-process/shared-`Dataset` boundary.
 | Python | Proposed | PyO3 scaffolding exports only `placeholder_version`; no database API exists. |
 | Durability/recovery | Partial | File/directory durability, immutable row-ID high-water, manifest integrity, and crash/reopen evidence exist within named local bounds; full branch verification remains. |
 | Schema/migrations | Partial | Dataset-owned schema and strict validation are implemented; schema evolution and migration remain deferred. |
-| Loom/chaos/fuzz/bench evidence | Partial | Exact loom/checkpoint/chaos gates are configured; bounded Windows synthetic segmented/lifecycle evidence is recorded, while CI execution/provenance, fuzz evidence, and portable real-fixture bounds remain. |
+| Loom/chaos/fuzz/bench evidence | Partial | Passing thorough-chaos evidence is local Ubuntu WSL only, not portable/native-platform or CI execution/log-retention evidence; local fuzz build/smoke now passes, while CI fuzz provenance and portable real-fixture performance bounds remain open. |
 | Compaction/GC | Proposed | No compaction, vacuum, orphan cleanup, or bounded history implementation. |
 | Cross-process coordination | Proposed | Independent openers do not share transaction state or durable conditional publication. |
 | Branching/object storage | Proposed | No branch/merge or object-store backend is implemented. |

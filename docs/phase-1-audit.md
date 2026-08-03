@@ -9,6 +9,15 @@ future fixes can still refer to the original evidence without maintaining seven 
 Line numbers are deliberately omitted because they are unstable; use the finding ID plus current
 source/tests as the anchor.
 
+## Closeout baseline and ledger
+
+The closeout branch is synchronized through merged PR #50,
+`8cd7696fdcf34f6253fb11f9e110f6632bc872de` (`Merge Phase 1 audit remediation`). The
+[Phase 1 closeout ledger](phase-1-closeout-ledger.md) is the mechanically scannable, row-per-finding
+record of current state, dependencies, acceptance assertions, and the future evidence required before
+this audit's verdict can change. It does not close Phase 1 or replace this audit as the controlling
+finding register.
+
 ## Approved remediation design
 
 The Phase 1 remediation keeps Strata's supported boundary at one process using one shared
@@ -55,10 +64,12 @@ implementation and recovery evidence for those slices; the supported
 packages are marked non-publishable. Task 7 now configures exact transaction and cache loom
 discovery, plus an index whole-binary loom run; checkpoint-abort and fast-chaos gates; and
 scheduled/manual thorough-chaos execution.
-Local targeted evidence exists, but full Linux CI execution/provenance and thorough 2000/2000 output
-remain pending. Task 8 now records bounded Windows synthetic segmented/lifecycle evidence with
-reproduction metadata; the optional real fixture, portable host matrix, and universal operating
-bounds remain open. This does not change the audit verdict from Partial and blocked.
+Fresh Ubuntu WSL exact-model transaction loom evidence and Ubuntu WSL thorough-chaos evidence
+(`2000/2000` seeds with zero violations) now exist. Fuzz build/smoke now also passes locally;
+retained CI execution/log-retention provenance and platform portability remain open. Task 8 now records bounded
+Windows synthetic segmented/lifecycle evidence with reproduction metadata; the optional real fixture,
+portable host matrix, and universal operating bounds remain open. This does not change the audit
+verdict from Partial and blocked.
 
 VER-04 through VER-06, PERF-01 through PERF-05, and the later/deferred findings remain separately
 tracked unless the final review proves a dependency for a Phase 1 fix.
@@ -145,25 +156,25 @@ consolidated register above; IDs marked "merged" retain the same evidence under 
 | IDX-03 | Preserved explicitly: fixed `ef_search` can underfill `k`, including an unbounded API request above 32. Phase 1 contract decision and Phase 2 API work. |
 | IDX-04 | Merged with ARCH-04 and VER-07: recall experiment was overgeneralized. Current decisions now bound the claim to its workload. |
 | PERF-01 | Bounded Windows synthetic retained-version/segment matrix is recorded in `docs/phase-1-performance.md`; real-fixture, CPU/RAM, and portable-host evidence remain open. |
-| PERF-02 | A 40-commit sample records manifest bytes at versions 1/10/20/40; it is evidence, not a universal bound. Incremental manifests/GC remain Phase 3. |
-| PERF-03 | A bounded lifecycle reopen point records recovery time; the separately reported manifest bytes are end-of-run after concurrent commits. Multi-scale recovery bounds and lifecycle work remain open. |
+| PERF-02 | Five-repetition manifest-growth measurements cover versions 1/10/20/40/80/160; they are evidence, not a universal bound. Incremental manifests/GC remain Phase 3. |
+| PERF-03 | Typed recovery-byte accounting and a deterministic row-ID load-boundary regression are implemented; multi-scale recovery bounds and portable/real-fixture evidence remain open. |
 | PERF-04 | A bounded Dataset/Snapshot fan-out sample covers K=1…64 synthetic segments; it does not establish a supported maximum. Compaction remains Phase 3. |
-| PERF-05 | A bounded sample retains four historical/current snapshots and reports live allocator bytes; RSS and a universal residency bound remain open. |
+| PERF-05 | Repeated bounded Windows synthetic evidence covers 0/1/4/16/64 retained handles with exact logical-versus-unique manifest/data/segment accounting plus labeled approximate cache/allocator observations; RSS, portable/real-fixture, and universal residency bounds remain open. |
 | PERF-06 | Preserved as later Phase 2/3 query/layout work: public scans lack projection pushdown and sub-file pruning; establish an honest baseline. |
 | PERF-07 | Preserved as documentation/query work: projection avoids some array construction but not dominant file-body reads; benchmark and correct the claim. |
-| ARCH-01 | Preserved: dataset-owned schema is missing. Phase 1 blocker. |
-| ARCH-02 | Merged with COR-05: target validation and singular update semantics are missing. Phase 1 blocker. |
-| ARCH-03 | Preserved: insufficient history can be reported as a false row conflict. Phase 1 blocker. |
+| ARCH-01 | Dataset-owned schema validation is implemented and regression-covered; schema evolution and final branch verification remain. |
+| ARCH-02 | Merged with COR-05: target validation and singular update semantics are implemented and regression-covered; final branch verification remains. |
+| ARCH-03 | Typed insufficient-history/error semantics are implemented and regression-covered; final branch verification remains. |
 | ARCH-04 | Merged with IDX-04 and VER-07: accepted decision/active docs overclaimed transaction or recall guarantees. Corrected and bounded in current docs. |
-| ARCH-05 | Preserved: public low-level surfaces can bypass `Dataset` invariants. Phase 1 facade-boundary blocker. |
+| ARCH-05 | Supported public facade and invariant-boundary cleanup are implemented; final branch verification remains. |
 | ARCH-06 | Preserved as later Phase 2 API work: subordinate-crate types leak through the transaction facade. |
 | ARCH-07 | Preserved as later Phase 2/6 work: backend abstraction is not threaded through all I/O. |
 | ARCH-08 | Preserved as later Phase 2 client work: CLI snapshot labels can disagree with displayed rows. |
-| VER-01 | Preserved: known counterexamples lack direct regression gates. Phase 1 blocker. |
-| VER-02 | Merged with CONC-02: Task 7 configures transaction/cache exact-model and index whole-binary loom CI gates; CI execution/provenance remains pending. Phase 1 blocker. |
-| VER-03 | Merged with DUR-04: Task 7 configures checkpoint-abort and fast-chaos CI gates plus scheduled/manual thorough chaos; CI execution/provenance and 2000/2000 output remain pending. Phase 1 blocker. |
-| VER-04 | Preserved as Phase 1 evidence gap: fuzz targets are not build-gated and do not cover all recovery parsers. |
-| VER-05 | Preserved as Phase 1 reproducibility hardening: CI action/tool provenance is mutable. |
+| VER-01 | Known counterexamples have targeted regression gates; complete branch verification remains. |
+| VER-02 | Merged with CONC-02: fresh Ubuntu WSL execution passed the nine production transaction models plus the separate compact semantic guard; CI execution/provenance remains pending. Phase 1 blocker. |
+| VER-03 | Merged with DUR-04: fresh Ubuntu WSL thorough chaos reached `2000/2000` seeds with zero violations; CI execution/provenance and portability remain pending. Phase 1 blocker. |
+| VER-04 | Ubuntu WSL completed both declared nightly ASAN targets and deterministic parser smoke inputs with a stable fuzz lock hash; retained CI execution/artifact evidence remains open. |
+| VER-05 | The evidence workflow now pins action SHAs and nightly `2026-07-25`; retained CI execution/provenance artifacts remain open. |
 | VER-06 | Preserved as Phase 1 measurement evidence blocker: bounded Windows synthetic inputs/results are recorded, but portable host/fixture provenance is still missing. |
 | VER-07 | Merged with ARCH-04 and DUR-05: current docs now qualify intended guarantees and retain Partial status. |
 

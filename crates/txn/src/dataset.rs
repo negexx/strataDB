@@ -31,8 +31,9 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use strata_index::{EfConstruction, HnswIndex, MaxConnections, MaxElements, MaxLayers};
 use strata_storage::{
     ColumnStats, DataFileEntry, Manifest, SegmentEntry, Value, commit_manifest, compute_stats,
-    initialize_row_id_high_water, read_batch, read_current, read_row_id_high_water, sync_dir,
-    write_batch, write_bytes,
+    initialize_row_id_high_water, read_current, read_current_with_byte_count,
+    read_row_id_high_water, read_row_id_high_water_with_byte_count, sync_dir, write_batch,
+    write_bytes,
 };
 
 use crate::commit_log::{CommitLog, ConflictCheck};
@@ -209,6 +210,33 @@ pub struct Dataset {
     /// `issue_timestamp`. Seeded from `Manifest.commit_time_high_water` on
     /// both `create` and `open`, so this floor survives a restart.
     last_issued_timestamp: Arc<AtomicI64>,
+}
+
+/// Exact on-disk payload bytes loaded during one successful
+/// [`Dataset::open_with_recovery_accounting`] recovery.
+///
+/// Each category records validation payloads, not process allocations, RSS,
+/// directory-listing metadata, or historical manifests that recovery did not
+/// open. Counts are `u128` so summing many valid `u64`-sized files cannot
+/// silently wrap the diagnostic.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RecoveryByteAccounting {
+    /// Bytes in the selected current manifest that recovery loaded and validated.
+    pub manifest_bytes: u128,
+    /// Bytes in immutable row-ID reservation records recovery loaded and validated.
+    pub row_id_catalog_bytes: u128,
+    /// Bytes in manifest-listed Arrow row files recovery loaded and validated.
+    pub row_data_bytes: u128,
+    /// Bytes in manifest-listed immutable vector segments recovery loaded and validated.
+    pub segment_bytes: u128,
+}
+
+impl RecoveryByteAccounting {
+    /// The sum of all recovery payload categories.
+    #[must_use]
+    pub const fn total_bytes(self) -> u128 {
+        self.manifest_bytes + self.row_id_catalog_bytes + self.row_data_bytes + self.segment_bytes
+    }
 }
 
 /// The single source of truth for "where does this dataset's data live,
@@ -446,8 +474,40 @@ impl Dataset {
     /// Returns [`TxnError::NotFound`] if no dataset exists at `dir`, or a
     /// storage error if the current manifest exists but fails to read.
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self> {
-        let dir = dir.into();
-        let manifest = read_current(&dir)?.ok_or_else(|| TxnError::NotFound(dir.clone()))?;
+        Self::open_inner(dir.into(), None)
+    }
+
+    /// Opens a dataset and returns exact recovery validation payload bytes.
+    ///
+    /// This opt-in diagnostic follows the same recovery and validation path
+    /// as [`Dataset::open`] without mutating the dataset or changing commit
+    /// acknowledgement semantics.
+    ///
+    /// # Errors
+    ///
+    /// As [`Dataset::open`], if recovery cannot locate or validate the
+    /// dataset's durable state.
+    pub fn open_with_recovery_accounting(
+        dir: impl Into<PathBuf>,
+    ) -> Result<(Self, RecoveryByteAccounting)> {
+        let mut accounting = RecoveryByteAccounting::default();
+        let dataset = Self::open_inner(dir.into(), Some(&mut accounting))?;
+        Ok((dataset, accounting))
+    }
+
+    fn open_inner(
+        dir: PathBuf,
+        mut accounting: Option<&mut RecoveryByteAccounting>,
+    ) -> Result<Self> {
+        let manifest = match accounting.as_deref_mut() {
+            Some(accounting) => {
+                let (manifest, bytes) = read_current_with_byte_count(&dir)?
+                    .ok_or_else(|| TxnError::NotFound(dir.clone()))?;
+                accounting.manifest_bytes = u128::from(bytes);
+                manifest
+            }
+            None => read_current(&dir)?.ok_or_else(|| TxnError::NotFound(dir.clone()))?,
+        };
         let manifest_path = dir
             .join("_versions")
             .join(format!("{:020}.manifest", manifest.version));
@@ -458,7 +518,14 @@ impl Dataset {
         // an allocation from it any more, but the ceiling is still a
         // panic-safety bound on what row-ids may reach `NodeTable` — see
         // `MAX_REASONABLE_ROW_ID_CAPACITY`.
-        let durable_high_water = read_row_id_high_water(&dir)?.ok_or_else(|| {
+        let durable_high_water = if let Some(accounting) = accounting.as_deref_mut() {
+            let loaded = read_row_id_high_water_with_byte_count(&dir)?;
+            accounting.row_id_catalog_bytes = loaded.bytes_read;
+            loaded.high_water
+        } else {
+            read_row_id_high_water(&dir)?
+        }
+        .ok_or_else(|| {
             strata_storage::StorageError::MissingRowIdHighWater(
                 dir.join(strata_storage::ROW_ID_HIGH_WATER_PREFIX),
             )
@@ -470,9 +537,9 @@ impl Dataset {
                 MAX_REASONABLE_ROW_ID_CAPACITY,
             ));
         }
-        let owned_rows = validate_data_files(&dir, &manifest, &schema)?;
+        let owned_rows = validate_data_files(&dir, &manifest, &schema, accounting.as_deref_mut())?;
         validate_tombstones(&dir, &manifest, &owned_rows)?;
-        let index = load_segments(&dir, &manifest, &owned_rows)?;
+        let index = load_segments(&dir, &manifest, &owned_rows, accounting)?;
         // The manifest's tombstone list is now the only source: index-level
         // tombstone entries went away with the delta log, and never had a
         // producer on the commit path anyway.
@@ -2065,6 +2132,7 @@ fn validate_data_files(
     dir: &Path,
     manifest: &Manifest,
     logical_schema: &SchemaRef,
+    mut accounting: Option<&mut RecoveryByteAccounting>,
 ) -> Result<HashSet<u64>> {
     let data_dir = data_subdir(dir);
     let mut owned_rows = HashSet::new();
@@ -2082,6 +2150,9 @@ fn validate_data_files(
         }
         let path = safe_join(&data_dir, &entry.name)?;
         let bytes = std::fs::read(&path)?;
+        if let Some(accounting) = accounting.as_deref_mut() {
+            accounting.row_data_bytes += u128::from(bytes.len() as u64);
+        }
         let actual_len = u64::try_from(bytes.len())?;
         if actual_len != entry.byte_len {
             return Err(TxnError::Storage(
@@ -2106,7 +2177,7 @@ fn validate_data_files(
                 ),
             ));
         }
-        let batch = read_batch(&data_dir.join(&entry.name))?;
+        let batch = strata_storage::datafile::read_batch_from_bytes(&path, &bytes)?;
         validate_physical_batch_schema(dir, manifest, logical_schema, &batch, &entry.name)?;
         let actual_rows = u64::try_from(batch.num_rows())?;
         if actual_rows != entry.row_count {
@@ -2183,6 +2254,7 @@ fn load_segments(
     dir: &Path,
     manifest: &Manifest,
     owned_rows: &HashSet<u64>,
+    mut accounting: Option<&mut RecoveryByteAccounting>,
 ) -> Result<strata_index::SegmentSet> {
     let data_dir = data_subdir(dir);
     let mut parts = Vec::with_capacity(manifest.segments.len());
@@ -2198,6 +2270,9 @@ fn load_segments(
         }
         let path = safe_join(&data_dir, &entry.name)?;
         let bytes = std::fs::read(&path)?;
+        if let Some(accounting) = accounting.as_deref_mut() {
+            accounting.segment_bytes += u128::from(bytes.len() as u64);
+        }
         // Checked before parsing so a truncated file is reported as the
         // truncation it is, rather than as whichever internal check its
         // remaining bytes happen to trip first. `SegmentEntry.byte_len`
@@ -4075,7 +4150,7 @@ mod tests {
     fn commit_after_reopen_does_not_destroy_prior_sessions_data_files() {
         // Regression test for the cross-session filename-collision bug
         // found during Task 6 self-review (see "Concern 1" in
-        // .superpowers/sdd/task-6-report.md): before the fix,
+        // the Phase 1 Task 6 self-review): before the fix,
         // `write_attempt_counter` was reseeded to 0 on every `Dataset::open`,
         // so a session that reopened an existing dataset and committed
         // again would regenerate the exact same `{attempt_id:020}-{i}`
@@ -8288,14 +8363,16 @@ mod loom_tests {
     /// assert inside loom, so a commit that only needs the stack — not the
     /// concurrency — still costs a hard-capped slot.
     ///
-    /// **Exactly one model is preemption-bounded rather than run
-    /// exhaustively:** Model 3 above races two full `Transaction::commit`s
-    /// across 4 threads and, unbounded, exhausts the machine's commit charge
-    /// before it finishes; it runs through `loom::model::Builder` with
-    /// `preemption_bound = Some(3)` instead. Every other model here runs
-    /// unbounded through `loom::model(...)` and stays that way — this is a
-    /// scoped exception, not a precedent for a new model. See that test's own
-    /// comment for the measurements behind the bound.
+    /// **Two models use explicit preemption bounds rather than the default
+    /// environment setting:** Model 3 above races two full
+    /// `Transaction::commit`s across 4 threads and, unbounded, exhausts the
+    /// machine's commit charge before it finishes; it uses
+    /// `preemption_bound = Some(3)`. The compact semantic publication model
+    /// below uses `Some(2)`, the smallest measured bound that reaches its
+    /// required four states; its fixed state machine is deliberately kept
+    /// separate from Model 3's full-stack resource limitation. All remaining
+    /// models run through `loom::model(...)` with the environment's default.
+    /// See each bounded test's own comment for its evidence.
     ///
     /// loom documents this value as bytes while `generator` consumes it as
     /// words, so the real stack is 8 MiB today. Left uncompensated on
@@ -9159,6 +9236,125 @@ mod loom_tests {
              only one side means DPOR collapsed this model to a single \
              trivial schedule again (see the module doc comment above `mod \
              loom_tests`)"
+        );
+    }
+
+    #[test]
+    fn immutable_snapshot_membership_controls_visibility_despite_claimed_high_water() {
+        // This is a compact semantic guard for the publication rule, not a
+        // model of Dataset, manifest I/O, or the production commit protocol.
+        // Report it separately from the production transaction loom models.
+        const A: u8 = 0b01;
+        const B: u8 = 0b10;
+
+        #[derive(Clone, Copy, Default)]
+        struct PublishedSnapshot {
+            high_water: u64,
+            rows: u8,
+            vectors: u8,
+        }
+
+        #[derive(Default)]
+        struct PublicationState {
+            next_row_id: u64,
+            a_id: Option<u64>,
+            b_id: Option<u64>,
+            current: PublishedSnapshot,
+        }
+
+        fn claim(state: &loom::sync::Mutex<PublicationState>, membership: u8) {
+            let mut state = state.lock().unwrap();
+            let id = state.next_row_id;
+            state.next_row_id += 1;
+            if membership == A {
+                state.a_id = Some(id);
+            } else {
+                state.b_id = Some(id);
+            }
+        }
+
+        fn publish(membership: u8, state: &loom::sync::Mutex<PublicationState>) {
+            let mut state = state.lock().unwrap();
+            state.current = PublishedSnapshot {
+                high_water: state.current.high_water.max(state.next_row_id),
+                rows: state.current.rows | membership,
+                vectors: state.current.vectors | membership,
+            };
+        }
+
+        // These non-modeled coverage registers live outside `loom::model`,
+        // so they accumulate the one reader observation from every explored
+        // execution. The publication state itself uses loom primitives only.
+        static OBSERVED_STATES: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+        static HIGH_WATER_COVERS_UNPUBLISHED_ID: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+
+        // Loom 0.7.2 seeds `Builder::new()` from LOOM_MAX_PREEMPTIONS;
+        // explicit `Some(2)` overrides it, keeping this finite coverage gate
+        // environment-independent. Bound 1 misses the high-water hazard;
+        // 2 is the smallest measured passing bound (3 passes).
+        let mut model = loom::model::Builder::new();
+        model.preemption_bound = Some(2);
+        model.check(|| {
+            let state = loom::sync::Arc::new(loom::sync::Mutex::new(PublicationState::default()));
+
+            let writer_a_state = loom::sync::Arc::clone(&state);
+            let writer_a = loom::thread::spawn(move || {
+                claim(&writer_a_state, A);
+                publish(A, &writer_a_state);
+            });
+
+            let writer_b_state = loom::sync::Arc::clone(&state);
+            let writer_b = loom::thread::spawn(move || {
+                claim(&writer_b_state, B);
+                publish(B, &writer_b_state);
+            });
+
+            let reader_state = loom::sync::Arc::clone(&state);
+            let reader = loom::thread::spawn(move || {
+                let state = reader_state.lock().unwrap();
+                let snapshot = state.current;
+                let a_row = snapshot.rows & A != 0;
+                let a_vector = snapshot.vectors & A != 0;
+                let b_row = snapshot.rows & B != 0;
+                let b_vector = snapshot.vectors & B != 0;
+
+                assert_eq!(a_row, a_vector, "A row/vector membership must agree");
+                assert_eq!(b_row, b_vector, "B row/vector membership must agree");
+
+                let high_water_covers_unpublished_id = state
+                    .a_id
+                    .is_some_and(|id| snapshot.high_water > id && !a_row)
+                    || state
+                        .b_id
+                        .is_some_and(|id| snapshot.high_water > id && !b_row);
+                if high_water_covers_unpublished_id {
+                    HIGH_WATER_COVERS_UNPUBLISHED_ID
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+
+                let state = match (a_row, b_row) {
+                    (false, false) => 0b0001,
+                    (true, false) => 0b0010,
+                    (false, true) => 0b0100,
+                    (true, true) => 0b1000,
+                };
+                OBSERVED_STATES.fetch_or(state, std::sync::atomic::Ordering::Relaxed);
+            });
+
+            writer_a.join().unwrap();
+            writer_b.join().unwrap();
+            reader.join().unwrap();
+        });
+
+        let observed = OBSERVED_STATES.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            observed, 0b1111,
+            "loom must observe neither, only A, only B, and both published; bitmask {observed:#06b}"
+        );
+        assert!(
+            HIGH_WATER_COVERS_UNPUBLISHED_ID.load(std::sync::atomic::Ordering::Relaxed),
+            "a published snapshot high-water must be able to cover a claimed but unpublished id"
         );
     }
 

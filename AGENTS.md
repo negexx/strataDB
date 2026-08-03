@@ -25,8 +25,9 @@ Non-negotiable target invariants:
   transaction interface or add another isolation level without a superseding ADR.
 - Conflicts are typed errors that identify contested row IDs; never silently resolve them.
 - Row IDs are intended to be dataset-global physical allocation values: monotonically allocated,
-  never reused; gaps are safe. Restart recovery currently has a Phase 1 non-reuse counterexample.
-  `update` tombstones an old physical row and inserts a replacement with a new ID.
+  never reused; gaps are safe. Restart non-reuse is regression-covered, while final CI and
+  platform evidence remain part of the Phase 1 gate. `update` tombstones an old physical row and
+  inserts a replacement with a new ID.
 - Strata remains embedded and single-node. Distributed transactions, full SQL, and additional ANN
   index families are out of scope.
 

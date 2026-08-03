@@ -363,6 +363,21 @@ pub fn commit_manifest(dataset_dir: &Path, manifest: &Manifest) -> Result<()> {
 /// genuinely corrupt manifest, not a crash-in-progress one (see the module
 /// doc comment for why those are distinguishable).
 pub fn read_current(dataset_dir: &Path) -> Result<Option<Manifest>> {
+    Ok(read_current_with_byte_count(dataset_dir)?.map(|(manifest, _)| manifest))
+}
+
+/// Returns the highest committed manifest together with the exact number of
+/// manifest bytes loaded to validate it.
+///
+/// This is a side-effect-free diagnostic companion to [`read_current`]. The
+/// count covers the one fully-renamed current manifest selected by recovery,
+/// not directory listings or older retained manifests that are not loaded.
+///
+/// # Errors
+///
+/// As [`read_current`], if recovery cannot list, load, parse, or validate the
+/// selected manifest.
+pub fn read_current_with_byte_count(dataset_dir: &Path) -> Result<Option<(Manifest, u64)>> {
     let backend = LocalFs::new(dataset_dir);
 
     let mut best: Option<(u64, String)> = None;
@@ -403,7 +418,7 @@ pub fn read_current(dataset_dir: &Path) -> Result<Option<Manifest>> {
     // so a caller that only uses `read_current` cannot accidentally treat a
     // catalog with broken schema ownership metadata as usable.
     envelope.manifest.schema(&path)?;
-    Ok(Some(envelope.manifest))
+    Ok(Some((envelope.manifest, bytes.len() as u64)))
 }
 
 #[cfg(test)]

@@ -41,6 +41,7 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -48,9 +49,10 @@ use std::time::{Duration, Instant};
 use arrow::array::{FixedSizeListArray, Float32Array, Float64Array, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use strata_bench::{ManifestListedFile, SnapshotFootprint, pinned_snapshot_footprint_diagnostics};
 use strata_query::{AggFunc, Predicate};
-use strata_storage::Value;
-use strata_txn::Dataset;
+use strata_storage::{Value, read_current_with_byte_count};
+use strata_txn::{Dataset, Snapshot};
 
 // ---- counting allocator ---------------------------------------------------
 
@@ -94,12 +96,14 @@ fn phase_start() -> (u64, i64) {
 struct PhaseMem {
     allocated: u64,
     peak_over_start: i64,
+    live_delta: i64,
 }
 
 fn phase_end(start: (u64, i64)) -> PhaseMem {
     PhaseMem {
         allocated: TOTAL.load(Ordering::Relaxed) - start.0,
         peak_over_start: PEAK.load(Ordering::Relaxed) - start.1,
+        live_delta: LIVE.load(Ordering::Relaxed) - start.1,
     }
 }
 
@@ -327,11 +331,144 @@ struct PhaseResult {
     mem: PhaseMem,
 }
 
+struct PinnedSnapshotDiagnostics {
+    distinct_snapshots: usize,
+    cache_entries: usize,
+    cache_charged_bytes: usize,
+    cache_budget_bytes: usize,
+}
+
+struct PinnedSnapshot {
+    snapshot: Arc<Snapshot>,
+    footprint: SnapshotFootprint,
+}
+
+fn capture_pinned_snapshot(dir: &Path, snapshot: Arc<Snapshot>) -> PinnedSnapshot {
+    // The benchmark takes this snapshot and reads the just-published current
+    // manifest on its single writer thread, before later commits begin. The
+    // captured manifest is therefore the immutable resource set retained by
+    // this handle, not a later recovery-only proxy.
+    let (manifest, manifest_payload_bytes) = read_current_with_byte_count(dir)
+        .unwrap()
+        .expect("the just-published snapshot must have a manifest");
+    PinnedSnapshot {
+        snapshot,
+        footprint: SnapshotFootprint {
+            version: manifest.version,
+            manifest_payload_bytes,
+            row_data_files: manifest
+                .data_files
+                .into_iter()
+                .map(|file| ManifestListedFile::new(file.name, file.byte_len))
+                .collect(),
+            immutable_segment_files: manifest
+                .segments
+                .into_iter()
+                .map(|segment| ManifestListedFile::new(segment.name, segment.byte_len))
+                .collect(),
+        },
+    }
+}
+
+fn pinned_snapshot_diagnostics(pinned: &[PinnedSnapshot]) -> PinnedSnapshotDiagnostics {
+    let mut distinct: Vec<&Arc<Snapshot>> = Vec::with_capacity(pinned.len());
+    for snapshot in pinned {
+        if !distinct
+            .iter()
+            .any(|existing| Arc::ptr_eq(existing, &snapshot.snapshot))
+        {
+            distinct.push(&snapshot.snapshot);
+        }
+    }
+    let mut cache_entries = 0;
+    let mut cache_charged_bytes = 0;
+    let mut cache_budget_bytes = 0;
+    for snapshot in &distinct {
+        let cache = snapshot.live_set_cache_accounting();
+        cache_entries += cache.entry_count;
+        cache_charged_bytes += cache.charged_bytes;
+        cache_budget_bytes += cache.byte_budget;
+    }
+    PinnedSnapshotDiagnostics {
+        distinct_snapshots: distinct.len(),
+        cache_entries,
+        cache_charged_bytes,
+        cache_budget_bytes,
+    }
+}
+
 fn mib(bytes: i64) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
 }
 
+fn requested_pin_counts() -> Vec<usize> {
+    std::env::var("STRATA_PINNED_SNAPSHOTS")
+        .unwrap_or_else(|_| "1".to_owned())
+        .split(',')
+        .map(|value| {
+            value.trim().parse().unwrap_or_else(|error| {
+                panic!("invalid STRATA_PINNED_SNAPSHOTS value {value:?}: {error}")
+            })
+        })
+        .collect()
+}
+
+fn lifecycle_run_count(name: &str, default: usize, minimum: usize) -> usize {
+    let count = std::env::var(name).ok().map_or(default, |value| {
+        value
+            .parse()
+            .unwrap_or_else(|error| panic!("invalid {name} value {value:?}: {error}"))
+    });
+    assert!(
+        count >= minimum,
+        "{name} must be at least {minimum} to preserve the lifecycle measurement protocol; got {count}"
+    );
+    count
+}
+
+fn run_lifecycle_measurements() {
+    let warmups = lifecycle_run_count("STRATA_LIFECYCLE_WARMUP_RUNS", 1, 1);
+    let repetitions = lifecycle_run_count("STRATA_LIFECYCLE_REPETITIONS", 5, 5);
+    let executable = std::env::current_exe().expect("lifecycle benchmark executable path");
+    for pin_count in requested_pin_counts() {
+        for warmup in 1..=warmups {
+            let status = Command::new(&executable)
+                .env("STRATA_LIFECYCLE_RUN_ONCE", "1")
+                .env("STRATA_PINNED_SNAPSHOTS", pin_count.to_string())
+                .env(
+                    "STRATA_LIFECYCLE_MEASUREMENT",
+                    format!("excluded warmup {warmup}/{warmups}; pins={pin_count}"),
+                )
+                .status()
+                .expect("start lifecycle warmup");
+            assert!(
+                status.success(),
+                "lifecycle warmup {warmup}/{warmups} for pin count {pin_count} failed: {status}"
+            );
+        }
+        for repetition in 1..=repetitions {
+            let status = Command::new(&executable)
+                .env("STRATA_LIFECYCLE_RUN_ONCE", "1")
+                .env("STRATA_PINNED_SNAPSHOTS", pin_count.to_string())
+                .env(
+                    "STRATA_LIFECYCLE_MEASUREMENT",
+                    format!("measured repetition {repetition}/{repetitions}; pins={pin_count}"),
+                )
+                .status()
+                .expect("start lifecycle measurement");
+            assert!(
+                status.success(),
+                "lifecycle repetition {repetition}/{repetitions} for pin count {pin_count} failed: {status}"
+            );
+        }
+    }
+}
+
 fn main() {
+    if std::env::var_os("STRATA_LIFECYCLE_RUN_ONCE").is_none() {
+        run_lifecycle_measurements();
+        return;
+    }
     let rows_n: usize = std::env::var("STRATA_LIFECYCLE_ROWS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -343,8 +480,7 @@ fn main() {
     let pinned_snapshots: usize = std::env::var("STRATA_PINNED_SNAPSHOTS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(1)
-        .max(1);
+        .unwrap_or(1);
     let queries_n: usize = 50;
     let k: usize = 10;
     let threads: usize = 8;
@@ -376,8 +512,8 @@ fn main() {
         txn.insert(batch_of(chunk)).unwrap();
         txn.commit().unwrap();
         commits += 1;
-        if retained_snapshots.len() < pinned_snapshots.saturating_sub(1) {
-            retained_snapshots.push(ds.snapshot());
+        if retained_snapshots.len() < pinned_snapshots {
+            retained_snapshots.push(capture_pinned_snapshot(&dir, ds.snapshot()));
         }
     }
     let wall = t.elapsed();
@@ -399,15 +535,21 @@ fn main() {
     drop(ds);
     let m = phase_start();
     let t = Instant::now();
-    let ds = Dataset::open(&dir).unwrap();
+    let (ds, recovery_bytes) = Dataset::open_with_recovery_accounting(&dir).unwrap();
     let wall = t.elapsed();
     results.push(PhaseResult {
         name: "recovery (reopen)",
         kind: "I/O + validation (segment load, no graph rebuild)",
         wall,
         detail: format!(
-            "loaded {n} rows, {:.0} rows/s",
-            n as f64 / wall.as_secs_f64()
+            "loaded {n} rows, {:.0} rows/s; recovery payload bytes: total={} manifest={} \
+             row-data={} row-id-catalog={} segments={}",
+            n as f64 / wall.as_secs_f64(),
+            recovery_bytes.total_bytes(),
+            recovery_bytes.manifest_bytes,
+            recovery_bytes.row_data_bytes,
+            recovery_bytes.row_id_catalog_bytes,
+            recovery_bytes.segment_bytes,
         ),
         mem: phase_end(m),
     });
@@ -416,21 +558,49 @@ fn main() {
     let snapshot_time = Instant::now();
     let current_snapshot = ds.snapshot();
     let mut pinned = retained_snapshots;
-    pinned.push(current_snapshot.clone());
     while pinned.len() < pinned_snapshots {
-        pinned.push(ds.snapshot());
+        pinned.push(capture_pinned_snapshot(&dir, ds.snapshot()));
     }
+    let cache_predicate = Predicate::Eq("category".to_owned(), Value::Int64(3));
+    for snapshot in &pinned {
+        snapshot
+            .snapshot
+            .vector_search(&rows[0].vector, k, Some(&cache_predicate))
+            .unwrap();
+    }
+    let pinned_diagnostics = pinned_snapshot_diagnostics(&pinned);
+    let pinned_footprints: Vec<_> = pinned
+        .iter()
+        .map(|snapshot| snapshot.footprint.clone())
+        .collect();
+    let pinned_footprint = pinned_snapshot_footprint_diagnostics(&pinned_footprints);
     let snapshot_wall = snapshot_time.elapsed();
+    let snapshot_mem = phase_end(snapshot_start);
     results.push(PhaseResult {
         name: "pinned snapshot/cache residency",
-        kind: "memory (immutable snapshot handles)",
+        kind: "direct retained payloads + approximate cache/allocation phase",
         wall: snapshot_wall,
         detail: format!(
-            "{} historical/current pinned handles; live allocator bytes={}",
+            "{} retained handles ({} distinct snapshots; operational current snapshot excluded); \
+             direct pinned manifest payload bytes: logical references={} unique physical files={}; \
+             direct pinned row-data bytes: logical manifest references={} unique physical files={}; \
+             direct pinned immutable segment bytes: logical manifest references={} unique physical files={}; \
+             cache-warming phase: entries={} charged-bytes~={} budget-bytes={}; \
+             allocator live delta~={} bytes",
             pinned.len(),
-            LIVE.load(Ordering::Relaxed)
+            pinned_diagnostics.distinct_snapshots,
+            pinned_footprint.logical_manifest_payload,
+            pinned_footprint.unique_manifest_payload,
+            pinned_footprint.logical_row_data,
+            pinned_footprint.unique_row_data,
+            pinned_footprint.logical_immutable_segments,
+            pinned_footprint.unique_immutable_segments,
+            pinned_diagnostics.cache_entries,
+            pinned_diagnostics.cache_charged_bytes,
+            pinned_diagnostics.cache_budget_bytes,
+            snapshot_mem.live_delta,
         ),
-        mem: phase_end(snapshot_start),
+        mem: snapshot_mem,
     });
     let snap = current_snapshot;
     let sch = schema();
@@ -494,6 +664,7 @@ fn main() {
         .take(queries_n)
         .map(|r| r.vector.clone())
         .collect();
+    let query_count = queries.len();
     let m = phase_start();
     let t = Instant::now();
     let mut hits = 0;
@@ -506,8 +677,8 @@ fn main() {
         kind: "CPU (graph traversal + SIMD dist)",
         wall,
         detail: format!(
-            "{queries_n} queries, {:.1} us/query, {hits} hits",
-            wall.as_secs_f64() * 1e6 / queries_n as f64
+            "{query_count} queries, {:.1} us/query, {hits} hits",
+            wall.as_secs_f64() * 1e6 / query_count as f64
         ),
         mem: phase_end(m),
     });
@@ -525,8 +696,8 @@ fn main() {
         kind: "I/O-bound (row-id resolve) + CPU",
         wall,
         detail: format!(
-            "{queries_n} queries, {:.2} ms/query, {fhits} hits",
-            wall.as_secs_f64() * 1000.0 / queries_n as f64
+            "{query_count} queries, {:.2} ms/query, {fhits} hits",
+            wall.as_secs_f64() * 1000.0 / query_count as f64
         ),
         mem: phase_end(m),
     });
@@ -568,9 +739,9 @@ fn main() {
         kind: "I/O-bound (row-id resolve) + CPU",
         wall,
         detail: format!(
-            "{queries_n} queries, {:.2} ms/query, {vhits} hits, predicate cycles 9 categories \
+            "{query_count} queries, {:.2} ms/query, {vhits} hits, predicate cycles 9 categories \
              disjoint from phase 7's category=3",
-            wall.as_secs_f64() * 1000.0 / queries_n as f64
+            wall.as_secs_f64() * 1000.0 / query_count as f64
         ),
         mem: phase_end(m),
     });
@@ -626,8 +797,8 @@ fn main() {
         "\n================ StrataDB lifecycle — {n} rows x {VECTOR_DIM}-dim ================\n"
     );
     println!(
-        "{:<28} {:>11} {:>12} {:>12}  {}",
-        "phase", "wall", "alloc'd", "peak-live", "kind"
+        "{:<28} {:>11} {:>12} {:>12} {:>12}  {}",
+        "phase", "wall", "alloc'd~", "peak-live~", "live-delta~", "kind"
     );
     println!("{}", "-".repeat(104));
     let slowest = results
@@ -644,11 +815,12 @@ fn main() {
         .map_or("", |r| r.name);
     for r in &results {
         println!(
-            "{:<28} {:>11} {:>10.1}MB {:>10.1}MB  {}",
+            "{:<28} {:>11} {:>10.1}MB {:>10.1}MB {:>10.1}MB  {}",
             r.name,
             format!("{:.2?}", r.wall),
             mib(r.mem.allocated as i64),
             mib(r.mem.peak_over_start),
+            mib(r.mem.live_delta),
             r.kind
         );
         println!("{:<28} {}", "", r.detail);
@@ -659,6 +831,10 @@ fn main() {
         mib((n * VECTOR_DIM * 4) as i64)
     );
     println!("input source           : {source}");
+    println!(
+        "measurement             : {}",
+        std::env::var("STRATA_LIFECYCLE_MEASUREMENT").unwrap_or_else(|_| "single run".to_owned())
+    );
     println!("input hash             : {:016x}", rows_hash(&rows));
     println!("newest manifest bytes  : {manifest_bytes}");
     println!("\nSLOWEST phase        : {slowest}");
@@ -667,6 +843,12 @@ fn main() {
     println!("\nNote: single-threaded wall time ~= CPU time for CPU-bound phases; commit/recovery");
     println!(
         "are dominated by fsync and disk I/O respectively, so their wall time overstates CPU."
+    );
+    println!(
+        "Allocator columns are benchmark-process accounting deltas, not RSS or an exact resident-memory bound;"
+    );
+    println!(
+        "cache charged bytes are approximate admission-control accounting, not allocator residency."
     );
 }
 
