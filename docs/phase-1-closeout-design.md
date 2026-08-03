@@ -1,16 +1,18 @@
 # Phase 1 Closeout Design
 
-**Status:** Approved design; implementation has not started.
+**Status:** Approved design; implementation and bounded evidence work are in progress, with the
+current branch still Partial and blocked pending the remaining verification/provenance gates.
 
 **Goal:** Close every remaining Phase 1 implementation, verification, reproducibility, and PERF-01 through PERF-05 evidence blocker without expanding into explicitly deferred Phase 2/3 work.
 
 ## Baseline and synchronization
 
-The implementation branch must be synchronized to the merged Phase 1 result before production changes begin:
+The implementation branch was synchronized to the merged Phase 1 result before production changes began:
 
 - merged baseline: `8cd7696fdcf34f6253fb11f9e110f6632bc872de`;
 - closeout branch: `codex/phase-1-close-all-gaps`;
-- current local mirror is still at PR #49, so no implementation task may start until the merged commit is present locally and the branch is based on it.
+- the closeout branch is based on the merged commit; subsequent task commits and evidence are listed
+  in the closeout ledger and canonical performance record.
 
 The root checkout contains unrelated user changes. The isolated worktree is the only write scope for this closeout.
 
