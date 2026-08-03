@@ -23,6 +23,7 @@ use crate::dataset::{ROW_ID_COLUMN, cast_batch_to_schema, data_subdir, safe_join
 use crate::error::{Result, TxnError};
 
 use crate::live_set_cache::LiveSetCache;
+pub use crate::live_set_cache::LiveSetCacheAccounting;
 
 /// Downcasts a `SegmentSet` part's opaque zone-map payload back to the
 /// concrete type `crates/txn` is the only crate that knows it really is
@@ -124,6 +125,16 @@ fn widen_ef(base_ef: usize, snapshot: &Snapshot, predicate: &Predicate) -> usize
 }
 
 impl Snapshot {
+    /// Returns the current per-snapshot live-set-cache observation.
+    ///
+    /// This is a read-only diagnostic for retained-footprint measurement.
+    /// Its charged-byte value is approximate accounting, not process RSS or
+    /// exact allocator residency; see [`LiveSetCacheAccounting`].
+    #[must_use]
+    pub fn live_set_cache_accounting(&self) -> LiveSetCacheAccounting {
+        self.live_set_cache.accounting()
+    }
+
     /// The immutable logical schema owned by this dataset.
     #[must_use]
     pub fn schema(&self) -> SchemaRef {

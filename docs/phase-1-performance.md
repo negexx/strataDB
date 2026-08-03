@@ -140,6 +140,78 @@ That older harness performed one unfiltered timed sweep per K and did not
 report repeat statistics or the filtered facade path, so it is retained only
 as reproduction history and is not part of this supported evidence envelope.
 
+## Task 8 retained snapshot/cache footprint evidence (fresh, bounded)
+
+**Run date:** 2026-08-03. **Measurement source:** the Task 8 working tree
+based on `1511b3b4472aa428ec72e1352634ebab82a066e5`, with the lifecycle
+retained-footprint diagnostic added in this task. **Lockfile SHA-256:**
+`2e6dfa6a8a1c8afd17085660894361256c319f876f5440e19b2902d9d336bb39`.
+**Runner/toolchain:** local Windows `10.0.26200`, `x86_64-pc-windows-msvc`;
+rustc `1.90.0 (1159e78c4 2025-09-14)` and Cargo `1.90.0
+(840b83a10 2025-07-30)`. The local Windows temporary filesystem was used and
+OS/filesystem caches were not flushed. CPU/RAM/OS CIM queries were denied with
+`0x80041003`, so no CPU or RAM inventory is claimed.
+
+The lifecycle benchmark used deterministic xorshift64 synthetic input: 64
+rows, 512 dimensions, seed `20260801`, input hash `97f1b4d1524e42f1`, and 64
+one-row commits. At every requested retained-handle point (exactly 0, 1, 4,
+16, and 64), it reopened through
+`Dataset::open_with_recovery_accounting`, then warmed one `category = 3`
+filtered-vector-search entry on each retained snapshot before sampling its
+per-snapshot cache accounting. The current operational snapshot needed for
+the rest of the lifecycle is deliberately excluded from the retained-handle
+count. Each point was one direct lifecycle smoke run with zero excluded
+warmups and one measured repetition; the command was:
+
+```text
+$env:STRATA_BENCH_SOURCE='synthetic'; $env:STRATA_BENCH_SEED='20260801'
+$env:STRATA_LIFECYCLE_ROWS='64'; $env:STRATA_LIFECYCLE_BATCH_ROWS='1'
+$env:STRATA_PINNED_SNAPSHOTS='<0|1|4|16|64>'
+cargo bench -p strata-bench --bench lifecycle_bench -- --noplot
+```
+
+| Retained handles / distinct snapshots | Snapshot/cache wall | Cache entries | Cache charged bytes (approx.) | Aggregate cache budget | Live allocator delta (approx.) | Snapshot-phase peak-live output |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0 / 0 | 1.20 us | 0 | 0 | 0 | 8 B | 0.0 MiB |
+| 1 / 1 | 29.50 us | 1 | 272 B | 64 MiB | 364 B | 0.0 MiB |
+| 4 / 4 | 402.10 us | 4 | 1,088 B | 256 MiB | 1,664 B | 0.0 MiB |
+| 16 / 16 | 2.31 ms | 16 | 4,352 B | 1 GiB | 5,988 B | 0.0 MiB |
+| 64 / 64 | 31.65 ms | 64 | 17,408 B | 4 GiB | 23,076 B | 0.0 MiB |
+
+`charged bytes` is the live-set cache's admission-control accounting (entry
+overhead, predicate-key bytes, and `LiveSet` payload). It is intentionally
+approximate: it excludes hash-map buckets, synchronization/`Arc` headers, and
+allocator metadata; aggregate budget is a soft per-snapshot cap, not retained
+usage. `peak-live` and live-delta are counting-allocator observations in this
+benchmark process, not RSS, exact resident memory, or a process-wide memory
+bound. No RSS sample was taken; any future RSS value is supplemental only.
+
+The direct reopen accounting and post-concurrent-commit newest-manifest bytes
+were:
+
+| Retained handles | Reopen wall | Recovery total | Recovery manifest | Row data | Row-ID catalog | Segments | Newest manifest after concurrent commits |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 64.64 ms | 471,313 B | 48,005 B | 279,168 B | 780 B | 143,360 B | 65,621 B |
+| 1 | 56.16 ms | 471,315 B | 48,007 B | 279,168 B | 780 B | 143,360 B | 65,626 B |
+| 4 | 71.19 ms | 471,322 B | 48,014 B | 279,168 B | 780 B | 143,360 B | 65,632 B |
+| 16 | 27.38 ms | 471,319 B | 48,011 B | 279,168 B | 780 B | 143,360 B | 65,625 B |
+| 64 | 42.21 ms | 471,322 B | 48,014 B | 279,168 B | 780 B | 143,360 B | 65,634 B |
+
+Recovery categories are exact payload bytes opened and validated for the
+selected current manifest and its listed files; they exclude directory
+metadata, allocator/RSS effects, and retained historical manifests not opened
+by that recovery. The minor manifest-byte differences are per-run serialized
+metadata, not a retained-handle effect. The lifecycle explicitly drops the
+retained handles, operational snapshot, and dataset before removing its
+temporary directory. The focused transaction regression warms a historical
+snapshot's cache, verifies a later commit cannot alter that immutable view,
+then verifies the historical snapshot (and therefore its per-snapshot cache)
+becomes unreachable when its final handle drops.
+
+This is bounded local synthetic evidence only. It does not establish a
+portable or real-fixture result, an exact RSS/process-memory bound, a cache
+eviction guarantee, a retained-history limit, or universal PERF-05 closure.
+
 ## Earlier related measurements
 
 **Run date:** 2026-08-02
