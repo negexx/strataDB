@@ -146,65 +146,94 @@ jobs:
       - name: Loom transaction models (strata-txn)
         run: |
           set -euo pipefail
-          cargo rustc -p strata-txn --lib --profile test --message-format=json -- --cfg loom \
-            | tee /tmp/loom-txn-build.json
-          bin=$(jq -r 'select(.reason == "compiler-artifact" and .executable != null) | .executable' /tmp/loom-txn-build.json | tail -1)
-          if [ -z "$bin" ]; then
-            echo "::error::no test binary produced by the --cfg loom build"
-            exit 1
-          fi
-          models=(
-            dataset::loom_tests::one_writer_store_races_safely_with_many_readers_load
-            dataset::loom_tests::two_threads_deleting_the_same_row_exactly_one_conflicts
-            dataset::loom_tests::two_threads_deleting_disjoint_rows_both_succeed
-            dataset::loom_tests::a_failed_commits_segment_is_never_searchable_under_concurrent_commits
-            dataset::loom_tests::concurrent_first_vector_commits_at_different_dimensions_are_not_both_accepted
-            dataset::loom_tests::a_failed_commits_segment_is_never_visible_to_a_concurrent_reader
-            dataset::loom_tests::a_commits_row_and_its_segment_become_visible_as_one_atomic_step
-            dataset::loom_tests::a_reader_never_sees_one_in_flight_commits_row_while_observing_an_unrelated_commits_row_id_counter
-            row_id::loom_tests::concurrent_claims_publish_monotonic_high_water
-          )
-          for model in "${models[@]}"; do
-            "$bin" --list --format terse | grep -Fx "${model}: test"
-            "$bin" --exact "$model" --test-threads=1
-          done
-          semantic_model=dataset::loom_tests::immutable_snapshot_membership_controls_visibility_despite_claimed_high_water
-          "$bin" --list --format terse | grep -Fx "${semantic_model}: test"
-          "$bin" --exact "$semantic_model" --test-threads=1
+          mkdir -p artifacts
+          {
+            cargo rustc -p strata-txn --lib --profile test --message-format=json -- --cfg loom \
+              | tee /tmp/loom-txn-build.json
+            bin=$(jq -r 'select(.reason == "compiler-artifact" and .executable != null) | .executable' /tmp/loom-txn-build.json | tail -1)
+            if [ -z "$bin" ]; then
+              echo "::error::no test binary produced by the --cfg loom build"
+              exit 1
+            fi
+            models=(
+              dataset::loom_tests::one_writer_store_races_safely_with_many_readers_load
+              dataset::loom_tests::two_threads_deleting_the_same_row_exactly_one_conflicts
+              dataset::loom_tests::two_threads_deleting_disjoint_rows_both_succeed
+              dataset::loom_tests::a_failed_commits_segment_is_never_searchable_under_concurrent_commits
+              dataset::loom_tests::concurrent_first_vector_commits_at_different_dimensions_are_not_both_accepted
+              dataset::loom_tests::a_failed_commits_segment_is_never_visible_to_a_concurrent_reader
+              dataset::loom_tests::a_commits_row_and_its_segment_become_visible_as_one_atomic_step
+              dataset::loom_tests::a_reader_never_sees_one_in_flight_commits_row_while_observing_an_unrelated_commits_row_id_counter
+              row_id::loom_tests::concurrent_claims_publish_monotonic_high_water
+            )
+            for model in "${models[@]}"; do
+              "$bin" --list --format terse | grep -Fx "${model}: test"
+              "$bin" --exact "$model" --test-threads=1
+            done
+            semantic_model=dataset::loom_tests::immutable_snapshot_membership_controls_visibility_despite_claimed_high_water
+            "$bin" --list --format terse | grep -Fx "${semantic_model}: test"
+            "$bin" --exact "$semantic_model" --test-threads=1
+          } 2>&1 | tee artifacts/loom-txn-evidence.log
 
       - name: Loom live-set-cache model (strata-txn)
         run: |
           set -euo pipefail
-          cargo rustc -p strata-txn --lib --profile test --message-format=json -- --cfg loom \
-            | tee /tmp/loom-txn-cache-build.json
-          bin=$(jq -r 'select(.reason == "compiler-artifact" and .executable != null) | .executable' /tmp/loom-txn-cache-build.json | tail -1)
-          if [ -z "$bin" ]; then
-            echo "::error::no test binary produced by the --cfg loom build"
-            exit 1
-          fi
-          model=live_set_cache::loom_tests::two_concurrent_misses_on_the_same_key_compute_exactly_once
-          "$bin" --list --format terse | grep -Fx "${model}: test"
-          "$bin" --exact "$model" --test-threads=1
+          mkdir -p artifacts
+          {
+            cargo rustc -p strata-txn --lib --profile test --message-format=json -- --cfg loom \
+              | tee /tmp/loom-txn-cache-build.json
+            bin=$(jq -r 'select(.reason == "compiler-artifact" and .executable != null) | .executable' /tmp/loom-txn-cache-build.json | tail -1)
+            if [ -z "$bin" ]; then
+              echo "::error::no test binary produced by the --cfg loom build"
+              exit 1
+            fi
+            model=live_set_cache::loom_tests::two_concurrent_misses_on_the_same_key_compute_exactly_once
+            "$bin" --list --format terse | grep -Fx "${model}: test"
+            "$bin" --exact "$model" --test-threads=1
+          } 2>&1 | tee artifacts/loom-txn-cache-evidence.log
 
       - name: Loom tests (strata-index)
         # Scoped to this one crate rather than a workspace-wide
         # `RUSTFLAGS=--cfg loom cargo test`; AGENTS.md explains why that
-        # would break other crates in the dependency graph. This is the only CI-visible
-        # regression gate for the empty-graph race and the publication-
-        # barrier fix (`EntryPoint::claim_if_empty`,
-        # `Node::is_published`/`mark_published`) -- both are proven solely
-        # by the exhaustive loom models in `crates/index/src/graph.rs`'s
-        # `loom_tests`, which nothing else in this workflow runs.
+        # would break other crates in the dependency graph. These exact model
+        # names are the CI-visible regression gate for the publication-barrier
+        # fix (`EntryPoint::claim_if_empty`, `Node::is_published`/
+        # `mark_published`) and the supporting index concurrency invariants.
         run: |
           set -euo pipefail
-          cargo rustc -p strata-index --lib --profile test --message-format=json -- --cfg loom \
-            | tee /tmp/loom-index-build.json
-          bin=$(jq -r 'select(.reason == "compiler-artifact" and .executable != null) | .executable' /tmp/loom-index-build.json | tail -1)
-          if [ -z "$bin" ]; then
-            echo "::error::no test binary produced by the --cfg loom build"
-            exit 1
-          fi
-          "$bin" --test-threads=1
+          mkdir -p artifacts
+          {
+            cargo rustc -p strata-index --lib --profile test --message-format=json -- --cfg loom \
+              | tee /tmp/loom-index-build.json
+            bin=$(jq -r 'select(.reason == "compiler-artifact" and .executable != null) | .executable' /tmp/loom-index-build.json | tail -1)
+            if [ -z "$bin" ]; then
+              echo "::error::no test binary produced by the --cfg loom build"
+              exit 1
+            fi
+            models=(
+              node::loom_tests::full_node_publish_is_completely_visible_to_a_reader
+              node_table::loom_tests::concurrent_chunk_allocation_publishes_exactly_one_chunk
+              slot_array::loom_tests::concurrent_claim_and_shrink_never_corrupts_a_slot
+              graph::loom_tests::concurrent_advances_always_settle_on_the_highest_level
+              graph::loom_tests::concurrent_inserts_of_distinct_rows_are_all_findable_and_uncorrupted
+              graph::loom_tests::concurrent_inserts_racing_on_one_shared_neighbor_always_keep_the_nearest
+              graph::loom_tests::concurrent_inserts_into_a_genuinely_empty_graph_never_strand_a_node_loom
+              graph::loom_tests::concurrent_insert_never_uses_an_unpublished_node_as_a_descent_entry_loom
+            )
+            for model in "${models[@]}"; do
+              "$bin" --list --format terse | grep -Fx "${model}: test"
+              "$bin" --exact "$model" --test-threads=1
+            done
+          } 2>&1 | tee artifacts/loom-index-evidence.log
+
+      - name: Retain loom evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: loom-evidence-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: artifacts/loom-*.log
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
