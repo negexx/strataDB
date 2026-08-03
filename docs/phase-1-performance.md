@@ -155,13 +155,17 @@ OS/filesystem caches were not flushed. CPU/RAM/OS CIM queries were denied with
 The lifecycle benchmark used deterministic xorshift64 synthetic input: 64
 rows, 512 dimensions, seed `20260801`, input hash `97f1b4d1524e42f1`, and 64
 one-row commits. At every requested retained-handle point (exactly 0, 1, 4,
-16, and 64), it reopened through
-`Dataset::open_with_recovery_accounting`, then warmed one `category = 3`
-filtered-vector-search entry on each retained snapshot before sampling its
-per-snapshot cache accounting. The current operational snapshot needed for
-the rest of the lifecycle is deliberately excluded from the retained-handle
-count. Each point was one direct lifecycle smoke run with zero excluded
-warmups and one measured repetition; the command was:
+16, and 64), it reopened through `Dataset::open_with_recovery_accounting`,
+constructed the final retained `pinned` set, and then warmed one `category =
+3` filtered-vector-search entry on each retained snapshot. Each pinned handle
+is paired with the exact just-published manifest payload and its
+manifest-listed row-data and immutable-segment entries before a later commit
+can occur. After the final set is constructed, the benchmark sums those
+per-handle records and also deduplicates their physical manifest/file
+identities. The current operational snapshot needed for the rest of the
+lifecycle is deliberately excluded from the retained-handle count. Each point
+was one direct lifecycle smoke run with zero excluded warmups and one measured
+repetition; the command was:
 
 ```text
 $env:STRATA_BENCH_SOURCE='synthetic'; $env:STRATA_BENCH_SEED='20260801'
@@ -170,21 +174,39 @@ $env:STRATA_PINNED_SNAPSHOTS='<0|1|4|16|64>'
 cargo bench -p strata-bench --bench lifecycle_bench -- --noplot
 ```
 
-| Retained handles / distinct snapshots | Snapshot/cache wall | Cache entries | Cache charged bytes (approx.) | Aggregate cache budget | Live allocator delta (approx.) | Snapshot-phase peak-live output |
+| Retained handles / distinct snapshots | Direct manifest payload bytes (logical / unique) | Direct manifest-listed row-data bytes (logical / unique) | Direct manifest-listed immutable-segment bytes (logical / unique) |
+|---:|---:|---:|---:|
+| 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 |
+| 1 / 1 | 1,761 / 1,761 | 4,362 / 4,362 | 2,240 / 2,240 |
+| 4 / 4 | 11,384 / 11,384 | 43,620 / 17,448 | 22,400 / 8,960 |
+| 16 / 16 | 115,298 / 115,298 | 593,232 / 69,792 | 304,640 / 35,840 |
+| 64 / 64 | 1,589,930 / 1,589,930 | 9,072,960 / 279,168 | 4,659,200 / 143,360 |
+
+The manifest payload byte count is the exact serialized payload read and
+validated for each pinned snapshot; row-data and immutable-segment bytes are
+the exact `byte_len` values listed in that snapshot's manifest. `logical`
+sums every retained handle's manifest-listed reference. `unique` deduplicates
+manifest versions and immutable row-data/segment filenames across the final
+pinned set. Thus logical totals describe retained references, while unique
+totals describe the distinct raw file payloads they retain; neither is process
+RSS, allocator residency, filesystem block allocation, or a universal bound.
+
+| Retained handles / distinct snapshots | Snapshot/cache-warming wall | Cache entries | Cache charged bytes (approx.) | Aggregate cache budget | Allocator live delta (approx.) | Allocator peak-live (approx.) |
 |---:|---:|---:|---:|---:|---:|---:|
-| 0 / 0 | 1.20 us | 0 | 0 | 0 | 8 B | 0.0 MiB |
-| 1 / 1 | 29.50 us | 1 | 272 B | 64 MiB | 364 B | 0.0 MiB |
-| 4 / 4 | 402.10 us | 4 | 1,088 B | 256 MiB | 1,664 B | 0.0 MiB |
-| 16 / 16 | 2.31 ms | 16 | 4,352 B | 1 GiB | 5,988 B | 0.0 MiB |
-| 64 / 64 | 31.65 ms | 64 | 17,408 B | 4 GiB | 23,076 B | 0.0 MiB |
+| 0 / 0 | 6.20 us | 0 | 0 | 0 | 8 B | 0.0 MiB |
+| 1 / 1 | 36.80 us | 1 | 272 B | 64 MiB | 364 B | 0.0 MiB |
+| 4 / 4 | 382.80 us | 4 | 1,088 B | 256 MiB | 1,664 B | 0.0 MiB |
+| 16 / 16 | 1.93 ms | 16 | 4,352 B | 1 GiB | 5,988 B | 0.0 MiB |
+| 64 / 64 | 23.85 ms | 64 | 17,408 B | 4 GiB | 23,076 B | 0.0 MiB |
 
 `charged bytes` is the live-set cache's admission-control accounting (entry
 overhead, predicate-key bytes, and `LiveSet` payload). It is intentionally
 approximate: it excludes hash-map buckets, synchronization/`Arc` headers, and
 allocator metadata; aggregate budget is a soft per-snapshot cap, not retained
-usage. `peak-live` and live-delta are counting-allocator observations in this
-benchmark process, not RSS, exact resident memory, or a process-wide memory
-bound. No RSS sample was taken; any future RSS value is supplemental only.
+usage. The allocator columns are phase allocation/cache-warming observations
+in this benchmark process, not RSS, exact resident memory, or a process-wide
+memory bound. No RSS sample was taken; any future RSS value is supplemental
+only.
 
 The direct reopen accounting and post-concurrent-commit newest-manifest bytes
 were:

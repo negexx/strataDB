@@ -40,6 +40,7 @@
 )]
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -49,7 +50,7 @@ use arrow::array::{FixedSizeListArray, Float32Array, Float64Array, Int64Array, R
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use strata_query::{AggFunc, Predicate};
-use strata_storage::Value;
+use strata_storage::{Value, read_current_with_byte_count};
 use strata_txn::{Dataset, Snapshot};
 
 // ---- counting allocator ---------------------------------------------------
@@ -336,14 +337,121 @@ struct PinnedSnapshotDiagnostics {
     cache_budget_bytes: usize,
 }
 
-fn pinned_snapshot_diagnostics(pinned: &[Arc<Snapshot>]) -> PinnedSnapshotDiagnostics {
+struct ManifestListedFile {
+    name: String,
+    byte_len: u64,
+}
+
+struct SnapshotFootprint {
+    version: u64,
+    manifest_payload_bytes: u64,
+    row_data_files: Vec<ManifestListedFile>,
+    immutable_segment_files: Vec<ManifestListedFile>,
+}
+
+struct PinnedSnapshot {
+    snapshot: Arc<Snapshot>,
+    footprint: SnapshotFootprint,
+}
+
+struct PinnedSnapshotFootprintDiagnostics {
+    logical_manifest_payload: u128,
+    unique_manifest_payload: u128,
+    logical_row_data: u128,
+    unique_row_data: u128,
+    logical_immutable_segments: u128,
+    unique_immutable_segments: u128,
+}
+
+fn capture_pinned_snapshot(dir: &Path, snapshot: Arc<Snapshot>) -> PinnedSnapshot {
+    // The benchmark takes this snapshot and reads the just-published current
+    // manifest on its single writer thread, before later commits begin. The
+    // captured manifest is therefore the immutable resource set retained by
+    // this handle, not a later recovery-only proxy.
+    let (manifest, manifest_payload_bytes) = read_current_with_byte_count(dir)
+        .unwrap()
+        .expect("the just-published snapshot must have a manifest");
+    PinnedSnapshot {
+        snapshot,
+        footprint: SnapshotFootprint {
+            version: manifest.version,
+            manifest_payload_bytes,
+            row_data_files: manifest
+                .data_files
+                .into_iter()
+                .map(|file| ManifestListedFile {
+                    name: file.name,
+                    byte_len: file.byte_len,
+                })
+                .collect(),
+            immutable_segment_files: manifest
+                .segments
+                .into_iter()
+                .map(|segment| ManifestListedFile {
+                    name: segment.name,
+                    byte_len: segment.byte_len,
+                })
+                .collect(),
+        },
+    }
+}
+
+fn unique_file_bytes<'a>(files: impl Iterator<Item = &'a ManifestListedFile>) -> u128 {
+    let mut unique = BTreeMap::new();
+    for file in files {
+        unique.entry(&file.name).or_insert(file.byte_len);
+    }
+    unique.values().map(|bytes| u128::from(*bytes)).sum()
+}
+
+fn pinned_snapshot_footprint_diagnostics(
+    pinned: &[PinnedSnapshot],
+) -> PinnedSnapshotFootprintDiagnostics {
+    PinnedSnapshotFootprintDiagnostics {
+        logical_manifest_payload: pinned
+            .iter()
+            .map(|snapshot| u128::from(snapshot.footprint.manifest_payload_bytes))
+            .sum(),
+        unique_manifest_payload: {
+            let mut unique = BTreeMap::new();
+            for snapshot in pinned {
+                unique
+                    .entry(snapshot.footprint.version)
+                    .or_insert(snapshot.footprint.manifest_payload_bytes);
+            }
+            unique.values().map(|bytes| u128::from(*bytes)).sum()
+        },
+        logical_row_data: pinned
+            .iter()
+            .flat_map(|snapshot| snapshot.footprint.row_data_files.iter())
+            .map(|file| u128::from(file.byte_len))
+            .sum(),
+        unique_row_data: unique_file_bytes(
+            pinned
+                .iter()
+                .flat_map(|snapshot| snapshot.footprint.row_data_files.iter()),
+        ),
+        logical_immutable_segments: pinned
+            .iter()
+            .flat_map(|snapshot| snapshot.footprint.immutable_segment_files.iter())
+            .map(|file| u128::from(file.byte_len))
+            .sum(),
+        unique_immutable_segments: unique_file_bytes(
+            pinned
+                .iter()
+                .flat_map(|snapshot| snapshot.footprint.immutable_segment_files.iter()),
+        ),
+    }
+}
+
+fn pinned_snapshot_diagnostics(pinned: &[PinnedSnapshot]) -> PinnedSnapshotDiagnostics {
     let mut distinct: Vec<&Arc<Snapshot>> = Vec::with_capacity(pinned.len());
     for snapshot in pinned {
         if !distinct
             .iter()
-            .any(|existing| Arc::ptr_eq(existing, snapshot))
+            .any(|existing| Arc::ptr_eq(existing, &snapshot.snapshot))
         {
-            distinct.push(snapshot);
+            distinct.push(&snapshot.snapshot);
         }
     }
     let mut cache_entries = 0;
@@ -412,7 +520,7 @@ fn main() {
         txn.commit().unwrap();
         commits += 1;
         if retained_snapshots.len() < pinned_snapshots {
-            retained_snapshots.push(ds.snapshot());
+            retained_snapshots.push(capture_pinned_snapshot(&dir, ds.snapshot()));
         }
     }
     let wall = t.elapsed();
@@ -458,26 +566,38 @@ fn main() {
     let current_snapshot = ds.snapshot();
     let mut pinned = retained_snapshots;
     while pinned.len() < pinned_snapshots {
-        pinned.push(ds.snapshot());
+        pinned.push(capture_pinned_snapshot(&dir, ds.snapshot()));
     }
     let cache_predicate = Predicate::Eq("category".to_owned(), Value::Int64(3));
     for snapshot in &pinned {
         snapshot
+            .snapshot
             .vector_search(&rows[0].vector, k, Some(&cache_predicate))
             .unwrap();
     }
     let pinned_diagnostics = pinned_snapshot_diagnostics(&pinned);
+    let pinned_footprint = pinned_snapshot_footprint_diagnostics(&pinned);
     let snapshot_wall = snapshot_time.elapsed();
     let snapshot_mem = phase_end(snapshot_start);
     results.push(PhaseResult {
         name: "pinned snapshot/cache residency",
-        kind: "memory (immutable snapshot handles)",
+        kind: "direct retained payloads + approximate cache/allocation phase",
         wall: snapshot_wall,
         detail: format!(
             "{} retained handles ({} distinct snapshots; operational current snapshot excluded); \
-             cache entries={} charged-bytes~={} budget-bytes={}; live allocator delta={} bytes",
+             direct pinned manifest payload bytes: logical references={} unique physical files={}; \
+             direct pinned row-data bytes: logical manifest references={} unique physical files={}; \
+             direct pinned immutable segment bytes: logical manifest references={} unique physical files={}; \
+             cache-warming phase: entries={} charged-bytes~={} budget-bytes={}; \
+             allocator live delta~={} bytes",
             pinned.len(),
             pinned_diagnostics.distinct_snapshots,
+            pinned_footprint.logical_manifest_payload,
+            pinned_footprint.unique_manifest_payload,
+            pinned_footprint.logical_row_data,
+            pinned_footprint.unique_row_data,
+            pinned_footprint.logical_immutable_segments,
+            pinned_footprint.unique_immutable_segments,
             pinned_diagnostics.cache_entries,
             pinned_diagnostics.cache_charged_bytes,
             pinned_diagnostics.cache_budget_bytes,
@@ -681,7 +801,7 @@ fn main() {
     );
     println!(
         "{:<28} {:>11} {:>12} {:>12} {:>12}  {}",
-        "phase", "wall", "alloc'd", "peak-live", "live-delta", "kind"
+        "phase", "wall", "alloc'd~", "peak-live~", "live-delta~", "kind"
     );
     println!("{}", "-".repeat(104));
     let slowest = results
