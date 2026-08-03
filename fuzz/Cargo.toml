@@ -11,18 +11,13 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 serde_json = "1"
 # Pinned to the exact version the main workspace's Cargo.lock resolves
-# (arrow-rs 58.3.0), not a bare "58" -- this fuzz workspace resolves its own
-# independent lockfile, and without the pin it drifted to 58.4.0, meaning a
-# found-or-not-found IPC decode panic wouldn't actually transfer to the
-# shipped binary. Pinning the aggregate `arrow` crate alone isn't enough --
-# confirmed directly: with only that pin in place, `arrow-ipc` (a separate
-# sub-crate `arrow`/`strata-storage` both pull in transitively) still
-# independently resolved to 58.4.0 on a fresh lockfile. Pin each sub-crate
-# transitively pulled in by strata-storage explicitly, not just the
-# aggregate. Neither entry is imported directly by any fuzz target --
-# these exist purely as version constraints on strata-storage's own
-# resolution. Do not remove as apparently-unused; that's what silently
-# reintroduces the drift.
+# (Arrow 58.3.0), not a bare "58". This fuzz workspace resolves its own
+# independent lockfile, so the direct constraints are kept explicit.
+# The fuzz target exercises the shipped storage parser, so the direct
+# `arrow`/`arrow-ipc` constraints are pre-existing and intentional. The
+# checked-in lockfile pins their transitively resolved Arrow family to the
+# same 58.3.0 release without adding direct dependencies for unused sub-crates.
+# Keep the aggregate constraints and lockfile in sync to prevent Arrow drift.
 arrow = "=58.3.0"
 arrow-ipc = "=58.3.0"
 

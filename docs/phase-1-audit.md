@@ -64,10 +64,12 @@ implementation and recovery evidence for those slices; the supported
 packages are marked non-publishable. Task 7 now configures exact transaction and cache loom
 discovery, plus an index whole-binary loom run; checkpoint-abort and fast-chaos gates; and
 scheduled/manual thorough-chaos execution.
-Local targeted evidence exists, but full Linux CI execution/provenance and thorough 2000/2000 output
-remain pending. Task 8 now records bounded Windows synthetic segmented/lifecycle evidence with
-reproduction metadata; the optional real fixture, portable host matrix, and universal operating
-bounds remain open. This does not change the audit verdict from Partial and blocked.
+Fresh Ubuntu WSL exact-model transaction loom evidence and Ubuntu WSL thorough-chaos evidence
+(`2000/2000` seeds with zero violations) now exist. Fuzz build/smoke now also passes locally;
+retained CI execution/log-retention provenance and platform portability remain open. Task 8 now records bounded
+Windows synthetic segmented/lifecycle evidence with reproduction metadata; the optional real fixture,
+portable host matrix, and universal operating bounds remain open. This does not change the audit
+verdict from Partial and blocked.
 
 VER-04 through VER-06, PERF-01 through PERF-05, and the later/deferred findings remain separately
 tracked unless the final review proves a dependency for a Phase 1 fix.
@@ -169,10 +171,10 @@ consolidated register above; IDs marked "merged" retain the same evidence under 
 | ARCH-07 | Preserved as later Phase 2/6 work: backend abstraction is not threaded through all I/O. |
 | ARCH-08 | Preserved as later Phase 2 client work: CLI snapshot labels can disagree with displayed rows. |
 | VER-01 | Known counterexamples have targeted regression gates; complete branch verification remains. |
-| VER-02 | Merged with CONC-02: Task 7 configures transaction/cache exact-model and index whole-binary loom CI gates; CI execution/provenance remains pending. Phase 1 blocker. |
-| VER-03 | Merged with DUR-04: Task 7 configures checkpoint-abort and fast-chaos CI gates plus scheduled/manual thorough chaos; CI execution/provenance and 2000/2000 output remain pending. Phase 1 blocker. |
-| VER-04 | Fuzz targets now have a build/discovery/smoke gate; complete parser coverage and retained CI evidence remain open. |
-| VER-05 | Preserved as Phase 1 reproducibility hardening: CI action/tool provenance is mutable. |
+| VER-02 | Merged with CONC-02: fresh Ubuntu WSL execution passed the nine production transaction models plus the separate compact semantic guard; CI execution/provenance remains pending. Phase 1 blocker. |
+| VER-03 | Merged with DUR-04: fresh Ubuntu WSL thorough chaos reached `2000/2000` seeds with zero violations; CI execution/provenance and portability remain pending. Phase 1 blocker. |
+| VER-04 | Ubuntu WSL completed both declared nightly ASAN targets and deterministic parser smoke inputs with a stable fuzz lock hash; retained CI execution/artifact evidence remains open. |
+| VER-05 | The evidence workflow now pins action SHAs and nightly `2026-07-25`; retained CI execution/provenance artifacts remain open. |
 | VER-06 | Preserved as Phase 1 measurement evidence blocker: bounded Windows synthetic inputs/results are recorded, but portable host/fixture provenance is still missing. |
 | VER-07 | Merged with ARCH-04 and DUR-05: current docs now qualify intended guarantees and retain Partial status. |
 

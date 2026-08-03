@@ -7,7 +7,7 @@ in [documentation history](history/README.md). Current implementation claims liv
 |---|---|---|---|
 | 0 — Foundation | Partial | Local format, manifests, row allocation, and bounded transaction primitives. | Restart-safe row-ID non-reuse and foundation tests are verified. |
 | 1 — Correctness and durability baseline | Partial — blocked | Shared-handle commits, immutable snapshots, typed conflicts, recovery/integrity, schema/error semantics, supported facade, and boundedness evidence. | All asserted guarantees have scope, implementation evidence, regression coverage, and current performance bounds. |
-| 2 — Query and usability | Partial | Stable schema/query APIs, scan/projection/filter/group-by integration, point lookup, CLI, and Python surface. | Supported query/client behavior is documented and integration-tested. |
+| 2 — Query and usability | Partial | Stable schema/query APIs, scan/projection/filter/group-by integration, point lookup, CLI, and Python surface. See the [Phase 2 audit](phase-2-audit.md). | Supported query/client behavior is documented and integration-tested. |
 | 3 — Operational lifecycle | Proposed | Compaction, vacuum/orphan cleanup, history retention, index lifecycle, migrations, and diagnostics. | Sustained operation safely bounds manifest/segment growth and manages retained data. |
 | 4 — Cross-process coordination | Proposed | Durable conditional publication, independent opener semantics, shared allocation, and process-boundary guarantees. | Separate processes coordinate without violating visibility, conflict, or durability invariants. |
 | 5 — Branching and merge | Proposed | Fork, abort, merge, conflict reporting, and branch-aware manifests. | Branch behavior is correct under concurrency and recovery tests. |
@@ -17,7 +17,8 @@ in [documentation history](history/README.md). Current implementation claims liv
 
 The [Phase 1 audit](phase-1-audit.md) is complete. Phase 1 remains Partial and blocked by:
 
-- pending CI execution/provenance and fuzz evidence; and
+- incomplete VER-01 direct-regression verification and CI execution/provenance evidence; local WSL fuzz build/smoke now passes;
+- passing thorough-chaos evidence only on Ubuntu WSL, with portable/native-platform coverage and CI execution/log-retention provenance still open; and
 - incomplete portable/real-fixture segmented performance and operating-bound evidence.
 
 The [Phase 1 closeout ledger](phase-1-closeout-ledger.md), synchronized at merged PR #50 commit
