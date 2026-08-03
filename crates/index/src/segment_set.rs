@@ -179,7 +179,7 @@ impl SegmentSet {
                     }
                     let raw = k_nn_search_generic(
                         reader.as_ref(),
-                        &crate::distance::L2,
+                        &crate::distance::SquaredL2,
                         query,
                         k,
                         ef_search,
@@ -202,11 +202,14 @@ impl SegmentSet {
         let mut seen = std::collections::HashSet::with_capacity(merged.len());
         merged.retain(|&(row_id, _)| seen.insert(row_id));
         merged.truncate(k);
+        // `k_nn_search_generic` was called with `SquaredL2`, so `dist` is
+        // already squared L2 (no sqrt) -- maps 1:1 onto `squared_distance`
+        // with no squaring step.
         Ok(merged
             .into_iter()
             .map(|(row_id, dist)| VectorMatch {
                 row_id,
-                squared_distance: dist * dist,
+                squared_distance: dist,
             })
             .collect())
     }
@@ -469,7 +472,7 @@ mod tests {
 
         let direct = crate::graph::k_nn_search_generic(
             &index.graph,
-            &crate::distance::L2,
+            &crate::distance::SquaredL2,
             &query,
             40,
             5,
@@ -486,11 +489,14 @@ mod tests {
             // is the test that catches that; this one is about traversal
             // equivalence.
             assert_eq!(a.row_id, b.0, "row-id order must match exactly");
+            // Both sides use `SquaredL2`, so `b.1` is already squared L2 --
+            // compare directly, no `b.1 * b.1` squaring (which would be a
+            // sqrt-then-square round trip against the old `L2` here).
             assert!(
-                (a.squared_distance - b.1 * b.1).abs() < f32::EPSILON,
+                (a.squared_distance - b.1).abs() < f32::EPSILON,
                 "distances must match exactly: {} vs {}",
                 a.squared_distance,
-                b.1 * b.1
+                b.1
             );
         }
     }

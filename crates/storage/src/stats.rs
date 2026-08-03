@@ -3,8 +3,11 @@
 
 use std::collections::HashMap;
 
-use arrow::array::{Array, Float64Array, Int64Array, RecordBatch, StringArray};
-use arrow::compute::kernels::aggregate::{max, max_string, min, min_string};
+use arrow::array::{Array, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray};
+use arrow::compute::{
+    filter,
+    kernels::aggregate::{max, max_string, min, min_string},
+};
 use arrow::datatypes::{DataType, Float64Type, Int64Type};
 use serde::{Deserialize, Serialize};
 
@@ -47,15 +50,30 @@ pub fn compute_stats(batch: &RecordBatch) -> HashMap<String, ColumnStats> {
             DataType::Float64 => column
                 .as_any()
                 .downcast_ref::<Float64Array>()
-                .and_then(
-                    |arr| match (min::<Float64Type>(arr), max::<Float64Type>(arr)) {
+                .and_then(|arr| {
+                    // NaN breaks pruning: arrow's min/max aggregate returns NaN
+                    // for a NaN-containing array, and `should_scan_file`'s `>=`/`<=`
+                    // comparisons are always false for NaN under IEEE partial
+                    // order - the file would be silently pruned = data loss.
+                    // Filter only NaN before computing min/max. Infinities are
+                    // valid ordered Float64 values and must remain in the
+                    // bounds; dropping them could cause false pruning. If every
+                    // value is NaN, return None so pruning fails open.
+                    let finite_mask: BooleanArray =
+                        arr.values().iter().map(|&v| !v.is_nan()).collect();
+                    let finite = filter(arr, &finite_mask)
+                        .ok()?
+                        .as_any()
+                        .downcast_ref::<Float64Array>()?
+                        .clone();
+                    match (min::<Float64Type>(&finite), max::<Float64Type>(&finite)) {
                         (Some(min_v), Some(max_v)) => Some(ColumnStats {
                             min: Value::Float64(min_v),
                             max: Value::Float64(max_v),
                         }),
                         _ => None,
-                    },
-                ),
+                    }
+                }),
             DataType::Utf8 => column
                 .as_any()
                 .downcast_ref::<StringArray>()
@@ -144,6 +162,64 @@ mod tests {
         let price_stats = stats.get("price").unwrap();
         assert_eq!(price_stats.min, Value::Float64(9.99));
         assert_eq!(price_stats.max, Value::Float64(99.99));
+    }
+
+    #[test]
+    fn float64_column_with_only_nan_gets_no_stats_entry() {
+        let schema = Arc::new(Schema::new(vec![Field::new("price", DT::Float64, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Float64Array::from(vec![
+                f64::NAN,
+                f64::NAN,
+                f64::NAN,
+            ]))],
+        )
+        .unwrap();
+
+        let stats = compute_stats(&batch);
+        assert!(
+            !stats.contains_key("price"),
+            "an all-NaN Float64 column must get no stats entry - a NaN min/max \
+             would make should_scan_file's >= / <= comparisons always false \
+             (IEEE partial order) and silently prune the file = data loss"
+        );
+    }
+
+    #[test]
+    fn float64_column_with_some_nan_ignores_nan_in_min_max() {
+        let schema = Arc::new(Schema::new(vec![Field::new("price", DT::Float64, false)]));
+        // NaN must not corrupt the min/max - the finite values [9.99, 49.5]
+        // should determine the stats, not the NaN.
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Float64Array::from(vec![9.99, f64::NAN, 49.5]))],
+        )
+        .unwrap();
+
+        let stats = compute_stats(&batch);
+        let price_stats = stats.get("price").unwrap();
+        assert_eq!(price_stats.min, Value::Float64(9.99));
+        assert_eq!(price_stats.max, Value::Float64(49.5));
+    }
+
+    #[test]
+    fn float64_column_preserves_infinities_in_min_max() {
+        let schema = Arc::new(Schema::new(vec![Field::new("price", DT::Float64, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Float64Array::from(vec![
+                f64::NEG_INFINITY,
+                9.99,
+                f64::INFINITY,
+            ]))],
+        )
+        .unwrap();
+
+        let stats = compute_stats(&batch);
+        let price_stats = stats.get("price").unwrap();
+        assert_eq!(price_stats.min, Value::Float64(f64::NEG_INFINITY));
+        assert_eq!(price_stats.max, Value::Float64(f64::INFINITY));
     }
 
     #[test]

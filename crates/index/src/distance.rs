@@ -22,6 +22,24 @@ impl Distance for L2 {
     }
 }
 
+/// Squared Euclidean (L2) distance — `sum((a-b)²)` with no final `sqrt`.
+/// HNSW uses the metric only for ordering, so squared-L2 preserves the
+/// ordering of plain L2 while avoiding a square-root per distance evaluation.
+/// Its raw value is already in `VectorMatch::squared_distance` units.
+pub struct SquaredL2;
+
+impl Distance for SquaredL2 {
+    fn eval(&self, a: &[f32], b: &[f32]) -> f32 {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| {
+                let diff = x - y;
+                diff * diff
+            })
+            .sum()
+    }
+}
+
 /// Cosine distance (`1 - cosine_similarity`) — smaller means more similar,
 /// matching this trait's convention. Verified against the installed
 /// `anndists-0.1.5` source (`impl Distance<f32> for DistCosine` in
@@ -97,6 +115,61 @@ mod tests {
     #[test]
     fn l2_distance_of_identical_vectors_is_zero() {
         assert_eq!(L2.eval(&[1.0, 2.0, 3.0], &[1.0, 2.0, 3.0]), 0.0);
+    }
+
+    #[test]
+    fn squared_l2_distance_of_identical_vectors_is_zero() {
+        assert_eq!(SquaredL2.eval(&[1.0, 2.0, 3.0], &[1.0, 2.0, 3.0]), 0.0);
+    }
+
+    #[test]
+    fn squared_l2_distance_matches_hand_computed_value_without_sqrt() {
+        // A 3-4-5 triangle: squared L2 is 3^2 + 4^2 = 25 (no sqrt), the
+        // value plain L2 would only reach as sqrt(25) = 5. The two are far
+        // enough apart that a sqrt-vs-no-sqrt bug can't accidentally pass.
+        let d = SquaredL2.eval(&[0.0, 0.0], &[3.0, 4.0]);
+        assert!((d - 25.0).abs() < 1e-5, "expected 25.0, got {d}");
+    }
+
+    #[test]
+    fn squared_l2_preserves_the_same_ordering_as_l2() {
+        // sqrt is monotonic, so squared-L2 and plain-L2 order any set of
+        // vectors identically -- this is the property that lets HNSW use
+        // squared-L2 internally (for ordering only) without changing graph
+        // structure or search result rank.
+        let query = [0.0_f32, 0.0];
+        let points = [[3.0, 4.0], [1.0, 0.0], [0.0, 1.0], [5.0, 12.0]];
+        let mut by_l2: Vec<(usize, f32)> = points
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (i, L2.eval(&query, p)))
+            .collect();
+        let mut by_sq: Vec<(usize, f32)> = points
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (i, SquaredL2.eval(&query, p)))
+            .collect();
+        by_l2.sort_by(|a, b| f32::total_cmp(&a.1, &b.1));
+        by_sq.sort_by(|a, b| f32::total_cmp(&a.1, &b.1));
+        // Same rank order: the i-th smallest plain-L2 and the i-th smallest
+        // squared-L2 must identify the same point, even though their numeric
+        // distances differ by the square root.
+        assert_eq!(
+            by_l2.iter().map(|(i, _)| i).collect::<Vec<_>>(),
+            by_sq.iter().map(|(i, _)| i).collect::<Vec<_>>()
+        );
+        assert!(
+            by_l2.windows(2).all(|w| w[0].1 <= w[1].1)
+                && by_sq.windows(2).all(|w| w[0].1 <= w[1].1),
+            "both must be sorted ascending: {by_l2:?} / {by_sq:?}"
+        );
+        // And specifically: squared-L2 of the nearest point (1.0) is 1.0,
+        // which is less than squared-L2 of the next (also 1.0) -- tie, and
+        // less than 25.0 (the 3-4-5 point). Plain L2 would be 1.0, 1.0, 5.0,
+        // 13.0 -- same ordering. Verify the nearest is unambiguously nearest
+        // under both.
+        assert_eq!(L2.eval(&query, &[1.0, 0.0]), 1.0);
+        assert_eq!(SquaredL2.eval(&query, &[1.0, 0.0]), 1.0);
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //! `hnsw_rs` as of this rewrite). See `docs/architecture.md` and
 //! `docs/design.md`.
 
-use crate::distance::L2;
+use crate::distance::SquaredL2;
 use crate::graph::Graph;
 use crate::live_set::LiveSet;
 
@@ -184,7 +184,7 @@ pub struct MaxLayers(pub usize);
 pub struct EfConstruction(pub usize);
 
 pub struct HnswIndex {
-    pub(crate) graph: Graph<L2>,
+    pub(crate) graph: Graph<SquaredL2>,
     m: usize,
     mmax0: usize,
     mmax: usize,
@@ -238,7 +238,7 @@ impl HnswIndex {
         #[allow(clippy::cast_precision_loss)]
         let m_l = 1.0 / (m as f64).ln();
         Ok(Self {
-            graph: Graph::new(L2, max_elements.0.max(1)),
+            graph: Graph::new(SquaredL2, max_elements.0.max(1)),
             m,
             mmax0: m * 2,
             mmax: m,
@@ -589,11 +589,15 @@ impl HnswIndex {
         is_visible: impl Fn(u64) -> bool,
     ) -> Result<Vec<VectorMatch>, IndexError> {
         let raw = self.graph.k_nn_search(query, k, ef_search, is_visible)?;
+        // `Graph<SquaredL2>`'s raw distance is already squared L2 (no
+        // sqrt), so it maps 1:1 onto `VectorMatch::squared_distance` with no
+        // squaring step -- the `dist * dist` this used to do was a wasted
+        // `sqrt`-then-`square` round trip on top of `L2`'s own `sqrt`.
         Ok(raw
             .into_iter()
             .map(|(row_id, dist)| VectorMatch {
                 row_id,
-                squared_distance: dist * dist,
+                squared_distance: dist,
             })
             .collect())
     }
@@ -660,11 +664,13 @@ impl HnswIndex {
     ) -> Result<Vec<VectorMatch>, IndexError> {
         let filter = build_live_filter_from_live_set(live, is_visible);
         let raw = self.graph.k_nn_search(query, k, ef_search, filter)?;
+        // As in `search`: `Graph<SquaredL2>`'s raw distance is already
+        // squared L2, so no squaring step here.
         Ok(raw
             .into_iter()
             .map(|(row_id, dist)| VectorMatch {
                 row_id,
-                squared_distance: dist * dist,
+                squared_distance: dist,
             })
             .collect())
     }
