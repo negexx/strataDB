@@ -788,6 +788,30 @@ mod tests {
     }
 
     #[test]
+    fn read_current_rejects_an_unsupported_manifest_format_version() {
+        // Break caught: opening a newer envelope as if it were this format
+        // could silently reinterpret fields that this reader does not know.
+        let dir = temp_dataset_dir("unsupported-format-version");
+        let manifest = Manifest::empty();
+        commit_manifest(&dir, &manifest).unwrap();
+        let path = manifest_path(&dir, manifest.version);
+        let mut envelope: ManifestEnvelope =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        envelope.format_version = MANIFEST_FORMAT_VERSION + 1;
+        envelope.checksum = 0;
+        envelope.checksum = envelope.canonical_checksum().unwrap();
+        fs::write(path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+
+        let result = read_current(&dir);
+        assert!(
+            matches!(result, Err(StorageError::CorruptManifest(_, ref reason)) if reason.contains("format_version") && reason.contains("unsupported")),
+            "recovery must reject an unsupported manifest envelope version: {result:?}"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn manifest_checksum_is_independent_of_map_insertion_order() {
         // Break caught: serializing HashMap iteration order directly would
         // make otherwise identical manifests produce unstable checksums.

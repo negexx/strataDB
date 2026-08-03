@@ -38,6 +38,74 @@ jobs:
       - name: Format check
         run: cargo fmt --check
 
+  phase-0-foundation-evidence:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master at 2026-08-03
+        with:
+          toolchain: "1.90"
+
+      - name: Run retained Phase 0 foundation regressions
+        shell: bash
+        run: |
+          set -o pipefail
+          set +e
+          mkdir -p artifacts
+          log=artifacts/phase-0-foundation.log
+          status=0
+          run_case() {
+            label="$1"
+            shift
+            {
+              echo
+              echo "===== $label ====="
+              echo "+ $*"
+              "$@"
+            } 2>&1 | tee -a "$log"
+            pipeline_status=("${PIPESTATUS[@]}")
+            if [ "${pipeline_status[0]}" -ne 0 ] || [ "${pipeline_status[1]}" -ne 0 ]; then
+              status=1
+              echo "===== $label FAILED (${pipeline_status[*]}) =====" | tee -a "$log"
+            else
+              echo "===== $label PASSED =====" | tee -a "$log"
+            fi
+          }
+
+          run_case revision git rev-parse HEAD
+          run_case runner-os printf 'runner.os=%s\nrunner.arch=%s\n' "$RUNNER_OS" "$RUNNER_ARCH"
+          run_case system uname -a
+          run_case rustc-version rustc -Vv
+          run_case cargo-version cargo -Vv
+
+          run_case row-id-restart \
+            cargo test -p strata-txn --features chaos-injection --test row_id_reservation_restart -- --nocapture
+          run_case manifest-checksum-rejection \
+            cargo test -p strata-storage --lib manifest::tests::read_current_rejects_a_manifest_with_a_mutated_checksum -- --exact
+          run_case manifest-format-version-rejection \
+            cargo test -p strata-storage --lib manifest::tests::read_current_rejects_an_unsupported_manifest_format_version -- --exact
+          run_case manifest-legacy-rejection \
+            cargo test -p strata-storage --lib manifest::tests::read_current_rejects_a_legacy_unenveloped_manifest -- --exact
+          run_case arrow-row-file-round-trip \
+            cargo test -p strata-storage --lib datafile::tests::write_then_read_round_trips -- --exact
+          run_case immutable-segment-round-trip \
+            cargo test -p strata-index --lib segment_reader::tests::every_nodes_level_vector_and_neighbor_list_survives_the_round_trip -- --exact
+          run_case immutable-segment-format-rejection \
+            cargo test -p strata-index --lib segment_reader::tests::a_wrong_magic_or_format_version_is_rejected_before_anything_else_is_read -- --exact
+
+          exit "$status"
+
+      - name: Retain Phase 0 foundation evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: phase-0-foundation-evidence-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: artifacts/phase-0-foundation.log
+          if-no-files-found: error
+          retention-days: 14
+
   ci:
     runs-on: ubuntu-latest
     steps:
