@@ -5,7 +5,7 @@ in [documentation history](history/README.md). Current implementation claims liv
 
 | Phase | Status | Scope | Exit signal |
 |---|---|---|---|
-| 0 — Foundation | Partial | Local format, manifests, row allocation, and bounded transaction primitives. See the [Phase 0 foundation audit](phase-0-audit.md). | Restart-safe row-ID non-reuse and retained foundation evidence pass within the named local-filesystem boundary. |
+| 0 — Foundation | Implemented within named local bounds | Local format, manifests, row allocation, and bounded transaction primitives. See the [Phase 0 foundation audit](phase-0-audit.md). | Restart-safe row-ID non-reuse and retained foundation evidence pass within the named local-filesystem boundary. |
 | 1 — Correctness and durability baseline | Partial — blocked | Shared-handle commits, immutable snapshots, typed conflicts, recovery/integrity, schema/error semantics, supported facade, and boundedness evidence. | All asserted guarantees have scope, implementation evidence, regression coverage, and current performance bounds. |
 | 2 — Query and usability | Partial | Stable schema/query APIs, scan/projection/filter/group-by integration, point lookup, CLI, and Python surface. See the [Phase 2 audit](phase-2-audit.md). | Supported query/client behavior is documented and integration-tested. |
 | 3 — Operational lifecycle | Proposed | Compaction, vacuum/orphan cleanup, history retention, index lifecycle, migrations, and diagnostics. | Sustained operation safely bounds manifest/segment growth and manages retained data. |

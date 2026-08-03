@@ -5,10 +5,16 @@ are evidence pointers; [roadmap](roadmap.md) owns phase ordering.
 
 ## Overall state
 
-The current baseline includes merged PR #52 commit `d0b0a8e613cd58abdbc34b60ddde29ec2c2f979a`. The
-[Phase 0 foundation audit](phase-0-audit.md) records the local foundation contract and its retained
-evidence requirement. The [Phase 1 closeout ledger](phase-1-closeout-ledger.md) tracks the remaining
-finding-level acceptance and evidence obligations; it does not change this Partial/blocked state.
+The current baseline is merged PR #53 commit `eb48519cd0368f2ec98316e3d9a8dbe9f8a27313`. The
+[Phase 0 foundation audit](phase-0-audit.md) records the foundation as implemented within its named
+local bounds, with retained CI evidence. The [Phase 1 closeout ledger](phase-1-closeout-ledger.md)
+tracks the remaining finding-level acceptance and evidence obligations; it does not change this
+Partial/blocked state.
+
+**Phase 0: Implemented within named local bounds.** The local Arrow/manifest/segmented-index
+foundation and restart-safe row-ID regression are covered by local tests and the retained PR #53 CI
+artifact. This does not claim portable filesystem behavior, cross-process coordination, serializability,
+compaction, migration, object storage, or universal power-loss durability.
 
 **Phase 1: Partial — blocked.** The [seven-lane Sol audit](phase-1-audit.md) found correctness,
 durability, schema, API-boundary, verification, and performance-evidence blockers inside the supported
@@ -29,7 +35,7 @@ single-process/shared-`Dataset` boundary.
 | Python | Proposed | PyO3 scaffolding exports only `placeholder_version`; no database API exists. |
 | Durability/recovery | Partial | File/directory durability, immutable row-ID high-water, manifest integrity, and crash/reopen evidence exist within named local bounds; full branch verification remains. |
 | Schema/migrations | Partial | Dataset-owned schema and strict validation are implemented; schema evolution and migration remain deferred. |
-| Loom/chaos/fuzz/bench evidence | Partial | Passing thorough-chaos evidence is local Ubuntu WSL only, not portable/native-platform or CI execution/log-retention evidence; local fuzz build/smoke now passes, while CI fuzz provenance and portable real-fixture performance bounds remain open. |
+| Loom/chaos/fuzz/bench evidence | Partial | Passing thorough-chaos evidence is local Ubuntu WSL only, not portable/native-platform or retained loom/chaos CI evidence; local fuzz build/smoke now passes, and the merged PR #53 fuzz-and-provenance job retained its CI artifact, while portable real-fixture performance bounds remain open. |
 | Compaction/GC | Proposed | No compaction, vacuum, orphan cleanup, or bounded history implementation. |
 | Cross-process coordination | Proposed | Independent openers do not share transaction state or durable conditional publication. |
 | Branching/object storage | Proposed | No branch/merge or object-store backend is implemented. |
