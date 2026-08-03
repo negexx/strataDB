@@ -85,13 +85,15 @@ fn retained_pin_matrix_creates_releases_and_preserves_each_immutable_view() {
         let predicate = Predicate::Eq("name".to_owned(), Value::Utf8("alice".to_owned()));
         let mut pinned = Vec::new();
 
-        for row_id in 0..64_i64 {
+        for row_id in 0_u16..64 {
             let mut txn = dataset.begin();
-            txn.insert(mvp_batch(&[(row_id, "alice", [row_id as f32, 1.0, 1.0])]).unwrap())
-                .unwrap();
+            txn.insert(
+                mvp_batch(&[(i64::from(row_id), "alice", [f32::from(row_id), 1.0, 1.0])]).unwrap(),
+            )
+            .unwrap();
             txn.commit().unwrap();
             if pinned.len() < pin_count {
-                pinned.push((row_id as u64, dataset.snapshot()));
+                pinned.push((row_id, dataset.snapshot()));
             }
         }
 
@@ -102,11 +104,11 @@ fn retained_pin_matrix_creates_releases_and_preserves_each_immutable_view() {
         );
         for (row_id, snapshot) in &pinned {
             let hits = snapshot
-                .vector_search(&[*row_id as f32, 1.0, 1.0], 1, Some(&predicate))
+                .vector_search(&[f32::from(*row_id), 1.0, 1.0], 1, Some(&predicate))
                 .unwrap();
             assert_eq!(
                 hits.first().map(|hit| hit.row_id),
-                Some(*row_id),
+                Some(u64::from(*row_id)),
                 "pin count {pin_count}: historical snapshot {row_id} must return its immutable vector view"
             );
             assert_eq!(snapshot.live_set_cache_accounting().entry_count, 1);
@@ -132,11 +134,11 @@ fn retained_pin_matrix_creates_releases_and_preserves_each_immutable_view() {
         for (row_id, snapshot) in &pinned {
             assert_eq!(
                 snapshot
-                    .vector_search(&[*row_id as f32, 1.0, 1.0], 1, Some(&predicate))
+                    .vector_search(&[f32::from(*row_id), 1.0, 1.0], 1, Some(&predicate))
                     .unwrap()
                     .first()
                     .map(|hit| hit.row_id),
-                Some(*row_id),
+                Some(u64::from(*row_id)),
                 "pin count {pin_count}: later publication must not mutate historical snapshot {row_id}"
             );
         }

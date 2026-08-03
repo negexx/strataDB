@@ -42,3 +42,22 @@ fn direct_footprint_keeps_logical_references_separate_from_unique_physical_files
         );
     }
 }
+
+#[test]
+fn direct_footprint_deduplicates_manifest_payloads_for_repeated_versions() {
+    // Break caught: treating repeated handles for one manifest version as
+    // separate physical manifests overstates retained manifest payload.
+    let snapshots = vec![snapshot(1), snapshot(1)];
+    let actual = pinned_snapshot_footprint_diagnostics(&snapshots);
+
+    assert!(
+        actual.logical_manifest_payload > actual.unique_manifest_payload,
+        "two handles for one manifest version must retain more logical references than unique manifest payload bytes"
+    );
+    assert_eq!(actual.logical_manifest_payload, 2_002);
+    assert_eq!(actual.unique_manifest_payload, 1_001);
+    assert_eq!(actual.logical_row_data, 22);
+    assert_eq!(actual.unique_row_data, 11);
+    assert_eq!(actual.logical_immutable_segments, 42);
+    assert_eq!(actual.unique_immutable_segments, 21);
+}

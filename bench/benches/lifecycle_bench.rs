@@ -413,17 +413,22 @@ fn requested_pin_counts() -> Vec<usize> {
         .collect()
 }
 
-fn lifecycle_run_count(name: &str, default: usize) -> usize {
-    std::env::var(name).ok().map_or(default, |value| {
+fn lifecycle_run_count(name: &str, default: usize, minimum: usize) -> usize {
+    let count = std::env::var(name).ok().map_or(default, |value| {
         value
             .parse()
             .unwrap_or_else(|error| panic!("invalid {name} value {value:?}: {error}"))
-    })
+    });
+    assert!(
+        count >= minimum,
+        "{name} must be at least {minimum} to preserve the lifecycle measurement protocol; got {count}"
+    );
+    count
 }
 
 fn run_lifecycle_measurements() {
-    let warmups = lifecycle_run_count("STRATA_LIFECYCLE_WARMUP_RUNS", 1);
-    let repetitions = lifecycle_run_count("STRATA_LIFECYCLE_REPETITIONS", 5);
+    let warmups = lifecycle_run_count("STRATA_LIFECYCLE_WARMUP_RUNS", 1, 1);
+    let repetitions = lifecycle_run_count("STRATA_LIFECYCLE_REPETITIONS", 5, 5);
     let executable = std::env::current_exe().expect("lifecycle benchmark executable path");
     for pin_count in requested_pin_counts() {
         for warmup in 1..=warmups {

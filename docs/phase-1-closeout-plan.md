@@ -225,6 +225,8 @@ envelope.
 - `crates/txn/src/snapshot.rs`
 - `crates/txn/src/dataset.rs`
 - `crates/txn/tests/*` for residency/release regressions
+- `bench/src/lib.rs` and `bench/tests/lifecycle_footprint.rs` for testable direct benchmark
+  accounting of manifest/file references only; no public engine API or `Snapshot` semantics change
 - `bench/benches/lifecycle_bench.rs`
 - `bench/cloud-performance/run.sh`
 - `bench/cloud-performance/summarize.py`
