@@ -1,0 +1,53 @@
+name: Cloud performance before/after
+
+on:
+  workflow_dispatch:
+    inputs:
+      before_revision:
+        description: Full commit SHA for the baseline revision
+        required: true
+        type: string
+      after_revision:
+        description: Full commit SHA for the candidate revision (defaults to this workflow SHA)
+        required: false
+        type: string
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master at 2026-08-03
+        with:
+          toolchain: "1.90"
+
+      - name: Run before/after matrix
+        shell: bash
+        env:
+          BEFORE_REVISION: ${{ inputs.before_revision }}
+          AFTER_REVISION: ${{ inputs.after_revision }}
+        run: |
+          set -euo pipefail
+          after="$AFTER_REVISION"
+          if [[ -z "$after" ]]; then after="$GITHUB_SHA"; fi
+          bash bench/cloud-performance/run.sh "$BEFORE_REVISION" "$after" artifacts
+          python3 bench/cloud-performance/summarize.py artifacts \
+            --jsonl artifacts/summary.jsonl \
+            --csv artifacts/deltas.csv \
+            --validate
+
+      - name: Retain cloud performance evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: cloud-performance-before-after-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: artifacts
+          if-no-files-found: error
+          retention-days: 14
