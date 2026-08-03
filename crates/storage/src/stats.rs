@@ -3,11 +3,8 @@
 
 use std::collections::HashMap;
 
-use arrow::array::{Array, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray};
-use arrow::compute::{
-    filter,
-    kernels::aggregate::{max, max_string, min, min_string},
-};
+use arrow::array::{Array, Float64Array, Int64Array, RecordBatch, StringArray};
+use arrow::compute::kernels::aggregate::{max, max_string, min, min_string};
 use arrow::datatypes::{DataType, Float64Type, Int64Type};
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +22,41 @@ pub enum Value {
 pub struct ColumnStats {
     pub min: Value,
     pub max: Value,
+}
+
+fn float64_bounds_ignoring_nan(values: &[f64]) -> Option<(f64, f64)> {
+    let mut bounds = None;
+    for &value in values {
+        if value.is_nan() {
+            continue;
+        }
+        bounds = Some(match bounds {
+            None => (value, value),
+            Some((min_value, max_value)) => (
+                if value < min_value { value } else { min_value },
+                if value > max_value { value } else { max_value },
+            ),
+        });
+    }
+    bounds
+}
+
+#[cfg(test)]
+mod float64_bounds_tests {
+    use super::float64_bounds_ignoring_nan;
+
+    #[test]
+    fn computes_nan_aware_bounds_without_materializing_a_filtered_column() {
+        assert_eq!(
+            float64_bounds_ignoring_nan(&[9.99, f64::NAN, 49.5]),
+            Some((9.99, 49.5))
+        );
+        assert_eq!(
+            float64_bounds_ignoring_nan(&[f64::NEG_INFINITY, f64::INFINITY]),
+            Some((f64::NEG_INFINITY, f64::INFINITY))
+        );
+        assert_eq!(float64_bounds_ignoring_nan(&[f64::NAN]), None);
+    }
 }
 
 /// Computes per-column min/max for every orderable column in `batch`.
@@ -51,28 +83,25 @@ pub fn compute_stats(batch: &RecordBatch) -> HashMap<String, ColumnStats> {
                 .as_any()
                 .downcast_ref::<Float64Array>()
                 .and_then(|arr| {
-                    // NaN breaks pruning: arrow's min/max aggregate returns NaN
-                    // for a NaN-containing array, and `should_scan_file`'s `>=`/`<=`
-                    // comparisons are always false for NaN under IEEE partial
-                    // order - the file would be silently pruned = data loss.
-                    // Filter only NaN before computing min/max. Infinities are
-                    // valid ordered Float64 values and must remain in the
-                    // bounds; dropping them could cause false pruning. If every
-                    // value is NaN, return None so pruning fails open.
-                    let finite_mask: BooleanArray =
-                        arr.values().iter().map(|&v| !v.is_nan()).collect();
-                    let finite = filter(arr, &finite_mask)
-                        .ok()?
-                        .as_any()
-                        .downcast_ref::<Float64Array>()?
-                        .clone();
-                    match (min::<Float64Type>(&finite), max::<Float64Type>(&finite)) {
-                        (Some(min_v), Some(max_v)) => Some(ColumnStats {
+                    // Arrow's max returns NaN when the array contains NaN, so
+                    // a non-NaN max is a cheap no-NaN fast-path that retains
+                    // Arrow's optimized aggregate kernels without allocating.
+                    // If max is NaN, compute both bounds in one scalar pass,
+                    // ignoring NaN while preserving valid infinities.
+                    let max_v = max::<Float64Type>(arr)?;
+                    let min_v = if max_v.is_nan() {
+                        let (min_v, max_v) = float64_bounds_ignoring_nan(arr.values())?;
+                        return Some(ColumnStats {
                             min: Value::Float64(min_v),
                             max: Value::Float64(max_v),
-                        }),
-                        _ => None,
-                    }
+                        });
+                    } else {
+                        min::<Float64Type>(arr)?
+                    };
+                    Some(ColumnStats {
+                        min: Value::Float64(min_v),
+                        max: Value::Float64(max_v),
+                    })
                 }),
             DataType::Utf8 => column
                 .as_any()
