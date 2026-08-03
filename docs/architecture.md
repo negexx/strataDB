@@ -20,6 +20,21 @@ for the current blockers.
 | CLI | `crates/cli` | Fixed-shape inspection/demo commands. |
 | Bindings | `crates/bindings` | A placeholder PyO3 extension exporting `placeholder_version`. |
 
+## Supported on-disk formats
+
+Phase 0 supports the following local-disk artifacts. These are explicit format contracts, not a
+general migration or compatibility framework:
+
+| Artifact | Current format | Validation and rejection behavior |
+|---|---|---|
+| Row data file | Arrow IPC file containing the committed record batch; there is no Strata-owned row-file version discriminator | Compatibility is delegated to the pinned Arrow IPC reader. Dataset recovery validates schema, row count, physical columns, byte length, and CRC metadata; malformed or incompatible data is rejected. |
+| Version manifest | JSON `ManifestEnvelope`, `format_version = 1`, CRC32C over the canonical envelope, and a version-matching filename | Legacy direct manifests, unsupported format versions, checksum mismatches, unknown envelope/manifest/entry fields, malformed schema bytes, and filename/version mismatches are rejected. |
+| Immutable vector segment | `STRTSEG\0` header, segment format version 1, little-endian fields, squared-L2 metric, and header/body CRCs | Wrong magic/version/endianness/metric, malformed geometry/topology, invalid row IDs, and CRC failures are rejected before the segment is exposed to a snapshot. |
+
+The supported backend for these formats is the local filesystem through `LocalFs`. Object storage,
+cross-process coordination, format migration, and universal power-loss guarantees are later-phase
+work and must not be inferred from these checks.
+
 ## What exists today
 
 - Local Arrow data files, immutable version manifests, per-file statistics, and the `LocalFs` backend.

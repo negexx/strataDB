@@ -5,7 +5,7 @@ in [documentation history](history/README.md). Current implementation claims liv
 
 | Phase | Status | Scope | Exit signal |
 |---|---|---|---|
-| 0 — Foundation | Partial | Local format, manifests, row allocation, and bounded transaction primitives. | Restart-safe row-ID non-reuse and foundation tests are verified. |
+| 0 — Foundation | Partial | Local format, manifests, row allocation, and bounded transaction primitives. See the [Phase 0 foundation audit](phase-0-audit.md). | Restart-safe row-ID non-reuse and retained foundation evidence pass within the named local-filesystem boundary. |
 | 1 — Correctness and durability baseline | Partial — blocked | Shared-handle commits, immutable snapshots, typed conflicts, recovery/integrity, schema/error semantics, supported facade, and boundedness evidence. | All asserted guarantees have scope, implementation evidence, regression coverage, and current performance bounds. |
 | 2 — Query and usability | Partial | Stable schema/query APIs, scan/projection/filter/group-by integration, point lookup, CLI, and Python surface. See the [Phase 2 audit](phase-2-audit.md). | Supported query/client behavior is documented and integration-tested. |
 | 3 — Operational lifecycle | Proposed | Compaction, vacuum/orphan cleanup, history retention, index lifecycle, migrations, and diagnostics. | Sustained operation safely bounds manifest/segment growth and manages retained data. |
@@ -21,9 +21,8 @@ The [Phase 1 audit](phase-1-audit.md) is complete. Phase 1 remains Partial and b
 - passing thorough-chaos evidence only on Ubuntu WSL, with portable/native-platform coverage and CI execution/log-retention provenance still open; and
 - incomplete portable/real-fixture segmented performance and operating-bound evidence.
 
-The [Phase 1 closeout ledger](phase-1-closeout-ledger.md), synchronized at merged PR #50 commit
-`8cd7696fdcf34f6253fb11f9e110f6632bc872de`, assigns each remaining finding an acceptance assertion
-and future evidence location. It is tracking material, not a phase-exit claim.
+The [Phase 1 closeout ledger](phase-1-closeout-ledger.md) assigns each remaining finding an
+acceptance assertion and future evidence location. It is tracking material, not a phase-exit claim.
 
 Targeted implementation and regression evidence now covers future tombstones, live update/delete
 targets and one-row replacement cardinality, restart-safe physical row-ID high-water allocation,

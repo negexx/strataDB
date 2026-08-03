@@ -5,9 +5,10 @@ are evidence pointers; [roadmap](roadmap.md) owns phase ordering.
 
 ## Overall state
 
-The closeout baseline is merged PR #50 commit `8cd7696fdcf34f6253fb11f9e110f6632bc872de`. The
-[Phase 1 closeout ledger](phase-1-closeout-ledger.md) tracks the remaining finding-level acceptance
-and evidence obligations; it does not change this Partial/blocked state.
+The current baseline includes merged PR #52 commit `d0b0a8e613cd58abdbc34b60ddde29ec2c2f979a`. The
+[Phase 0 foundation audit](phase-0-audit.md) records the local foundation contract and its retained
+evidence requirement. The [Phase 1 closeout ledger](phase-1-closeout-ledger.md) tracks the remaining
+finding-level acceptance and evidence obligations; it does not change this Partial/blocked state.
 
 **Phase 1: Partial — blocked.** The [seven-lane Sol audit](phase-1-audit.md) found correctness,
 durability, schema, API-boundary, verification, and performance-evidence blockers inside the supported
