@@ -117,6 +117,20 @@ jobs:
           toolchain: "1.90"
           components: clippy, rustfmt
 
+      - name: Record CI provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          {
+            printf 'revision='; git rev-parse HEAD
+            printf 'runner.os=%s\nrunner.arch=%s\n' "$RUNNER_OS" "$RUNNER_ARCH"
+            uname -a
+            rustc -Vv
+            cargo -Vv
+            sha256sum Cargo.lock
+          } | tee artifacts/ci-provenance.log
+
       - name: Build
         run: cargo build --workspace
 
@@ -232,6 +246,15 @@ jobs:
         with:
           name: loom-evidence-${{ github.run_id }}-attempt-${{ github.run_attempt }}
           path: artifacts/loom-*.log
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Retain CI provenance
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ci-provenance-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: artifacts/ci-provenance.log
           if-no-files-found: error
           retention-days: 14
 

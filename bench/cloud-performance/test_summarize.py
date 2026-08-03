@@ -21,7 +21,7 @@ class SummarizeTests(unittest.TestCase):
                 )
                 (artifact / label / "segment_recall.log").write_text(
                     "unfiltered query results (median / p95 over measured repetitions):\n"
-                    f"   1   1.0000 / 1.0000  {latency} / {latency}  100 / 100\n",
+                    f"   1   1.0000 /  1.0000     {latency} /    {latency}    100 /   100\n",
                     encoding="utf-8",
                 )
                 (artifact / label / "manifest_growth.time").write_text(
