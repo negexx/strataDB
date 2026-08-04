@@ -117,7 +117,7 @@ jobs:
           toolchain: "1.90"
           components: clippy, rustfmt
 
-      - name: Record CI provenance
+      - name: Initialize CI provenance
         shell: bash
         run: |
           set -euo pipefail
@@ -129,53 +129,25 @@ jobs:
             rustc -Vv
             cargo -Vv
             sha256sum Cargo.lock
-            printf 'command.01=cargo build --workspace\n'
-            printf 'command.02=cargo test --workspace\n'
-            printf 'command.03=cargo test -p strata-txn --features parallel-insert\n'
-            printf 'command.04=cargo test -p strata-txn --features test-fault-injection\n'
-            printf 'command.05=cargo test -p strata-storage --features chaos-injection --test chaos_checkpoint_actually_aborts -- --exact commit_manifest_aborts_at_the_configured_checkpoint\n'
-            printf 'command.06=cargo test -p strata-sim fast_tier_random_seeds_survive_random_crash_points -- --exact --nocapture\n'
-            printf 'command.07=cargo rustc -p strata-txn --lib --profile test --message-format=json -- --cfg loom\n'
-            printf 'command.08=bin=$(jq -r '\''select(.reason == "compiler-artifact" and .executable != null) | .executable'\'' /tmp/loom-txn-build.json | tail -1)\n'
-            printf 'command.09="$bin" --exact dataset::loom_tests::one_writer_store_races_safely_with_many_readers_load --test-threads=1\n'
-            printf 'command.10="$bin" --exact dataset::loom_tests::two_threads_deleting_the_same_row_exactly_one_conflicts --test-threads=1\n'
-            printf 'command.11="$bin" --exact dataset::loom_tests::two_threads_deleting_disjoint_rows_both_succeed --test-threads=1\n'
-            printf 'command.12="$bin" --exact dataset::loom_tests::a_failed_commits_segment_is_never_searchable_under_concurrent_commits --test-threads=1\n'
-            printf 'command.13="$bin" --exact dataset::loom_tests::concurrent_first_vector_commits_at_different_dimensions_are_not_both_accepted --test-threads=1\n'
-            printf 'command.14="$bin" --exact dataset::loom_tests::a_failed_commits_segment_is_never_visible_to_a_concurrent_reader --test-threads=1\n'
-            printf 'command.15="$bin" --exact dataset::loom_tests::a_commits_row_and_its_segment_become_visible_as_one_atomic_step --test-threads=1\n'
-            printf 'command.16="$bin" --exact dataset::loom_tests::a_reader_never_sees_one_in_flight_commits_row_while_observing_an_unrelated_commits_row_id_counter --test-threads=1\n'
-            printf 'command.17="$bin" --exact row_id::loom_tests::concurrent_claims_publish_monotonic_high_water --test-threads=1\n'
-            printf 'command.18="$bin" --exact dataset::loom_tests::immutable_snapshot_membership_controls_visibility_despite_claimed_high_water --test-threads=1\n'
-            printf 'command.19=cargo rustc -p strata-txn --lib --profile test --message-format=json -- --cfg loom\n'
-            printf 'command.20=bin=$(jq -r '\''select(.reason == "compiler-artifact" and .executable != null) | .executable'\'' /tmp/loom-txn-cache-build.json | tail -1)\n'
-            printf 'command.21="$bin" --exact live_set_cache::loom_tests::two_concurrent_misses_on_the_same_key_compute_exactly_once --test-threads=1\n'
-            printf 'command.22=cargo rustc -p strata-index --lib --profile test --message-format=json -- --cfg loom\n'
-            printf 'command.23=bin=$(jq -r '\''select(.reason == "compiler-artifact" and .executable != null) | .executable'\'' /tmp/loom-index-build.json | tail -1)\n'
-            printf 'command.24="$bin" --exact node::loom_tests::full_node_publish_is_completely_visible_to_a_reader --test-threads=1\n'
-            printf 'command.25="$bin" --exact node_table::loom_tests::concurrent_chunk_allocation_publishes_exactly_one_chunk --test-threads=1\n'
-            printf 'command.26="$bin" --exact slot_array::loom_tests::concurrent_claim_and_shrink_never_corrupts_a_slot --test-threads=1\n'
-            printf 'command.27="$bin" --exact graph::loom_tests::concurrent_advances_always_settle_on_the_highest_level --test-threads=1\n'
-            printf 'command.28="$bin" --exact graph::loom_tests::concurrent_inserts_of_distinct_rows_are_all_findable_and_uncorrupted --test-threads=1\n'
-            printf 'command.29="$bin" --exact graph::loom_tests::concurrent_inserts_racing_on_one_shared_neighbor_always_keep_the_nearest --test-threads=1\n'
-            printf 'command.30="$bin" --exact graph::loom_tests::concurrent_inserts_into_a_genuinely_empty_graph_never_strand_a_node_loom --test-threads=1\n'
-            printf 'command.31="$bin" --exact graph::loom_tests::concurrent_insert_never_uses_an_unpublished_node_as_a_descent_entry_loom --test-threads=1\n'
-            printf 'command.32=cargo clippy --workspace --all-targets -- -D warnings\n'
-            printf 'command.33=cargo clippy -p strata-txn --all-targets --features parallel-insert -- -D warnings\n'
-            printf 'command.34=cargo clippy -p strata-txn --all-targets --features test-fault-injection -- -D warnings\n'
-            printf 'command.35=cargo metadata --no-deps --format-version 1; facade/package boundary and stale-claim checks\n'
-            printf 'command.36=cargo fmt --check\n'
-            printf 'command.37=cargo doc --workspace --no-deps\n'
-            printf 'command.38=cargo deny check bans sources advisories\n'
           } | tee artifacts/ci-provenance.log
+          cat > artifacts/ci-provenance.bash_env <<'EOF'
+          exec 19>>"$GITHUB_WORKSPACE/artifacts/ci-provenance.log"
+          export BASH_XTRACEFD=19
+          export PS4='+ ${BASH_SOURCE}:${LINENO}: '
+          set -x
+          EOF
+          printf 'BASH_ENV=%s\n' "$GITHUB_WORKSPACE/artifacts/ci-provenance.bash_env" >> "$GITHUB_ENV"
 
       - name: Build
+        id: build
         run: cargo build --workspace
 
       - name: Test
+        id: test
         run: cargo test --workspace
 
       - name: Test (parallel-insert feature)
+        id: test_parallel
         # `insert_batch_parallel`'s clustered-data recall hazard fix is
         # exercised end-to-end through `crates/txn`'s commit path only when
         # this feature is on --
@@ -184,18 +156,22 @@ jobs:
         run: cargo test -p strata-txn --features parallel-insert
 
       - name: Test (directory durability fault injection)
+        id: test_fault_injection
         # Dataset creation's ordered directory-sync boundaries use this
         # thread-local fault seam. The default workspace suite intentionally
         # does not compile this test-only feature, so run it explicitly.
         run: cargo test -p strata-txn --features test-fault-injection
 
       - name: Test chaos checkpoint abort
+        id: chaos_checkpoint
         run: cargo test -p strata-storage --features chaos-injection --test chaos_checkpoint_actually_aborts -- --exact commit_manifest_aborts_at_the_configured_checkpoint
 
       - name: Test fast chaos tier
+        id: chaos_fast
         run: cargo test -p strata-sim fast_tier_random_seeds_survive_random_crash_points -- --exact --nocapture
 
       - name: Loom transaction models (strata-txn)
+        id: loom_txn
         run: |
           set -euo pipefail
           mkdir -p artifacts
@@ -228,6 +204,7 @@ jobs:
           } 2>&1 | tee artifacts/loom-txn-evidence.log
 
       - name: Loom live-set-cache model (strata-txn)
+        id: loom_cache
         run: |
           set -euo pipefail
           mkdir -p artifacts
@@ -245,6 +222,7 @@ jobs:
           } 2>&1 | tee artifacts/loom-txn-cache-evidence.log
 
       - name: Loom tests (strata-index)
+        id: loom_index
         # Scoped to this one crate rather than a workspace-wide
         # `RUSTFLAGS=--cfg loom cargo test`; AGENTS.md explains why that
         # would break other crates in the dependency graph. These exact model
@@ -279,6 +257,7 @@ jobs:
           } 2>&1 | tee artifacts/loom-index-evidence.log
 
       - name: Retain loom evidence
+        id: retain_loom
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -287,25 +266,20 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: Retain CI provenance
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: ci-provenance-${{ github.run_id }}-attempt-${{ github.run_attempt }}
-          path: artifacts/ci-provenance.log
-          if-no-files-found: error
-          retention-days: 14
-
       - name: Clippy
+        id: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Clippy (parallel-insert feature)
+        id: clippy_parallel
         run: cargo clippy -p strata-txn --all-targets --features parallel-insert -- -D warnings
 
       - name: Clippy (directory durability fault injection)
+        id: clippy_fault_injection
         run: cargo clippy -p strata-txn --all-targets --features test-fault-injection -- -D warnings
 
       - name: Verify facade and package boundaries
+        id: facade
         run: |
           set -euo pipefail
           test ! -d docs/superpowers
@@ -328,18 +302,59 @@ jobs:
             docs/status.md docs/architecture.md docs/design.md
 
       - name: Format check
+        id: format
         run: cargo fmt --check
 
       - name: Doc
+        id: doc
         run: cargo doc --workspace --no-deps
 
       - name: Install cargo-deny
+        id: install_deny
         uses: taiki-e/install-action@f1d783a3a0ed7012c43e2889fbe3519390e9025b # cargo-deny
         with:
           tool: cargo-deny
 
       - name: cargo-deny (bans, sources, advisories)
+        id: deny
         run: cargo deny check bans sources advisories
+
+      - name: Finalize CI provenance
+        if: always()
+        shell: bash
+        run: |
+          set +x
+          {
+            printf 'job.status=%s\n' '${{ job.status }}'
+            printf 'step.build=%s\n' '${{ steps.build.outcome }}'
+            printf 'step.test=%s\n' '${{ steps.test.outcome }}'
+            printf 'step.test_parallel=%s\n' '${{ steps.test_parallel.outcome }}'
+            printf 'step.test_fault_injection=%s\n' '${{ steps.test_fault_injection.outcome }}'
+            printf 'step.chaos_checkpoint=%s\n' '${{ steps.chaos_checkpoint.outcome }}'
+            printf 'step.chaos_fast=%s\n' '${{ steps.chaos_fast.outcome }}'
+            printf 'step.loom_txn=%s\n' '${{ steps.loom_txn.outcome }}'
+            printf 'step.loom_cache=%s\n' '${{ steps.loom_cache.outcome }}'
+            printf 'step.loom_index=%s\n' '${{ steps.loom_index.outcome }}'
+            printf 'step.retain_loom=%s\n' '${{ steps.retain_loom.outcome }}'
+            printf 'step.clippy=%s\n' '${{ steps.clippy.outcome }}'
+            printf 'step.clippy_parallel=%s\n' '${{ steps.clippy_parallel.outcome }}'
+            printf 'step.clippy_fault_injection=%s\n' '${{ steps.clippy_fault_injection.outcome }}'
+            printf 'step.facade=%s\n' '${{ steps.facade.outcome }}'
+            printf 'step.format=%s\n' '${{ steps.format.outcome }}'
+            printf 'step.doc=%s\n' '${{ steps.doc.outcome }}'
+            printf 'step.install_deny=%s\n' '${{ steps.install_deny.outcome }}'
+            printf 'step.deny=%s\n' '${{ steps.deny.outcome }}'
+          } >> artifacts/ci-provenance.log
+          cat artifacts/ci-provenance.log
+
+      - name: Upload CI provenance
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ci-provenance-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: artifacts/ci-provenance.log
+          if-no-files-found: error
+          retention-days: 14
 
   fuzz-and-provenance:
     runs-on: ubuntu-latest

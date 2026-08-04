@@ -139,25 +139,25 @@ consolidated register above; IDs marked "merged" retain the same evidence under 
 
 | Legacy ID | Consolidated disposition |
 |---|---|
-| COR-01 | Merged with CONC-01 and IDX-01: future tombstone can hide an acknowledged insert. Phase 1 blocker. |
-| COR-02 | Merged with CONC-03: abandoned row-ID reservation can be reused after restart. Phase 1 blocker. |
-| COR-03 | Merged with DUR-01 and DUR-02: directory durability can fail open. Phase 1 blocker. |
-| COR-04 | Merged with DUR-03a: manifest filename and payload versions can disagree. Phase 1 blocker. |
-| COR-05 | Merged with ARCH-02: update/delete target and replacement cardinality are under-specified. Phase 1 blocker. |
-| CONC-01 | Merged with COR-01 and IDX-01: future/in-flight tombstone visibility hole. Phase 1 blocker. |
-| CONC-02 | Merged with VER-02: transaction and cache loom models are not CI gates. Phase 1 blocker. |
-| CONC-03 | Merged with COR-02: restart can reuse an abandoned physical row-ID claim. Phase 1 blocker. |
+| COR-01 | Historical counterexample; remediated with regression coverage under CONC-01/IDX-01. Final branch verification remains. |
+| COR-02 | Historical counterexample; remediated with durable high-water allocation and regression coverage under CONC-03. Final branch verification remains. |
+| COR-03 | Historical counterexample; remediated within the named local filesystem boundary under DUR-01/DUR-02. Final branch verification remains. |
+| COR-04 | Historical counterexample; remediated with manifest identity/integrity checks under DUR-03a. Final branch verification remains. |
+| COR-05 | Historical contract gap; remediated with live-target and replacement-cardinality validation under ARCH-02. Final branch verification remains. |
+| CONC-01 | Historical counterexample; remediated with base-snapshot tombstone targeting under COR-01/IDX-01. Final branch verification remains. |
+| CONC-02 | Historical verification gap; the named transaction/cache models now pass the manual Ubuntu CI gate, while branch provenance/native-platform evidence remains. |
+| CONC-03 | Historical counterexample; remediated with durable row-ID reservation/high-water checks under COR-02. Final branch verification remains. |
 | CONC-04 | Preserved as later Phase 4 work: independent openers lack shared conditional publication. Not a Phase 1 scope expansion. |
-| DUR-01 | Merged with COR-03: directory sync errors are discarded before acknowledgement. Phase 1 blocker. |
-| DUR-02 | Preserved separately: initial dataset directory entries lack a durable parent boundary. Phase 1 blocker. |
-| DUR-03 | Split into DUR-03a (manifest identity) and DUR-03b (validly encoded manifest/row-file integrity); both remain Phase 1 blockers. |
-| DUR-04 | Merged with VER-03: process-abort chaos does not prove power-loss durability and can be non-exercising. Phase 1 verification blocker. |
-| DUR-05 | Merged with ARCH-04 and VER-07: active wording overstated durability. Corrected in current docs; evidence remains blocked until implementation fixes land. |
+| DUR-01 | Historical counterexample; directory sync errors now return typed failure within the named local boundary under COR-03. Final branch verification remains. |
+| DUR-02 | Historical counterexample; dataset creation now synchronizes the immediate-parent boundary. Final branch verification remains. |
+| DUR-03 | Historical counterexample split into DUR-03a (manifest identity) and DUR-03b (valid encoding); both now have integrity checks and regression coverage. Final branch verification remains. |
+| DUR-04 | Historical verification gap; checkpoint/fast/thorough chaos now pass the manual Ubuntu CI gate, but they do not prove power-loss durability or native-platform coverage. |
+| DUR-05 | Historical claim overstatement; merged with ARCH-04/VER-07 and bounded in current docs. Final canonical review remains. |
 | DUR-06 | Preserved as later Phase 3 lifecycle work: failed commits/crashes can leave unreachable files; current growth obligation remains documented. |
 | DUR-07 | Preserved as later Phase 3/4/6 boundary work: LocalFs platform/key and durable-delete constraints need an explicit contract. |
 | DUR-08 | Preserved as later Phase 4 work: independent openers can race manifest versions; unsupported in the current boundary. |
-| IDX-01 | Merged with COR-01 and CONC-01: unrestricted tombstone can hide row and vector. Phase 1 blocker. |
-| IDX-02 | Preserved explicitly: recovery does not reject ambiguous cross-segment row/vector identity or vector IDs without row ownership. Phase 1 recovery blocker. |
+| IDX-01 | Historical counterexample; remediated with row/vector identity validation and base-snapshot targeting under COR-01/CONC-01. Final branch verification remains. |
+| IDX-02 | Historical recovery-integrity counterexample; remediated with manifest-listed row/vector identity validation and regression coverage. Final branch verification remains. |
 | IDX-03 | Preserved explicitly: fixed `ef_search` can underfill `k`, including an unbounded API request above 32. Phase 1 contract decision and Phase 2 API work. |
 | IDX-04 | Merged with ARCH-04 and VER-07: recall experiment was overgeneralized. Current decisions now bound the claim to its workload. |
 | PERF-01 | Bounded Windows synthetic retained-version/segment matrix is recorded in `docs/phase-1-performance.md`; real-fixture, CPU/RAM, and portable-host evidence remain open. |

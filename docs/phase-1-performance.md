@@ -46,9 +46,9 @@ portable performance, a retained-history limit, or real-fixture behavior.
 
 The checked-in `bench/cloud-performance/` harness and
 `.github/workflows/cloud-performance-before-after.yml` workflow now provide a reproducible cloud
-comparison path. They do not themselves close PERF-01: a retained before/after artifact, portable
-runner provenance, and compatible real-fixture evidence are still required before the claim can
-advance.
+comparison path. The retained synthetic artifact below closes the cloud-evidence portion of PERF-01;
+portable/native runner coverage and compatible real-fixture evidence remain required before PERF-01
+can advance further.
 
 ## Cloud before/after comparison (fresh, bounded, synthetic)
 
