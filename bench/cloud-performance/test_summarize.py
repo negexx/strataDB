@@ -116,6 +116,7 @@ command_lifecycle=lifecycle
             "segment_m": "16",
             "segment_ef_construction": "100",
             "segment_max_layer": "16",
+            "segment_points": "1,2,4,8,16,32,64",
             "segment_warmup_runs": "1",
             "segment_repetitions": "5",
         }
@@ -128,6 +129,7 @@ command_lifecycle=lifecycle
             "lockfile_sha256=lock",
             "benchmark=fixture_segment_recall",
             *(f"{key}={value}" for key, value in summarize.FIXTURE_PROVENANCE.items()),
+            f"fixture_worktree_path={fixture_path}",
             f"loaded 256 rows from fixture {fixture_path}; input hash={input_hash}",
             "computing exact ground truth for 16 queries...",
             "==== recall vs segment count â€” 256 rows x 512-dim, k=10, ef_search=32 ====",
@@ -407,6 +409,7 @@ command_lifecycle=lifecycle
         for filename in (
             "fixture_segment_recall.env",
             "fixture_segment_recall.log",
+            "fixture_segment_recall.time",
             "fixture_segment_recall.status",
         ):
             with self.subTest(filename=filename), tempfile.TemporaryDirectory() as root:
@@ -446,6 +449,45 @@ command_lifecycle=lifecycle
                 )
 
                 with self.assertRaisesRegex(ValueError, key):
+                    summarize.validate_records(summarize.summarize_directory(artifact), artifact)
+
+    def test_validation_rejects_truncated_fixture_filtered_metrics(self):
+        with tempfile.TemporaryDirectory() as root:
+            artifact = Path(root)
+            self._write_complete_configured_matrix(artifact, "requested")
+            for label in ("before", "after"):
+                self._write_fixture_evidence(artifact, label)
+            fixture_log = artifact / "before" / "fixture_segment_recall.log"
+            final_filtered_row = "  64  1.0000 / 1.0000     10.0 / 11.0     100 / 90"
+            before, separator, after = fixture_log.read_text(encoding="utf-8").rpartition(final_filtered_row)
+            fixture_log.write_text(
+                before + after if separator else fixture_log.read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "segment_k64_filtered"):
+                summarize.validate_records(summarize.summarize_directory(artifact), artifact)
+
+    def test_validation_rejects_conflicting_duplicate_fixture_metadata(self):
+        conflicts = {
+            "source": "loaded 256 rows from fixture /unexpected/fixture.parquet; input hash=f1a2ce123",
+            "path": "fixture_worktree_path=/unexpected/fixture.parquet",
+            "shape": "==== recall vs segment count — 256 rows x 999-dim, k=10, ef_search=32 ====",
+            "hash": "loaded 256 rows from fixture /worktrees/before/bench/data/dbpedia-openai-100k.parquet; input hash=differenthash",
+        }
+        for kind, duplicate in conflicts.items():
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as root:
+                artifact = Path(root)
+                self._write_complete_configured_matrix(artifact, "requested")
+                for label in ("before", "after"):
+                    self._write_fixture_evidence(artifact, label)
+                fixture_log = artifact / "before" / "fixture_segment_recall.log"
+                fixture_log.write_text(
+                    fixture_log.read_text(encoding="utf-8") + f"\n{duplicate}\n",
+                    encoding="utf-8",
+                )
+
+                with self.assertRaises(ValueError):
                     summarize.validate_records(summarize.summarize_directory(artifact), artifact)
 
 
