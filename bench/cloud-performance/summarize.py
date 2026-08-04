@@ -22,7 +22,9 @@ MANIFEST_BYTES = re.compile(
 )
 RSS = re.compile(r"Maximum resident set size \(kbytes\):\s*(\d+)")
 SEGMENT_ROW = re.compile(
-    r"^\s*(\d+)\s+([0-9.]+) / ([0-9.]+)\s+([0-9.]+) / ([0-9.]+)\s+([0-9.]+) / ([0-9.]+)\s*$"
+    r"^\s*(\d+)\s+([0-9.]+)\s+/\s+([0-9.]+)\s+"
+    r"([0-9.]+)\s+/\s+([0-9.]+)\s+"
+    r"([0-9.]+)\s+/\s+([0-9.]+)\s*$"
 )
 LIFECYCLE_MEASUREMENT = re.compile(r"measurement\s*:\s*(.+)")
 LIFECYCLE_PINS = re.compile(r"pins=(\d+)")

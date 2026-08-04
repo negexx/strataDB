@@ -17,8 +17,8 @@ in [documentation history](history/README.md). Current implementation claims liv
 
 The [Phase 1 audit](phase-1-audit.md) is complete. Phase 1 remains Partial and blocked by:
 
-- incomplete VER-01 direct-regression verification and CI execution/provenance evidence; local WSL fuzz build/smoke now passes;
-- passing thorough-chaos evidence only on Ubuntu WSL, with portable/native-platform coverage and CI execution/log-retention provenance still open; and
+- incomplete VER-01 direct-regression inventory and final branch verification; the manual Ubuntu CI run [30861009780](https://github.com/negexx/strataDB/actions/runs/30861009780) passed the named loom and thorough-chaos gates;
+- the completed exact-head branch CI run [30865323724](https://github.com/negexx/strataDB/actions/runs/30865323724) now supplies retained command/outcome provenance; portable/native-platform coverage and final verification remain; and
 - incomplete portable/real-fixture segmented performance and operating-bound evidence.
 
 The [Phase 1 closeout ledger](phase-1-closeout-ledger.md) assigns each remaining finding an

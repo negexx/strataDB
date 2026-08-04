@@ -109,21 +109,72 @@ jobs:
   ci:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Initialize CI provenance
+        id: initialize_provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          provenance_dir="$RUNNER_TEMP/strata-ci-provenance"
+          mkdir -p "$provenance_dir"
+          log="$provenance_dir/ci-provenance.log"
+          {
+            printf 'revision=unavailable\n'
+            printf 'workflow=%s\n' "$GITHUB_WORKFLOW"
+            printf 'run.id=%s\nrun.attempt=%s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+            printf 'event=%s\nref=%s\n' "$GITHUB_EVENT_NAME" "$GITHUB_REF"
+            printf 'runner.os=%s\nrunner.arch=%s\n' "$RUNNER_OS" "$RUNNER_ARCH"
+            uname -a
+          } > "$log"
+          cat > "$provenance_dir/ci-provenance.bash_env" <<EOF
+          exec 19>>"$log"
+          export BASH_XTRACEFD=19
+          export PS4='+ \${BASH_SOURCE}:\${LINENO}: '
+          set -x
+          EOF
+          printf 'STRATA_PROVENANCE_DIR=%s\nBASH_ENV=%s\n' \
+            "$provenance_dir" "$provenance_dir/ci-provenance.bash_env" >> "$GITHUB_ENV"
+
+      - name: Checkout
+        id: checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install Rust toolchain
+        id: install_toolchain
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master at 2026-08-03
         with:
           toolchain: "1.90"
           components: clippy, rustfmt
 
+      - name: Record repository and toolchain provenance
+        id: record_provenance
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          provenance_dir="${STRATA_PROVENANCE_DIR:-$RUNNER_TEMP/strata-ci-provenance}"
+          mkdir -p "$provenance_dir"
+          log="$provenance_dir/ci-provenance.log"
+          {
+            if revision=$(git rev-parse HEAD 2>/dev/null); then
+              sed -i "s/^revision=.*/revision=$revision/" "$log"
+            else
+              printf 'revision=unavailable\n' >> "$log"
+            fi
+            if command -v rustc >/dev/null 2>&1; then rustc -Vv; else printf 'rustc=unavailable\n'; fi
+            if command -v cargo >/dev/null 2>&1; then cargo -Vv; else printf 'cargo=unavailable\n'; fi
+            if [ -f Cargo.lock ]; then sha256sum Cargo.lock; else printf 'Cargo.lock=unavailable\n'; fi
+          } >> "$log"
+
       - name: Build
+        id: build
         run: cargo build --workspace
 
       - name: Test
+        id: test
         run: cargo test --workspace
 
       - name: Test (parallel-insert feature)
+        id: test_parallel
         # `insert_batch_parallel`'s clustered-data recall hazard fix is
         # exercised end-to-end through `crates/txn`'s commit path only when
         # this feature is on --
@@ -132,18 +183,22 @@ jobs:
         run: cargo test -p strata-txn --features parallel-insert
 
       - name: Test (directory durability fault injection)
+        id: test_fault_injection
         # Dataset creation's ordered directory-sync boundaries use this
         # thread-local fault seam. The default workspace suite intentionally
         # does not compile this test-only feature, so run it explicitly.
         run: cargo test -p strata-txn --features test-fault-injection
 
       - name: Test chaos checkpoint abort
+        id: chaos_checkpoint
         run: cargo test -p strata-storage --features chaos-injection --test chaos_checkpoint_actually_aborts -- --exact commit_manifest_aborts_at_the_configured_checkpoint
 
       - name: Test fast chaos tier
+        id: chaos_fast
         run: cargo test -p strata-sim fast_tier_random_seeds_survive_random_crash_points -- --exact --nocapture
 
       - name: Loom transaction models (strata-txn)
+        id: loom_txn
         run: |
           set -euo pipefail
           mkdir -p artifacts
@@ -176,6 +231,7 @@ jobs:
           } 2>&1 | tee artifacts/loom-txn-evidence.log
 
       - name: Loom live-set-cache model (strata-txn)
+        id: loom_cache
         run: |
           set -euo pipefail
           mkdir -p artifacts
@@ -193,6 +249,7 @@ jobs:
           } 2>&1 | tee artifacts/loom-txn-cache-evidence.log
 
       - name: Loom tests (strata-index)
+        id: loom_index
         # Scoped to this one crate rather than a workspace-wide
         # `RUSTFLAGS=--cfg loom cargo test`; AGENTS.md explains why that
         # would break other crates in the dependency graph. These exact model
@@ -227,6 +284,7 @@ jobs:
           } 2>&1 | tee artifacts/loom-index-evidence.log
 
       - name: Retain loom evidence
+        id: retain_loom
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -236,15 +294,19 @@ jobs:
           retention-days: 14
 
       - name: Clippy
+        id: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Clippy (parallel-insert feature)
+        id: clippy_parallel
         run: cargo clippy -p strata-txn --all-targets --features parallel-insert -- -D warnings
 
       - name: Clippy (directory durability fault injection)
+        id: clippy_fault_injection
         run: cargo clippy -p strata-txn --all-targets --features test-fault-injection -- -D warnings
 
       - name: Verify facade and package boundaries
+        id: facade
         run: |
           set -euo pipefail
           test ! -d docs/superpowers
@@ -267,18 +329,67 @@ jobs:
             docs/status.md docs/architecture.md docs/design.md
 
       - name: Format check
+        id: format
         run: cargo fmt --check
 
       - name: Doc
+        id: doc
         run: cargo doc --workspace --no-deps
 
       - name: Install cargo-deny
+        id: install_deny
         uses: taiki-e/install-action@f1d783a3a0ed7012c43e2889fbe3519390e9025b # cargo-deny
         with:
           tool: cargo-deny
 
       - name: cargo-deny (bans, sources, advisories)
+        id: deny
         run: cargo deny check bans sources advisories
+
+      - name: Finalize CI provenance
+        if: always()
+        shell: bash
+        run: |
+          set +x
+          provenance_dir="${STRATA_PROVENANCE_DIR:-$RUNNER_TEMP/strata-ci-provenance}"
+          mkdir -p "$provenance_dir"
+          log="$provenance_dir/ci-provenance.log"
+          touch "$log"
+          {
+            printf 'step.initialize_provenance=%s\n' '${{ steps.initialize_provenance.outcome }}'
+            printf 'step.checkout=%s\n' '${{ steps.checkout.outcome }}'
+            printf 'step.install_toolchain=%s\n' '${{ steps.install_toolchain.outcome }}'
+            printf 'step.record_provenance=%s\n' '${{ steps.record_provenance.outcome }}'
+            printf 'job.status=%s\n' '${{ job.status }}'
+            printf 'step.build=%s\n' '${{ steps.build.outcome }}'
+            printf 'step.test=%s\n' '${{ steps.test.outcome }}'
+            printf 'step.test_parallel=%s\n' '${{ steps.test_parallel.outcome }}'
+            printf 'step.test_fault_injection=%s\n' '${{ steps.test_fault_injection.outcome }}'
+            printf 'step.chaos_checkpoint=%s\n' '${{ steps.chaos_checkpoint.outcome }}'
+            printf 'step.chaos_fast=%s\n' '${{ steps.chaos_fast.outcome }}'
+            printf 'step.loom_txn=%s\n' '${{ steps.loom_txn.outcome }}'
+            printf 'step.loom_cache=%s\n' '${{ steps.loom_cache.outcome }}'
+            printf 'step.loom_index=%s\n' '${{ steps.loom_index.outcome }}'
+            printf 'step.retain_loom=%s\n' '${{ steps.retain_loom.outcome }}'
+            printf 'step.clippy=%s\n' '${{ steps.clippy.outcome }}'
+            printf 'step.clippy_parallel=%s\n' '${{ steps.clippy_parallel.outcome }}'
+            printf 'step.clippy_fault_injection=%s\n' '${{ steps.clippy_fault_injection.outcome }}'
+            printf 'step.facade=%s\n' '${{ steps.facade.outcome }}'
+            printf 'step.format=%s\n' '${{ steps.format.outcome }}'
+            printf 'step.doc=%s\n' '${{ steps.doc.outcome }}'
+            printf 'step.install_deny=%s\n' '${{ steps.install_deny.outcome }}'
+            printf 'step.deny=%s\n' '${{ steps.deny.outcome }}'
+          } >> "$log"
+          cat "$log"
+
+      - name: Upload CI provenance
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ci-provenance-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/strata-ci-provenance/ci-provenance.log
+          if-no-files-found: error
+          retention-days: 14
 
   fuzz-and-provenance:
     runs-on: ubuntu-latest

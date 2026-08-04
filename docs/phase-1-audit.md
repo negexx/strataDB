@@ -11,8 +11,10 @@ source/tests as the anchor.
 
 ## Closeout baseline and ledger
 
-The closeout branch is synchronized through merged PR #50,
-`8cd7696fdcf34f6253fb11f9e110f6632bc872de` (`Merge Phase 1 audit remediation`). The
+The original remediation closeout was synchronized through merged PR #50,
+`8cd7696fdcf34f6253fb11f9e110f6632bc872de` (`Merge Phase 1 audit remediation`). The current
+evidence-finalization branch is based on merged PR #55, `152373a0408b7e9f7c4479daf319ce58d61c70e7`.
+The
 [Phase 1 closeout ledger](phase-1-closeout-ledger.md) is the mechanically scannable, row-per-finding
 record of current state, dependencies, acceptance assertions, and the future evidence required before
 this audit's verdict can change. It does not close Phase 1 or replace this audit as the controlling
@@ -65,10 +67,12 @@ packages are marked non-publishable. Task 7 now configures exact transaction and
 discovery, plus eight exact index loom models; checkpoint-abort and fast-chaos gates; and
 scheduled/manual thorough-chaos execution.
 Fresh Ubuntu WSL exact-model transaction loom evidence and Ubuntu WSL thorough-chaos evidence
-(`2000/2000` seeds with zero violations) now exist. Fuzz build/smoke now also passes locally;
-the merged PR #53 CI run also passed the declared fuzz-and-provenance job and retained
-`fuzz-provenance-30841989478-attempt-1`. Loom/chaos CI provenance and platform portability remain
-open. Task 8 now records bounded Windows synthetic segmented/lifecycle evidence with reproduction
+(`2000/2000` seeds with zero violations) now exist. Manual Ubuntu GitHub Actions run
+[30861009780](https://github.com/negexx/strataDB/actions/runs/30861009780) also passed the named
+loom and thorough-chaos gates. Fuzz build/smoke passes locally; the merged PR #53 CI run passed the
+declared fuzz-and-provenance job and retained `fuzz-provenance-30841989478-attempt-1`. Native
+platform coverage and final verification remain open; exact-head CI run [30865323724](https://github.com/negexx/strataDB/actions/runs/30865323724) supplies the retained branch-level command/outcome provenance. Task 8 and the
+cloud comparison now record bounded synthetic segmented/lifecycle evidence with reproduction
 metadata; the optional real fixture, portable host matrix, and universal operating bounds remain
 open. This does not change the audit verdict from Partial and blocked.
 
@@ -135,25 +139,25 @@ consolidated register above; IDs marked "merged" retain the same evidence under 
 
 | Legacy ID | Consolidated disposition |
 |---|---|
-| COR-01 | Merged with CONC-01 and IDX-01: future tombstone can hide an acknowledged insert. Phase 1 blocker. |
-| COR-02 | Merged with CONC-03: abandoned row-ID reservation can be reused after restart. Phase 1 blocker. |
-| COR-03 | Merged with DUR-01 and DUR-02: directory durability can fail open. Phase 1 blocker. |
-| COR-04 | Merged with DUR-03a: manifest filename and payload versions can disagree. Phase 1 blocker. |
-| COR-05 | Merged with ARCH-02: update/delete target and replacement cardinality are under-specified. Phase 1 blocker. |
-| CONC-01 | Merged with COR-01 and IDX-01: future/in-flight tombstone visibility hole. Phase 1 blocker. |
-| CONC-02 | Merged with VER-02: transaction and cache loom models are not CI gates. Phase 1 blocker. |
-| CONC-03 | Merged with COR-02: restart can reuse an abandoned physical row-ID claim. Phase 1 blocker. |
+| COR-01 | Historical counterexample; remediated with regression coverage under CONC-01/IDX-01. Final branch verification remains. |
+| COR-02 | Historical counterexample; remediated with durable high-water allocation and regression coverage under CONC-03. Final branch verification remains. |
+| COR-03 | Historical counterexample; remediated within the named local filesystem boundary under DUR-01/DUR-02. Final branch verification remains. |
+| COR-04 | Historical counterexample; remediated with manifest identity/integrity checks under DUR-03a. Final branch verification remains. |
+| COR-05 | Historical contract gap; remediated with live-target and replacement-cardinality validation under ARCH-02. Final branch verification remains. |
+| CONC-01 | Historical counterexample; remediated with base-snapshot tombstone targeting under COR-01/IDX-01. Final branch verification remains. |
+| CONC-02 | Historical verification gap; the named transaction/cache models now pass the manual Ubuntu CI gate, while branch provenance/native-platform evidence remains. |
+| CONC-03 | Historical counterexample; remediated with durable row-ID reservation/high-water checks under COR-02. Final branch verification remains. |
 | CONC-04 | Preserved as later Phase 4 work: independent openers lack shared conditional publication. Not a Phase 1 scope expansion. |
-| DUR-01 | Merged with COR-03: directory sync errors are discarded before acknowledgement. Phase 1 blocker. |
-| DUR-02 | Preserved separately: initial dataset directory entries lack a durable parent boundary. Phase 1 blocker. |
-| DUR-03 | Split into DUR-03a (manifest identity) and DUR-03b (validly encoded manifest/row-file integrity); both remain Phase 1 blockers. |
-| DUR-04 | Merged with VER-03: process-abort chaos does not prove power-loss durability and can be non-exercising. Phase 1 verification blocker. |
-| DUR-05 | Merged with ARCH-04 and VER-07: active wording overstated durability. Corrected in current docs; evidence remains blocked until implementation fixes land. |
+| DUR-01 | Historical counterexample; directory sync errors now return typed failure within the named local boundary under COR-03. Final branch verification remains. |
+| DUR-02 | Historical counterexample; dataset creation now synchronizes the immediate-parent boundary. Final branch verification remains. |
+| DUR-03 | Historical counterexample split into DUR-03a (manifest identity) and DUR-03b (valid encoding); both now have integrity checks and regression coverage. Final branch verification remains. |
+| DUR-04 | Historical verification gap; checkpoint/fast/thorough chaos now pass the manual Ubuntu CI gate, but they do not prove power-loss durability or native-platform coverage. |
+| DUR-05 | Historical claim overstatement; merged with ARCH-04/VER-07 and bounded in current docs. Final canonical review remains. |
 | DUR-06 | Preserved as later Phase 3 lifecycle work: failed commits/crashes can leave unreachable files; current growth obligation remains documented. |
 | DUR-07 | Preserved as later Phase 3/4/6 boundary work: LocalFs platform/key and durable-delete constraints need an explicit contract. |
 | DUR-08 | Preserved as later Phase 4 work: independent openers can race manifest versions; unsupported in the current boundary. |
-| IDX-01 | Merged with COR-01 and CONC-01: unrestricted tombstone can hide row and vector. Phase 1 blocker. |
-| IDX-02 | Preserved explicitly: recovery does not reject ambiguous cross-segment row/vector identity or vector IDs without row ownership. Phase 1 recovery blocker. |
+| IDX-01 | Historical counterexample; remediated with row/vector identity validation and base-snapshot targeting under COR-01/CONC-01. Final branch verification remains. |
+| IDX-02 | Historical recovery-integrity counterexample; remediated with manifest-listed row/vector identity validation and regression coverage. Final branch verification remains. |
 | IDX-03 | Preserved explicitly: fixed `ef_search` can underfill `k`, including an unbounded API request above 32. Phase 1 contract decision and Phase 2 API work. |
 | IDX-04 | Merged with ARCH-04 and VER-07: recall experiment was overgeneralized. Current decisions now bound the claim to its workload. |
 | PERF-01 | Bounded Windows synthetic retained-version/segment matrix is recorded in `docs/phase-1-performance.md`; real-fixture, CPU/RAM, and portable-host evidence remain open. |
@@ -172,11 +176,11 @@ consolidated register above; IDs marked "merged" retain the same evidence under 
 | ARCH-07 | Preserved as later Phase 2/6 work: backend abstraction is not threaded through all I/O. |
 | ARCH-08 | Preserved as later Phase 2 client work: CLI snapshot labels can disagree with displayed rows. |
 | VER-01 | Known counterexamples have targeted regression gates; complete branch verification remains. |
-| VER-02 | Merged with CONC-02: fresh Ubuntu WSL execution passed the nine production transaction models plus the separate compact semantic guard; CI execution/provenance remains pending. Phase 1 blocker. |
-| VER-03 | Merged with DUR-04: fresh Ubuntu WSL thorough chaos reached `2000/2000` seeds with zero violations; CI execution/provenance and portability remain pending. Phase 1 blocker. |
+| VER-02 | Merged with CONC-02: fresh Ubuntu WSL and manual Ubuntu GitHub Actions execution passed the nine production transaction models plus the separate compact semantic guard; native-platform and final verification remain pending. Phase 1 blocker. |
+| VER-03 | Merged with DUR-04: fresh Ubuntu WSL and manual Ubuntu GitHub Actions thorough chaos reached `2000/2000` seeds with zero violations; native-platform and final verification remain pending. Phase 1 blocker. |
 | VER-04 | Ubuntu WSL completed both declared nightly ASAN targets and deterministic parser smoke inputs with a stable fuzz lock hash; merged PR #53 also passed the declared fuzz-and-provenance job and retained `fuzz-provenance-30841989478-attempt-1`. Broader fuzz campaign and platform evidence remain open. |
-| VER-05 | The evidence workflow now pins action SHAs and nightly `2026-07-25`; the merged PR #53 fuzz job retained its execution/provenance artifact. Loom/chaos and broader platform/provenance evidence remain open. |
-| VER-06 | Preserved as Phase 1 measurement evidence blocker: bounded Windows synthetic inputs/results are recorded, but portable host/fixture provenance is still missing. |
+| VER-05 | The evidence workflow pins action SHAs and nightly `2026-07-25`; the merged PR #53 fuzz job retained its artifact, and exact-head CI run [30865323724](https://github.com/negexx/strataDB/actions/runs/30865323724) retained branch command/outcome provenance. Portable/native benchmark provenance and final verification remain open. |
+| VER-06 | Preserved as a Phase 1 measurement evidence blocker: bounded Windows and Ubuntu cloud synthetic inputs/results are recorded, but portable native-host and real-fixture provenance is still missing. |
 | VER-07 | Merged with ARCH-04 and DUR-05: current docs now qualify intended guarantees and retain Partial status. |
 
 ## Evidence that must be preserved
