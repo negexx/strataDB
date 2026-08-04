@@ -11,6 +11,11 @@ on:
         description: Full commit SHA for the candidate revision (defaults to this workflow SHA)
         required: false
         type: string
+      real_fixture:
+        description: Download and compare the pinned DBpedia fixture in addition to the synthetic matrix
+        required: true
+        default: false
+        type: boolean
 permissions:
   contents: read
 
@@ -33,11 +38,53 @@ jobs:
         env:
           BEFORE_REVISION: ${{ inputs.before_revision }}
           AFTER_REVISION: ${{ inputs.after_revision }}
+          REAL_FIXTURE_REQUESTED: ${{ inputs.real_fixture && 'true' || 'false' }}
         run: |
           set -euo pipefail
+          mkdir -p artifacts
           after="$AFTER_REVISION"
           if [[ -z "$after" ]]; then after="$GITHUB_SHA"; fi
-          bash bench/cloud-performance/run.sh "$BEFORE_REVISION" "$after" artifacts
+          if [[ "$REAL_FIXTURE_REQUESTED" == "true" ]]; then
+            fixture="$GITHUB_WORKSPACE/bench/data/dbpedia-openai-100k.parquet"
+            fixture_log="artifacts/fixture-download.log"
+            fixture_repo="Qdrant/dbpedia-entities-openai3-text-embedding-3-small-512-100K"
+            fixture_revision="56e6849a3d0f7913e56b475bf92c0064c93b576d"
+            fixture_file="data/train-00000-of-00001.parquet"
+            fixture_url="https://huggingface.co/datasets/$fixture_repo/resolve/$fixture_revision/$fixture_file"
+            expected_size=363758493
+            expected_sha256="5ea400d91cba9b27fa55fc659e48f7bda8cba68443f087a15ddbc0e42acd049d"
+            mkdir -p bench/data
+            {
+              printf 'fixture_url=%s\nfixture_repo=%s\nfixture_revision=%s\nfixture_file=%s\n' \
+                "$fixture_url" "$fixture_repo" "$fixture_revision" "$fixture_file"
+              printf 'expected_size_bytes=%s\nexpected_sha256=%s\nfixture_verification=download-started\n' \
+                "$expected_size" "$expected_sha256"
+            } | tee "$fixture_log"
+            if ! curl --fail --location --retry 3 --output "$fixture" "$fixture_url" 2>> "$fixture_log"; then
+              printf 'fixture_verification=download-failed\n' | tee -a "$fixture_log"
+              exit 1
+            fi
+            actual_size="$(wc -c < "$fixture" | tr -d '[:space:]')"
+            actual_sha256="$(sha256sum "$fixture" | awk '{print $1}')"
+            size_verification=passed
+            sha256_verification=passed
+            [[ "$actual_size" == "$expected_size" ]] || size_verification=failed
+            [[ "$actual_sha256" == "$expected_sha256" ]] || sha256_verification=failed
+            {
+              printf 'actual_size_bytes=%s\nactual_sha256=%s\n' "$actual_size" "$actual_sha256"
+              printf 'size_verification=%s\nsha256_verification=%s\n' \
+                "$size_verification" "$sha256_verification"
+            } | tee -a "$fixture_log"
+            if [[ "$size_verification" != "passed" || "$sha256_verification" != "passed" ]]; then
+              printf 'fixture_verification=failed\n' | tee -a "$fixture_log"
+              exit 1
+            fi
+            printf 'fixture_verification=passed\n' | tee -a "$fixture_log"
+            STRATA_REAL_FIXTURE=1 STRATA_BENCH_FIXTURE="$(realpath "$fixture")" \
+              bash bench/cloud-performance/run.sh "$BEFORE_REVISION" "$after" artifacts
+          else
+            bash bench/cloud-performance/run.sh "$BEFORE_REVISION" "$after" artifacts
+          fi
           python3 bench/cloud-performance/summarize.py artifacts \
             --jsonl artifacts/summary.jsonl \
             --csv artifacts/deltas.csv \
