@@ -397,6 +397,20 @@ command_lifecycle=lifecycle
                 any(row["benchmark"] == "fixture_segment_recall" for row in records)
             )
 
+    def test_validation_rejects_fixture_input_hash_mismatch_between_revisions(self):
+        with tempfile.TemporaryDirectory() as root:
+            artifact = Path(root)
+            self._write_complete_configured_matrix(artifact, "requested")
+            self._write_fixture_evidence(artifact, "before", input_hash="f1a2ce123")
+            self._write_fixture_evidence(artifact, "after", input_hash="d4e5fa678")
+
+            records = summarize.summarize_directory(artifact)
+
+            with self.assertRaisesRegex(
+                ValueError, "before/after fixture_segment_recall input hashes differ"
+            ):
+                summarize.validate_records(records, artifact)
+
     def test_validation_rejects_requested_fixture_evidence_when_all_artifacts_are_missing(self):
         with tempfile.TemporaryDirectory() as root:
             artifact = Path(root)
