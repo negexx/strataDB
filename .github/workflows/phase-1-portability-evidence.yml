@@ -1,10 +1,13 @@
 name: Phase 1 portability evidence
 
 on:
-  pull_request:
-  push:
-    branches: [main]
   workflow_dispatch:
+    inputs:
+      real_fixture:
+        description: "Download and smoke-test the pinned DBpedia fixture on supported runners"
+        required: true
+        default: true
+        type: boolean
 
 permissions:
   contents: read
@@ -55,10 +58,23 @@ jobs:
               echo "===== $label PASSED =====" | tee -a "$log"
             fi
           }
+          observe() {
+            label="$1"
+            shift
+            {
+              echo
+              echo "===== observation: $label ====="
+              echo "+ $*"
+              "$@" || true
+            } 2>&1 | tee -a "$log"
+          }
 
           run_case revision git rev-parse HEAD
           run_case runner printf 'runner.os=%s\nrunner.arch=%s\n' "$RUNNER_OS" "$RUNNER_ARCH"
           run_case system uname -a
+          observe filesystem df -T .
+          observe cpu bash -c 'lscpu || powershell.exe -NoProfile -Command "Get-CimInstance Win32_Processor | Format-List *"'
+          observe ram bash -c 'grep -E "MemTotal|MemAvailable" /proc/meminfo || powershell.exe -NoProfile -Command "Get-CimInstance Win32_ComputerSystem | Format-List TotalPhysicalMemory"'
           run_case rustc-version rustc -Vv
           run_case cargo-version cargo -Vv
           hash_file() {
@@ -71,6 +87,29 @@ jobs:
             fi
           }
           run_case lockfile hash_file Cargo.lock
+          {
+            echo 'source_revision='"$(git rev-parse HEAD)"
+            echo 'fixture_repo=Qdrant/dbpedia-entities-openai3-text-embedding-3-small-512-100K'
+            echo 'fixture_revision=56e6849a3d0f7913e56b475bf92c0064c93b576d'
+            echo 'fixture_file=data/train-00000-of-00001.parquet'
+            echo 'fixture_size_bytes=363758493'
+            echo 'fixture_sha256=5ea400d91cba9b27fa55fc659e48f7bda8cba68443f087a15ddbc0e42acd049d'
+            echo 'seed=20260801'
+            echo 'cache_policy=OS/filesystem caches are not forcibly flushed'
+            echo 'synthetic_repetitions=1'
+            echo 'fixture_repetitions=1'
+          } | tee -a "$log"
+          run_case synthetic-manifest env STRATA_GROWTH_COMMITS=10 cargo bench --locked -p strata-bench --bench manifest_growth_bench -- --noplot
+          if [[ "$RUNNER_OS" == "Linux" && "${{ inputs.real_fixture }}" == "true" ]]; then
+            fixture=bench/data/dbpedia-openai-100k.parquet
+            mkdir -p bench/data
+            run_case fixture-download curl --fail --location --retry 3 --output "$fixture" "https://huggingface.co/datasets/Qdrant/dbpedia-entities-openai3-text-embedding-3-small-512-100K/resolve/56e6849a3d0f7913e56b475bf92c0064c93b576d/data/train-00000-of-00001.parquet"
+            run_case fixture-size bash -c "test \"\$(wc -c < '$fixture')\" = 363758493"
+            run_case fixture-sha256 bash -c "test \"\$(sha256sum '$fixture' | awk '{print \$1}')\" = 5ea400d91cba9b27fa55fc659e48f7bda8cba68443f087a15ddbc0e42acd049d"
+            run_case fixture-segment-smoke env STRATA_BENCH_SOURCE=fixture STRATA_BENCH_FIXTURE="$fixture" STRATA_SEG_ROWS=64 STRATA_SEG_QUERIES=4 cargo bench --locked -p strata-bench --bench segment_recall_bench -- --noplot
+          else
+            echo "fixture_status=skipped (supported measurement runner is Ubuntu)" | tee -a "$log"
+          fi
           run_case storage-tests cargo test --locked -p strata-storage
           run_case directory-faults cargo test --locked -p strata-txn --features test-fault-injection
           run_case row-id-restart cargo test --locked -p strata-txn --features chaos-injection --test row_id_reservation_restart -- --nocapture

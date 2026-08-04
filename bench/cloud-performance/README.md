@@ -15,8 +15,15 @@ The comparison runs:
   repetitions per point.
 
 Each run records the revision, lockfile hash, runner OS/architecture, toolchain, raw benchmark
-output, exact command/configuration provenance, and a GNU time report. `summarize.py` emits
-machine-readable JSONL and CSV deltas only after verifying the complete like-for-like matrix.
+output, exact command/configuration provenance, fixture revision/size/SHA-256, seed, cache policy,
+repetitions, and a GNU time report. `summarize.py` emits machine-readable JSONL and CSV deltas only
+after verifying the complete like-for-like matrix. Fixture records are rejected unless they match the
+pinned Qdrant revision and SHA-256 exactly.
+
+The fixture identity is `Qdrant/dbpedia-entities-openai3-text-embedding-3-small-512-100K`, revision
+`56e6849a3d0f7913e56b475bf92c0064c93b576d`, file `data/train-00000-of-00001.parquet`, exactly
+363758493 bytes, SHA-256
+`5ea400d91cba9b27fa55fc659e48f7bda8cba68443f087a15ddbc0e42acd049d`.
 
 ## Local use
 
@@ -34,9 +41,17 @@ directory for each revision so compiled artifacts are not mixed across the compa
 benchmark filesystem and OS caches are not forcibly flushed; that policy is recorded in the
 provenance log.
 
+Set `STRATA_REAL_FIXTURE=1` and `STRATA_BENCH_FIXTURE=/path/to/train-00000-of-00001.parquet` to
+retain the pinned fixture identity and add a real-fixture segmented `Dataset`/`Snapshot` smoke run.
+The fixture is copied into each disposable worktree at the benchmark path expected by the current
+benchmarks; it is never added to Git. Synthetic benchmark behavior remains unchanged.
+
 ## GitHub Actions
 
-The `Cloud performance before/after` workflow is manually dispatchable. Provide full commit SHAs
-for `before_revision` and `after_revision`; the generated artifact is
-`cloud-performance-before-after-<run-id>-attempt-<attempt>`. The workflow retains raw logs,
-provenance, JSONL, CSV, and the exact command output for 14 days.
+`Phase 1 portability evidence` is manually dispatchable and runs an Ubuntu/Windows matrix. Both
+runners retain raw native evidence and provenance (OS, architecture, filesystem, CPU/RAM observation,
+toolchain, source revision, seed, cache policy, and repetitions). Ubuntu can additionally download,
+verify, and smoke-test the pinned real fixture; Windows records that this optional measurement is
+skipped rather than presenting a synthetic result as fixture evidence. Artifacts are retained for 14
+days. This infrastructure records bounded observations only; it makes no production-limit or
+performance claim.

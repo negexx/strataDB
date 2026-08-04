@@ -8,6 +8,17 @@ import summarize
 
 
 class SummarizeTests(unittest.TestCase):
+    def test_fixture_provenance_rejects_missing_pinned_sha256(self):
+        config = {
+            "source": "fixture",
+            "fixture_repo": "Qdrant/dbpedia-entities-openai3-text-embedding-3-small-512-100K",
+            "fixture_revision": "56e6849a3d0f7913e56b475bf92c0064c93b576d",
+            "fixture_file": "data/train-00000-of-00001.parquet",
+            "fixture_size_bytes": "363758493",
+        }
+        with self.assertRaisesRegex(ValueError, "fixture_sha256"):
+            summarize.validate_fixture_provenance(config)
+
     def test_collects_manifest_and_segment_metrics_and_delta(self):
         with tempfile.TemporaryDirectory() as root:
             artifact = Path(root)

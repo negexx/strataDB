@@ -53,6 +53,13 @@ SEGMENT_QUERY_POLICY = re.compile(
 )
 EXPECTED_SEGMENTS = (1, 2, 4, 8, 16, 32, 64)
 EXPECTED_PINS = (0, 1, 4, 16, 64)
+FIXTURE_PROVENANCE = {
+    "fixture_repo": "Qdrant/dbpedia-entities-openai3-text-embedding-3-small-512-100K",
+    "fixture_revision": "56e6849a3d0f7913e56b475bf92c0064c93b576d",
+    "fixture_file": "data/train-00000-of-00001.parquet",
+    "fixture_size_bytes": "363758493",
+    "fixture_sha256": "5ea400d91cba9b27fa55fc659e48f7bda8cba68443f087a15ddbc0e42acd049d",
+}
 
 
 def _read(path: Path) -> str:
@@ -75,6 +82,15 @@ def _load_config(directory: Path) -> dict[str, str]:
             key, value = line.split("=", 1)
             config[key] = value
     return config
+
+
+def validate_fixture_provenance(config: dict[str, str]) -> None:
+    """Reject fixture measurements that do not name the pinned input exactly."""
+    if config.get("source") != "fixture":
+        return
+    for key, expected in FIXTURE_PROVENANCE.items():
+        if config.get(key) != expected:
+            raise ValueError(f"fixture provenance {key!r} must equal the pinned value")
 
 
 def _base(label: str, benchmark: str, time_path: Path, config: dict[str, str]) -> dict[str, Any]:
@@ -236,6 +252,11 @@ def validate_records(records: list[dict[str, Any]], artifact: Path) -> None:
     if not configs["before"] or not configs["after"]:
         errors.append("both before/config.env and after/config.env are required")
     else:
+        for label, config in configs.items():
+            try:
+                validate_fixture_provenance(config)
+            except ValueError as error:
+                errors.append(f"{label}: {error}")
         comparable_keys = sorted(set(configs["before"]) | set(configs["after"]))
         for key in comparable_keys:
             if key in {"label", "revision", "lockfile_sha256"}:
