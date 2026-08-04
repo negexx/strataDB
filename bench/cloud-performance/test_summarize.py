@@ -165,6 +165,7 @@ command_lifecycle=lifecycle
             "lifecycle_warmup_runs": "1",
             "lifecycle_repetitions": "5",
             "fixture_lifecycle_protocol": "fixture-100000-rows-batch-5000-pins-1-warmups-1-repetitions-5",
+            "command": "fixture-lifecycle-command",
         }
         (directory / "fixture_lifecycle.env").write_text(
             "".join(f"{key}={value}\n" for key, value in config.items()), encoding="utf-8"
@@ -176,6 +177,7 @@ command_lifecycle=lifecycle
             "benchmark=fixture_lifecycle",
             *(f"{key}={value}" for key, value in summarize.FIXTURE_PROVENANCE.items()),
             f"fixture_worktree_path={path}",
+            f"command={config['command']}",
         ]
         for measurement in ("excluded warmup 1/1; pins=1", *(f"measured repetition {i}/5; pins=1" for i in range(1, 6))):
             log.extend(
@@ -644,6 +646,54 @@ command_lifecycle=lifecycle
             )
 
             with self.assertRaisesRegex(ValueError, "measurement protocol"):
+                summarize.validate_records(summarize.summarize_directory(artifact), artifact)
+
+    def test_validation_rejects_fixture_lifecycle_block_metadata_deletion_duplication_or_mismatch(self):
+        metadata = {
+            "commit": (
+                "                            20 commits, 5000 rows/s, 1.00 ms/commit",
+                "                            19 commits, 5000 rows/s, 1.00 ms/commit",
+            ),
+            "distinct snapshots": (
+                "1 retained handles (1 distinct snapshots; operational current snapshot excluded);",
+                "2 retained handles (2 distinct snapshots; operational current snapshot excluded);",
+            ),
+        }
+        for name, (expected, mismatch) in metadata.items():
+            for mutation in ("deleted", "duplicated", "mismatched"):
+                with self.subTest(metadata=name, mutation=mutation), tempfile.TemporaryDirectory() as root:
+                    artifact = Path(root)
+                    self._write_complete_configured_matrix(artifact, "requested")
+                    for label in ("before", "after"):
+                        self._write_fixture_evidence(artifact, label)
+                    path = artifact / "before" / "fixture_lifecycle.log"
+                    text = path.read_text(encoding="utf-8")
+                    if mutation == "deleted":
+                        text = text.replace(f"{expected}\n", "", 1)
+                    elif mutation == "duplicated":
+                        text = text.replace(expected, f"{expected}\n{expected}", 1)
+                    else:
+                        text = text.replace(expected, mismatch, 1)
+                    path.write_text(text, encoding="utf-8")
+
+                    with self.assertRaisesRegex(ValueError, "fixture lifecycle block metadata"):
+                        summarize.validate_records(summarize.summarize_directory(artifact), artifact)
+
+    def test_validation_rejects_missing_fixture_lifecycle_command_provenance(self):
+        with tempfile.TemporaryDirectory() as root:
+            artifact = Path(root)
+            self._write_complete_configured_matrix(artifact, "requested")
+            for label in ("before", "after"):
+                self._write_fixture_evidence(artifact, label)
+            path = artifact / "before" / "fixture_lifecycle.log"
+            path.write_text(
+                path.read_text(encoding="utf-8").replace(
+                    "command=fixture-lifecycle-command\n", "", 1
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "command provenance"):
                 summarize.validate_records(summarize.summarize_directory(artifact), artifact)
 
     def test_validation_rejects_truncated_fixture_lifecycle_phases(self):

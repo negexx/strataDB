@@ -229,6 +229,22 @@ def _validate_single_rss(directory: Path, benchmark: str, label: str, errors: li
         errors.append(f"{label}: {benchmark}.time must contain exactly one GNU time RSS metric")
 
 
+def _validate_fixture_lifecycle_block_metadata(
+    blocks: list[str], expected_commits: int, expected_pins: int, label: str, errors: list[str]
+) -> None:
+    for number, block in enumerate(blocks, start=1):
+        if LIFECYCLE_INGEST_COMMITS.findall(block) != [str(expected_commits)]:
+            errors.append(
+                f"{label}: fixture lifecycle block metadata must contain exactly one "
+                f"{expected_commits}-commit line in block {number}"
+            )
+        if LIFECYCLE_DISTINCT.findall(block) != [(str(expected_pins), str(expected_pins))]:
+            errors.append(
+                f"{label}: fixture lifecycle block metadata must contain exactly one "
+                f"{expected_pins}-pin distinct-snapshot line in block {number}"
+            )
+
+
 def _base(label: str, benchmark: str, time_path: Path, config: dict[str, str]) -> dict[str, Any]:
     max_rss = RSS.search(_read(time_path))
     return {
@@ -680,6 +696,8 @@ def validate_records(records: list[dict[str, Any]], artifact: Path) -> None:
         _validate_raw_provenance(directory, "fixture_lifecycle", config, label, errors)
         if _exact_values(fixture_log, "benchmark") != ["fixture_lifecycle"]:
             errors.append(f"{label}: fixture_lifecycle.log must identify its benchmark exactly once")
+        if _exact_values(fixture_log, "command") != [config.get("command")]:
+            errors.append(f"{label}: fixture lifecycle command provenance must appear exactly once and match its sidecar")
         for key in ("fixture_worktree_path", *FIXTURE_PROVENANCE):
             if _exact_values(fixture_log, key) != [config.get(key)]:
                 errors.append(f"{label}: fixture_lifecycle emitted {key} does not match its sidecar")
@@ -721,6 +739,8 @@ def validate_records(records: list[dict[str, Any]], artifact: Path) -> None:
             measurements.append(markers[0].strip())
         if tuple(measurements) != EXPECTED_FIXTURE_LIFECYCLE_MEASUREMENTS:
             errors.append(f"{label}: fixture lifecycle measurement protocol does not match the exact warmup/repetition sequence")
+        if len(lifecycle_blocks) != len(EXPECTED_FIXTURE_LIFECYCLE_MEASUREMENTS):
+            errors.append(f"{label}: fixture lifecycle must contain exactly six lifecycle blocks")
         for block in lifecycle_blocks:
             phases = [_lifecycle_phase_name(match) for match in LIFECYCLE_PHASE.finditer(block)]
             phase_counts = Counter(phases)
@@ -733,15 +753,13 @@ def validate_records(records: list[dict[str, Any]], artifact: Path) -> None:
                     f"missing={','.join(missing_phases) or 'none'}; "
                     f"unexpected-or-duplicate={','.join(unexpected_phases) or 'none'}"
                 )
-        commit_counts = [int(value) for value in LIFECYCLE_INGEST_COMMITS.findall(fixture_log)]
         rows_config = int(config.get("lifecycle_rows", "0"))
         batch_rows = int(config.get("lifecycle_batch_rows", "1"))
         expected_commits = (rows_config + batch_rows - 1) // batch_rows
-        if not commit_counts or any(count != expected_commits for count in commit_counts):
-            errors.append(f"{label}: fixture lifecycle commit count does not match configured batch size")
-        distinct_counts = [int(value) for _, value in LIFECYCLE_DISTINCT.findall(fixture_log)]
-        if sorted(set(distinct_counts)) != list(fixture_pins):
-            errors.append(f"{label}: fixture lifecycle distinct-snapshot counts do not match configured pins")
+        if fixture_pins == (1,):
+            _validate_fixture_lifecycle_block_metadata(
+                lifecycle_blocks, expected_commits, fixture_pins[0], label, errors
+            )
         fixture_lifecycle_rows = [row for row in by_label[label] if row["benchmark"] == "fixture_lifecycle"]
         metric = "lifecycle_pins1_ingest_commit_wall_ms"
         metric_rows = [row for row in fixture_lifecycle_rows if row["metric"] == metric]

@@ -295,6 +295,11 @@ run_benchmark() {
         "$fixture_repo" "$fixture_revision" "$fixture_file" "$fixture_size_bytes" "$fixture_sha256" \
         "$revision_dir/bench/data/dbpedia-openai-100k.parquet"
     fi
+    if [[ "$benchmark" == "fixture_lifecycle" ]]; then
+      printf 'command=CARGO_TARGET_DIR=<revision-target> STRATA_BENCH_SOURCE=fixture STRATA_BENCH_FIXTURE=%s STRATA_LIFECYCLE_ROWS=%s STRATA_LIFECYCLE_BATCH_ROWS=%s STRATA_PINNED_SNAPSHOTS=%s STRATA_LIFECYCLE_WARMUP_RUNS=%s STRATA_LIFECYCLE_REPETITIONS=%s STRATA_LIFECYCLE_MEASUREMENT=fixture-cloud cargo bench --locked -p strata-bench --bench lifecycle_bench -- --noplot\n' \
+        "$revision_dir/bench/data/dbpedia-openai-100k.parquet" "$fixture_lifecycle_rows" "$fixture_lifecycle_batch_rows" \
+        "$fixture_lifecycle_pins" "$fixture_lifecycle_warmups" "$fixture_lifecycle_repetitions"
+    fi
     case "$benchmark" in
       manifest_growth_*)
         commits="${benchmark#manifest_growth_}"
