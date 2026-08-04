@@ -13,6 +13,8 @@ class SummarizeTests(unittest.TestCase):
 seed=20260801
 source=synthetic
 fixture_evidence={fixture_evidence}
+fixture_rows=256
+fixture_queries=16
 manifest_points=1,10,20,40,80,160
 manifest_warmup_runs=1
 manifest_repetitions=5
@@ -117,7 +119,14 @@ command_lifecycle=lifecycle
                 )
 
     def _write_fixture_evidence(
-        self, artifact: Path, label: str, *, path: str | None = None, input_hash: str = "f1a2ce123"
+        self,
+        artifact: Path,
+        label: str,
+        *,
+        path: str | None = None,
+        input_hash: str = "f1a2ce123",
+        rows: str = "256",
+        queries: str = "16",
     ) -> None:
         directory = artifact / label
         fixture_path = path or f"/worktrees/{label}/bench/data/dbpedia-openai-100k.parquet"
@@ -130,8 +139,8 @@ command_lifecycle=lifecycle
             "fixture_worktree_path": fixture_path,
             "fixture_source": f"fixture {fixture_path}",
             "fixture_input_hash": input_hash,
-            "segment_rows": "256",
-            "segment_queries": "16",
+            "segment_rows": rows,
+            "segment_queries": queries,
             "segment_dimension": "512",
             "segment_k": "10",
             "segment_ef_search": "32",
@@ -152,11 +161,14 @@ command_lifecycle=lifecycle
             "benchmark=fixture_segment_recall",
             *(f"{key}={value}" for key, value in summarize.FIXTURE_PROVENANCE.items()),
             f"fixture_worktree_path={fixture_path}",
-            f"loaded 256 rows from fixture {fixture_path}; input hash={input_hash}",
-            "computing exact ground truth for 16 queries...",
+            f"loaded {rows} rows from fixture {fixture_path}; input hash={input_hash}",
+            f"computing exact ground truth for {queries} queries...",
             "==== recall vs segment count â€” 256 rows x 512-dim, k=10, ef_search=32 ====",
             "production HNSW parameters: M=16, ef_construction=100, max_layer=16",
             "query policy: 1 full unfiltered+filtered warmup sweep(s), then 5 measured sweep(s) per K",
+        ]
+        log = [
+            line.replace("256 rows x 512-dim", f"{rows} rows x 512-dim") for line in log
         ]
         for mode in ("unfiltered", "filtered"):
             log.append(f"{mode} query results (median / p95 over measured repetitions):")
@@ -486,6 +498,26 @@ command_lifecycle=lifecycle
                 any(row["benchmark"] == "fixture_segment_recall" for row in records)
             )
 
+    def test_validation_accepts_selected_full_fixture_for_both_revisions(self):
+        with tempfile.TemporaryDirectory() as root:
+            artifact = Path(root)
+            self._write_complete_configured_matrix(artifact, "requested")
+            for label in ("before", "after"):
+                config = artifact / label / "config.env"
+                config.write_text(
+                    config.read_text(encoding="utf-8").replace(
+                        "fixture_rows=256\nfixture_queries=16\n",
+                        "fixture_rows=100000\nfixture_queries=200\n",
+                        1,
+                    ),
+                    encoding="utf-8",
+                )
+                self._write_fixture_evidence(
+                    artifact, label, rows="100000", queries="200"
+                )
+
+            summarize.validate_records(summarize.summarize_directory(artifact), artifact)
+
     def test_validation_rejects_fixture_input_hash_mismatch_between_revisions(self):
         with tempfile.TemporaryDirectory() as root:
             artifact = Path(root)
@@ -499,6 +531,32 @@ command_lifecycle=lifecycle
                 ValueError, "before/after fixture_segment_recall input hashes differ"
             ):
                 summarize.validate_records(records, artifact)
+
+    def test_validation_rejects_fixture_rows_or_queries_different_from_selected_values(self):
+        for selected_rows, selected_queries, sidecar_key, selected_key in (
+            ("100000", "16", "segment_rows", "fixture_rows"),
+            ("256", "200", "segment_queries", "fixture_queries"),
+        ):
+            with self.subTest(rows=selected_rows, queries=selected_queries), tempfile.TemporaryDirectory() as root:
+                artifact = Path(root)
+                self._write_complete_configured_matrix(artifact, "requested")
+                for label in ("before", "after"):
+                    config = artifact / label / "config.env"
+                    config.write_text(
+                        config.read_text(encoding="utf-8").replace(
+                            "fixture_rows=256\nfixture_queries=16\n",
+                            f"fixture_rows={selected_rows}\nfixture_queries={selected_queries}\n",
+                            1,
+                        ),
+                        encoding="utf-8",
+                    )
+                    self._write_fixture_evidence(artifact, label)
+
+                with self.assertRaisesRegex(
+                    ValueError,
+                    rf"before: fixture sidecar {sidecar_key} does not match selected {selected_key}",
+                ):
+                    summarize.validate_records(summarize.summarize_directory(artifact), artifact)
 
     def test_validation_rejects_requested_fixture_evidence_when_all_artifacts_are_missing(self):
         with tempfile.TemporaryDirectory() as root:

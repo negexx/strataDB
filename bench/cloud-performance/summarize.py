@@ -536,8 +536,6 @@ def validate_records(records: list[dict[str, Any]], artifact: Path) -> None:
             "label",
             "revision",
             "lockfile_sha256",
-            "segment_rows",
-            "segment_queries",
             "segment_dimension",
             "segment_k",
             "segment_ef_search",
@@ -550,6 +548,14 @@ def validate_records(records: list[dict[str, Any]], artifact: Path) -> None:
         ):
             if config.get(key) != configs[label].get(key):
                 errors.append(f"{label}: fixture sidecar {key} does not match config.env")
+        for sidecar_key, selected_key in (
+            ("segment_rows", "fixture_rows"),
+            ("segment_queries", "fixture_queries"),
+        ):
+            if config.get(sidecar_key) != configs[label].get(selected_key):
+                errors.append(
+                    f"{label}: fixture sidecar {sidecar_key} does not match selected {selected_key}"
+                )
         fixture_log = _read(paths["log"])
         for key in ("label", "revision", "lockfile_sha256", *FIXTURE_PROVENANCE, "fixture_worktree_path"):
             expected = config.get(key)

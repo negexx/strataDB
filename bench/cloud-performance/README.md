@@ -42,12 +42,15 @@ benchmark filesystem and OS caches are not forcibly flushed; that policy is reco
 provenance log.
 
 Set `STRATA_REAL_FIXTURE=1` and `STRATA_BENCH_FIXTURE=/path/to/train-00000-of-00001.parquet` to
-add a real-fixture segmented `Dataset`/`Snapshot` smoke run. The runner verifies the pinned identity,
-copies the fixture into each disposable worktree before its fixture benchmark, and writes a separate
-`fixture_segment_recall.env` beside the emitted fixture log. The current benches receive that copied
-path through `STRATA_BENCH_FIXTURE`; they do not rely on a hard-coded worktree path. Synthetic and
-fixture records therefore remain distinct and both are validated against their emitted input-source
-metadata. Synthetic benchmark behavior remains unchanged.
+add a real-fixture segmented `Dataset`/`Snapshot` run. Its row/query selection defaults to the
+bounded 256 rows and 16 queries; pass `STRATA_FIXTURE_SEG_ROWS=100000 STRATA_FIXTURE_SEG_QUERIES=200` for the
+full-fixture closeout run. The runner verifies the pinned identity, copies the fixture into each
+disposable worktree before its fixture benchmark, and writes a separate `fixture_segment_recall.env`
+beside the emitted fixture log. The current benches receive that copied path through
+`STRATA_BENCH_FIXTURE`; they do not rely on a hard-coded worktree path. Synthetic and fixture records
+therefore remain distinct and both are validated against their emitted input-source metadata. Fixture
+records fail validation unless each revision loads the selected row/query count and both input hashes
+are identical. Synthetic benchmark behavior remains unchanged.
 
 ## GitHub Actions
 
@@ -60,7 +63,8 @@ Ubuntu run can additionally download and verify the pinned real fixture before p
 bounded-row fixture smoke. The separate `Cloud performance before/after` workflow downloads and
 verifies the pinned fixture, then compares it across both revisions; it records the download URL,
 expected/actual size, expected/actual SHA-256, and verification outcome before the matrix starts.
-That comparison uses the benchmark's configured bounded row sample, not the full 100K-row file, and
+The before/after manual dispatch exposes fixture row and query inputs, defaulting to the bounded
+256-row/16-query sample; select 100000 rows and 200 queries for the full-fixture closeout run.
 Windows records that the optional portability measurement is skipped rather than presenting a
 synthetic result as fixture evidence. Artifacts are retained for 14 days. This infrastructure records
 bounded observations only; it makes no production-limit or performance claim.
