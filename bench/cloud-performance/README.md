@@ -54,11 +54,13 @@ metadata. Synthetic benchmark behavior remains unchanged.
 `Phase 1 portability evidence` runs automatically for pull requests and pushes to `main`, and is also
 manually dispatchable, on an Ubuntu/Windows matrix. Both runners retain raw native evidence and
 provenance (OS, architecture, filesystem, CPU/RAM observation, toolchain, source revision, seed,
-cache policy, and repetitions). Its synthetic segment smoke exercises the current
-`Dataset`/`Snapshot` path on both runners. A manually dispatched Ubuntu run can additionally download,
-verify, and compare the pinned real fixture across both revisions; the cloud workflow records the
-download URL, expected/actual size, expected/actual SHA-256, and verification outcome before the
-matrix starts. The comparison uses the benchmark's configured bounded row sample, not the full
-100K-row file, and Windows records that this optional measurement is skipped rather than presenting
-a synthetic result as fixture evidence. Artifacts are retained for 14 days. This infrastructure
-records bounded observations only; it makes no production-limit or performance claim.
+cache policy, and repetitions). This is single-revision portability evidence: its synthetic segment
+smoke exercises the current `Dataset`/`Snapshot` path on both runners, and a manually dispatched
+Ubuntu run can additionally download and verify the pinned real fixture before performing its
+bounded-row fixture smoke. The separate `Cloud performance before/after` workflow downloads and
+verifies the pinned fixture, then compares it across both revisions; it records the download URL,
+expected/actual size, expected/actual SHA-256, and verification outcome before the matrix starts.
+That comparison uses the benchmark's configured bounded row sample, not the full 100K-row file, and
+Windows records that the optional portability measurement is skipped rather than presenting a
+synthetic result as fixture evidence. Artifacts are retained for 14 days. This infrastructure records
+bounded observations only; it makes no production-limit or performance claim.
