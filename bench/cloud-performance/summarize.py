@@ -543,15 +543,19 @@ def validate_records(records: list[dict[str, Any]], artifact: Path) -> None:
         fixture_points = _configured_points(
             config, "segment_points", EXPECTED_SEGMENTS, label, errors
         )
-        _validate_segment_log(
-            fixture_log,
-            config,
-            expected_fixture_source,
-            label,
-            "fixture_segment_recall",
-            errors,
-            config.get("fixture_input_hash"),
-        )
+        fixture_input_hash = config.get("fixture_input_hash")
+        if not fixture_input_hash:
+            errors.append(f"{label}: fixture_input_hash must be non-empty")
+        else:
+            _validate_segment_log(
+                fixture_log,
+                config,
+                expected_fixture_source,
+                label,
+                "fixture_segment_recall",
+                errors,
+                fixture_input_hash,
+            )
         _validate_segment_matrix(by_label[label], label, "fixture_segment_recall", fixture_points, errors)
         fixture_rows = [row for row in by_label[label] if row["benchmark"] == "fixture_segment_recall"]
         if not fixture_rows:
@@ -562,7 +566,7 @@ def validate_records(records: list[dict[str, Any]], artifact: Path) -> None:
     if fixture_requested == {"before", "after"}:
         before_hash = fixture_configs["before"].get("fixture_input_hash")
         after_hash = fixture_configs["after"].get("fixture_input_hash")
-        if before_hash != after_hash:
+        if before_hash and after_hash and before_hash != after_hash:
             errors.append("before/after fixture_segment_recall input hashes differ")
     if errors:
         raise ValueError("incomplete before/after evidence:\n" + "\n".join(errors))

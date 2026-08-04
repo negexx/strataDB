@@ -451,6 +451,29 @@ command_lifecycle=lifecycle
                 with self.assertRaisesRegex(ValueError, key):
                     summarize.validate_records(summarize.summarize_directory(artifact), artifact)
 
+    def test_validation_rejects_missing_or_empty_fixture_sidecar_input_hash(self):
+        for label in ("before", "after"):
+            for replacement in (None, ""):
+                with self.subTest(label=label, replacement=replacement), tempfile.TemporaryDirectory() as root:
+                    artifact = Path(root)
+                    self._write_complete_configured_matrix(artifact, "requested")
+                    for fixture_label in ("before", "after"):
+                        self._write_fixture_evidence(artifact, fixture_label)
+                    sidecar = artifact / label / "fixture_segment_recall.env"
+                    sidecar_text = sidecar.read_text(encoding="utf-8")
+                    replacement_line = "" if replacement is None else "fixture_input_hash=\n"
+                    sidecar.write_text(
+                        sidecar_text.replace(
+                            "fixture_input_hash=f1a2ce123\n", replacement_line, 1
+                        ),
+                        encoding="utf-8",
+                    )
+
+                    with self.assertRaisesRegex(
+                        ValueError, rf"{label}: fixture_input_hash must be non-empty"
+                    ):
+                        summarize.validate_records(summarize.summarize_directory(artifact), artifact)
+
     def test_validation_rejects_truncated_fixture_filtered_metrics(self):
         with tempfile.TemporaryDirectory() as root:
             artifact = Path(root)
