@@ -30,6 +30,10 @@ fixture_file="data/train-00000-of-00001.parquet"
 fixture_size_bytes=363758493
 fixture_sha256="5ea400d91cba9b27fa55fc659e48f7bda8cba68443f087a15ddbc0e42acd049d"
 fixture_path="${STRATA_BENCH_FIXTURE:-$repo_root/bench/data/dbpedia-openai-100k.parquet}"
+fixture_evidence="not-requested"
+if [[ "${STRATA_REAL_FIXTURE:-0}" == "1" ]]; then
+  fixture_evidence="requested"
+fi
 segment_dimension=512
 segment_k=10
 segment_ef_search=32
@@ -82,6 +86,7 @@ revision=$sha
 lockfile_sha256=$lock_sha
 seed=$bench_seed
 source=synthetic
+fixture_evidence=$fixture_evidence
 fixture_repo=$fixture_repo
 fixture_revision=$fixture_revision
 fixture_file=$fixture_file
@@ -132,6 +137,34 @@ record_fixture() {
   [[ "$actual_sha" == "$fixture_sha256" ]] || { printf 'fixture sha256 mismatch: %s\n' "$actual_sha" >&2; return 1; }
   mkdir -p "$(dirname "$destination")"
   cp "$fixture_path" "$destination"
+}
+
+record_fixture_evidence() {
+  local label="$1"
+  local sha="$2"
+  local revision_dir="$3"
+  local destination="$revision_dir/bench/data/dbpedia-openai-100k.parquet"
+  local log="$artifact_dir/$label/fixture_segment_recall.log"
+  local rows
+  local source
+  local input_hash
+  local -a loadings
+  mapfile -t loadings < <(
+    sed -nE 's/^loaded ([0-9]+) rows from (.*); input hash=([0-9a-f]+)$/\1\t\2\t\3/p' "$log"
+  )
+  [[ "${#loadings[@]}" == "1" ]] || {
+    printf 'fixture benchmark emitted %s input identity lines\n' "${#loadings[@]}" >&2
+    return 1
+  }
+  IFS=$'\t' read -r rows source input_hash <<< "${loadings[0]}"
+  [[ "$source" == "fixture $destination" ]] || {
+    printf 'fixture source mismatch: %s\n' "$source" >&2
+    return 1
+  }
+  [[ "$rows" == "$segment_rows" ]] || {
+    printf 'fixture row count mismatch: %s\n' "$rows" >&2
+    return 1
+  }
   cat > "$artifact_dir/$label/fixture_segment_recall.env" <<EOF
 label=$label
 revision=$sha
@@ -143,6 +176,8 @@ fixture_file=$fixture_file
 fixture_size_bytes=$fixture_size_bytes
 fixture_sha256=$fixture_sha256
 fixture_worktree_path=$destination
+fixture_source=$source
+fixture_input_hash=$input_hash
 segment_rows=$segment_rows
 segment_queries=$segment_queries
 segment_dimension=$segment_dimension
@@ -156,6 +191,7 @@ segment_warmup_runs=$segment_warmups
 segment_repetitions=$segment_repetitions
 command=CARGO_TARGET_DIR=<revision-target> STRATA_BENCH_SOURCE=fixture STRATA_BENCH_FIXTURE=$destination STRATA_SEG_ROWS=$segment_rows STRATA_SEG_QUERIES=$segment_queries STRATA_SEG_WARMUP_RUNS=$segment_warmups STRATA_SEG_REPETITIONS=$segment_repetitions cargo bench -p strata-bench --bench segment_recall_bench -- --noplot
 EOF
+  printf 'fixture_status=complete\n' > "$artifact_dir/$label/fixture_segment_recall.status"
 }
 
 run_benchmark() {
@@ -173,8 +209,13 @@ run_benchmark() {
     printf 'label=%s\nrevision=' "$label"
     git rev-parse HEAD
     printf 'lockfile_sha256='
-    sha256sum Cargo.lock
+    sha256sum Cargo.lock | awk '{print $1}'
     printf 'benchmark=%s\n' "$benchmark"
+    if [[ "$benchmark" == "fixture_segment_recall" ]]; then
+      printf 'fixture_repo=%s\nfixture_revision=%s\nfixture_file=%s\nfixture_size_bytes=%s\nfixture_sha256=%s\nfixture_worktree_path=%s\n' \
+        "$fixture_repo" "$fixture_revision" "$fixture_file" "$fixture_size_bytes" "$fixture_sha256" \
+        "$revision_dir/bench/data/dbpedia-openai-100k.parquet"
+    fi
     case "$benchmark" in
       manifest_growth_*)
         commits="${benchmark#manifest_growth_}"
@@ -246,5 +287,6 @@ for label_dir_sha in "before:$before_dir:$before_sha" "after:$after_dir:$after_s
   record_fixture "$label" "$sha" "$revision_dir"
   if [[ "${STRATA_REAL_FIXTURE:-0}" == "1" ]]; then
     run_benchmark "$label" "$sha" "$revision_dir" fixture_segment_recall
+    record_fixture_evidence "$label" "$sha" "$revision_dir"
   fi
 done

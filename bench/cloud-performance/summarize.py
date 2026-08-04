@@ -84,6 +84,10 @@ def _load_config(directory: Path, name: str = "config.env") -> dict[str, str]:
     return config
 
 
+def _log_values(text: str, key: str) -> list[str]:
+    return re.findall(rf"(?m)^{re.escape(key)}=(.*)$", text)
+
+
 def validate_fixture_provenance(config: dict[str, str]) -> None:
     """Reject fixture measurements that do not name the pinned input exactly."""
     if config.get("source") != "fixture":
@@ -262,6 +266,8 @@ def validate_records(records: list[dict[str, Any]], artifact: Path) -> None:
                 validate_fixture_provenance(config)
             except ValueError as error:
                 errors.append(f"{label}: {error}")
+            if config.get("fixture_evidence") not in {"requested", "not-requested"}:
+                errors.append(f"{label}: fixture_evidence must be requested or not-requested")
         comparable_keys = sorted(set(configs["before"]) | set(configs["after"]))
         for key in comparable_keys:
             if key in {"label", "revision", "lockfile_sha256"}:
@@ -402,45 +408,79 @@ def validate_records(records: list[dict[str, Any]], artifact: Path) -> None:
     fixture_configs = {
         label: _load_config(artifact / label, "fixture_segment_recall.env") for label in by_label
     }
-    fixture_present = {label for label, config in fixture_configs.items() if config}
-    if fixture_present and fixture_present != {"before", "after"}:
-        errors.append("fixture_segment_recall provenance is required for both before and after")
-    if fixture_present == {"before", "after"}:
-        for label, config in fixture_configs.items():
+    fixture_requested = {label for label, config in configs.items() if config.get("fixture_evidence") == "requested"}
+    if fixture_requested and fixture_requested != {"before", "after"}:
+        errors.append("fixture_evidence must be requested for both before and after")
+    for label in by_label:
+        directory = artifact / label
+        requested = configs[label].get("fixture_evidence") == "requested"
+        status = _load_config(directory, "fixture_segment_recall.status")
+        expected_status = "complete" if requested else "not-requested"
+        if status.get("fixture_status") != expected_status:
+            errors.append(f"{label}: fixture_segment_recall.status must report {expected_status}")
+        paths = {
+            "sidecar": directory / "fixture_segment_recall.env",
+            "log": directory / "fixture_segment_recall.log",
+            "time": directory / "fixture_segment_recall.time",
+        }
+        if not requested:
+            for name, path in paths.items():
+                if path.exists():
+                    errors.append(f"{label}: synthetic-only evidence must not include fixture_segment_recall {name}")
+            continue
+        missing = [name for name, path in paths.items() if not path.is_file()]
+        if missing:
+            errors.append(f"{label}: missing fixture_segment_recall {', '.join(missing)}")
+            continue
+        config = fixture_configs[label]
+        if config.get("source") != "fixture":
+            errors.append(f"{label}: fixture sidecar source must be fixture")
+        else:
             try:
                 validate_fixture_provenance(config)
             except ValueError as error:
                 errors.append(f"{label}: {error}")
-            directory = artifact / label
-            log_path = directory / "fixture_segment_recall.log"
-            time_path = directory / "fixture_segment_recall.time"
-            if not log_path.is_file() or not time_path.is_file():
-                errors.append(f"{label}: missing fixture_segment_recall log or time output")
-                continue
-            fixture_log = _read(log_path)
-            fixture_loading = SEGMENT_LOADING.search(fixture_log)
-            if not fixture_loading or not fixture_loading.group(2).startswith("fixture "):
-                errors.append(f"{label}: fixture_segment_recall did not emit a fixture input source")
-            elif fixture_loading.group(1) != config.get("segment_rows", ""):
+        for key in ("label", "revision", "lockfile_sha256"):
+            if config.get(key) != configs[label].get(key):
+                errors.append(f"{label}: fixture sidecar {key} does not match config.env")
+        fixture_log = _read(paths["log"])
+        for key in ("label", "revision", "lockfile_sha256", *FIXTURE_PROVENANCE):
+            expected = config.get(key)
+            if _log_values(fixture_log, key) != [expected]:
+                errors.append(f"{label}: fixture_segment_recall emitted {key} does not match its sidecar")
+        expected_fixture_source = f"fixture {config.get('fixture_worktree_path', '')}"
+        if config.get("fixture_source") != expected_fixture_source:
+            errors.append(f"{label}: fixture_worktree_path does not match fixture_source")
+        fixture_loading = SEGMENT_LOADING.search(fixture_log)
+        if not fixture_loading:
+            errors.append(f"{label}: fixture_segment_recall did not emit a fixture input source")
+        else:
+            emitted_rows, emitted_source = fixture_loading.groups()
+            if emitted_source != config.get("fixture_source"):
+                errors.append(f"{label}: fixture_segment_recall emitted source does not match its sidecar")
+            if emitted_rows != config.get("segment_rows", ""):
                 errors.append(f"{label}: fixture_segment_recall row count does not match config")
-            fixture_rows = [
-                row
-                for row in by_label[label]
-                if row["benchmark"] == "fixture_segment_recall"
-            ]
-            if not fixture_rows:
-                errors.append(f"{label}: no parsed fixture_segment_recall metrics")
-        fixture_hashes = {
-            label: {
-                tuple(row.get("input_hashes", []))
-                for row in by_label[label]
-                if row["benchmark"] == "fixture_segment_recall"
-            }
-            for label in by_label
-        }
-        if any(len(hashes) != 1 or len(next(iter(hashes), ())) != 1 for hashes in fixture_hashes.values()):
-            errors.append("fixture_segment_recall must contain exactly one input hash per revision")
-        elif fixture_hashes["before"] != fixture_hashes["after"]:
+        fixture_hashes = sorted(set(re.findall(r"input hash=([0-9a-f]+)", fixture_log)))
+        if fixture_hashes != [config.get("fixture_input_hash")]:
+            errors.append(f"{label}: fixture_input_hash does not match fixture_segment_recall output")
+        fixture_header = SEGMENT_HEADER.search(fixture_log)
+        expected_header = (
+            int(config.get("segment_rows", "0")),
+            int(config.get("segment_dimension", "0")),
+            int(config.get("segment_k", "0")),
+            int(config.get("segment_ef_search", "0")),
+        )
+        if not fixture_header or tuple(map(int, fixture_header.groups())) != expected_header:
+            errors.append(f"{label}: fixture_segment_recall vector shape does not match config")
+        fixture_rows = [row for row in by_label[label] if row["benchmark"] == "fixture_segment_recall"]
+        if not fixture_rows:
+            errors.append(f"{label}: no parsed fixture_segment_recall metrics")
+        elif any(row["max_rss_kb"] is None for row in fixture_rows):
+            errors.append(f"{label}: missing fixture_segment_recall GNU time RSS metric")
+    if fixture_requested == {"before", "after"}:
+        before_hash = fixture_configs["before"].get("fixture_input_hash")
+        after_hash = fixture_configs["after"].get("fixture_input_hash")
+        if before_hash != after_hash:
             errors.append("before/after fixture_segment_recall input hashes differ")
     if errors:
         raise ValueError("incomplete before/after evidence:\n" + "\n".join(errors))
