@@ -71,7 +71,7 @@ Fresh Ubuntu WSL exact-model transaction loom evidence and Ubuntu WSL thorough-c
 [30861009780](https://github.com/negexx/strataDB/actions/runs/30861009780) also passed the named
 loom and thorough-chaos gates. Fuzz build/smoke passes locally; the merged PR #53 CI run passed the
 declared fuzz-and-provenance job and retained `fuzz-provenance-30841989478-attempt-1`. Native
-platform coverage, branch-level CI provenance, and final verification remain open. Task 8 and the
+platform coverage and final verification remain open; exact-head CI run [30865323724](https://github.com/negexx/strataDB/actions/runs/30865323724) supplies the retained branch-level command/outcome provenance. Task 8 and the
 cloud comparison now record bounded synthetic segmented/lifecycle evidence with reproduction
 metadata; the optional real fixture, portable host matrix, and universal operating bounds remain
 open. This does not change the audit verdict from Partial and blocked.
@@ -179,7 +179,7 @@ consolidated register above; IDs marked "merged" retain the same evidence under 
 | VER-02 | Merged with CONC-02: fresh Ubuntu WSL and manual Ubuntu GitHub Actions execution passed the nine production transaction models plus the separate compact semantic guard; native-platform and final verification remain pending. Phase 1 blocker. |
 | VER-03 | Merged with DUR-04: fresh Ubuntu WSL and manual Ubuntu GitHub Actions thorough chaos reached `2000/2000` seeds with zero violations; native-platform and final verification remain pending. Phase 1 blocker. |
 | VER-04 | Ubuntu WSL completed both declared nightly ASAN targets and deterministic parser smoke inputs with a stable fuzz lock hash; merged PR #53 also passed the declared fuzz-and-provenance job and retained `fuzz-provenance-30841989478-attempt-1`. Broader fuzz campaign and platform evidence remain open. |
-| VER-05 | The evidence workflow pins action SHAs and nightly `2026-07-25`; the merged PR #53 fuzz job retained its artifact, and the follow-up branch adds CI provenance retention. A successful branch CI run and broader platform/provenance evidence remain open. |
+| VER-05 | The evidence workflow pins action SHAs and nightly `2026-07-25`; the merged PR #53 fuzz job retained its artifact, and exact-head CI run [30865323724](https://github.com/negexx/strataDB/actions/runs/30865323724) retained branch command/outcome provenance. Portable/native benchmark provenance and final verification remain open. |
 | VER-06 | Preserved as a Phase 1 measurement evidence blocker: bounded Windows and Ubuntu cloud synthetic inputs/results are recorded, but portable native-host and real-fixture provenance is still missing. |
 | VER-07 | Merged with ARCH-04 and DUR-05: current docs now qualify intended guarantees and retain Partial status. |
 
