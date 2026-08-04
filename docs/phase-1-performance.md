@@ -47,7 +47,7 @@ portable performance, a retained-history limit, or real-fixture behavior.
 The checked-in `bench/cloud-performance/` harness and
 `.github/workflows/cloud-performance-before-after.yml` workflow now provide a reproducible cloud
 comparison path. A later portability run also passed the native foundation matrix on Ubuntu and
-Windows and exercised the pinned real fixture on Ubuntu; a full real-fixture before/after matrix and
+Windows and exercised the pinned real fixture on Ubuntu; the full-dataset-scale comparison and
 universal operating bounds remain open.
 
 ## Cloud before/after comparison (fresh, bounded, synthetic)
@@ -81,6 +81,36 @@ supported segment/history maximum. The performance-related Phase 1 rows therefor
 evidence-limited rather than closed by this comparison. The separate portability run
 [30881986345](https://github.com/negexx/strataDB/actions/runs/30881986345) passed Ubuntu/Windows
 native foundation checks and Ubuntu fixture smoke (download, size, SHA, and segmented search).
+
+## Cloud before/after comparison (fresh, pinned real-fixture segment matrix)
+
+**Run:** [GitHub Actions 30892210202](https://github.com/negexx/strataDB/actions/runs/30892210202),
+Ubuntu 24.04 x86_64, Rust 1.90.0, the same lockfile SHA-256 and separate revision target
+directories as the synthetic run. The retained artifact is named
+`cloud-performance-before-after-30892210202-attempt-1`.
+
+The directly comparable pair is merged PR #56,
+`76d12919b5234f5e089cf26e4ba469e7aaa982f0`, versus the evidence branch,
+`dad48a8ee0cf561bdc304e18b02576c2154fb0e8`. Both use the exact pinned Qdrant fixture identified
+above; the workflow recorded and verified size `363758493` and SHA-256
+`5ea400d91cba9b27fa55fc659e48f7bda8cba68443f087a15ddbc0e42acd049d` before running either
+revision. The segment benchmark uses a bounded 256-row prefix of that 100K-row fixture, 16 fixed
+queries, K=1…64, one excluded warmup, and five measured repetitions per K/mode. Both revisions
+emitted the same fixture input hash `7a911b4e03268d44`; `summarize.py --validate` accepted 542
+records and 269 before/after deltas.
+
+| Workload | Before | After | Relative change |
+|---|---:|---:|---:|
+| Fixture K=1 unfiltered: median µs/query | 45.4 | 46.1 | +1.54% |
+| Fixture K=1 filtered: median µs/query | 47.9 | 46.8 | -2.30% |
+| Fixture K=64 unfiltered: median µs/query | 80.4 | 84.2 | +4.73% |
+| Fixture K=64 filtered: median µs/query | 57.8 | 59.5 | +2.94% |
+| Fixture recall, all reported K/modes | 1.0000 | 1.0000 | 0.00% |
+
+This is the complete before/after K/mode matrix on the bounded fixture prefix, not a full 100K-row
+benchmark. It provides real-input provenance and measured direction for the current segmented path;
+it does not establish a production performance win, a full-dataset bound, RSS/process-memory bound,
+statistics-path isolation, projection/pruning behavior, or a supported segment/history maximum.
 
 ## Task 6 recovery-byte accounting evidence (fresh, bounded)
 
@@ -337,7 +367,7 @@ or supported maximum follows from it. The small sweep covers 40 retained manifes
 They do not establish a universal latency,
 memory, recovery-time, or segment-count guarantee. The manifest and segment sets grow with retained
 commits in the current implementation. Compaction, vacuum, orphan cleanup, retention policy, and
-indefinite sustained operation remain Phase 3 work. Native foundation provenance and Ubuntu fixture
-smoke are now captured, but full real-fixture measurements and universal operating bounds remain
-open evidence work; PERF-01 through PERF-05 therefore remain tracked rather than marked universally
-remediated.
+indefinite sustained operation remain Phase 3 work. Native foundation provenance, Ubuntu fixture
+smoke, and a bounded real-fixture before/after matrix are now captured, but full 100K-row
+measurements and universal operating bounds remain open evidence work; PERF-01 through PERF-05
+therefore remain tracked rather than marked universally remediated.
