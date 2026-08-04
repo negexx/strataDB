@@ -13,7 +13,8 @@ source/tests as the anchor.
 
 The original remediation closeout was synchronized through merged PR #50,
 `8cd7696fdcf34f6253fb11f9e110f6632bc872de` (`Merge Phase 1 audit remediation`). The current
-evidence-finalization branch is based on merged PR #55, `152373a0408b7e9f7c4479daf319ce58d61c70e7`.
+gap-closure branch is based on merged PR #56, `76d12919b5234f5e089cf26e4ba469e7aaa982f0`, which
+includes the subsequent evidence-finalization changes.
 The
 [Phase 1 closeout ledger](phase-1-closeout-ledger.md) is the mechanically scannable, row-per-finding
 record of current state, dependencies, acceptance assertions, and the future evidence required before

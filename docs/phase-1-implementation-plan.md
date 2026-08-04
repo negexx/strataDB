@@ -294,7 +294,7 @@ The recorded Ubuntu WSL results cover nine production transaction loom models pl
 
 ### Task 10: Publish, merge, and cleanup
 
-- [ ] **Step 1: Push the branch** `codex/phase-1-evidence-finalization`.
+- [ ] **Step 1: Push the branch** `codex/phase-1-gap-closure`.
 - [ ] **Step 2: Open a ready-for-review PR** describing the supported boundary, explicit legacy rejection, named durability platform scope, verification evidence, and deferred findings.
 - [ ] **Step 3: Wait for required checks** and investigate any failure with systematic debugging before changing code.
 - [ ] **Step 4: Merge only after checks and fresh Sol review pass.**

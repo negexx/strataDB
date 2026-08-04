@@ -1,8 +1,8 @@
 # Phase 1 closeout ledger
 
-**Baseline:** merged PR #55, `152373a0408b7e9f7c4479daf319ce58d61c70e7`.
+**Baseline:** merged PR #56, `76d12919b5234f5e089cf26e4ba469e7aaa982f0`.
 
-**Branch:** `codex/phase-1-evidence-finalization` descends from that baseline. The isolated closeout
+**Branch:** `codex/phase-1-gap-closure` descends from that baseline. The isolated closeout
 worktree was clean before this documentation task; the separate root checkout's unrelated edits are
 outside this ledger and this task's scope.
 

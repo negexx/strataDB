@@ -9,18 +9,18 @@
 
 **Files:** none in the repository.
 
-**Objective:** make `codex/phase-1-close-all-gaps` descend from merged PR #50,
-`8cd7696fdcf34f6253fb11f9e110f6632bc872de`, before any production edit.
+**Objective:** make `codex/phase-1-gap-closure` descend from merged PR #56,
+`76d12919b5234f5e089cf26e4ba469e7aaa982f0`, before any production edit.
 
 **Actions:**
 
 1. Confirm the isolated worktree and branch, and record its clean status.
 2. Fetch or otherwise obtain the merged commit from an environment with GitHub access.
-3. Verify the commit identity, PR #50 merge ancestry, and that the closeout branch is based on it.
+3. Verify the commit identity, PR #56 merge ancestry, and that the closeout branch is based on it.
 4. Preserve the unrelated dirty root checkout; do not copy its edits into this worktree.
 
 **Exit evidence:** `git status --short --branch`, `git merge-base`, and the ancestry check all
-show the merged PR #50 baseline. If the commit cannot be obtained, stop before implementation
+show the merged PR #56 baseline. If the commit cannot be obtained, stop before implementation
 and report the network/repository-state blocker.
 
 ## 1. Build the finding ledger and baseline record
@@ -291,7 +291,7 @@ fresh implementation, regression, or required evidence.
 ## 11. Publish and clean up only after remote confirmation
 
 Stage only intentional files, inspect the staged diff, create focused commits, push
-`codex/phase-1-close-all-gaps`, open a ready-for-review PR, wait for required checks, and merge
+`codex/phase-1-gap-closure`, open a ready-for-review PR, wait for required checks, and merge
 only after the final Sol review and all required checks pass. Confirm merged `main` remotely,
 then remove the isolated worktree and branch. Report the merged PR, exact verification output,
 bounded performance evidence, and every deferred finding.

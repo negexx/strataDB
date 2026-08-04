@@ -7,10 +7,10 @@ current branch still Partial and blocked pending the remaining verification/prov
 
 ## Baseline and synchronization
 
-The implementation branch was synchronized to the merged Phase 1 result before production changes began:
+The implementation branch was synchronized to the latest merged Phase 1 result before production changes began:
 
-- merged baseline: `8cd7696fdcf34f6253fb11f9e110f6632bc872de`;
-- closeout branch: `codex/phase-1-close-all-gaps`;
+- merged baseline: PR #56, `76d12919b5234f5e089cf26e4ba469e7aaa982f0`;
+- closeout branch: `codex/phase-1-gap-closure`;
 - the closeout branch is based on the merged commit; subsequent task commits and evidence are listed
   in the closeout ledger and canonical performance record.
 

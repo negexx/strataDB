@@ -5,7 +5,7 @@ are evidence pointers; [roadmap](roadmap.md) owns phase ordering.
 
 ## Overall state
 
-The current baseline is merged PR #55 commit `152373a0408b7e9f7c4479daf319ce58d61c70e7`. The
+The current baseline is merged PR #56 commit `76d12919b5234f5e089cf26e4ba469e7aaa982f0`. The
 [Phase 0 foundation audit](phase-0-audit.md) records the foundation as implemented within its named
 local bounds, with retained CI evidence. The [Phase 1 closeout ledger](phase-1-closeout-ledger.md)
 tracks the remaining finding-level acceptance and evidence obligations; it does not change this
