@@ -112,6 +112,45 @@ benchmark. It provides real-input provenance and measured direction for the curr
 it does not establish a production performance win, a full-dataset bound, RSS/process-memory bound,
 statistics-path isolation, projection/pruning behavior, or a supported segment/history maximum.
 
+## Cloud before/after comparison (fresh, full pinned 100K-row fixture)
+
+**Run:** [GitHub Actions 30901929352](https://github.com/negexx/strataDB/actions/runs/30901929352),
+Ubuntu 24.04 x86_64, Rust 1.90.0, lockfile SHA-256
+`252e017f63e8bfbe6f6521fb9fb5d39085b1961b2f73d75f48479f9cd20b305b`, separate target directories,
+and OS caches left untouched. The retained artifact is
+`cloud-performance-before-after-30901929352-attempt-1`; `summarize.py --validate` accepted 640
+records and 314 before/after deltas.
+
+The directly comparable pair is merged `origin/main` at
+`21811031d0fbe3ed3f55532941c056c0c9e091b0` versus closeout commit `821dad3`. Both revisions loaded
+the exact pinned Qdrant fixture (363,758,493 bytes; SHA-256
+`5ea400d91cba9b27fa55fc659e48f7bda8cba68443f087a15ddbc0e42acd049d`) and emitted the identical
+input hash `f09d3ebad4b1a2b3`. The segmented matrix used 100,000 rows, 200 fixed queries, K=1...64,
+both filtered/unfiltered modes, one excluded warmup, and five measured repetitions. The lifecycle
+matrix used the same 100,000 rows, 5,000 rows per commit (20 commits), one retained snapshot, one
+excluded warmup, and five measured repetitions, with recovery-byte accounting and all ten lifecycle
+phases retained.
+
+| Workload | Before | After | Relative change |
+|---|---:|---:|---:|
+| Fixture lifecycle ingest+commit wall | 25,200 ms | 25,730 ms | +2.10% |
+| Fixture lifecycle recovery/reopen wall | 194.86 ms | 201.25 ms | +3.28% |
+| Fixture lifecycle full scan wall | 58.47 ms | 59.41 ms | +1.61% |
+| Fixture lifecycle unfiltered vector-search wall | 163.22 ms | 166.79 ms | +2.19% |
+| Fixture K=1 unfiltered median us/query | 163.3 | 163.7 | +0.24% |
+| Fixture K=16 unfiltered median us/query | 2,942.0 | 3,228.9 | +9.75% |
+| Fixture K=64 unfiltered median us/query | 9,234.0 | 9,252.0 | +0.19% |
+| Fixture recall, reported K/modes | unchanged | unchanged | 0.00% |
+
+This run did not measure a performance improvement: the closeout candidate is modestly slower on
+the listed wall-time and median-latency samples, while recall is unchanged. The candidate changes
+are benchmark/evidence validation changes rather than a production optimization, so these results
+must not be attributed to a product performance fix or generalized into a universal regression.
+They are now full-fixture bounded evidence for PERF-01 and the named PERF-03/PERF-04/PERF-05
+protocols. They do not establish universal latency, memory, recovery, RSS, statistics/projection,
+segment-count, or lifecycle-reclamation bounds; compaction, vacuum, retention, orphan cleanup, and
+cross-process durability remain deferred.
+
 ## Task 6 recovery-byte accounting evidence (fresh, bounded)
 
 **Run date:** 2026-08-02. **Implementation revision:** `4b39f16`; the
@@ -368,6 +407,6 @@ They do not establish a universal latency,
 memory, recovery-time, or segment-count guarantee. The manifest and segment sets grow with retained
 commits in the current implementation. Compaction, vacuum, orphan cleanup, retention policy, and
 indefinite sustained operation remain Phase 3 work. Native foundation provenance, Ubuntu fixture
-smoke, and a bounded real-fixture before/after matrix are now captured, but full 100K-row
-measurements and universal operating bounds remain open evidence work; PERF-01 through PERF-05
-therefore remain tracked rather than marked universally remediated.
+smoke, and a validated full 100K-row real-fixture before/after matrix are now captured. Universal
+operating bounds remain open evidence work; PERF-01 through PERF-05 are bounded-evidence rows rather
+than universal performance guarantees.

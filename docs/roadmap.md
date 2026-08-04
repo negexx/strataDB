@@ -17,9 +17,9 @@ in [documentation history](history/README.md). Current implementation claims liv
 
 The [Phase 1 audit](phase-1-audit.md) is complete. Phase 1 remains Partial and blocked by:
 
-- incomplete VER-01 direct-regression inventory and final branch verification; the manual Ubuntu CI run [30861009780](https://github.com/negexx/strataDB/actions/runs/30861009780) passed the named loom and thorough-chaos gates;
+- incomplete VER-01 direct-regression inventory and final branch verification; the manual Ubuntu CI run [30897605936](https://github.com/negexx/strataDB/actions/runs/30897605936) passed the named loom and thorough-chaos gates, including `2000/2000` chaos seeds;
 - the completed exact-head branch CI run [30865323724](https://github.com/negexx/strataDB/actions/runs/30865323724) supplies retained command/outcome provenance, while the fresh native matrix [30881986345](https://github.com/negexx/strataDB/actions/runs/30881986345) covers Ubuntu and Windows; and
-- incomplete full 100K-row before/after segmented performance and universal operating-bound evidence (the bounded pinned-fixture matrix passed in [30892210202](https://github.com/negexx/strataDB/actions/runs/30892210202); the pinned Ubuntu fixture smoke passed in [30881986345](https://github.com/negexx/strataDB/actions/runs/30881986345)).
+- universal operating-bound evidence and final branch verification remain open; the validated full 100K-row segmented/lifecycle before/after matrix passed in [30901929352](https://github.com/negexx/strataDB/actions/runs/30901929352), but it showed no product performance win and does not establish universal bounds.
 
 The [Phase 1 closeout ledger](phase-1-closeout-ledger.md) assigns each remaining finding an
 acceptance assertion and future evidence location. It is tracking material, not a phase-exit claim.

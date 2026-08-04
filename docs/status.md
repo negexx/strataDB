@@ -5,7 +5,7 @@ are evidence pointers; [roadmap](roadmap.md) owns phase ordering.
 
 ## Overall state
 
-The current baseline is merged PR #56 commit `76d12919b5234f5e089cf26e4ba469e7aaa982f0`. The
+The current baseline is merged PR #58 commit `21811031d0fbe3ed3f55532941c056c0c9e091b0`. The
 [Phase 0 foundation audit](phase-0-audit.md) records the foundation as implemented within its named
 local bounds, with retained CI evidence. The [Phase 1 closeout ledger](phase-1-closeout-ledger.md)
 tracks the remaining finding-level acceptance and evidence obligations; it does not change this
@@ -35,7 +35,7 @@ single-process/shared-`Dataset` boundary.
 | Python | Proposed | PyO3 scaffolding exports only `placeholder_version`; no database API exists. |
 | Durability/recovery | Partial | File/directory durability, immutable row-ID high-water, manifest integrity, and crash/reopen evidence exist within named local bounds; full branch verification remains. |
 | Schema/migrations | Partial | Dataset-owned schema and strict validation are implemented; schema evolution and migration remain deferred. |
-| Loom/chaos/fuzz/bench evidence | Partial | The manual Ubuntu GitHub Actions run [30861009780](https://github.com/negexx/strataDB/actions/runs/30861009780) passed the named loom gates and thorough-chaos `2000/2000` seed gate; native Ubuntu/Windows checks, Ubuntu pinned-fixture smoke, and a complete K/mode before/after matrix on a verified 256-row fixture prefix passed in [30881986345](https://github.com/negexx/strataDB/actions/runs/30881986345) and [30892210202](https://github.com/negexx/strataDB/actions/runs/30892210202), while full 100K-row behavior and universal bounds remain open. |
+| Loom/chaos/fuzz/bench evidence | Partial | The manual Ubuntu GitHub Actions run [30897605936](https://github.com/negexx/strataDB/actions/runs/30897605936) passed the named loom gates and thorough-chaos `2000/2000` seed gate; native Ubuntu/Windows checks and the validated full 100K-row pinned-fixture segmented/lifecycle matrix passed in [30881986345](https://github.com/negexx/strataDB/actions/runs/30881986345) and [30901929352](https://github.com/negexx/strataDB/actions/runs/30901929352). Universal bounds and final branch verification remain open. |
 | Compaction/GC | Proposed | No compaction, vacuum, orphan cleanup, or bounded history implementation. |
 | Cross-process coordination | Proposed | Independent openers do not share transaction state or durable conditional publication. |
 | Branching/object storage | Proposed | No branch/merge or object-store backend is implemented. |
