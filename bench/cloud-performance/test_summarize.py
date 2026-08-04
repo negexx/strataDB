@@ -19,6 +19,36 @@ class SummarizeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "fixture_sha256"):
             summarize.validate_fixture_provenance(config)
 
+    def test_collects_fixture_segment_metrics_with_pinned_provenance(self):
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root) / "before"
+            directory.mkdir()
+            config = {
+                "label": "before",
+                "revision": "revision",
+                "lockfile_sha256": "lock",
+                "source": "fixture",
+                **summarize.FIXTURE_PROVENANCE,
+            }
+            (directory / "fixture_segment_recall.env").write_text(
+                "".join(f"{key}={value}\n" for key, value in config.items()), encoding="utf-8"
+            )
+            (directory / "fixture_segment_recall.log").write_text(
+                "loaded 64 rows from fixture /tmp/dbpedia-openai-100k.parquet; input hash=abc123\n"
+                "unfiltered query results (median / p95 over measured repetitions):\n"
+                "   1   1.0000 /  1.0000     10.0 /    11.0    100 /   90\n",
+                encoding="utf-8",
+            )
+            (directory / "fixture_segment_recall.time").write_text(
+                "Maximum resident set size (kbytes): 1234\n", encoding="utf-8"
+            )
+
+            records = summarize.summarize_directory(Path(root))
+
+            self.assertTrue(records)
+            self.assertEqual({row["benchmark"] for row in records}, {"fixture_segment_recall"})
+            self.assertTrue(all(row["config"]["source"] == "fixture" for row in records))
+
     def test_collects_manifest_and_segment_metrics_and_delta(self):
         with tempfile.TemporaryDirectory() as root:
             artifact = Path(root)

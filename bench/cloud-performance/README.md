@@ -42,15 +42,20 @@ benchmark filesystem and OS caches are not forcibly flushed; that policy is reco
 provenance log.
 
 Set `STRATA_REAL_FIXTURE=1` and `STRATA_BENCH_FIXTURE=/path/to/train-00000-of-00001.parquet` to
-retain the pinned fixture identity and add a real-fixture segmented `Dataset`/`Snapshot` smoke run.
-The fixture is copied into each disposable worktree at the benchmark path expected by the current
-benchmarks; it is never added to Git. Synthetic benchmark behavior remains unchanged.
+add a real-fixture segmented `Dataset`/`Snapshot` smoke run. The runner verifies the pinned identity,
+copies the fixture into each disposable worktree before its fixture benchmark, and writes a separate
+`fixture_segment_recall.env` beside the emitted fixture log. The current benches receive that copied
+path through `STRATA_BENCH_FIXTURE`; they do not rely on a hard-coded worktree path. Synthetic and
+fixture records therefore remain distinct and both are validated against their emitted input-source
+metadata. Synthetic benchmark behavior remains unchanged.
 
 ## GitHub Actions
 
-`Phase 1 portability evidence` is manually dispatchable and runs an Ubuntu/Windows matrix. Both
-runners retain raw native evidence and provenance (OS, architecture, filesystem, CPU/RAM observation,
-toolchain, source revision, seed, cache policy, and repetitions). Ubuntu can additionally download,
+`Phase 1 portability evidence` runs automatically for pull requests and pushes to `main`, and is also
+manually dispatchable, on an Ubuntu/Windows matrix. Both runners retain raw native evidence and
+provenance (OS, architecture, filesystem, CPU/RAM observation, toolchain, source revision, seed,
+cache policy, and repetitions). Its synthetic segment smoke exercises the current
+`Dataset`/`Snapshot` path on both runners. A manually dispatched Ubuntu run can additionally download,
 verify, and smoke-test the pinned real fixture; Windows records that this optional measurement is
 skipped rather than presenting a synthetic result as fixture evidence. Artifacts are retained for 14
 days. This infrastructure records bounded observations only; it makes no production-limit or

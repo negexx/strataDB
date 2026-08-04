@@ -72,8 +72,8 @@ def _summary(values: list[float]) -> tuple[float, float]:
     return statistics.median(ordered), ordered[p95_index]
 
 
-def _load_config(directory: Path) -> dict[str, str]:
-    config_path = directory / "config.env"
+def _load_config(directory: Path, name: str = "config.env") -> dict[str, str]:
+    config_path = directory / name
     if not config_path.is_file():
         return {}
     config: dict[str, str] = {}
@@ -137,12 +137,14 @@ def _manifest(label: str, directory: Path, config: dict[str, str]) -> list[dict[
     return rows
 
 
-def _segment(label: str, directory: Path, config: dict[str, str]) -> list[dict[str, Any]]:
-    text = _read(directory / "segment_recall.log")
+def _segment(
+    label: str, directory: Path, config: dict[str, str], benchmark: str = "segment_recall"
+) -> list[dict[str, Any]]:
+    text = _read(directory / f"{benchmark}.log")
     mode = None
     rows: list[dict[str, Any]] = []
     input_hashes = sorted(set(re.findall(r"input hash=([0-9a-f]+)", text)))
-    base = _base(label, "segment_recall", directory / "segment_recall.time", config)
+    base = _base(label, benchmark, directory / f"{benchmark}.time", config)
     base["input_hashes"] = input_hashes
     for line in text.splitlines():
         if line.startswith("unfiltered query results"):
@@ -213,6 +215,9 @@ def summarize_directory(artifact: Path) -> list[dict[str, Any]]:
         records.extend(_manifest(label, directory, config))
         records.extend(_segment(label, directory, config))
         records.extend(_lifecycle(label, directory, config))
+        fixture_config = _load_config(directory, "fixture_segment_recall.env")
+        if fixture_config:
+            records.extend(_segment(label, directory, fixture_config, "fixture_segment_recall"))
     return records
 
 
@@ -394,6 +399,49 @@ def validate_records(records: list[dict[str, Any]], artifact: Path) -> None:
         }
         if before_hashes != after_hashes:
             errors.append(f"before/after input hashes differ for {benchmark}")
+    fixture_configs = {
+        label: _load_config(artifact / label, "fixture_segment_recall.env") for label in by_label
+    }
+    fixture_present = {label for label, config in fixture_configs.items() if config}
+    if fixture_present and fixture_present != {"before", "after"}:
+        errors.append("fixture_segment_recall provenance is required for both before and after")
+    if fixture_present == {"before", "after"}:
+        for label, config in fixture_configs.items():
+            try:
+                validate_fixture_provenance(config)
+            except ValueError as error:
+                errors.append(f"{label}: {error}")
+            directory = artifact / label
+            log_path = directory / "fixture_segment_recall.log"
+            time_path = directory / "fixture_segment_recall.time"
+            if not log_path.is_file() or not time_path.is_file():
+                errors.append(f"{label}: missing fixture_segment_recall log or time output")
+                continue
+            fixture_log = _read(log_path)
+            fixture_loading = SEGMENT_LOADING.search(fixture_log)
+            if not fixture_loading or not fixture_loading.group(2).startswith("fixture "):
+                errors.append(f"{label}: fixture_segment_recall did not emit a fixture input source")
+            elif fixture_loading.group(1) != config.get("segment_rows", ""):
+                errors.append(f"{label}: fixture_segment_recall row count does not match config")
+            fixture_rows = [
+                row
+                for row in by_label[label]
+                if row["benchmark"] == "fixture_segment_recall"
+            ]
+            if not fixture_rows:
+                errors.append(f"{label}: no parsed fixture_segment_recall metrics")
+        fixture_hashes = {
+            label: {
+                tuple(row.get("input_hashes", []))
+                for row in by_label[label]
+                if row["benchmark"] == "fixture_segment_recall"
+            }
+            for label in by_label
+        }
+        if any(len(hashes) != 1 or len(next(iter(hashes), ())) != 1 for hashes in fixture_hashes.values()):
+            errors.append("fixture_segment_recall must contain exactly one input hash per revision")
+        elif fixture_hashes["before"] != fixture_hashes["after"]:
+            errors.append("before/after fixture_segment_recall input hashes differ")
     if errors:
         raise ValueError("incomplete before/after evidence:\n" + "\n".join(errors))
 

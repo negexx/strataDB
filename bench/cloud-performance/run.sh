@@ -110,18 +110,19 @@ lifecycle_repetitions=$lifecycle_repetitions
 command_manifest=CARGO_TARGET_DIR=<revision-target> STRATA_GROWTH_COMMITS=<point> STRATA_GROWTH_WARMUP_RUNS=$growth_warmups STRATA_GROWTH_REPETITIONS=$growth_repetitions cargo bench -p strata-bench --bench manifest_growth_bench -- --noplot
 command_segment=CARGO_TARGET_DIR=<revision-target> STRATA_BENCH_SOURCE=synthetic STRATA_BENCH_SEED=$bench_seed STRATA_SEG_ROWS=$segment_rows STRATA_SEG_QUERIES=$segment_queries STRATA_SEG_WARMUP_RUNS=$segment_warmups STRATA_SEG_REPETITIONS=$segment_repetitions cargo bench -p strata-bench --bench segment_recall_bench -- --noplot
 command_lifecycle=CARGO_TARGET_DIR=<revision-target> STRATA_BENCH_SOURCE=synthetic STRATA_BENCH_SEED=$bench_seed STRATA_LIFECYCLE_ROWS=$lifecycle_rows STRATA_LIFECYCLE_BATCH_ROWS=$lifecycle_batch_rows STRATA_PINNED_SNAPSHOTS=<pin-count> STRATA_LIFECYCLE_WARMUP_RUNS=$lifecycle_warmups STRATA_LIFECYCLE_REPETITIONS=$lifecycle_repetitions STRATA_LIFECYCLE_MEASUREMENT=cloud cargo bench -p strata-bench --bench lifecycle_bench -- --noplot
-command_fixture_smoke=STRATA_BENCH_FIXTURE=$fixture_path STRATA_BENCH_SOURCE=fixture cargo bench -p strata-bench --bench segment_recall_bench -- --noplot
+command_fixture_smoke=CARGO_TARGET_DIR=<revision-target> STRATA_BENCH_SOURCE=fixture STRATA_BENCH_FIXTURE=<revision-worktree>/bench/data/dbpedia-openai-100k.parquet STRATA_SEG_ROWS=$segment_rows STRATA_SEG_QUERIES=$segment_queries STRATA_SEG_WARMUP_RUNS=$segment_warmups STRATA_SEG_REPETITIONS=$segment_repetitions cargo bench -p strata-bench --bench segment_recall_bench -- --noplot
 EOF
 }
 
 record_fixture() {
   local label="$1"
-  local revision_dir="$2"
+  local sha="$2"
+  local revision_dir="$3"
   local destination="$revision_dir/bench/data/dbpedia-openai-100k.parquet"
   local actual_sha
   local actual_size
   if [[ "${STRATA_REAL_FIXTURE:-0}" != "1" ]]; then
-    printf 'fixture_status=not-requested\n' > "$artifact_dir/$label/fixture.env"
+    printf 'fixture_status=not-requested\n' > "$artifact_dir/$label/fixture_segment_recall.status"
     return
   fi
   [[ -f "$fixture_path" ]] || { printf 'fixture path missing: %s\n' "$fixture_path" >&2; return 1; }
@@ -131,8 +132,30 @@ record_fixture() {
   [[ "$actual_sha" == "$fixture_sha256" ]] || { printf 'fixture sha256 mismatch: %s\n' "$actual_sha" >&2; return 1; }
   mkdir -p "$(dirname "$destination")"
   cp "$fixture_path" "$destination"
-  printf 'source=fixture\nfixture_repo=%s\nfixture_revision=%s\nfixture_file=%s\nfixture_size_bytes=%s\nfixture_sha256=%s\n' \
-    "$fixture_repo" "$fixture_revision" "$fixture_file" "$fixture_size_bytes" "$fixture_sha256" > "$artifact_dir/$label/fixture.env"
+  cat > "$artifact_dir/$label/fixture_segment_recall.env" <<EOF
+label=$label
+revision=$sha
+lockfile_sha256=$(sha256sum "$revision_dir/Cargo.lock" | awk '{print $1}')
+source=fixture
+fixture_repo=$fixture_repo
+fixture_revision=$fixture_revision
+fixture_file=$fixture_file
+fixture_size_bytes=$fixture_size_bytes
+fixture_sha256=$fixture_sha256
+fixture_worktree_path=$destination
+segment_rows=$segment_rows
+segment_queries=$segment_queries
+segment_dimension=$segment_dimension
+segment_k=$segment_k
+segment_ef_search=$segment_ef_search
+segment_m=$segment_m
+segment_ef_construction=$segment_ef_construction
+segment_max_layer=$segment_max_layer
+segment_points=1,2,4,8,16,32,64
+segment_warmup_runs=$segment_warmups
+segment_repetitions=$segment_repetitions
+command=CARGO_TARGET_DIR=<revision-target> STRATA_BENCH_SOURCE=fixture STRATA_BENCH_FIXTURE=$destination STRATA_SEG_ROWS=$segment_rows STRATA_SEG_QUERIES=$segment_queries STRATA_SEG_WARMUP_RUNS=$segment_warmups STRATA_SEG_REPETITIONS=$segment_repetitions cargo bench -p strata-bench --bench segment_recall_bench -- --noplot
+EOF
 }
 
 run_benchmark() {
@@ -193,6 +216,8 @@ run_benchmark() {
             STRATA_BENCH_FIXTURE="$revision_dir/bench/data/dbpedia-openai-100k.parquet" \
             STRATA_SEG_ROWS="$segment_rows" \
             STRATA_SEG_QUERIES="$segment_queries" \
+            STRATA_SEG_WARMUP_RUNS="$segment_warmups" \
+            STRATA_SEG_REPETITIONS="$segment_repetitions" \
             cargo bench -p strata-bench --bench segment_recall_bench -- --noplot
         ;;
       *)
@@ -218,7 +243,7 @@ for label_dir_sha in "before:$before_dir:$before_sha" "after:$after_dir:$after_s
   for benchmark in segment_recall lifecycle; do
     run_benchmark "$label" "$sha" "$revision_dir" "$benchmark"
   done
-  record_fixture "$label" "$revision_dir"
+  record_fixture "$label" "$sha" "$revision_dir"
   if [[ "${STRATA_REAL_FIXTURE:-0}" == "1" ]]; then
     run_benchmark "$label" "$sha" "$revision_dir" fixture_segment_recall
   fi

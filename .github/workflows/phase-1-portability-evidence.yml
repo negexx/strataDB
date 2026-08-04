@@ -1,6 +1,9 @@
 name: Phase 1 portability evidence
 
 on:
+  pull_request:
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       real_fixture:
@@ -14,6 +17,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  REAL_FIXTURE_REQUESTED: ${{ github.event_name == 'workflow_dispatch' && inputs.real_fixture && 'true' || 'false' }}
 
 jobs:
   native-foundation-evidence:
@@ -99,14 +103,15 @@ jobs:
             echo 'synthetic_repetitions=1'
             echo 'fixture_repetitions=1'
           } | tee -a "$log"
-          run_case synthetic-manifest env STRATA_GROWTH_COMMITS=10 cargo bench --locked -p strata-bench --bench manifest_growth_bench -- --noplot
-          if [[ "$RUNNER_OS" == "Linux" && "${{ inputs.real_fixture }}" == "true" ]]; then
+          run_case synthetic-manifest env STRATA_GROWTH_COMMITS=10 STRATA_GROWTH_WARMUP_RUNS=1 STRATA_GROWTH_REPETITIONS=1 cargo bench --locked -p strata-bench --bench manifest_growth_bench -- --noplot
+          run_case synthetic-segment-smoke env STRATA_BENCH_SOURCE=synthetic STRATA_BENCH_SEED=20260801 STRATA_SEG_ROWS=64 STRATA_SEG_QUERIES=4 STRATA_SEG_WARMUP_RUNS=1 STRATA_SEG_REPETITIONS=1 cargo bench --locked -p strata-bench --bench segment_recall_bench -- --noplot
+          if [[ "$RUNNER_OS" == "Linux" && "$REAL_FIXTURE_REQUESTED" == "true" ]]; then
             fixture=bench/data/dbpedia-openai-100k.parquet
             mkdir -p bench/data
             run_case fixture-download curl --fail --location --retry 3 --output "$fixture" "https://huggingface.co/datasets/Qdrant/dbpedia-entities-openai3-text-embedding-3-small-512-100K/resolve/56e6849a3d0f7913e56b475bf92c0064c93b576d/data/train-00000-of-00001.parquet"
             run_case fixture-size bash -c "test \"\$(wc -c < '$fixture')\" = 363758493"
             run_case fixture-sha256 bash -c "test \"\$(sha256sum '$fixture' | awk '{print \$1}')\" = 5ea400d91cba9b27fa55fc659e48f7bda8cba68443f087a15ddbc0e42acd049d"
-            run_case fixture-segment-smoke env STRATA_BENCH_SOURCE=fixture STRATA_BENCH_FIXTURE="$fixture" STRATA_SEG_ROWS=64 STRATA_SEG_QUERIES=4 cargo bench --locked -p strata-bench --bench segment_recall_bench -- --noplot
+            run_case fixture-segment-smoke env STRATA_BENCH_SOURCE=fixture STRATA_BENCH_FIXTURE="$fixture" STRATA_SEG_ROWS=64 STRATA_SEG_QUERIES=4 STRATA_SEG_WARMUP_RUNS=1 STRATA_SEG_REPETITIONS=1 cargo bench --locked -p strata-bench --bench segment_recall_bench -- --noplot
           else
             echo "fixture_status=skipped (supported measurement runner is Ubuntu)" | tee -a "$log"
           fi
