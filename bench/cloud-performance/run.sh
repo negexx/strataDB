@@ -112,10 +112,10 @@ lifecycle_batch_rows=$lifecycle_batch_rows
 lifecycle_pins=$lifecycle_pins
 lifecycle_warmup_runs=$lifecycle_warmups
 lifecycle_repetitions=$lifecycle_repetitions
-command_manifest=CARGO_TARGET_DIR=<revision-target> STRATA_GROWTH_COMMITS=<point> STRATA_GROWTH_WARMUP_RUNS=$growth_warmups STRATA_GROWTH_REPETITIONS=$growth_repetitions cargo bench -p strata-bench --bench manifest_growth_bench -- --noplot
-command_segment=CARGO_TARGET_DIR=<revision-target> STRATA_BENCH_SOURCE=synthetic STRATA_BENCH_SEED=$bench_seed STRATA_SEG_ROWS=$segment_rows STRATA_SEG_QUERIES=$segment_queries STRATA_SEG_WARMUP_RUNS=$segment_warmups STRATA_SEG_REPETITIONS=$segment_repetitions cargo bench -p strata-bench --bench segment_recall_bench -- --noplot
-command_lifecycle=CARGO_TARGET_DIR=<revision-target> STRATA_BENCH_SOURCE=synthetic STRATA_BENCH_SEED=$bench_seed STRATA_LIFECYCLE_ROWS=$lifecycle_rows STRATA_LIFECYCLE_BATCH_ROWS=$lifecycle_batch_rows STRATA_PINNED_SNAPSHOTS=<pin-count> STRATA_LIFECYCLE_WARMUP_RUNS=$lifecycle_warmups STRATA_LIFECYCLE_REPETITIONS=$lifecycle_repetitions STRATA_LIFECYCLE_MEASUREMENT=cloud cargo bench -p strata-bench --bench lifecycle_bench -- --noplot
-command_fixture_smoke=CARGO_TARGET_DIR=<revision-target> STRATA_BENCH_SOURCE=fixture STRATA_BENCH_FIXTURE=<revision-worktree>/bench/data/dbpedia-openai-100k.parquet STRATA_SEG_ROWS=$segment_rows STRATA_SEG_QUERIES=$segment_queries STRATA_SEG_WARMUP_RUNS=$segment_warmups STRATA_SEG_REPETITIONS=$segment_repetitions cargo bench -p strata-bench --bench segment_recall_bench -- --noplot
+command_manifest=CARGO_TARGET_DIR=<revision-target> STRATA_GROWTH_COMMITS=<point> STRATA_GROWTH_WARMUP_RUNS=$growth_warmups STRATA_GROWTH_REPETITIONS=$growth_repetitions cargo bench --locked -p strata-bench --bench manifest_growth_bench -- --noplot
+command_segment=CARGO_TARGET_DIR=<revision-target> STRATA_BENCH_SOURCE=synthetic STRATA_BENCH_SEED=$bench_seed STRATA_SEG_ROWS=$segment_rows STRATA_SEG_QUERIES=$segment_queries STRATA_SEG_WARMUP_RUNS=$segment_warmups STRATA_SEG_REPETITIONS=$segment_repetitions cargo bench --locked -p strata-bench --bench segment_recall_bench -- --noplot
+command_lifecycle=CARGO_TARGET_DIR=<revision-target> STRATA_BENCH_SOURCE=synthetic STRATA_BENCH_SEED=$bench_seed STRATA_LIFECYCLE_ROWS=$lifecycle_rows STRATA_LIFECYCLE_BATCH_ROWS=$lifecycle_batch_rows STRATA_PINNED_SNAPSHOTS=<pin-count> STRATA_LIFECYCLE_WARMUP_RUNS=$lifecycle_warmups STRATA_LIFECYCLE_REPETITIONS=$lifecycle_repetitions STRATA_LIFECYCLE_MEASUREMENT=cloud cargo bench --locked -p strata-bench --bench lifecycle_bench -- --noplot
+command_fixture_smoke=CARGO_TARGET_DIR=<revision-target> STRATA_BENCH_SOURCE=fixture STRATA_BENCH_FIXTURE=<revision-worktree>/bench/data/dbpedia-openai-100k.parquet STRATA_SEG_ROWS=$segment_rows STRATA_SEG_QUERIES=$segment_queries STRATA_SEG_WARMUP_RUNS=$segment_warmups STRATA_SEG_REPETITIONS=$segment_repetitions cargo bench --locked -p strata-bench --bench segment_recall_bench -- --noplot
 EOF
 }
 
@@ -189,7 +189,7 @@ segment_max_layer=$segment_max_layer
 segment_points=1,2,4,8,16,32,64
 segment_warmup_runs=$segment_warmups
 segment_repetitions=$segment_repetitions
-command=CARGO_TARGET_DIR=<revision-target> STRATA_BENCH_SOURCE=fixture STRATA_BENCH_FIXTURE=$destination STRATA_SEG_ROWS=$segment_rows STRATA_SEG_QUERIES=$segment_queries STRATA_SEG_WARMUP_RUNS=$segment_warmups STRATA_SEG_REPETITIONS=$segment_repetitions cargo bench -p strata-bench --bench segment_recall_bench -- --noplot
+command=CARGO_TARGET_DIR=<revision-target> STRATA_BENCH_SOURCE=fixture STRATA_BENCH_FIXTURE=$destination STRATA_SEG_ROWS=$segment_rows STRATA_SEG_QUERIES=$segment_queries STRATA_SEG_WARMUP_RUNS=$segment_warmups STRATA_SEG_REPETITIONS=$segment_repetitions cargo bench --locked -p strata-bench --bench segment_recall_bench -- --noplot
 EOF
   printf 'fixture_status=complete\n' > "$artifact_dir/$label/fixture_segment_recall.status"
 }
@@ -224,7 +224,7 @@ run_benchmark() {
             STRATA_GROWTH_COMMITS="$commits" \
             STRATA_GROWTH_WARMUP_RUNS="$growth_warmups" \
             STRATA_GROWTH_REPETITIONS="$growth_repetitions" \
-            cargo bench -p strata-bench --bench manifest_growth_bench -- --noplot
+            cargo bench --locked -p strata-bench --bench manifest_growth_bench -- --noplot
         ;;
       segment_recall)
         /usr/bin/time -v -o "$timing" env \
@@ -235,7 +235,7 @@ run_benchmark() {
             STRATA_SEG_QUERIES="$segment_queries" \
             STRATA_SEG_WARMUP_RUNS="$segment_warmups" \
             STRATA_SEG_REPETITIONS="$segment_repetitions" \
-            cargo bench -p strata-bench --bench segment_recall_bench -- --noplot
+            cargo bench --locked -p strata-bench --bench segment_recall_bench -- --noplot
         ;;
       lifecycle)
         /usr/bin/time -v -o "$timing" env \
@@ -248,7 +248,7 @@ run_benchmark() {
             STRATA_LIFECYCLE_WARMUP_RUNS="$lifecycle_warmups" \
             STRATA_LIFECYCLE_REPETITIONS="$lifecycle_repetitions" \
             STRATA_LIFECYCLE_MEASUREMENT=cloud \
-            cargo bench -p strata-bench --bench lifecycle_bench -- --noplot
+            cargo bench --locked -p strata-bench --bench lifecycle_bench -- --noplot
         ;;
       fixture_segment_recall)
         /usr/bin/time -v -o "$timing" env \
@@ -259,7 +259,7 @@ run_benchmark() {
             STRATA_SEG_QUERIES="$segment_queries" \
             STRATA_SEG_WARMUP_RUNS="$segment_warmups" \
             STRATA_SEG_REPETITIONS="$segment_repetitions" \
-            cargo bench -p strata-bench --bench segment_recall_bench -- --noplot
+            cargo bench --locked -p strata-bench --bench segment_recall_bench -- --noplot
         ;;
       *)
         printf 'unknown benchmark: %s\n' "$benchmark" >&2

@@ -11,6 +11,7 @@ class SummarizeTests(unittest.TestCase):
     def _write_complete_configured_matrix(self, artifact: Path, fixture_evidence: str) -> None:
         config = f"""workload_signature=synthetic-seed-20260801-dim512-hnsw-M16-efc100-efsearch32-k10
 seed=20260801
+source=synthetic
 fixture_evidence={fixture_evidence}
 manifest_points=1,10,20,40,80,160
 manifest_warmup_runs=1
@@ -38,6 +39,11 @@ command_lifecycle=lifecycle
         for label in ("before", "after"):
             directory = artifact / label
             directory.mkdir()
+            raw_headers = [
+                f"label={label}",
+                f"revision={'a' if label == 'before' else 'b'}",
+                "lockfile_sha256=lock",
+            ]
             (directory / "config.env").write_text(
                 f"label={label}\nrevision={'a' if label == 'before' else 'b'}\n"
                 "lockfile_sha256=lock\n" + config,
@@ -45,7 +51,9 @@ command_lifecycle=lifecycle
             )
             for point in (1, 10, 20, 40, 80, 160):
                 (directory / f"manifest_growth_{point}.log").write_text(
-                    f"manifest growth â€” {point} sequential commits, one data file each\n"
+                    "\n".join(raw_headers)
+                    + "\n"
+                    + f"manifest growth â€” {point} sequential commits, one data file each\n"
                     f"input: deterministic id-only rows; commits={point}; buckets=20; warmup runs excluded=1; measured repetitions=5\n"
                     "median commit-sequence wall: 1.000 ms; p95: 1.100 ms; sample variance: 0.100 ms^2\n"
                     "median newest manifest: 712 bytes; p95: 713 bytes; sample variance: 0.100 bytes^2\n",
@@ -55,6 +63,7 @@ command_lifecycle=lifecycle
                     "Maximum resident set size (kbytes): 1234\n", encoding="utf-8"
                 )
             segment = [
+                *raw_headers,
                 "loaded 256 rows from synthetic seed=20260801; input hash=abc123",
                 "computing exact ground truth for 16 queries...",
                 "==== recall vs segment count â€” 256 rows x 512-dim, k=10, ef_search=32 ====",
@@ -69,7 +78,7 @@ command_lifecycle=lifecycle
             (directory / "segment_recall.time").write_text(
                 "Maximum resident set size (kbytes): 1234\n", encoding="utf-8"
             )
-            lifecycle = []
+            lifecycle = [*raw_headers]
             for pins in (0, 1, 4, 16, 64):
                 for repetition in range(1, 6):
                     lifecycle.extend(
@@ -289,6 +298,7 @@ newest manifest bytes  : 200
             artifact = Path(root)
             config = """workload_signature=synthetic-seed-20260801-dim512-hnsw-M16-efc100-efsearch32-k10
 seed=20260801
+source=synthetic
 fixture_evidence=not-requested
 manifest_points=1,10,20,40,80,160
 manifest_warmup_runs=1
@@ -316,6 +326,11 @@ command_lifecycle=lifecycle
             for label in ("before", "after"):
                 directory = artifact / label
                 directory.mkdir()
+                raw_headers = [
+                    f"label={label}",
+                    f"revision={'a' if label == 'before' else 'b'}",
+                    "lockfile_sha256=lock",
+                ]
                 (directory / "fixture_segment_recall.status").write_text(
                     "fixture_status=not-requested\n", encoding="utf-8"
                 )
@@ -326,7 +341,9 @@ command_lifecycle=lifecycle
                 )
                 for point in (1, 10, 20, 40, 80, 160):
                     (directory / f"manifest_growth_{point}.log").write_text(
-                        f"manifest growth — {point} sequential commits, one data file each\n"
+                        "\n".join(raw_headers)
+                        + "\n"
+                        + f"manifest growth — {point} sequential commits, one data file each\n"
                         f"input: deterministic id-only rows; commits={point}; buckets=20; warmup runs excluded=1; measured repetitions=5\n"
                         "median commit-sequence wall: 1.000 ms; p95: 1.100 ms; sample variance: 0.100 ms^2\n"
                         "median newest manifest: 712 bytes; p95: 713 bytes; sample variance: 0.100 bytes^2\n",
@@ -336,6 +353,7 @@ command_lifecycle=lifecycle
                         "Maximum resident set size (kbytes): 1234\n", encoding="utf-8"
                     )
                 segment = [
+                    *raw_headers,
                     "loaded 256 rows from synthetic seed=20260801; input hash=abc123",
                     "computing exact ground truth for 16 queries...",
                     "==== recall vs segment count — 256 rows x 512-dim, k=10, ef_search=32 ====",
@@ -350,7 +368,7 @@ command_lifecycle=lifecycle
                 (directory / "segment_recall.time").write_text(
                     "Maximum resident set size (kbytes): 1234\n", encoding="utf-8"
                 )
-                lifecycle = []
+                lifecycle = [*raw_headers]
                 for pins in (0, 1, 4, 16, 64):
                     for repetition in range(1, 6):
                         lifecycle.extend(
@@ -382,6 +400,51 @@ command_lifecycle=lifecycle
             )
             with self.assertRaises(ValueError):
                 summarize.validate_records(summarize.summarize_directory(artifact), artifact)
+
+    def test_validation_rejects_forged_synthetic_raw_provenance(self):
+        for key, replacement in (
+            ("label", "forged-label"),
+            ("revision", "forged-revision"),
+            ("lockfile_sha256", "forged-lockfile"),
+        ):
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as root:
+                artifact = Path(root)
+                self._write_complete_configured_matrix(artifact, "not-requested")
+                log = artifact / "before" / "segment_recall.log"
+                expected = "before" if key == "label" else "a" if key == "revision" else "lock"
+                log.write_text(
+                    log.read_text(encoding="utf-8").replace(
+                        f"{key}={expected}\n", f"{key}={replacement}\n", 1
+                    ),
+                    encoding="utf-8",
+                )
+
+                with self.assertRaisesRegex(
+                    ValueError,
+                    rf"before: segment_recall\.log must emit {key} exactly once matching config\.env",
+                ):
+                    summarize.validate_records(summarize.summarize_directory(artifact), artifact)
+
+    def test_validation_rejects_missing_or_duplicate_synthetic_raw_provenance_headers(self):
+        for key in ("label", "revision", "lockfile_sha256"):
+            for mutation in ("missing", "duplicate"):
+                with self.subTest(key=key, mutation=mutation), tempfile.TemporaryDirectory() as root:
+                    artifact = Path(root)
+                    self._write_complete_configured_matrix(artifact, "not-requested")
+                    log = artifact / "before" / "manifest_growth_1.log"
+                    expected = "before" if key == "label" else "a" if key == "revision" else "lock"
+                    text = log.read_text(encoding="utf-8")
+                    if mutation == "missing":
+                        text = text.replace(f"{key}={expected}\n", "", 1)
+                    else:
+                        text += f"\n{key}={expected}\n"
+                    log.write_text(text, encoding="utf-8")
+
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        rf"before: manifest_growth_1\.log must emit {key} exactly once matching config\.env",
+                    ):
+                        summarize.validate_records(summarize.summarize_directory(artifact), artifact)
 
     def test_validation_accepts_complete_before_after_fixture_evidence(self):
         with tempfile.TemporaryDirectory() as root:

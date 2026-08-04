@@ -63,6 +63,7 @@ SEGMENT_METRIC_SUFFIXES = (
     "qps_p95",
 )
 EXPECTED_PINS = (0, 1, 4, 16, 64)
+RAW_PROVENANCE_KEYS = ("label", "revision", "lockfile_sha256")
 FIXTURE_PROVENANCE = {
     "fixture_repo": "Qdrant/dbpedia-entities-openai3-text-embedding-3-small-512-100K",
     "fixture_revision": "56e6849a3d0f7913e56b475bf92c0064c93b576d",
@@ -109,6 +110,17 @@ def validate_fixture_provenance(config: dict[str, str]) -> None:
 
 def _exact_values(text: str, key: str) -> list[str]:
     return _log_values(text, key)
+
+
+def _validate_raw_provenance(
+    directory: Path, benchmark: str, config: dict[str, str], label: str, errors: list[str]
+) -> None:
+    text = _read(directory / f"{benchmark}.log")
+    for key in RAW_PROVENANCE_KEYS:
+        if _exact_values(text, key) != [config.get(key)]:
+            errors.append(
+                f"{label}: {benchmark}.log must emit {key} exactly once matching config.env"
+            )
 
 
 def _configured_points(
@@ -362,6 +374,8 @@ def validate_records(records: list[dict[str, Any]], artifact: Path) -> None:
                 validate_fixture_provenance(config)
             except ValueError as error:
                 errors.append(f"{label}: {error}")
+            if config.get("source") != "synthetic":
+                errors.append(f"{label}: config.env source must be synthetic")
             if config.get("fixture_evidence") not in {"requested", "not-requested"}:
                 errors.append(f"{label}: fixture_evidence must be requested or not-requested")
         comparable_keys = sorted(set(configs["before"]) | set(configs["after"]))
@@ -382,6 +396,7 @@ def validate_records(records: list[dict[str, Any]], artifact: Path) -> None:
             "segment_recall",
             "lifecycle",
         ):
+            _validate_raw_provenance(directory, benchmark, config, label, errors)
             for suffix in (".log", ".time"):
                 if not (directory / f"{benchmark}{suffix}").is_file():
                     errors.append(f"{label}: missing {benchmark}{suffix}")
