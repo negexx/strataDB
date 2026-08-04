@@ -109,34 +109,61 @@ jobs:
   ci:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Initialize CI provenance
+        id: initialize_provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          provenance_dir="$RUNNER_TEMP/strata-ci-provenance"
+          mkdir -p "$provenance_dir"
+          log="$provenance_dir/ci-provenance.log"
+          {
+            printf 'revision=unavailable\n'
+            printf 'workflow=%s\n' "$GITHUB_WORKFLOW"
+            printf 'run.id=%s\nrun.attempt=%s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+            printf 'event=%s\nref=%s\n' "$GITHUB_EVENT_NAME" "$GITHUB_REF"
+            printf 'runner.os=%s\nrunner.arch=%s\n' "$RUNNER_OS" "$RUNNER_ARCH"
+            uname -a
+          } > "$log"
+          cat > "$provenance_dir/ci-provenance.bash_env" <<EOF
+          exec 19>>"$log"
+          export BASH_XTRACEFD=19
+          export PS4='+ \${BASH_SOURCE}:\${LINENO}: '
+          set -x
+          EOF
+          printf 'STRATA_PROVENANCE_DIR=%s\nBASH_ENV=%s\n' \
+            "$provenance_dir" "$provenance_dir/ci-provenance.bash_env" >> "$GITHUB_ENV"
+
+      - name: Checkout
+        id: checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install Rust toolchain
+        id: install_toolchain
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master at 2026-08-03
         with:
           toolchain: "1.90"
           components: clippy, rustfmt
 
-      - name: Initialize CI provenance
+      - name: Record repository and toolchain provenance
+        id: record_provenance
+        if: always()
         shell: bash
         run: |
-          set -euo pipefail
-          mkdir -p artifacts
+          set +e
+          provenance_dir="${STRATA_PROVENANCE_DIR:-$RUNNER_TEMP/strata-ci-provenance}"
+          mkdir -p "$provenance_dir"
+          log="$provenance_dir/ci-provenance.log"
           {
-            printf 'revision='; git rev-parse HEAD
-            printf 'runner.os=%s\nrunner.arch=%s\n' "$RUNNER_OS" "$RUNNER_ARCH"
-            uname -a
-            rustc -Vv
-            cargo -Vv
-            sha256sum Cargo.lock
-          } | tee artifacts/ci-provenance.log
-          cat > artifacts/ci-provenance.bash_env <<'EOF'
-          exec 19>>"$GITHUB_WORKSPACE/artifacts/ci-provenance.log"
-          export BASH_XTRACEFD=19
-          export PS4='+ ${BASH_SOURCE}:${LINENO}: '
-          set -x
-          EOF
-          printf 'BASH_ENV=%s\n' "$GITHUB_WORKSPACE/artifacts/ci-provenance.bash_env" >> "$GITHUB_ENV"
+            if revision=$(git rev-parse HEAD 2>/dev/null); then
+              sed -i "s/^revision=.*/revision=$revision/" "$log"
+            else
+              printf 'revision=unavailable\n' >> "$log"
+            fi
+            if command -v rustc >/dev/null 2>&1; then rustc -Vv; else printf 'rustc=unavailable\n'; fi
+            if command -v cargo >/dev/null 2>&1; then cargo -Vv; else printf 'cargo=unavailable\n'; fi
+            if [ -f Cargo.lock ]; then sha256sum Cargo.lock; else printf 'Cargo.lock=unavailable\n'; fi
+          } >> "$log"
 
       - name: Build
         id: build
@@ -324,7 +351,15 @@ jobs:
         shell: bash
         run: |
           set +x
+          provenance_dir="${STRATA_PROVENANCE_DIR:-$RUNNER_TEMP/strata-ci-provenance}"
+          mkdir -p "$provenance_dir"
+          log="$provenance_dir/ci-provenance.log"
+          touch "$log"
           {
+            printf 'step.initialize_provenance=%s\n' '${{ steps.initialize_provenance.outcome }}'
+            printf 'step.checkout=%s\n' '${{ steps.checkout.outcome }}'
+            printf 'step.install_toolchain=%s\n' '${{ steps.install_toolchain.outcome }}'
+            printf 'step.record_provenance=%s\n' '${{ steps.record_provenance.outcome }}'
             printf 'job.status=%s\n' '${{ job.status }}'
             printf 'step.build=%s\n' '${{ steps.build.outcome }}'
             printf 'step.test=%s\n' '${{ steps.test.outcome }}'
@@ -344,15 +379,15 @@ jobs:
             printf 'step.doc=%s\n' '${{ steps.doc.outcome }}'
             printf 'step.install_deny=%s\n' '${{ steps.install_deny.outcome }}'
             printf 'step.deny=%s\n' '${{ steps.deny.outcome }}'
-          } >> artifacts/ci-provenance.log
-          cat artifacts/ci-provenance.log
+          } >> "$log"
+          cat "$log"
 
       - name: Upload CI provenance
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ci-provenance-${{ github.run_id }}-attempt-${{ github.run_attempt }}
-          path: artifacts/ci-provenance.log
+          path: ${{ runner.temp }}/strata-ci-provenance/ci-provenance.log
           if-no-files-found: error
           retention-days: 14
 
