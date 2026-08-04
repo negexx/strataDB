@@ -80,6 +80,19 @@ command_lifecycle=lifecycle
             )
             lifecycle = [*raw_headers]
             for pins in (0, 1, 4, 16, 64):
+                lifecycle.extend(
+                    [
+                        "================ StrataDB lifecycle Ã¢â‚¬â€ 64 rows x 512-dim ================",
+                        "ingest+commit                    20.00ms       2.0MB       3.0MB      -1.0MB  fsync",
+                        "                            64 commits, 64 rows/s, 1.00 ms/commit",
+                        "8 threads x 3 = 24 commits, 24/s",
+                        "input hash=abc123",
+                        "measurement             : excluded warmup 1/1; pins=" + str(pins),
+                        f"{pins} retained handles ({pins} distinct snapshots; operational current snapshot excluded);",
+                        "loading 64 rows (512-dim) from synthetic seed=20260801; input hash=abc123",
+                        "newest manifest bytes  : 200",
+                    ]
+                )
                 for repetition in range(1, 6):
                     lifecycle.extend(
                         [
@@ -370,6 +383,19 @@ command_lifecycle=lifecycle
                 )
                 lifecycle = [*raw_headers]
                 for pins in (0, 1, 4, 16, 64):
+                    lifecycle.extend(
+                        [
+                            "================ StrataDB lifecycle Ã¢â‚¬â€ 64 rows x 512-dim ================",
+                            "ingest+commit                    20.00ms       2.0MB       3.0MB      -1.0MB  fsync",
+                            "                            64 commits, 64 rows/s, 1.00 ms/commit",
+                            "8 threads x 3 = 24 commits, 24/s",
+                            "input hash=abc123",
+                            f"measurement             : excluded warmup 1/1; pins={pins}",
+                            f"{pins} retained handles ({pins} distinct snapshots; operational current snapshot excluded);",
+                            "loading 64 rows (512-dim) from synthetic seed=20260801; input hash=abc123",
+                            "newest manifest bytes  : 200",
+                        ]
+                    )
                     for repetition in range(1, 6):
                         lifecycle.extend(
                             [

@@ -106,7 +106,7 @@ jobs:
           run_case synthetic-manifest env STRATA_GROWTH_COMMITS=10 STRATA_GROWTH_WARMUP_RUNS=1 STRATA_GROWTH_REPETITIONS=1 cargo bench --locked -p strata-bench --bench manifest_growth_bench -- --noplot
           run_case synthetic-segment-smoke env STRATA_BENCH_SOURCE=synthetic STRATA_BENCH_SEED=20260801 STRATA_SEG_ROWS=64 STRATA_SEG_QUERIES=4 STRATA_SEG_WARMUP_RUNS=1 STRATA_SEG_REPETITIONS=1 cargo bench --locked -p strata-bench --bench segment_recall_bench -- --noplot
           if [[ "$RUNNER_OS" == "Linux" && "$REAL_FIXTURE_REQUESTED" == "true" ]]; then
-            fixture=bench/data/dbpedia-openai-100k.parquet
+            fixture="$GITHUB_WORKSPACE/bench/data/dbpedia-openai-100k.parquet"
             mkdir -p bench/data
             run_case fixture-download curl --fail --location --retry 3 --output "$fixture" "https://huggingface.co/datasets/Qdrant/dbpedia-entities-openai3-text-embedding-3-small-512-100K/resolve/56e6849a3d0f7913e56b475bf92c0064c93b576d/data/train-00000-of-00001.parquet"
             run_case fixture-size bash -c "test \"\$(wc -c < '$fixture')\" = 363758493"

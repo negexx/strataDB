@@ -434,7 +434,10 @@ def validate_records(records: list[dict[str, Any]], artifact: Path) -> None:
             "512",
             expected_source,
         )
-        expected_lifecycle_samples = int(config.get("lifecycle_repetitions", "0")) * len(lifecycle_pins)
+        expected_lifecycle_samples = (
+            int(config.get("lifecycle_warmup_runs", "0"))
+            + int(config.get("lifecycle_repetitions", "0"))
+        ) * len(lifecycle_pins)
         if (
             len(loadings) != expected_lifecycle_samples
             or any(loading[:3] != expected_loading for loading in loadings)
