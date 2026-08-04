@@ -50,6 +50,36 @@ comparison path. They do not themselves close PERF-01: a retained before/after a
 runner provenance, and compatible real-fixture evidence are still required before the claim can
 advance.
 
+## Cloud before/after comparison (fresh, bounded, synthetic)
+
+**Run:** [GitHub Actions 30862347913](https://github.com/negexx/strataDB/actions/runs/30862347913),
+Ubuntu 24.04 x86_64, four vCPUs, Rust 1.90.0, lockfile SHA-256
+`252e017f63e8bfbe6f6521fb9fb5d39085b1961b2f73d75f48479f9cd20b305b`, with separate target
+directories per revision and OS caches left untouched. The retained artifact is named
+`cloud-performance-before-after-30862347913-attempt-1`.
+
+The directly comparable pair is the parent of the Phase 1 benchmarked implementation,
+`5daff106a6b1dfc59f2aec6d15e672bdb90977cb`, versus the follow-up SIMD/statistics change,
+`80b4e54cc1af574e79a1317f6a45af557b23cc11`. Both use deterministic synthetic workloads; the
+earlier requested benchmark pair `48dc6247848c225b30f8c1bc2c40d6f6bb41667` ->
+`16812af3c196f993ac37834a8a6c06eb5ac6a0b5` was rejected because its historical benchmark required
+a missing real fixture. The corrected run validated 410 records and 205 before/after deltas.
+
+| Workload | Before | After | Relative change |
+|---|---:|---:|---:|
+| Manifest growth, 160 commits: wall | 569.239 ms | 561.013 ms | -1.45% |
+| Manifest growth, 160 commits: newest manifest | 40,478 B | 40,471 B | -0.02% |
+| Segment K=1 unfiltered: us/query | 56.6 | 55.8 | -1.41% |
+| Segment K=64 unfiltered: us/query | 85.8 | 86.2 | +0.47% |
+| Lifecycle, 0 pins: ingest+commit wall | 196.17 ms | 202.43 ms | +3.19% |
+| Lifecycle, 64 pins: ingest+commit wall | 265.76 ms | 266.72 ms | +0.36% |
+
+These are small, synthetic, VM-local observations—not proof of a broad performance win or
+regression. The matrix does not isolate the statistics path, real-fixture behavior, portable
+native filesystems, RSS/process-memory bounds, projection/pruning, or a supported segment/history
+maximum. The performance-related Phase 1 rows therefore remain evidence-limited rather than
+closed by this comparison.
+
 ## Task 6 recovery-byte accounting evidence (fresh, bounded)
 
 **Run date:** 2026-08-02. **Implementation revision:** `4b39f16`; the

@@ -5,7 +5,7 @@ are evidence pointers; [roadmap](roadmap.md) owns phase ordering.
 
 ## Overall state
 
-The current baseline is merged PR #53 commit `eb48519cd0368f2ec98316e3d9a8dbe9f8a27313`. The
+The current baseline is merged PR #55 commit `152373a0408b7e9f7c4479daf319ce58d61c70e7`. The
 [Phase 0 foundation audit](phase-0-audit.md) records the foundation as implemented within its named
 local bounds, with retained CI evidence. The [Phase 1 closeout ledger](phase-1-closeout-ledger.md)
 tracks the remaining finding-level acceptance and evidence obligations; it does not change this
@@ -35,7 +35,7 @@ single-process/shared-`Dataset` boundary.
 | Python | Proposed | PyO3 scaffolding exports only `placeholder_version`; no database API exists. |
 | Durability/recovery | Partial | File/directory durability, immutable row-ID high-water, manifest integrity, and crash/reopen evidence exist within named local bounds; full branch verification remains. |
 | Schema/migrations | Partial | Dataset-owned schema and strict validation are implemented; schema evolution and migration remain deferred. |
-| Loom/chaos/fuzz/bench evidence | Partial | Passing thorough-chaos evidence is local Ubuntu WSL only, not portable/native-platform or retained loom/chaos CI evidence; local fuzz build/smoke now passes, and the merged PR #53 fuzz-and-provenance job retained its CI artifact, while portable real-fixture performance bounds remain open. |
+| Loom/chaos/fuzz/bench evidence | Partial | The manual Ubuntu GitHub Actions run [30861009780](https://github.com/negexx/strataDB/actions/runs/30861009780) passed the named loom gates and thorough-chaos `2000/2000` seed gate; portable/native-platform and real-fixture performance bounds remain open. |
 | Compaction/GC | Proposed | No compaction, vacuum, orphan cleanup, or bounded history implementation. |
 | Cross-process coordination | Proposed | Independent openers do not share transaction state or durable conditional publication. |
 | Branching/object storage | Proposed | No branch/merge or object-store backend is implemented. |

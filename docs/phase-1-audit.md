@@ -11,8 +11,10 @@ source/tests as the anchor.
 
 ## Closeout baseline and ledger
 
-The closeout branch is synchronized through merged PR #50,
-`8cd7696fdcf34f6253fb11f9e110f6632bc872de` (`Merge Phase 1 audit remediation`). The
+The original remediation closeout was synchronized through merged PR #50,
+`8cd7696fdcf34f6253fb11f9e110f6632bc872de` (`Merge Phase 1 audit remediation`). The current
+evidence-finalization branch is based on merged PR #55, `152373a0408b7e9f7c4479daf319ce58d61c70e7`.
+The
 [Phase 1 closeout ledger](phase-1-closeout-ledger.md) is the mechanically scannable, row-per-finding
 record of current state, dependencies, acceptance assertions, and the future evidence required before
 this audit's verdict can change. It does not close Phase 1 or replace this audit as the controlling
@@ -65,10 +67,12 @@ packages are marked non-publishable. Task 7 now configures exact transaction and
 discovery, plus eight exact index loom models; checkpoint-abort and fast-chaos gates; and
 scheduled/manual thorough-chaos execution.
 Fresh Ubuntu WSL exact-model transaction loom evidence and Ubuntu WSL thorough-chaos evidence
-(`2000/2000` seeds with zero violations) now exist. Fuzz build/smoke now also passes locally;
-the merged PR #53 CI run also passed the declared fuzz-and-provenance job and retained
-`fuzz-provenance-30841989478-attempt-1`. Loom/chaos CI provenance and platform portability remain
-open. Task 8 now records bounded Windows synthetic segmented/lifecycle evidence with reproduction
+(`2000/2000` seeds with zero violations) now exist. Manual Ubuntu GitHub Actions run
+[30861009780](https://github.com/negexx/strataDB/actions/runs/30861009780) also passed the named
+loom and thorough-chaos gates. Fuzz build/smoke passes locally; the merged PR #53 CI run passed the
+declared fuzz-and-provenance job and retained `fuzz-provenance-30841989478-attempt-1`. Native
+platform coverage, branch-level CI provenance, and final verification remain open. Task 8 and the
+cloud comparison now record bounded synthetic segmented/lifecycle evidence with reproduction
 metadata; the optional real fixture, portable host matrix, and universal operating bounds remain
 open. This does not change the audit verdict from Partial and blocked.
 
@@ -172,11 +176,11 @@ consolidated register above; IDs marked "merged" retain the same evidence under 
 | ARCH-07 | Preserved as later Phase 2/6 work: backend abstraction is not threaded through all I/O. |
 | ARCH-08 | Preserved as later Phase 2 client work: CLI snapshot labels can disagree with displayed rows. |
 | VER-01 | Known counterexamples have targeted regression gates; complete branch verification remains. |
-| VER-02 | Merged with CONC-02: fresh Ubuntu WSL execution passed the nine production transaction models plus the separate compact semantic guard; CI execution/provenance remains pending. Phase 1 blocker. |
-| VER-03 | Merged with DUR-04: fresh Ubuntu WSL thorough chaos reached `2000/2000` seeds with zero violations; CI execution/provenance and portability remain pending. Phase 1 blocker. |
+| VER-02 | Merged with CONC-02: fresh Ubuntu WSL and manual Ubuntu GitHub Actions execution passed the nine production transaction models plus the separate compact semantic guard; native-platform and final verification remain pending. Phase 1 blocker. |
+| VER-03 | Merged with DUR-04: fresh Ubuntu WSL and manual Ubuntu GitHub Actions thorough chaos reached `2000/2000` seeds with zero violations; native-platform and final verification remain pending. Phase 1 blocker. |
 | VER-04 | Ubuntu WSL completed both declared nightly ASAN targets and deterministic parser smoke inputs with a stable fuzz lock hash; merged PR #53 also passed the declared fuzz-and-provenance job and retained `fuzz-provenance-30841989478-attempt-1`. Broader fuzz campaign and platform evidence remain open. |
-| VER-05 | The evidence workflow now pins action SHAs and nightly `2026-07-25`; the merged PR #53 fuzz job retained its execution/provenance artifact. Loom/chaos and broader platform/provenance evidence remain open. |
-| VER-06 | Preserved as Phase 1 measurement evidence blocker: bounded Windows synthetic inputs/results are recorded, but portable host/fixture provenance is still missing. |
+| VER-05 | The evidence workflow pins action SHAs and nightly `2026-07-25`; the merged PR #53 fuzz job retained its artifact, and the follow-up branch adds CI provenance retention. A successful branch CI run and broader platform/provenance evidence remain open. |
+| VER-06 | Preserved as a Phase 1 measurement evidence blocker: bounded Windows and Ubuntu cloud synthetic inputs/results are recorded, but portable native-host and real-fixture provenance is still missing. |
 | VER-07 | Merged with ARCH-04 and DUR-05: current docs now qualify intended guarantees and retain Partial status. |
 
 ## Evidence that must be preserved
