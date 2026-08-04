@@ -14,11 +14,18 @@ The comparison runs:
   retained-snapshot points (0/1/4/16/64 distinct snapshots), one excluded warmup, and five measured
   repetitions per point.
 
+When `STRATA_REAL_FIXTURE=1`, the runner additionally executes lifecycle/recovery accounting against
+the pinned 100,000-row fixture. This is a distinct bounded fixture protocol: 5,000 rows per commit
+(20 commits per lifecycle process), one retained snapshot, one excluded warmup, and five measured
+repetitions. It is intentionally separate from, and does not alter, the synthetic lifecycle matrix.
+
 Each run records the revision, lockfile hash, runner OS/architecture, toolchain, raw benchmark
 output, exact command/configuration provenance, fixture revision/size/SHA-256, seed, cache policy,
 repetitions, and a GNU time report. `summarize.py` emits machine-readable JSONL and CSV deltas only
-after verifying the complete like-for-like matrix. Fixture records are rejected unless they match the
-pinned Qdrant revision and SHA-256 exactly.
+after verifying the complete like-for-like matrix. Fixture segment and lifecycle records are rejected
+unless they match the pinned Qdrant revision and SHA-256 exactly; lifecycle evidence additionally
+requires the exact 100,000-row/5,000-row-batch protocol, complete input metadata, one GNU time RSS
+value, and equal input hashes before and after.
 
 The fixture identity is `Qdrant/dbpedia-entities-openai3-text-embedding-3-small-512-100K`, revision
 `56e6849a3d0f7913e56b475bf92c0064c93b576d`, file `data/train-00000-of-00001.parquet`, exactly
@@ -45,12 +52,14 @@ Set `STRATA_REAL_FIXTURE=1` and `STRATA_BENCH_FIXTURE=/path/to/train-00000-of-00
 add a real-fixture segmented `Dataset`/`Snapshot` run. Its row/query selection defaults to the
 bounded 256 rows and 16 queries; pass `STRATA_FIXTURE_SEG_ROWS=100000 STRATA_FIXTURE_SEG_QUERIES=200` for the
 full-fixture closeout run. The runner verifies the pinned identity, copies the fixture into each
-disposable worktree before its fixture benchmark, and writes a separate `fixture_segment_recall.env`
-beside the emitted fixture log. The current benches receive that copied path through
+disposable worktree before its fixture benchmark, and writes separate `fixture_segment_recall.env`
+and `fixture_lifecycle.env` files beside their emitted logs. The current benches receive that copied path through
 `STRATA_BENCH_FIXTURE`; they do not rely on a hard-coded worktree path. Synthetic and fixture records
 therefore remain distinct and both are validated against their emitted input-source metadata. Fixture
-records fail validation unless each revision loads the selected row/query count and both input hashes
-are identical. Synthetic benchmark behavior remains unchanged.
+segment records fail validation unless each revision loads the selected row/query count and both input
+hashes are identical. Fixture lifecycle records fail validation unless every run loads all 100,000 rows
+with the bounded batch protocol and both lifecycle input hashes are identical. Synthetic benchmark
+behavior remains unchanged.
 
 ## GitHub Actions
 

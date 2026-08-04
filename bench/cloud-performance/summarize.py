@@ -71,6 +71,34 @@ FIXTURE_PROVENANCE = {
     "fixture_size_bytes": "363758493",
     "fixture_sha256": "5ea400d91cba9b27fa55fc659e48f7bda8cba68443f087a15ddbc0e42acd049d",
 }
+FIXTURE_LIFECYCLE_PROTOCOL = {
+    "fixture_lifecycle_rows": "100000",
+    "fixture_lifecycle_batch_rows": "5000",
+    "fixture_lifecycle_pins": "1",
+    "fixture_lifecycle_warmup_runs": "1",
+    "fixture_lifecycle_repetitions": "5",
+    "fixture_lifecycle_protocol": "fixture-100000-rows-batch-5000-pins-1-warmups-1-repetitions-5",
+}
+EXPECTED_FIXTURE_LIFECYCLE_MEASUREMENTS = (
+    "excluded warmup 1/1; pins=1",
+    "measured repetition 1/5; pins=1",
+    "measured repetition 2/5; pins=1",
+    "measured repetition 3/5; pins=1",
+    "measured repetition 4/5; pins=1",
+    "measured repetition 5/5; pins=1",
+)
+EXPECTED_LIFECYCLE_PHASES = {
+    "ingest_commit",
+    "recovery_reopen",
+    "pinned_snapshot_cache_residency",
+    "full_scan",
+    "filtered_scan",
+    "group_by_4_aggs",
+    "vector_search_unfiltered",
+    "vector_search_filtered",
+    "vector_search_filtered_varying_predicate",
+    "concurrent_commits",
+}
 
 
 def _read(path: Path) -> str:
@@ -276,18 +304,28 @@ def _segment(
     return rows
 
 
-def _lifecycle(label: str, directory: Path, config: dict[str, str]) -> list[dict[str, Any]]:
-    text = _read(directory / "lifecycle.log")
-    base = _base(label, "lifecycle", directory / "lifecycle.time", config)
+def _lifecycle(
+    label: str, directory: Path, config: dict[str, str], benchmark: str = "lifecycle"
+) -> list[dict[str, Any]]:
+    text = _read(directory / f"{benchmark}.log")
+    base = _base(label, benchmark, directory / f"{benchmark}.time", config)
     input_hashes = sorted(set(re.findall(r"input hash=([0-9a-f]+)", text)))
     base["input_hashes"] = input_hashes
     samples: dict[str, list[float]] = {}
     blocks = re.split(r"(?=^================ StrataDB lifecycle)", text, flags=re.MULTILINE)
     for block in blocks:
-        measurement = LIFECYCLE_MEASUREMENT.search(block)
-        if not measurement or "measured repetition" not in measurement.group(1):
+        if not re.search(r"^================ StrataDB lifecycle", block, flags=re.MULTILINE):
             continue
-        pins_match = LIFECYCLE_PINS.search(measurement.group(1))
+        markers = LIFECYCLE_MEASUREMENT.findall(block)
+        if len(markers) != 1:
+            raise ValueError("lifecycle block must contain exactly one measurement marker")
+        measurement = markers[0].strip()
+        phase_names = [_lifecycle_phase_name(match) for match in LIFECYCLE_PHASE.finditer(block)]
+        if benchmark == "fixture_lifecycle" and Counter(phase_names) != Counter(EXPECTED_LIFECYCLE_PHASES):
+            raise ValueError("lifecycle block phases do not match the exact emitted set")
+        if "measured repetition" not in measurement:
+            continue
+        pins_match = LIFECYCLE_PINS.search(measurement)
         if not pins_match:
             raise ValueError("measured lifecycle block is missing pins=... metadata")
         pins = pins_match.group(1)
@@ -295,7 +333,7 @@ def _lifecycle(label: str, directory: Path, config: dict[str, str]) -> list[dict
         if manifest:
             samples.setdefault(f"lifecycle_pins{pins}_manifest_bytes", []).append(float(manifest.group(1)))
         for phase_match in LIFECYCLE_PHASE.finditer(block):
-            phase = re.sub(r"[^a-z0-9]+", "_", phase_match.group("phase").lower()).strip("_")
+            phase = _lifecycle_phase_name(phase_match)
             unit = phase_match.group("unit")
             factor = {"ns": 1e-6, "us": 1e-3, "ms": 1.0, "s": 1000.0}[unit]
             values = {
@@ -313,6 +351,10 @@ def _lifecycle(label: str, directory: Path, config: dict[str, str]) -> list[dict
     return rows
 
 
+def _lifecycle_phase_name(match: re.Match[str]) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", match.group("phase").lower()).strip("_")
+
+
 def summarize_directory(artifact: Path) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     for label in ("before", "after"):
@@ -326,6 +368,9 @@ def summarize_directory(artifact: Path) -> list[dict[str, Any]]:
         fixture_config = _load_config(directory, "fixture_segment_recall.env")
         if fixture_config:
             records.extend(_segment(label, directory, fixture_config, "fixture_segment_recall"))
+        fixture_lifecycle_config = _load_config(directory, "fixture_lifecycle.env")
+        if fixture_lifecycle_config:
+            records.extend(_lifecycle(label, directory, fixture_lifecycle_config, "fixture_lifecycle"))
     return records
 
 
@@ -378,6 +423,9 @@ def validate_records(records: list[dict[str, Any]], artifact: Path) -> None:
                 errors.append(f"{label}: config.env source must be synthetic")
             if config.get("fixture_evidence") not in {"requested", "not-requested"}:
                 errors.append(f"{label}: fixture_evidence must be requested or not-requested")
+            for key, expected in FIXTURE_LIFECYCLE_PROTOCOL.items():
+                if config.get(key) != expected:
+                    errors.append(f"{label}: {key} must equal {expected}")
         comparable_keys = sorted(set(configs["before"]) | set(configs["after"]))
         for key in comparable_keys:
             if key in {"label", "revision", "lockfile_sha256"}:
@@ -497,6 +545,9 @@ def validate_records(records: list[dict[str, Any]], artifact: Path) -> None:
     fixture_configs = {
         label: _load_config(artifact / label, "fixture_segment_recall.env") for label in by_label
     }
+    fixture_lifecycle_configs = {
+        label: _load_config(artifact / label, "fixture_lifecycle.env") for label in by_label
+    }
     fixture_requested = {label for label, config in configs.items() if config.get("fixture_evidence") == "requested"}
     if fixture_requested and fixture_requested != {"before", "after"}:
         errors.append("fixture_evidence must be requested for both before and after")
@@ -506,15 +557,22 @@ def validate_records(records: list[dict[str, Any]], artifact: Path) -> None:
         expected_status = "complete" if requested else "not-requested"
         if _exact_values(_read(directory / "fixture_segment_recall.status"), "fixture_status") != [expected_status]:
             errors.append(f"{label}: fixture_segment_recall.status must report {expected_status}")
+        if _exact_values(_read(directory / "fixture_lifecycle.status"), "fixture_status") != [expected_status]:
+            errors.append(f"{label}: fixture_lifecycle.status must report {expected_status}")
         paths = {
             "sidecar": directory / "fixture_segment_recall.env",
             "log": directory / "fixture_segment_recall.log",
             "time": directory / "fixture_segment_recall.time",
         }
+        lifecycle_paths = {
+            "sidecar": directory / "fixture_lifecycle.env",
+            "log": directory / "fixture_lifecycle.log",
+            "time": directory / "fixture_lifecycle.time",
+        }
         if not requested:
-            for name, path in paths.items():
+            for name, path in {**paths, **{f"lifecycle {name}": value for name, value in lifecycle_paths.items()}}.items():
                 if path.exists():
-                    errors.append(f"{label}: synthetic-only evidence must not include fixture_segment_recall {name}")
+                    errors.append(f"{label}: synthetic-only evidence must not include fixture evidence {name}")
             continue
         missing = [name for name, path in paths.items() if not path.is_file()]
         if missing:
@@ -587,11 +645,129 @@ def validate_records(records: list[dict[str, Any]], artifact: Path) -> None:
         elif any(row["max_rss_kb"] is None for row in fixture_rows):
             errors.append(f"{label}: missing fixture_segment_recall GNU time RSS metric")
         _validate_single_rss(directory, "fixture_segment_recall", label, errors)
+        missing = [name for name, path in lifecycle_paths.items() if not path.is_file()]
+        if missing:
+            errors.append(f"{label}: missing fixture_lifecycle {', '.join(missing)}")
+            continue
+        config = fixture_lifecycle_configs[label]
+        sidecar_text = _read(lifecycle_paths["sidecar"])
+        for key, value in config.items():
+            if _exact_values(sidecar_text, key) != [value]:
+                errors.append(f"{label}: fixture lifecycle sidecar must emit {key} exactly once")
+        if config.get("source") != "fixture":
+            errors.append(f"{label}: fixture lifecycle sidecar source must be fixture")
+        else:
+            try:
+                validate_fixture_provenance(config)
+            except ValueError as error:
+                errors.append(f"{label}: {error}")
+        for key in ("label", "revision", "lockfile_sha256"):
+            if config.get(key) != configs[label].get(key):
+                errors.append(f"{label}: fixture lifecycle sidecar {key} does not match config.env")
+        for sidecar_key, selected_key in (
+            ("lifecycle_rows", "fixture_lifecycle_rows"),
+            ("lifecycle_batch_rows", "fixture_lifecycle_batch_rows"),
+            ("lifecycle_pins", "fixture_lifecycle_pins"),
+            ("lifecycle_warmup_runs", "fixture_lifecycle_warmup_runs"),
+            ("lifecycle_repetitions", "fixture_lifecycle_repetitions"),
+            ("fixture_lifecycle_protocol", "fixture_lifecycle_protocol"),
+        ):
+            if config.get(sidecar_key) != configs[label].get(selected_key):
+                errors.append(
+                    f"{label}: fixture lifecycle sidecar {sidecar_key} does not match config.env"
+                )
+        fixture_log = _read(lifecycle_paths["log"])
+        _validate_raw_provenance(directory, "fixture_lifecycle", config, label, errors)
+        if _exact_values(fixture_log, "benchmark") != ["fixture_lifecycle"]:
+            errors.append(f"{label}: fixture_lifecycle.log must identify its benchmark exactly once")
+        for key in ("fixture_worktree_path", *FIXTURE_PROVENANCE):
+            if _exact_values(fixture_log, key) != [config.get(key)]:
+                errors.append(f"{label}: fixture_lifecycle emitted {key} does not match its sidecar")
+        expected_fixture_source = f"fixture {config.get('fixture_worktree_path', '')}"
+        if config.get("fixture_source") != expected_fixture_source:
+            errors.append(f"{label}: fixture lifecycle worktree path does not match fixture_source")
+        fixture_input_hash = config.get("fixture_input_hash")
+        if not fixture_input_hash:
+            errors.append(f"{label}: fixture lifecycle input hash must be non-empty")
+            continue
+        try:
+            fixture_pins = tuple(int(value) for value in config.get("lifecycle_pins", "").split(","))
+        except ValueError:
+            fixture_pins = ()
+        if fixture_pins != (1,):
+            errors.append(f"{label}: fixture lifecycle pins must equal 1")
+        expected_loading = (config.get("lifecycle_rows", "0"), "512", expected_fixture_source)
+        loadings = LIFECYCLE_LOADING.findall(fixture_log)
+        expected_samples = (
+            int(config.get("lifecycle_warmup_runs", "0"))
+            + int(config.get("lifecycle_repetitions", "0"))
+        ) * len(fixture_pins)
+        if (
+            len(loadings) != expected_samples
+            or any(loading[:3] != expected_loading or loading[3] != fixture_input_hash for loading in loadings)
+        ):
+            errors.append(f"{label}: fixture lifecycle input metadata does not match sidecar")
+        lifecycle_blocks = [
+            block
+            for block in re.split(r"(?=^================ StrataDB lifecycle)", fixture_log, flags=re.MULTILINE)
+            if re.search(r"^================ StrataDB lifecycle", block, flags=re.MULTILINE)
+        ]
+        measurements: list[str] = []
+        for block in lifecycle_blocks:
+            markers = LIFECYCLE_MEASUREMENT.findall(block)
+            if len(markers) != 1:
+                errors.append(f"{label}: each fixture lifecycle block must contain exactly one measurement marker")
+                continue
+            measurements.append(markers[0].strip())
+        if tuple(measurements) != EXPECTED_FIXTURE_LIFECYCLE_MEASUREMENTS:
+            errors.append(f"{label}: fixture lifecycle measurement protocol does not match the exact warmup/repetition sequence")
+        for block in lifecycle_blocks:
+            phases = [_lifecycle_phase_name(match) for match in LIFECYCLE_PHASE.finditer(block)]
+            phase_counts = Counter(phases)
+            expected_phase_counts = Counter(EXPECTED_LIFECYCLE_PHASES)
+            if phase_counts != expected_phase_counts:
+                missing_phases = sorted(expected_phase_counts - phase_counts)
+                unexpected_phases = sorted(phase_counts - expected_phase_counts)
+                errors.append(
+                    f"{label}: fixture lifecycle block phases must match the exact emitted set once; "
+                    f"missing={','.join(missing_phases) or 'none'}; "
+                    f"unexpected-or-duplicate={','.join(unexpected_phases) or 'none'}"
+                )
+        commit_counts = [int(value) for value in LIFECYCLE_INGEST_COMMITS.findall(fixture_log)]
+        rows_config = int(config.get("lifecycle_rows", "0"))
+        batch_rows = int(config.get("lifecycle_batch_rows", "1"))
+        expected_commits = (rows_config + batch_rows - 1) // batch_rows
+        if not commit_counts or any(count != expected_commits for count in commit_counts):
+            errors.append(f"{label}: fixture lifecycle commit count does not match configured batch size")
+        distinct_counts = [int(value) for _, value in LIFECYCLE_DISTINCT.findall(fixture_log)]
+        if sorted(set(distinct_counts)) != list(fixture_pins):
+            errors.append(f"{label}: fixture lifecycle distinct-snapshot counts do not match configured pins")
+        fixture_lifecycle_rows = [row for row in by_label[label] if row["benchmark"] == "fixture_lifecycle"]
+        metric = "lifecycle_pins1_ingest_commit_wall_ms"
+        metric_rows = [row for row in fixture_lifecycle_rows if row["metric"] == metric]
+        if not metric_rows:
+            errors.append(f"{label}: missing fixture_lifecycle/{metric}")
+        elif any(row.get("samples") != int(config.get("lifecycle_repetitions", "0")) for row in metric_rows):
+            errors.append(f"{label}: fixture lifecycle ingest metrics do not contain measured repetitions")
+        hashes = {tuple(row.get("input_hashes", [])) for row in fixture_lifecycle_rows}
+        if hashes != {(fixture_input_hash,)}:
+            errors.append(f"{label}: fixture lifecycle must contain exactly its sidecar input hash")
+        if any(row["max_rss_kb"] is None for row in fixture_lifecycle_rows):
+            errors.append(f"{label}: missing fixture_lifecycle GNU time RSS metric")
+        _validate_single_rss(directory, "fixture_lifecycle", label, errors)
     if fixture_requested == {"before", "after"}:
         before_hash = fixture_configs["before"].get("fixture_input_hash")
         after_hash = fixture_configs["after"].get("fixture_input_hash")
         if before_hash and after_hash and before_hash != after_hash:
             errors.append("before/after fixture_segment_recall input hashes differ")
+        before_lifecycle_hash = fixture_lifecycle_configs["before"].get("fixture_input_hash")
+        after_lifecycle_hash = fixture_lifecycle_configs["after"].get("fixture_input_hash")
+        if (
+            before_lifecycle_hash
+            and after_lifecycle_hash
+            and before_lifecycle_hash != after_lifecycle_hash
+        ):
+            errors.append("before/after fixture_lifecycle input hashes differ")
     if errors:
         raise ValueError("incomplete before/after evidence:\n" + "\n".join(errors))
 

@@ -2,12 +2,26 @@ import tempfile
 import unittest
 import subprocess
 import sys
+import re
 from pathlib import Path
 
 import summarize
 
 
 class SummarizeTests(unittest.TestCase):
+    LIFECYCLE_PHASE_LINES = (
+        "ingest+commit                    20.00ms       2.0MB       3.0MB      -1.0MB  fsync",
+        "recovery (reopen)                20.00ms       2.0MB       3.0MB      -1.0MB  I/O + validation",
+        "pinned snapshot/cache residency  20.00ms       2.0MB       3.0MB      -1.0MB  cache accounting",
+        "full scan                        20.00ms       2.0MB       3.0MB      -1.0MB  I/O",
+        "filtered scan                    20.00ms       2.0MB       3.0MB      -1.0MB  I/O + CPU",
+        "group-by (4 aggs)                20.00ms       2.0MB       3.0MB      -1.0MB  CPU",
+        "vector search (unfiltered)       20.00ms       2.0MB       3.0MB      -1.0MB  CPU",
+        "vector search (filtered)         20.00ms       2.0MB       3.0MB      -1.0MB  I/O + CPU",
+        "vector search (filtered, varying predicate) 20.00ms       2.0MB       3.0MB      -1.0MB  I/O + CPU",
+        "concurrent commits                20.00ms       2.0MB       3.0MB      -1.0MB  I/O",
+    )
+
     def _write_complete_configured_matrix(self, artifact: Path, fixture_evidence: str) -> None:
         config = f"""workload_signature=synthetic-seed-20260801-dim512-hnsw-M16-efc100-efsearch32-k10
 seed=20260801
@@ -34,6 +48,12 @@ lifecycle_batch_rows=1
 lifecycle_pins=0,1,4,16,64
 lifecycle_warmup_runs=1
 lifecycle_repetitions=5
+fixture_lifecycle_rows=100000
+fixture_lifecycle_batch_rows=5000
+fixture_lifecycle_pins=1
+fixture_lifecycle_warmup_runs=1
+fixture_lifecycle_repetitions=5
+fixture_lifecycle_protocol=fixture-100000-rows-batch-5000-pins-1-warmups-1-repetitions-5
 command_manifest=manifest
 command_segment=segment
 command_lifecycle=lifecycle
@@ -117,6 +137,74 @@ command_lifecycle=lifecycle
                 (directory / "fixture_segment_recall.status").write_text(
                     "fixture_status=not-requested\n", encoding="utf-8"
                 )
+                (directory / "fixture_lifecycle.status").write_text(
+                    "fixture_status=not-requested\n", encoding="utf-8"
+                )
+
+    def _write_fixture_lifecycle_evidence(
+        self,
+        artifact: Path,
+        label: str,
+        *,
+        path: str,
+        input_hash: str,
+    ) -> None:
+        directory = artifact / label
+        config = {
+            "label": label,
+            "revision": "a" if label == "before" else "b",
+            "lockfile_sha256": "lock",
+            "source": "fixture",
+            **summarize.FIXTURE_PROVENANCE,
+            "fixture_worktree_path": path,
+            "fixture_source": f"fixture {path}",
+            "fixture_input_hash": input_hash,
+            "lifecycle_rows": "100000",
+            "lifecycle_batch_rows": "5000",
+            "lifecycle_pins": "1",
+            "lifecycle_warmup_runs": "1",
+            "lifecycle_repetitions": "5",
+            "fixture_lifecycle_protocol": "fixture-100000-rows-batch-5000-pins-1-warmups-1-repetitions-5",
+        }
+        (directory / "fixture_lifecycle.env").write_text(
+            "".join(f"{key}={value}\n" for key, value in config.items()), encoding="utf-8"
+        )
+        log = [
+            f"label={label}",
+            f"revision={config['revision']}",
+            "lockfile_sha256=lock",
+            "benchmark=fixture_lifecycle",
+            *(f"{key}={value}" for key, value in summarize.FIXTURE_PROVENANCE.items()),
+            f"fixture_worktree_path={path}",
+        ]
+        for measurement in ("excluded warmup 1/1; pins=1", *(f"measured repetition {i}/5; pins=1" for i in range(1, 6))):
+            log.extend(
+                [
+                    "================ StrataDB lifecycle â€” 100000 rows x 512-dim ================",
+                    "ingest+commit                    20.00ms       2.0MB       3.0MB      -1.0MB  fsync",
+                    "recovery (reopen)                10.00ms       1.0MB       2.0MB      -0.5MB  I/O + validation",
+                    "pinned snapshot/cache residency   1.00ms       0.1MB       0.2MB      -0.1MB  direct retained payloads",
+                    "full scan                          5.00ms       1.0MB       1.5MB      -0.2MB  I/O",
+                    "filtered scan                      2.00ms       0.2MB       0.3MB      -0.1MB  I/O + CPU",
+                    "group-by (4 aggs)                  1.00ms       0.1MB       0.2MB      -0.1MB  CPU",
+                    "vector search (unfiltered)         3.00ms       0.2MB       0.3MB      -0.1MB  CPU",
+                    "vector search (filtered)           4.00ms       0.2MB       0.3MB      -0.1MB  I/O-bound",
+                    "vector search (filtered, varying predicate) 4.00ms       0.2MB       0.3MB      -0.1MB  I/O-bound",
+                    "concurrent commits                  8.00ms       0.3MB       0.4MB      -0.1MB  I/O-bound",
+                    "                            20 commits, 5000 rows/s, 1.00 ms/commit",
+                    "1 retained handles (1 distinct snapshots; operational current snapshot excluded);",
+                    f"loading 100000 rows (512-dim) from fixture {path}; input hash={input_hash}",
+                    f"measurement             : {measurement}",
+                    "newest manifest bytes  : 200",
+                ]
+            )
+        (directory / "fixture_lifecycle.log").write_text("\n".join(log), encoding="utf-8")
+        (directory / "fixture_lifecycle.time").write_text(
+            "Maximum resident set size (kbytes): 1234\n", encoding="utf-8"
+        )
+        (directory / "fixture_lifecycle.status").write_text(
+            "fixture_status=complete\n", encoding="utf-8"
+        )
 
     def _write_fixture_evidence(
         self,
@@ -127,6 +215,7 @@ command_lifecycle=lifecycle
         input_hash: str = "f1a2ce123",
         rows: str = "256",
         queries: str = "16",
+        include_lifecycle: bool = True,
     ) -> None:
         directory = artifact / label
         fixture_path = path or f"/worktrees/{label}/bench/data/dbpedia-openai-100k.parquet"
@@ -181,6 +270,10 @@ command_lifecycle=lifecycle
         (directory / "fixture_segment_recall.status").write_text(
             "fixture_status=complete\n", encoding="utf-8"
         )
+        if include_lifecycle:
+            self._write_fixture_lifecycle_evidence(
+                artifact, label, path=fixture_path, input_hash=input_hash
+            )
 
     def test_fixture_provenance_rejects_missing_pinned_sha256(self):
         config = {
@@ -344,6 +437,12 @@ lifecycle_batch_rows=1
 lifecycle_pins=0,1,4,16,64
 lifecycle_warmup_runs=1
 lifecycle_repetitions=5
+fixture_lifecycle_rows=100000
+fixture_lifecycle_batch_rows=5000
+fixture_lifecycle_pins=1
+fixture_lifecycle_warmup_runs=1
+fixture_lifecycle_repetitions=5
+fixture_lifecycle_protocol=fixture-100000-rows-batch-5000-pins-1-warmups-1-repetitions-5
 command_manifest=manifest
 command_segment=segment
 command_lifecycle=lifecycle
@@ -357,6 +456,9 @@ command_lifecycle=lifecycle
                     "lockfile_sha256=lock",
                 ]
                 (directory / "fixture_segment_recall.status").write_text(
+                    "fixture_status=not-requested\n", encoding="utf-8"
+                )
+                (directory / "fixture_lifecycle.status").write_text(
                     "fixture_status=not-requested\n", encoding="utf-8"
                 )
                 (directory / "config.env").write_text(
@@ -497,6 +599,142 @@ command_lifecycle=lifecycle
             self.assertTrue(
                 any(row["benchmark"] == "fixture_segment_recall" for row in records)
             )
+
+    def test_validation_rejects_requested_fixture_without_lifecycle_artifacts(self):
+        with tempfile.TemporaryDirectory() as root:
+            artifact = Path(root)
+            self._write_complete_configured_matrix(artifact, "requested")
+            for label in ("before", "after"):
+                self._write_fixture_evidence(artifact, label, include_lifecycle=False)
+
+            with self.assertRaisesRegex(ValueError, "fixture_lifecycle"):
+                summarize.validate_records(summarize.summarize_directory(artifact), artifact)
+
+    def test_validation_rejects_fixture_lifecycle_hash_mismatch_between_revisions(self):
+        with tempfile.TemporaryDirectory() as root:
+            artifact = Path(root)
+            self._write_complete_configured_matrix(artifact, "requested")
+            for label in ("before", "after"):
+                self._write_fixture_evidence(artifact, label)
+            after = artifact / "after"
+            for filename in ("fixture_lifecycle.env", "fixture_lifecycle.log"):
+                path = after / filename
+                path.write_text(
+                    path.read_text(encoding="utf-8").replace("f1a2ce123", "d4e5fa678"),
+                    encoding="utf-8",
+                )
+
+            with self.assertRaisesRegex(
+                ValueError, "before/after fixture_lifecycle input hashes differ"
+            ):
+                summarize.validate_records(summarize.summarize_directory(artifact), artifact)
+
+    def test_validation_rejects_fixture_lifecycle_measurement_sequence_mismatch(self):
+        with tempfile.TemporaryDirectory() as root:
+            artifact = Path(root)
+            self._write_complete_configured_matrix(artifact, "requested")
+            for label in ("before", "after"):
+                self._write_fixture_evidence(artifact, label)
+            path = artifact / "before" / "fixture_lifecycle.log"
+            path.write_text(
+                path.read_text(encoding="utf-8").replace(
+                    "measured repetition 2/5; pins=1", "measured repetition 1/5; pins=1", 1
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "measurement protocol"):
+                summarize.validate_records(summarize.summarize_directory(artifact), artifact)
+
+    def test_validation_rejects_truncated_fixture_lifecycle_phases(self):
+        with tempfile.TemporaryDirectory() as root:
+            artifact = Path(root)
+            self._write_complete_configured_matrix(artifact, "requested")
+            for label in ("before", "after"):
+                self._write_fixture_evidence(artifact, label)
+            path = artifact / "before" / "fixture_lifecycle.log"
+            lines = [
+                line
+                for line in path.read_text(encoding="utf-8").splitlines()
+                if not line.startswith("recovery (reopen)")
+            ]
+            path.write_text("\n".join(lines), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "exact emitted set"):
+                summarize.validate_records(summarize.summarize_directory(artifact), artifact)
+
+    def test_validation_rejects_duplicate_fixture_lifecycle_phase(self):
+        with tempfile.TemporaryDirectory() as root:
+            artifact = Path(root)
+            self._write_complete_configured_matrix(artifact, "requested")
+            for label in ("before", "after"):
+                self._write_fixture_evidence(artifact, label)
+            path = artifact / "before" / "fixture_lifecycle.log"
+            text = path.read_text(encoding="utf-8")
+            duplicate = "recovery (reopen)                10.00ms       1.0MB       2.0MB      -0.5MB  I/O + validation"
+            path.write_text(text.replace(duplicate, f"{duplicate}\n{duplicate}", 1), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "exact emitted set"):
+                summarize.validate_records(summarize.summarize_directory(artifact), artifact)
+
+    def test_validation_rejects_unexpected_fixture_lifecycle_phase(self):
+        with tempfile.TemporaryDirectory() as root:
+            artifact = Path(root)
+            self._write_complete_configured_matrix(artifact, "requested")
+            for label in ("before", "after"):
+                self._write_fixture_evidence(artifact, label)
+            path = artifact / "before" / "fixture_lifecycle.log"
+            text = path.read_text(encoding="utf-8")
+            extra = "unexpected phase                    1.00ms       0.1MB       0.2MB      -0.1MB  forged"
+            path.write_text(text.replace("newest manifest bytes  : 200", f"{extra}\nnewest manifest bytes  : 200", 1), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "exact emitted set"):
+                summarize.validate_records(summarize.summarize_directory(artifact), artifact)
+
+    def test_validation_rejects_duplicate_fixture_lifecycle_measurement_marker(self):
+        with tempfile.TemporaryDirectory() as root:
+            artifact = Path(root)
+            self._write_complete_configured_matrix(artifact, "requested")
+            for label in ("before", "after"):
+                self._write_fixture_evidence(artifact, label)
+            path = artifact / "before" / "fixture_lifecycle.log"
+            text = path.read_text(encoding="utf-8")
+            marker = "measurement             : excluded warmup 1/1; pins=1"
+            path.write_text(text.replace(marker, f"{marker}\n{marker}", 1), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "exactly one measurement marker"):
+                summarize.validate_records(summarize.summarize_directory(artifact), artifact)
+
+    def test_validation_rejects_empty_fixture_lifecycle_block(self):
+        with tempfile.TemporaryDirectory() as root:
+            artifact = Path(root)
+            self._write_complete_configured_matrix(artifact, "requested")
+            for label in ("before", "after"):
+                self._write_fixture_evidence(artifact, label)
+            path = artifact / "before" / "fixture_lifecycle.log"
+            text = path.read_text(encoding="utf-8")
+            header = "================ StrataDB lifecycle — forged empty block ================"
+            path.write_text(f"{text}\n{header}\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "exactly one measurement marker"):
+                summarize.validate_records(summarize.summarize_directory(artifact), artifact)
+
+    def test_summarization_rejects_empty_measured_fixture_lifecycle_block(self):
+        with tempfile.TemporaryDirectory() as root:
+            artifact = Path(root)
+            self._write_complete_configured_matrix(artifact, "requested")
+            for label in ("before", "after"):
+                self._write_fixture_evidence(artifact, label)
+            path = artifact / "before" / "fixture_lifecycle.log"
+            text = path.read_text(encoding="utf-8")
+            forged = (
+                "================ StrataDB lifecycle — forged measured block ================\n"
+                "measurement             : measured repetition 6/5; pins=1\n"
+            )
+            path.write_text(f"{text}\n{forged}", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "exact emitted set"):
+                summarize.summarize_directory(artifact)
 
     def test_validation_accepts_selected_full_fixture_for_both_revisions(self):
         with tempfile.TemporaryDirectory() as root:
