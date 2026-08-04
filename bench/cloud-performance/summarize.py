@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import csv
 import json
 import re
@@ -37,7 +38,7 @@ LIFECYCLE_PHASE = re.compile(
     r"(?P<live>[-+]?[0-9.]+)MB\s+",
     re.MULTILINE,
 )
-LIFECYCLE_LOADING = re.compile(r"loading (\d+) rows \((\d+)-dim\) from ([^;]+); input hash=")
+LIFECYCLE_LOADING = re.compile(r"loading (\d+) rows \((\d+)-dim\) from ([^;]+); input hash=([0-9a-f]+)")
 LIFECYCLE_INGEST_COMMITS = re.compile(r"(?m)^\s*(\d+) commits, [^\n]+$")
 LIFECYCLE_DISTINCT = re.compile(r"(\d+) retained handles \((\d+) distinct snapshots;")
 MANIFEST_INPUT = re.compile(
@@ -46,13 +47,30 @@ MANIFEST_INPUT = re.compile(
 SEGMENT_HEADER = re.compile(r"(\d+) rows x (\d+)-dim, k=(\d+), ef_search=(\d+)")
 SEGMENT_PARAMS = re.compile(r"M=(\d+), ef_construction=(\d+), max_layer=(\d+)")
 SEGMENT_QUERIES = re.compile(r"computing exact ground truth for (\d+) queries")
-SEGMENT_LOADING = re.compile(r"loaded (\d+) rows from ([^;]+); input hash=")
+SEGMENT_LOADING = re.compile(r"loaded (\d+) rows from ([^;]+); input hash=([0-9a-f]+)")
 SEGMENT_QUERY_POLICY = re.compile(
     r"query policy: (\d+) full unfiltered\+filtered warmup sweep\(s\), "
     r"then (\d+) measured sweep\(s\) per K"
 )
 EXPECTED_SEGMENTS = (1, 2, 4, 8, 16, 32, 64)
+EXPECTED_SEGMENT_MODES = ("unfiltered", "filtered")
+SEGMENT_METRIC_SUFFIXES = (
+    "recall_median",
+    "recall_p95",
+    "us_per_query_median",
+    "us_per_query_p95",
+    "qps_median",
+    "qps_p95",
+)
 EXPECTED_PINS = (0, 1, 4, 16, 64)
+RAW_PROVENANCE_KEYS = ("label", "revision", "lockfile_sha256")
+FIXTURE_PROVENANCE = {
+    "fixture_repo": "Qdrant/dbpedia-entities-openai3-text-embedding-3-small-512-100K",
+    "fixture_revision": "56e6849a3d0f7913e56b475bf92c0064c93b576d",
+    "fixture_file": "data/train-00000-of-00001.parquet",
+    "fixture_size_bytes": "363758493",
+    "fixture_sha256": "5ea400d91cba9b27fa55fc659e48f7bda8cba68443f087a15ddbc0e42acd049d",
+}
 
 
 def _read(path: Path) -> str:
@@ -65,8 +83,8 @@ def _summary(values: list[float]) -> tuple[float, float]:
     return statistics.median(ordered), ordered[p95_index]
 
 
-def _load_config(directory: Path) -> dict[str, str]:
-    config_path = directory / "config.env"
+def _load_config(directory: Path, name: str = "config.env") -> dict[str, str]:
+    config_path = directory / name
     if not config_path.is_file():
         return {}
     config: dict[str, str] = {}
@@ -75,6 +93,112 @@ def _load_config(directory: Path) -> dict[str, str]:
             key, value = line.split("=", 1)
             config[key] = value
     return config
+
+
+def _log_values(text: str, key: str) -> list[str]:
+    return re.findall(rf"(?m)^{re.escape(key)}=(.*)$", text)
+
+
+def validate_fixture_provenance(config: dict[str, str]) -> None:
+    """Reject fixture measurements that do not name the pinned input exactly."""
+    if config.get("source") != "fixture":
+        return
+    for key, expected in FIXTURE_PROVENANCE.items():
+        if config.get(key) != expected:
+            raise ValueError(f"fixture provenance {key!r} must equal the pinned value")
+
+
+def _exact_values(text: str, key: str) -> list[str]:
+    return _log_values(text, key)
+
+
+def _validate_raw_provenance(
+    directory: Path, benchmark: str, config: dict[str, str], label: str, errors: list[str]
+) -> None:
+    text = _read(directory / f"{benchmark}.log")
+    for key in RAW_PROVENANCE_KEYS:
+        if _exact_values(text, key) != [config.get(key)]:
+            errors.append(
+                f"{label}: {benchmark}.log must emit {key} exactly once matching config.env"
+            )
+
+
+def _configured_points(
+    config: dict[str, str], key: str, expected: tuple[int, ...], label: str, errors: list[str]
+) -> tuple[int, ...]:
+    try:
+        points = tuple(int(value) for value in config.get(key, "").split(","))
+    except ValueError:
+        points = ()
+    if points != expected:
+        errors.append(f"{label}: {key} must equal {','.join(map(str, expected))}")
+    return expected
+
+
+def _validate_segment_log(
+    text: str,
+    config: dict[str, str],
+    expected_source: str,
+    label: str,
+    benchmark: str,
+    errors: list[str],
+    expected_hash: str | None = None,
+) -> None:
+    loadings = SEGMENT_LOADING.findall(text)
+    expected_rows = config.get("segment_rows", "0")
+    if len(loadings) != 1 or loadings[0][:2] != (expected_rows, expected_source):
+        errors.append(f"{label}: {benchmark} input metadata does not match config exactly once")
+    hashes = re.findall(r"input hash=([0-9a-f]+)", text)
+    expected_hashes = [expected_hash] if expected_hash is not None else [loadings[0][2]] if len(loadings) == 1 else []
+    if hashes != expected_hashes:
+        hash_name = "fixture_input_hash" if expected_hash is not None else "input hash"
+        errors.append(f"{label}: {benchmark} must emit exactly one consistent {hash_name}")
+    expected_header = (
+        int(config.get("segment_rows", "0")),
+        int(config.get("segment_dimension", "0")),
+        int(config.get("segment_k", "0")),
+        int(config.get("segment_ef_search", "0")),
+    )
+    if SEGMENT_HEADER.findall(text) != [tuple(map(str, expected_header))]:
+        errors.append(f"{label}: {benchmark} vector shape does not match config exactly once")
+    expected_params = (
+        int(config.get("segment_m", "0")),
+        int(config.get("segment_ef_construction", "0")),
+        int(config.get("segment_max_layer", "0")),
+    )
+    if SEGMENT_PARAMS.findall(text) != [tuple(map(str, expected_params))]:
+        errors.append(f"{label}: {benchmark} HNSW parameters do not match config exactly once")
+    expected_queries = str(config.get("segment_queries", "0"))
+    if SEGMENT_QUERIES.findall(text) != [expected_queries]:
+        errors.append(f"{label}: {benchmark} query count does not match config exactly once")
+    expected_policy = (
+        str(config.get("segment_warmup_runs", "0")),
+        str(config.get("segment_repetitions", "0")),
+    )
+    if SEGMENT_QUERY_POLICY.findall(text) != [expected_policy]:
+        errors.append(f"{label}: {benchmark} warmup/repetition policy does not match config exactly once")
+
+
+def _validate_segment_matrix(
+    rows: list[dict[str, Any]], label: str, benchmark: str, points: tuple[int, ...], errors: list[str]
+) -> None:
+    expected = Counter(
+        f"segment_k{point}_{mode}_{suffix}"
+        for point in points
+        for mode in EXPECTED_SEGMENT_MODES
+        for suffix in SEGMENT_METRIC_SUFFIXES
+    )
+    actual = Counter(row["metric"] for row in rows if row["benchmark"] == benchmark)
+    if actual != expected:
+        missing = sorted((expected - actual).elements())
+        duplicate_or_unexpected = sorted((actual - expected).elements())
+        details = ", ".join(missing + duplicate_or_unexpected)
+        errors.append(f"{label}: incomplete {benchmark} segment metric matrix: {details}")
+
+
+def _validate_single_rss(directory: Path, benchmark: str, label: str, errors: list[str]) -> None:
+    if len(RSS.findall(_read(directory / f"{benchmark}.time"))) != 1:
+        errors.append(f"{label}: {benchmark}.time must contain exactly one GNU time RSS metric")
 
 
 def _base(label: str, benchmark: str, time_path: Path, config: dict[str, str]) -> dict[str, Any]:
@@ -121,12 +245,14 @@ def _manifest(label: str, directory: Path, config: dict[str, str]) -> list[dict[
     return rows
 
 
-def _segment(label: str, directory: Path, config: dict[str, str]) -> list[dict[str, Any]]:
-    text = _read(directory / "segment_recall.log")
+def _segment(
+    label: str, directory: Path, config: dict[str, str], benchmark: str = "segment_recall"
+) -> list[dict[str, Any]]:
+    text = _read(directory / f"{benchmark}.log")
     mode = None
     rows: list[dict[str, Any]] = []
     input_hashes = sorted(set(re.findall(r"input hash=([0-9a-f]+)", text)))
-    base = _base(label, "segment_recall", directory / "segment_recall.time", config)
+    base = _base(label, benchmark, directory / f"{benchmark}.time", config)
     base["input_hashes"] = input_hashes
     for line in text.splitlines():
         if line.startswith("unfiltered query results"):
@@ -197,6 +323,9 @@ def summarize_directory(artifact: Path) -> list[dict[str, Any]]:
         records.extend(_manifest(label, directory, config))
         records.extend(_segment(label, directory, config))
         records.extend(_lifecycle(label, directory, config))
+        fixture_config = _load_config(directory, "fixture_segment_recall.env")
+        if fixture_config:
+            records.extend(_segment(label, directory, fixture_config, "fixture_segment_recall"))
     return records
 
 
@@ -236,6 +365,19 @@ def validate_records(records: list[dict[str, Any]], artifact: Path) -> None:
     if not configs["before"] or not configs["after"]:
         errors.append("both before/config.env and after/config.env are required")
     else:
+        for label, config in configs.items():
+            config_text = _read(artifact / label / "config.env")
+            for key, value in config.items():
+                if _exact_values(config_text, key) != [value]:
+                    errors.append(f"{label}: config.env must emit {key} exactly once")
+            try:
+                validate_fixture_provenance(config)
+            except ValueError as error:
+                errors.append(f"{label}: {error}")
+            if config.get("source") != "synthetic":
+                errors.append(f"{label}: config.env source must be synthetic")
+            if config.get("fixture_evidence") not in {"requested", "not-requested"}:
+                errors.append(f"{label}: fixture_evidence must be requested or not-requested")
         comparable_keys = sorted(set(configs["before"]) | set(configs["after"]))
         for key in comparable_keys:
             if key in {"label", "revision", "lockfile_sha256"}:
@@ -245,17 +387,22 @@ def validate_records(records: list[dict[str, Any]], artifact: Path) -> None:
     for label, rows in by_label.items():
         directory = artifact / label
         config = configs[label]
-        for benchmark in tuple(f"manifest_growth_{point}" for point in (1, 10, 20, 40, 80, 160)) + (
+        manifest_points = _configured_points(
+            config, "manifest_points", (1, 10, 20, 40, 80, 160), label, errors
+        )
+        segment_points = _configured_points(config, "segment_points", EXPECTED_SEGMENTS, label, errors)
+        lifecycle_pins = _configured_points(config, "lifecycle_pins", EXPECTED_PINS, label, errors)
+        for benchmark in tuple(f"manifest_growth_{point}" for point in manifest_points) + (
             "segment_recall",
             "lifecycle",
         ):
+            _validate_raw_provenance(directory, benchmark, config, label, errors)
             for suffix in (".log", ".time"):
                 if not (directory / f"{benchmark}{suffix}").is_file():
                     errors.append(f"{label}: missing {benchmark}{suffix}")
             if not any(row["benchmark"] == benchmark for row in rows):
                 errors.append(f"{label}: no parsed metrics for {benchmark}")
-        metrics = {row["metric"] for row in rows}
-        for point in (1, 10, 20, 40, 80, 160):
+        for point in manifest_points:
             for metric in ("wall_ms", "manifest_bytes"):
                 benchmark = f"manifest_growth_{point}"
                 point_rows = [
@@ -266,49 +413,20 @@ def validate_records(records: list[dict[str, Any]], artifact: Path) -> None:
                 elif any(row.get("variance") is None for row in point_rows):
                     errors.append(f"{label}: missing variance for {benchmark}/{metric}")
             manifest_text = _read(directory / f"manifest_growth_{point}.log")
-            manifest_input = MANIFEST_INPUT.search(manifest_text)
+            manifest_inputs = MANIFEST_INPUT.findall(manifest_text)
             expected_manifest = (
                 point,
                 int(config.get("manifest_warmup_runs", "0")),
                 int(config.get("manifest_repetitions", "0")),
             )
-            if not manifest_input or tuple(map(int, manifest_input.groups())) != expected_manifest:
+            if manifest_inputs != [tuple(map(str, expected_manifest))]:
                 errors.append(f"{label}: manifest_growth_{point} emitted protocol does not match config")
         segment_text = _read(directory / "segment_recall.log")
-        segment_loading = SEGMENT_LOADING.search(segment_text)
-        segment_header = SEGMENT_HEADER.search(segment_text)
-        segment_params = SEGMENT_PARAMS.search(segment_text)
-        segment_queries = SEGMENT_QUERIES.search(segment_text)
-        segment_query_policy = SEGMENT_QUERY_POLICY.search(segment_text)
         expected_source = f"synthetic seed={config.get('seed', '')}"
-        if not segment_loading or (
-            segment_loading.group(1) != config.get("segment_rows", "0")
-            or segment_loading.group(2) != expected_source
-        ):
-            errors.append(f"{label}: segment input metadata does not match config")
-        expected_segment = (
-            int(config.get("segment_rows", "0")),
-            int(config.get("segment_dimension", "0")),
-            int(config.get("segment_k", "0")),
-            int(config.get("segment_ef_search", "0")),
+        _validate_segment_log(
+            segment_text, config, expected_source, label, "segment_recall", errors
         )
-        if not segment_header or tuple(map(int, segment_header.groups())) != expected_segment:
-            errors.append(f"{label}: segment header does not match configured rows/dimension/k/ef_search")
-        expected_params = (
-            int(config.get("segment_m", "0")),
-            int(config.get("segment_ef_construction", "0")),
-            int(config.get("segment_max_layer", "0")),
-        )
-        if not segment_params or tuple(map(int, segment_params.groups())) != expected_params:
-            errors.append(f"{label}: segment HNSW parameters do not match the configured workload")
-        if not segment_queries or int(segment_queries.group(1)) != int(config.get("segment_queries", "0")):
-            errors.append(f"{label}: segment query count does not match config")
-        expected_query_policy = (
-            int(config.get("segment_warmup_runs", "0")),
-            int(config.get("segment_repetitions", "0")),
-        )
-        if not segment_query_policy or tuple(map(int, segment_query_policy.groups())) != expected_query_policy:
-            errors.append(f"{label}: segment warmup/repetition policy does not match config")
+        _validate_segment_matrix(rows, label, "segment_recall", segment_points, errors)
         lifecycle_text = _read(directory / "lifecycle.log")
         loadings = LIFECYCLE_LOADING.findall(lifecycle_text)
         expected_loading = (
@@ -316,7 +434,15 @@ def validate_records(records: list[dict[str, Any]], artifact: Path) -> None:
             "512",
             expected_source,
         )
-        if not loadings or any(loading != expected_loading for loading in loadings):
+        expected_lifecycle_samples = (
+            int(config.get("lifecycle_warmup_runs", "0"))
+            + int(config.get("lifecycle_repetitions", "0"))
+        ) * len(lifecycle_pins)
+        if (
+            len(loadings) != expected_lifecycle_samples
+            or any(loading[:3] != expected_loading for loading in loadings)
+            or len({loading[3] for loading in loadings}) != 1
+        ):
             errors.append(f"{label}: lifecycle input metadata does not match config")
         commit_counts = [int(value) for value in LIFECYCLE_INGEST_COMMITS.findall(lifecycle_text)]
         lifecycle_rows_config = int(config.get("lifecycle_rows", "0"))
@@ -325,15 +451,9 @@ def validate_records(records: list[dict[str, Any]], artifact: Path) -> None:
         if not commit_counts or any(count != expected_commits for count in commit_counts):
             errors.append(f"{label}: lifecycle commit count does not match configured batch size")
         distinct_counts = [int(value) for _, value in LIFECYCLE_DISTINCT.findall(lifecycle_text)]
-        expected_distinct = sorted(int(value) for value in config.get("lifecycle_pins", "").split(","))
-        if sorted(set(distinct_counts)) != expected_distinct:
+        if sorted(set(distinct_counts)) != list(lifecycle_pins):
             errors.append(f"{label}: lifecycle distinct-snapshot counts do not match configured pins")
-        for segment in EXPECTED_SEGMENTS:
-            for mode in ("unfiltered", "filtered"):
-                metric = f"segment_k{segment}_{mode}_us_per_query_median"
-                if metric not in metrics:
-                    errors.append(f"{label}: missing segment_recall/{metric}")
-        for pins in EXPECTED_PINS:
+        for pins in lifecycle_pins:
             metric = f"lifecycle_pins{pins}_ingest_commit_wall_ms"
             lifecycle_rows = [
                 row for row in rows if row["benchmark"] == "lifecycle" and row["metric"] == metric
@@ -346,12 +466,13 @@ def validate_records(records: list[dict[str, Any]], artifact: Path) -> None:
                     errors.append(
                         f"{label}: lifecycle/{metric} does not contain {expected_samples} measured repetitions"
                     )
-        for benchmark in tuple(f"manifest_growth_{point}" for point in (1, 10, 20, 40, 80, 160)) + (
+        for benchmark in tuple(f"manifest_growth_{point}" for point in manifest_points) + (
             "segment_recall",
             "lifecycle",
         ):
             if not any(row["benchmark"] == benchmark and row["max_rss_kb"] is not None for row in rows):
                 errors.append(f"{label}: missing GNU time RSS metric for {benchmark}")
+            _validate_single_rss(directory, benchmark, label, errors)
         for benchmark in ("segment_recall", "lifecycle"):
             hashes = {
                 tuple(row.get("input_hashes", []))
@@ -373,6 +494,98 @@ def validate_records(records: list[dict[str, Any]], artifact: Path) -> None:
         }
         if before_hashes != after_hashes:
             errors.append(f"before/after input hashes differ for {benchmark}")
+    fixture_configs = {
+        label: _load_config(artifact / label, "fixture_segment_recall.env") for label in by_label
+    }
+    fixture_requested = {label for label, config in configs.items() if config.get("fixture_evidence") == "requested"}
+    if fixture_requested and fixture_requested != {"before", "after"}:
+        errors.append("fixture_evidence must be requested for both before and after")
+    for label in by_label:
+        directory = artifact / label
+        requested = configs[label].get("fixture_evidence") == "requested"
+        expected_status = "complete" if requested else "not-requested"
+        if _exact_values(_read(directory / "fixture_segment_recall.status"), "fixture_status") != [expected_status]:
+            errors.append(f"{label}: fixture_segment_recall.status must report {expected_status}")
+        paths = {
+            "sidecar": directory / "fixture_segment_recall.env",
+            "log": directory / "fixture_segment_recall.log",
+            "time": directory / "fixture_segment_recall.time",
+        }
+        if not requested:
+            for name, path in paths.items():
+                if path.exists():
+                    errors.append(f"{label}: synthetic-only evidence must not include fixture_segment_recall {name}")
+            continue
+        missing = [name for name, path in paths.items() if not path.is_file()]
+        if missing:
+            errors.append(f"{label}: missing fixture_segment_recall {', '.join(missing)}")
+            continue
+        config = fixture_configs[label]
+        sidecar_text = _read(paths["sidecar"])
+        for key, value in config.items():
+            if _exact_values(sidecar_text, key) != [value]:
+                errors.append(f"{label}: fixture sidecar must emit {key} exactly once")
+        if config.get("source") != "fixture":
+            errors.append(f"{label}: fixture sidecar source must be fixture")
+        else:
+            try:
+                validate_fixture_provenance(config)
+            except ValueError as error:
+                errors.append(f"{label}: {error}")
+        for key in (
+            "label",
+            "revision",
+            "lockfile_sha256",
+            "segment_rows",
+            "segment_queries",
+            "segment_dimension",
+            "segment_k",
+            "segment_ef_search",
+            "segment_m",
+            "segment_ef_construction",
+            "segment_max_layer",
+            "segment_points",
+            "segment_warmup_runs",
+            "segment_repetitions",
+        ):
+            if config.get(key) != configs[label].get(key):
+                errors.append(f"{label}: fixture sidecar {key} does not match config.env")
+        fixture_log = _read(paths["log"])
+        for key in ("label", "revision", "lockfile_sha256", *FIXTURE_PROVENANCE, "fixture_worktree_path"):
+            expected = config.get(key)
+            if _exact_values(fixture_log, key) != [expected]:
+                errors.append(f"{label}: fixture_segment_recall emitted {key} does not match its sidecar")
+        expected_fixture_source = f"fixture {config.get('fixture_worktree_path', '')}"
+        if config.get("fixture_source") != expected_fixture_source:
+            errors.append(f"{label}: fixture_worktree_path does not match fixture_source")
+        fixture_points = _configured_points(
+            config, "segment_points", EXPECTED_SEGMENTS, label, errors
+        )
+        fixture_input_hash = config.get("fixture_input_hash")
+        if not fixture_input_hash:
+            errors.append(f"{label}: fixture_input_hash must be non-empty")
+        else:
+            _validate_segment_log(
+                fixture_log,
+                config,
+                expected_fixture_source,
+                label,
+                "fixture_segment_recall",
+                errors,
+                fixture_input_hash,
+            )
+        _validate_segment_matrix(by_label[label], label, "fixture_segment_recall", fixture_points, errors)
+        fixture_rows = [row for row in by_label[label] if row["benchmark"] == "fixture_segment_recall"]
+        if not fixture_rows:
+            errors.append(f"{label}: no parsed fixture_segment_recall metrics")
+        elif any(row["max_rss_kb"] is None for row in fixture_rows):
+            errors.append(f"{label}: missing fixture_segment_recall GNU time RSS metric")
+        _validate_single_rss(directory, "fixture_segment_recall", label, errors)
+    if fixture_requested == {"before", "after"}:
+        before_hash = fixture_configs["before"].get("fixture_input_hash")
+        after_hash = fixture_configs["after"].get("fixture_input_hash")
+        if before_hash and after_hash and before_hash != after_hash:
+            errors.append("before/after fixture_segment_recall input hashes differ")
     if errors:
         raise ValueError("incomplete before/after evidence:\n" + "\n".join(errors))
 

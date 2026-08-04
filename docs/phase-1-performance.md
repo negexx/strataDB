@@ -46,39 +46,41 @@ portable performance, a retained-history limit, or real-fixture behavior.
 
 The checked-in `bench/cloud-performance/` harness and
 `.github/workflows/cloud-performance-before-after.yml` workflow now provide a reproducible cloud
-comparison path. The retained synthetic artifact below closes the cloud-evidence portion of PERF-01;
-portable/native runner coverage and compatible real-fixture evidence remain required before PERF-01
-can advance further.
+comparison path. A later portability run also passed the native foundation matrix on Ubuntu and
+Windows and exercised the pinned real fixture on Ubuntu; a full real-fixture before/after matrix and
+universal operating bounds remain open.
 
 ## Cloud before/after comparison (fresh, bounded, synthetic)
 
-**Run:** [GitHub Actions 30862347913](https://github.com/negexx/strataDB/actions/runs/30862347913),
+**Run:** [GitHub Actions 30881988012](https://github.com/negexx/strataDB/actions/runs/30881988012),
 Ubuntu 24.04 x86_64, four vCPUs, Rust 1.90.0, lockfile SHA-256
 `252e017f63e8bfbe6f6521fb9fb5d39085b1961b2f73d75f48479f9cd20b305b`, with separate target
 directories per revision and OS caches left untouched. The retained artifact is named
-`cloud-performance-before-after-30862347913-attempt-1`.
+`cloud-performance-before-after-30881988012-attempt-1`.
 
-The directly comparable pair is the parent of the Phase 1 benchmarked implementation,
-`5daff106a6b1dfc59f2aec6d15e672bdb90977cb`, versus the follow-up SIMD/statistics change,
-`80b4e54cc1af574e79a1317f6a45af557b23cc11`. Both use deterministic synthetic workloads; the
-earlier requested benchmark pair `48dc6247848c225b30f8c1bc2c40d6f6bb41667` ->
-`16812af3c196f993ac37834a8a6c06eb5ac6a0b5` was rejected because its historical benchmark required
-a missing real fixture. The corrected run validated 410 records and 205 before/after deltas.
+The directly comparable pair is merged PR #56,
+`76d12919b5234f5e089cf26e4ba469e7aaa982f0`, versus the evidence branch,
+`c64f000ea96efdfbf754de3de94ef294984550e1`. Both use deterministic synthetic workloads. The
+candidate-side changes in this comparison are evidence-harness and validation changes, not a
+production performance optimization; observed deltas therefore must not be attributed to a product
+performance fix. The corrected run validated 370 records and 185 before/after deltas.
 
 | Workload | Before | After | Relative change |
 |---|---:|---:|---:|
-| Manifest growth, 160 commits: wall | 569.239 ms | 561.013 ms | -1.45% |
-| Manifest growth, 160 commits: newest manifest | 40,478 B | 40,471 B | -0.02% |
-| Segment K=1 unfiltered: us/query | 56.6 | 55.8 | -1.41% |
-| Segment K=64 unfiltered: us/query | 85.8 | 86.2 | +0.47% |
-| Lifecycle, 0 pins: ingest+commit wall | 196.17 ms | 202.43 ms | +3.19% |
-| Lifecycle, 64 pins: ingest+commit wall | 265.76 ms | 266.72 ms | +0.36% |
+| Manifest growth, 160 commits: wall | 562.894 ms | 794.943 ms | +41.22% |
+| Manifest growth, 160 commits: newest manifest | 40,470 B | 40,474 B | +0.01% |
+| Segment K=1 unfiltered: us/query | 39.8 | 40.3 | +1.26% |
+| Segment K=64 unfiltered: us/query | 62.0 | 62.2 | +0.32% |
+| Lifecycle, 0 pins: ingest+commit wall | 284.99 ms | 248.57 ms | -12.78% |
+| Lifecycle, 64 pins: ingest+commit wall | 243.15 ms | 293.10 ms | +20.54% |
 
 These are small, synthetic, VM-local observations—not proof of a broad performance win or
-regression. The matrix does not isolate the statistics path, real-fixture behavior, portable
-native filesystems, RSS/process-memory bounds, projection/pruning, or a supported segment/history
-maximum. The performance-related Phase 1 rows therefore remain evidence-limited rather than
-closed by this comparison.
+regression. The matrix does not isolate the statistics path, full real-fixture before/after
+behavior, portable native filesystems, RSS/process-memory bounds, projection/pruning, or a
+supported segment/history maximum. The performance-related Phase 1 rows therefore remain
+evidence-limited rather than closed by this comparison. The separate portability run
+[30881986345](https://github.com/negexx/strataDB/actions/runs/30881986345) passed Ubuntu/Windows
+native foundation checks and Ubuntu fixture smoke (download, size, SHA, and segmented search).
 
 ## Task 6 recovery-byte accounting evidence (fresh, bounded)
 
@@ -335,6 +337,7 @@ or supported maximum follows from it. The small sweep covers 40 retained manifes
 They do not establish a universal latency,
 memory, recovery-time, or segment-count guarantee. The manifest and segment sets grow with retained
 commits in the current implementation. Compaction, vacuum, orphan cleanup, retention policy, and
-indefinite sustained operation remain Phase 3 work. Portable benchmark provenance, a captured host
-matrix, and real-fixture measurements remain open evidence work; PERF-01 through PERF-05 therefore
-remain tracked rather than marked universally remediated.
+indefinite sustained operation remain Phase 3 work. Native foundation provenance and Ubuntu fixture
+smoke are now captured, but full real-fixture measurements and universal operating bounds remain
+open evidence work; PERF-01 through PERF-05 therefore remain tracked rather than marked universally
+remediated.

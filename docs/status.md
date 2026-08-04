@@ -5,7 +5,7 @@ are evidence pointers; [roadmap](roadmap.md) owns phase ordering.
 
 ## Overall state
 
-The current baseline is merged PR #55 commit `152373a0408b7e9f7c4479daf319ce58d61c70e7`. The
+The current baseline is merged PR #56 commit `76d12919b5234f5e089cf26e4ba469e7aaa982f0`. The
 [Phase 0 foundation audit](phase-0-audit.md) records the foundation as implemented within its named
 local bounds, with retained CI evidence. The [Phase 1 closeout ledger](phase-1-closeout-ledger.md)
 tracks the remaining finding-level acceptance and evidence obligations; it does not change this
@@ -35,7 +35,7 @@ single-process/shared-`Dataset` boundary.
 | Python | Proposed | PyO3 scaffolding exports only `placeholder_version`; no database API exists. |
 | Durability/recovery | Partial | File/directory durability, immutable row-ID high-water, manifest integrity, and crash/reopen evidence exist within named local bounds; full branch verification remains. |
 | Schema/migrations | Partial | Dataset-owned schema and strict validation are implemented; schema evolution and migration remain deferred. |
-| Loom/chaos/fuzz/bench evidence | Partial | The manual Ubuntu GitHub Actions run [30861009780](https://github.com/negexx/strataDB/actions/runs/30861009780) passed the named loom gates and thorough-chaos `2000/2000` seed gate; portable/native-platform and real-fixture performance bounds remain open. |
+| Loom/chaos/fuzz/bench evidence | Partial | The manual Ubuntu GitHub Actions run [30861009780](https://github.com/negexx/strataDB/actions/runs/30861009780) passed the named loom gates and thorough-chaos `2000/2000` seed gate; native Ubuntu/Windows checks and Ubuntu pinned-fixture smoke passed in [30881986345](https://github.com/negexx/strataDB/actions/runs/30881986345), while full real-fixture before/after performance and universal bounds remain open. |
 | Compaction/GC | Proposed | No compaction, vacuum, orphan cleanup, or bounded history implementation. |
 | Cross-process coordination | Proposed | Independent openers do not share transaction state or durable conditional publication. |
 | Branching/object storage | Proposed | No branch/merge or object-store backend is implemented. |
