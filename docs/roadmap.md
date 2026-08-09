@@ -8,7 +8,7 @@ in [documentation history](history/README.md). Current implementation claims liv
 | 0 — Foundation | Implemented within named local bounds | Local format, manifests, row allocation, and bounded transaction primitives. See the [Phase 0 foundation audit](phase-0-audit.md). | Restart-safe row-ID non-reuse and retained foundation evidence pass within the named local-filesystem boundary. |
 | 1 — Correctness and durability baseline | Partial — blocked | Shared-handle commits, immutable snapshots, typed conflicts, recovery/integrity, schema/error semantics, supported facade, and boundedness evidence. | All asserted guarantees have scope, implementation evidence, regression coverage, and current performance bounds. |
 | 2 — Query and usability | Implemented within named bounds | Stable schema/query APIs, scan/projection/filter/group-by integration, point lookup, CLI, and Python surface. See the [Phase 2 audit](phase-2-audit.md). | Supported query/client behavior is documented and integration-tested within the embedded single-process boundary. |
-| 3 — Operational lifecycle | Proposed | Compaction, vacuum/orphan cleanup, history retention, index lifecycle, migrations, and diagnostics. | Sustained operation safely bounds manifest/segment growth and manages retained data. |
+| 3 — Operational lifecycle | Proposed | Compaction, vacuum/orphan cleanup, history retention, index lifecycle, migrations, and diagnostics. `Dataset::lifecycle_report()` is implemented diagnostic evidence only, not reclamation; see the [design](phase-3-lifecycle-inventory-design.md) and [focused integration test](../crates/txn/tests/lifecycle_inventory.rs). | Sustained operation safely bounds manifest/segment growth and manages retained data. |
 | 4 — Cross-process coordination | Proposed | Durable conditional publication, independent opener semantics, shared allocation, and process-boundary guarantees. | Separate processes coordinate without violating visibility, conflict, or durability invariants. |
 | 5 — Branching and merge | Proposed | Fork, abort, merge, conflict reporting, and branch-aware manifests. | Branch behavior is correct under concurrency and recovery tests. |
 | 6 — Object storage and deployment | Proposed | Object-store conditional writes, S3-compatible backends, remote recovery, and durability testing. | The supported correctness suite passes against supported remote backends. |
@@ -38,7 +38,7 @@ These are not requests for cross-process transactions, serializability, or compa
 
 | Capability | Placement | Current boundary |
 |---|---|---|
-| Compaction, vacuum, orphan cleanup, bounded history | Phase 3 | No reclamation or segment-count bound is implemented. |
+| Compaction, vacuum, orphan cleanup, bounded history | Phase 3 | No reclamation or segment-count bound is implemented. `Dataset::lifecycle_report()` may identify unreferenced-object candidates, including active-snapshot data and temporary/unknown files; candidates are not safe to delete without a later retention/cleanup design. |
 | Schema catalog, migrations, point lookup, time travel, stable query API | Phase 2–3 | Current Arrow batches/manifests are not a complete catalog or migration layer. |
 | Independent-open and cross-process coordination | Phase 4 | Shared-handle locking is not durable conditional publication. |
 | Fork, abort, branch reads, and merge | Phase 5 | Immutable segments are a prerequisite, not a delivered feature. |

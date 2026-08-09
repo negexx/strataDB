@@ -42,6 +42,8 @@ work and must not be inferred from these checks.
 - Write-write optimistic conflict detection for transactions sharing one `Dataset` handle.
 - Immutable HNSW segments listed by the manifest; vector search fans out across segments and merges top-k.
 - Predicate pruning, filtered ANN primitives, and in-memory group-by.
+- `Dataset::lifecycle_report()`, a read-only snapshot-anchored inventory of manifest/data objects,
+  reachability, and unreferenced-object candidates.
 - Real-process crash/reopen tests, targeted loom models, fuzz targets, and benchmarks.
 
 These are usable slices, not a finished database API. There is no schema-evolution/migration workflow, planner,
@@ -67,6 +69,21 @@ their documented typed contracts and integration verification.
 Publication is lock-serialized inside one `Dataset` handle. Independent handles/processes do not share
 the lock, allocator, history, or in-memory snapshot, so the implementation is not a cross-process
 conditional-CAS protocol.
+
+## Lifecycle diagnostics
+
+`Dataset::lifecycle_report()` captures one immutable snapshot and reports its manifest version together
+with a best-effort backend listing of manifest/data object counts and bytes, reachable row files and
+segments, tombstones, physical rows, and unreferenced-object candidates. The report is diagnostic
+evidence only: it does not acquire the commit lock, mutate storage, or provide a globally atomic
+filesystem inventory.
+
+An orphan candidate is only an object not referenced by the captured manifest. It can include data
+still required by an active snapshot, as well as temporary or unknown files. It is therefore not safe
+to delete without a later retention/cleanup design; this API implements no reclamation, compaction,
+vacuum, or retention policy. The [Phase 3 lifecycle diagnostics design](phase-3-lifecycle-inventory-design.md)
+and [focused integration test](../crates/txn/tests/lifecycle_inventory.rs) define and exercise this
+boundary.
 
 ## Reads, updates, and index behavior
 

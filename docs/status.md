@@ -26,6 +26,12 @@ embedded/single-process boundary. This does not alter the independent Phase 1 bl
 serializability, universal durability/performance/recall, cross-process coordination, or lifecycle
 reclamation.
 
+**Phase 3: Proposed.** `Dataset::lifecycle_report()` is implemented as read-only diagnostic evidence,
+not lifecycle management. It inventories one captured snapshot and backend listings, but does not
+authorize deletion, retention, cleanup, compaction, or reclamation. See the [Phase 3 lifecycle
+diagnostics design](phase-3-lifecycle-inventory-design.md) and its [focused integration
+test](../crates/txn/tests/lifecycle_inventory.rs).
+
 ## Capability ledger
 
 | Capability | State | Current boundary |
@@ -41,6 +47,7 @@ reclamation.
 | Python | Partial | Thin PyO3 Dataset/Snapshot query facade returns Arrow IPC bytes for tabular results and typed vector matches; integration review remains. |
 | Durability/recovery | Partial | File/directory durability, immutable row-ID high-water, manifest integrity, and crash/reopen evidence exist within named local bounds; full branch verification remains. |
 | Schema/migrations | Partial | Dataset-owned schema and strict validation are implemented; schema evolution and migration remain deferred. |
+| Lifecycle diagnostics | Implemented as diagnostic evidence only | `Dataset::lifecycle_report()` reports snapshot-anchored manifest/data inventory and unreferenced-object candidates. Candidates may include data used by active snapshots and temporary or unknown files, so they are not safe to delete without a later retention/cleanup design. See the [design](phase-3-lifecycle-inventory-design.md) and [focused integration test](../crates/txn/tests/lifecycle_inventory.rs). |
 | Loom/chaos/fuzz/bench evidence | Partial | Exact-head CI run [30904907577](https://github.com/negexx/strataDB/actions/runs/30904907577) at revision `6bcd020` retains current command/outcome provenance; the manual Ubuntu run [30897605936](https://github.com/negexx/strataDB/actions/runs/30897605936) passed the named loom gates and thorough-chaos `2000/2000` seed gate; native Ubuntu/Windows checks and the validated full 100K-row pinned-fixture segmented/lifecycle matrix passed in [30881986345](https://github.com/negexx/strataDB/actions/runs/30881986345) and [30907464857](https://github.com/negexx/strataDB/actions/runs/30907464857). Universal bounds and final limitations remain open. |
 | Compaction/GC | Proposed | No compaction, vacuum, orphan cleanup, or bounded history implementation. |
 | Cross-process coordination | Proposed | Independent openers do not share transaction state or durable conditional publication. |
