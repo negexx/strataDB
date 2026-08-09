@@ -124,24 +124,8 @@ pub(crate) fn collect(
     let expected_manifest_key = manifest_object_key(manifest.version);
     let reachable = reachable_keys(manifest)?;
 
-    let mut manifest_object_count = 0;
-    let mut manifest_bytes = 0;
-    let mut current_manifest_bytes = None;
-    let mut listed_manifest_keys = BTreeSet::new();
-    for object in manifest_objects {
-        validate_listed_key(&object.key, "_versions/")?;
-        if !listed_manifest_keys.insert(object.key.clone()) {
-            return Err(corrupt_manifest(
-                manifest,
-                format!("duplicate listed manifest object key: {}", object.key),
-            ));
-        }
-        manifest_object_count = checked_add("manifest_object_count", manifest_object_count, 1)?;
-        manifest_bytes = checked_add("manifest_bytes", manifest_bytes, object.size)?;
-        if object.key == expected_manifest_key {
-            current_manifest_bytes = Some(object.size);
-        }
-    }
+    let (manifest_object_count, manifest_bytes, current_manifest_bytes) =
+        collect_manifest_objects(manifest_objects, manifest, &expected_manifest_key)?;
 
     let mut data_object_count = 0;
     let mut data_bytes = 0;
@@ -202,18 +186,7 @@ pub(crate) fn collect(
         }
     }
 
-    let mut tombstone_count = 0;
-    for _ in &manifest.tombstones {
-        tombstone_count = checked_add("tombstone_count", tombstone_count, 1)?;
-    }
-    let mut physical_row_count = 0;
-    for data_file in &manifest.data_files {
-        physical_row_count = checked_add(
-            "physical_row_count",
-            physical_row_count,
-            data_file.row_count,
-        )?;
-    }
+    let (tombstone_count, physical_row_count) = manifest_totals(manifest)?;
 
     Ok(LifecycleReport {
         observed_version: manifest.version,
@@ -231,6 +204,52 @@ pub(crate) fn collect(
         tombstone_count,
         physical_row_count,
     })
+}
+
+fn collect_manifest_objects(
+    manifest_objects: &[ObjectMeta],
+    manifest: &Manifest,
+    expected_manifest_key: &str,
+) -> Result<(u64, u64, Option<u64>)> {
+    let mut manifest_object_count = 0;
+    let mut manifest_bytes = 0;
+    let mut current_manifest_bytes = None;
+    let mut listed_manifest_keys = BTreeSet::new();
+    for object in manifest_objects {
+        validate_listed_key(&object.key, "_versions/")?;
+        if !listed_manifest_keys.insert(object.key.clone()) {
+            return Err(corrupt_manifest(
+                manifest,
+                format!("duplicate listed manifest object key: {}", object.key),
+            ));
+        }
+        manifest_object_count = checked_add("manifest_object_count", manifest_object_count, 1)?;
+        manifest_bytes = checked_add("manifest_bytes", manifest_bytes, object.size)?;
+        if object.key == expected_manifest_key {
+            current_manifest_bytes = Some(object.size);
+        }
+    }
+    Ok((
+        manifest_object_count,
+        manifest_bytes,
+        current_manifest_bytes,
+    ))
+}
+
+fn manifest_totals(manifest: &Manifest) -> Result<(u64, u64)> {
+    let mut tombstone_count = 0;
+    for _ in &manifest.tombstones {
+        tombstone_count = checked_add("tombstone_count", tombstone_count, 1)?;
+    }
+    let mut physical_row_count = 0;
+    for data_file in &manifest.data_files {
+        physical_row_count = checked_add(
+            "physical_row_count",
+            physical_row_count,
+            data_file.row_count,
+        )?;
+    }
+    Ok((tombstone_count, physical_row_count))
 }
 
 fn checked_add(total: &str, current: u64, value: u64) -> Result<u64> {
@@ -314,6 +333,8 @@ fn corrupt_manifest(manifest: &Manifest, reason: String) -> TxnError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use strata_storage::{DataFileEntry, Manifest, ObjectMeta, SegmentEntry, StorageError};
 
     use super::*;
@@ -362,7 +383,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_classifies_current_manifest_objects_without_mutation() {
+    fn collect_classifies_current_manifest_objects_without_mutation() -> crate::Result<()> {
         // Break caught: treating a captured manifest's row file or segment as
         // an orphan candidate would make diagnostic inventory misleading.
         let mut manifest = Manifest::empty();
@@ -381,7 +402,7 @@ mod tests {
             object("data/left-over.tmp", 23),
         ];
 
-        let report = collect(&manifests, &data, &manifest).unwrap();
+        let report = collect(&manifests, &data, &manifest)?;
 
         assert_eq!(report.observed_version(), 7);
         assert_eq!(report.manifest_object_count(), 2);
@@ -397,6 +418,7 @@ mod tests {
         assert_eq!(report.orphan_candidate_bytes(), 23);
         assert_eq!(report.tombstone_count(), 2);
         assert_eq!(report.physical_row_count(), 3);
+        Ok(())
     }
 
     fn object(key: &str, size: u64) -> ObjectMeta {
@@ -413,7 +435,7 @@ mod tests {
             crc32c: 0,
             row_count: 0,
             row_id_range: None,
-            stats: Default::default(),
+            stats: HashMap::default(),
         }
     }
 
@@ -426,7 +448,7 @@ mod tests {
             row_id_min: 0,
             row_id_max: 0,
             byte_len: 0,
-            zone_map: Default::default(),
+            zone_map: HashMap::default(),
         }
     }
 }

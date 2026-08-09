@@ -602,6 +602,12 @@ impl Dataset {
     /// Object listings are a best-effort physical observation. The report's
     /// `observed_version` identifies the manifest that supplied its logical
     /// reachability rules if a concurrent commit changes the listings.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error if the backend cannot list lifecycle objects, or
+    /// if the captured manifest and object inventory contain invalid,
+    /// duplicate, missing, or overflowing lifecycle metadata.
     pub fn lifecycle_report(&self) -> Result<crate::LifecycleReport> {
         let snapshot = self.snapshot();
         let backend = LocalFs::new(&self.dir);
