@@ -17,8 +17,8 @@ for the current blockers.
 | Transactions | `crates/txn` | `Dataset`, snapshots, row-ID allocation, write-write OCC, tombstones, commit ordering, and row/index publication. |
 | Index | `crates/index` | From-scratch HNSW construction/search, immutable segment encoding, validation, loading, and fan-out search. |
 | Query | `crates/query` | Predicates, pruning decisions, and group-by primitives. |
-| CLI | `crates/cli` | Fixed-shape inspection/demo commands. |
-| Bindings | `crates/bindings` | A placeholder PyO3 extension exporting `placeholder_version`. |
+| CLI | `crates/cli` | Typed query/inspection commands within the one-process boundary; mutating commands require explicit single-writer acknowledgement. |
+| Bindings | `crates/bindings` | Thin PyO3 Dataset/Snapshot facade; tabular results use Arrow IPC bytes and vector results expose typed squared-L2 matches. |
 
 ## Supported on-disk formats
 
@@ -45,8 +45,9 @@ work and must not be inferred from these checks.
 - Real-process crash/reopen tests, targeted loom models, fuzz targets, and benchmarks.
 
 These are usable slices, not a finished database API. There is no schema-evolution/migration workflow, planner,
-stable Python API, stable administration CLI, point lookup, compaction, vacuum, orphan cleanup, time
-travel, or cross-process protocol.
+stable Python API, compaction, vacuum, orphan cleanup, time
+travel, or cross-process protocol. The Phase 2 Python/CLI surfaces are partial and remain subject to
+their documented typed contracts and integration verification.
 
 ## Commit lifecycle
 

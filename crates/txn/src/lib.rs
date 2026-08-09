@@ -10,10 +10,19 @@ pub mod dataset;
 pub mod error;
 pub(crate) mod live_set_cache;
 pub mod mvp_fixtures;
+pub mod query;
 pub(crate) mod row_id;
 pub mod snapshot;
 
 pub use arrow;
 pub use dataset::{Dataset, ROW_ID_COLUMN, TIMESTAMP_COLUMN, Transaction};
 pub use error::{Result, TxnError};
+pub use query::{
+    Aggregate, AggregateFunction, AggregateOutput, Comparison, ComparisonOperator,
+    FilterExpression, FilterLiteral, GroupByRequest, GroupByResult, GroupedRow, HydrationError,
+    LogicalType, ProjectedField, ProjectedRow, Projection, QueryError, QueryExecutionError,
+    QueryResult, QueryValidationError, ResultValue, RowId, RowLookupOutcome, RowLookupRequest,
+    RowLookupResult, ScanRequest, ScanResult, VectorHit, VectorHydration, VectorHydrationState,
+    VectorSearchRequest, VectorSearchResult,
+};
 pub use snapshot::Snapshot;

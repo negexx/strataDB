@@ -9,18 +9,29 @@
 //! module doc), which is fine precisely because nothing clones a `Snapshot`
 //! by value, only the surrounding `Arc`.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use arrow::array::{Array, BooleanArray, RecordBatch, UInt64Array};
+use arrow::array::{
+    Array, BooleanArray, FixedSizeListArray, Float32Array, Float64Array, Int64Array, RecordBatch,
+    StringArray, UInt64Array,
+};
 use arrow::compute::{concat_batches, filter_record_batch};
-use arrow::datatypes::{Field, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use strata_index::LiveSet;
 use strata_query::{Predicate, PredicateKey, filter, mask, should_scan_file};
 use strata_storage::{DataFileEntry, Manifest, read_batch, read_batch_columns};
 
 use crate::dataset::{ROW_ID_COLUMN, cast_batch_to_schema, data_subdir, safe_join};
 use crate::error::{Result, TxnError};
+use crate::query::{
+    Aggregate, AggregateFunction, AggregateOutput, Comparison, ComparisonOperator, DatasetSchema,
+    FilterExpression, FilterLiteral, GroupByRequest, GroupByResult, GroupedRow, LogicalColumn,
+    LogicalType, ProjectedField, ProjectedRow, QueryExecutionError, QueryResult, ResultValue,
+    RowId, RowLookupOutcome, RowLookupRequest, RowLookupResult, ScanRequest, ScanResult, VectorHit,
+    VectorHydrationState, VectorSearchRequest, VectorSearchResult,
+};
 
 use crate::live_set_cache::LiveSetCache;
 pub use crate::live_set_cache::LiveSetCacheAccounting;
@@ -372,6 +383,351 @@ impl Snapshot {
         Ok(concat_batches(schema, &batches)?)
     }
 
+    /// Executes a typed scan against this immutable snapshot.
+    ///
+    /// The request is validated against this dataset's owned logical schema.
+    /// Physical columns stay internal: `_row_id` is read to enforce
+    /// tombstone visibility, while filter-only columns are read but never
+    /// returned. Rows and fields retain the request's explicit projection
+    /// order.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error for an incompatible query contract or an
+    /// execution error wrapping any underlying engine failure.
+    pub fn scan_query(&self, request: &ScanRequest) -> QueryResult<ScanResult> {
+        let projection = self.query_schema()?.validate_scan(request)?;
+        let columns = scan_columns(&projection, request.filter.as_ref());
+        let query_schema = self.query_schema_for_columns(&columns)?;
+        let rows = self
+            .read_surviving_files(None, Some(&columns), |batch| {
+                let batch = cast_batch_to_schema(&batch, &query_schema)?;
+                let filtered = match &request.filter {
+                    Some(filter) => filter_record_batch(&batch, &filter_mask(&batch, filter)?)?,
+                    None => batch,
+                };
+                projected_rows(&filtered, &projection)
+            })?
+            .into_iter()
+            .flatten()
+            .collect();
+        Ok(ScanResult { projection, rows })
+    }
+
+    /// Executes a grouped aggregate query against this immutable snapshot.
+    ///
+    /// Files are processed in manifest order. Tombstones are removed before
+    /// filters are evaluated, and groups retain the order in which their key
+    /// first appears among the remaining rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error for an incompatible query contract, an
+    /// [`QueryExecutionError::Int64SumOverflow`] for an overflowing integer
+    /// sum, or an execution error wrapping an underlying engine failure.
+    pub fn group_by_query(&self, request: &GroupByRequest) -> QueryResult<GroupByResult> {
+        let outputs = self.query_schema()?.validate_group_by(request)?;
+        let columns = group_by_columns(request);
+        let query_schema = self.query_schema_for_columns(&columns)?;
+        let batches = self.read_surviving_files(None, Some(&columns), |batch| {
+            let batch = cast_batch_to_schema(&batch, &query_schema)?;
+            match &request.filter {
+                Some(filter) => Ok(filter_record_batch(&batch, &filter_mask(&batch, filter)?)?),
+                None => Ok(batch),
+            }
+        })?;
+
+        let aggregate_templates = request
+            .aggregates
+            .iter()
+            .zip(&outputs)
+            .map(|(aggregate, output)| AggregateState::new(aggregate, output))
+            .collect::<QueryResult<Vec<_>>>()?;
+        let mut group_indices = HashMap::new();
+        let mut groups = Vec::new();
+
+        for batch in batches {
+            let mut partial_indices = HashMap::new();
+            let mut partial_groups = Vec::new();
+            for row in 0..batch.num_rows() {
+                let keys = request
+                    .group_by
+                    .iter()
+                    .map(|column| {
+                        let index = batch
+                            .schema_ref()
+                            .index_of(column)
+                            .map_err(TxnError::Arrow)?;
+                        result_value(batch.column(index), row)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let key = GroupKey::new(&keys)?;
+                let group_index = if let Some(index) = partial_indices.get(&key) {
+                    *index
+                } else {
+                    let index = partial_groups.len();
+                    partial_indices.insert(key, index);
+                    partial_groups.push(GroupState {
+                        keys,
+                        aggregates: aggregate_templates.clone(),
+                    });
+                    index
+                };
+
+                for (aggregate, state) in request
+                    .aggregates
+                    .iter()
+                    .zip(&mut partial_groups[group_index].aggregates)
+                {
+                    let index = batch
+                        .schema_ref()
+                        .index_of(&aggregate.column)
+                        .map_err(TxnError::Arrow)?;
+                    state.update(&result_value(batch.column(index), row)?, &aggregate.alias)?;
+                }
+            }
+
+            for partial_group in partial_groups {
+                let key = GroupKey::new(&partial_group.keys)?;
+                let group_index = if let Some(index) = group_indices.get(&key) {
+                    *index
+                } else {
+                    let index = groups.len();
+                    group_indices.insert(key, index);
+                    groups.push(GroupState {
+                        keys: partial_group.keys,
+                        aggregates: aggregate_templates.clone(),
+                    });
+                    index
+                };
+                for ((aggregate, partial_state), state) in request
+                    .aggregates
+                    .iter()
+                    .zip(partial_group.aggregates)
+                    .zip(&mut groups[group_index].aggregates)
+                {
+                    state.merge(partial_state, &aggregate.alias)?;
+                }
+            }
+        }
+
+        let rows = groups
+            .into_iter()
+            .map(|group| GroupedRow {
+                keys: group.keys,
+                aggregates: group
+                    .aggregates
+                    .into_iter()
+                    .map(AggregateState::finish)
+                    .collect(),
+            })
+            .collect();
+        GroupByResult::new(request.group_by.clone(), outputs, rows)
+    }
+
+    /// Looks up one physical row as of this immutable snapshot.
+    ///
+    /// The result distinguishes a row tombstoned in this snapshot from an
+    /// ID that this snapshot has no manifest-visible row for. Live rows use
+    /// the same dataset-owned projection validation and value conversion as
+    /// [`Self::scan_query`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error for an incompatible projection or an
+    /// execution error wrapping an underlying engine failure.
+    pub fn lookup_row(&self, request: &RowLookupRequest) -> QueryResult<RowLookupResult> {
+        let projection = self.query_schema()?.validate_row_lookup(request)?;
+        let row_id = request.row_id.0;
+        if !self.owns_row(row_id) {
+            return Ok(RowLookupResult {
+                row_id: request.row_id,
+                projection,
+                outcome: RowLookupOutcome::NotFound,
+            });
+        }
+
+        let mut columns = projection.iter().map(String::as_str).collect::<Vec<_>>();
+        push_unique_column(&mut columns, ROW_ID_COLUMN);
+        let query_schema = self.query_schema_for_columns(&columns)?;
+        let data_dir = data_subdir(&self.dir);
+        for entry in self.manifest.data_files.iter().filter(|entry| {
+            entry
+                .row_id_range
+                .is_some_and(|(first, last)| first <= row_id && row_id <= last)
+        }) {
+            let path = safe_join(&data_dir, &entry.name)?;
+            let raw_batch = read_batch_columns(&path, &columns).map_err(TxnError::Storage)?;
+            let batch = cast_batch_to_schema(&raw_batch, &query_schema)?;
+            let row_ids = batch
+                .column(
+                    batch
+                        .schema_ref()
+                        .index_of(ROW_ID_COLUMN)
+                        .map_err(TxnError::Arrow)?,
+                )
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| query_cast_error(ROW_ID_COLUMN, "UInt64"))?;
+            if let Some(row) = (0..row_ids.len()).find(|&row| row_ids.value(row) == row_id) {
+                let outcome = if self.is_visible(row_id) {
+                    RowLookupOutcome::Live(projected_row(&batch, row, &projection)?)
+                } else {
+                    RowLookupOutcome::Tombstoned
+                };
+                return Ok(RowLookupResult {
+                    row_id: request.row_id,
+                    projection,
+                    outcome,
+                });
+            }
+        }
+        Ok(RowLookupResult {
+            row_id: request.row_id,
+            projection,
+            outcome: RowLookupOutcome::NotFound,
+        })
+    }
+
+    fn query_schema(&self) -> QueryResult<DatasetSchema> {
+        let columns = self
+            .schema
+            .fields()
+            .iter()
+            .map(|field| {
+                Ok(LogicalColumn::new(
+                    field.name(),
+                    logical_type(field.data_type())?,
+                    field.is_nullable(),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        DatasetSchema::new(columns)
+    }
+
+    fn query_schema_for_columns(&self, columns: &[&str]) -> Result<SchemaRef> {
+        let fields = columns
+            .iter()
+            .map(|column| {
+                if *column == ROW_ID_COLUMN {
+                    Ok(Field::new(ROW_ID_COLUMN, DataType::UInt64, false))
+                } else {
+                    self.schema
+                        .field_with_name(column)
+                        .map(|field| field.as_ref().clone())
+                        .map_err(|_| TxnError::BatchSchemaMismatch {
+                            expected: format!("owned field named {column:?}"),
+                            actual: format!("query field list missing {column:?}"),
+                        })
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Arc::new(Schema::new_with_metadata(
+            fields,
+            self.schema.metadata().clone(),
+        )))
+    }
+
+    /// Executes nearest-neighbor search against this immutable snapshot.
+    ///
+    /// The current physical index has one vector column. Filters are resolved
+    /// from the same immutable row files before candidates are admitted to the
+    /// index search. Optional hydration uses this snapshot's point lookup, so
+    /// it cannot observe a later manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed query validation errors for an invalid request and wraps
+    /// missing or unreadable committed data as a typed engine execution error.
+    pub fn vector_search_query(
+        &self,
+        request: &VectorSearchRequest,
+    ) -> QueryResult<VectorSearchResult> {
+        let hydration_projection = self.query_schema()?.validate_vector_search(request)?;
+        let mut matches = match &request.filter {
+            Some(filter) => {
+                let live_set = self.vector_filter_live_set(filter)?;
+                self.index
+                    .search_filtered_pruned_live(
+                        &request.query,
+                        request.k,
+                        EF_SEARCH_DEFAULT,
+                        &live_set,
+                        |id| self.is_visible(id),
+                        |_| true,
+                    )
+                    .map_err(TxnError::from)?
+            }
+            None => self
+                .index
+                .search(&request.query, request.k, EF_SEARCH_DEFAULT, |id| {
+                    self.is_visible(id)
+                })
+                .map_err(TxnError::from)?,
+        };
+        matches.sort_by(|left, right| {
+            left.squared_distance
+                .total_cmp(&right.squared_distance)
+                .then_with(|| left.row_id.cmp(&right.row_id))
+        });
+
+        let mut hits = Vec::with_capacity(matches.len());
+        for vector_match in matches {
+            let row_id = RowId(vector_match.row_id);
+            let hydration = match &hydration_projection {
+                None => VectorHydrationState::NotRequested,
+                Some(projection) => match self.lookup_row(&RowLookupRequest {
+                    row_id,
+                    projection: crate::query::Projection::Columns(projection.clone()),
+                })? {
+                    RowLookupResult {
+                        outcome: RowLookupOutcome::Live(row),
+                        ..
+                    } => VectorHydrationState::Hydrated(row),
+                    RowLookupResult {
+                        outcome: RowLookupOutcome::Tombstoned,
+                        ..
+                    } => VectorHydrationState::Unresolved(crate::query::HydrationError::Tombstoned),
+                    RowLookupResult {
+                        outcome: RowLookupOutcome::NotFound,
+                        ..
+                    } => VectorHydrationState::Unresolved(crate::query::HydrationError::NotFound),
+                },
+            };
+            hits.push(VectorHit {
+                row_id,
+                squared_l2_distance: vector_match.squared_distance,
+                hydration,
+            });
+        }
+        VectorSearchResult::new(request.k, hydration_projection, hits)
+    }
+
+    fn vector_filter_live_set(&self, filter: &FilterExpression) -> QueryResult<LiveSet> {
+        let mut columns = Vec::new();
+        filter_columns(filter, &mut columns);
+        push_unique_column(&mut columns, ROW_ID_COLUMN);
+        let query_schema = self.query_schema_for_columns(&columns)?;
+        let row_ids = self
+            .read_surviving_files(None, Some(&columns), |batch| {
+                let batch = cast_batch_to_schema(&batch, &query_schema)?;
+                let selection = filter_mask(&batch, filter)?;
+                let row_ids = batch
+                    .column(batch.schema_ref().index_of(ROW_ID_COLUMN)?)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or_else(|| query_cast_error(ROW_ID_COLUMN, "UInt64"))?;
+                (0..row_ids.len())
+                    .filter(|&row| selection.is_valid(row) && selection.value(row))
+                    .map(|row| usize::try_from(row_ids.value(row)).map_err(TxnError::from))
+                    .collect::<Result<Vec<_>>>()
+            })?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        Ok(LiveSet::from_row_ids(&row_ids))
+    }
+
     /// Approximate nearest-neighbor search over the vector column, as of
     /// this snapshot's version, optionally narrowed to rows matching
     /// `predicate`. Visibility (the tombstone set) is enforced by passing
@@ -533,10 +889,566 @@ impl Snapshot {
     }
 }
 
+fn logical_type(data_type: &DataType) -> Result<LogicalType> {
+    let logical_type = match data_type {
+        DataType::Boolean => LogicalType::Boolean,
+        DataType::Int64 => LogicalType::Int64,
+        DataType::UInt64 => LogicalType::UInt64,
+        DataType::Float64 => LogicalType::Float64,
+        DataType::Utf8 => LogicalType::Utf8,
+        DataType::FixedSizeList(field, dimensions) if field.data_type() == &DataType::Float32 => {
+            LogicalType::Vector {
+                dimensions: usize::try_from(*dimensions)?,
+            }
+        }
+        _ => {
+            return Err(TxnError::Arrow(arrow::error::ArrowError::CastError(
+                format!("unsupported query column type {data_type:?}"),
+            )));
+        }
+    };
+    Ok(logical_type)
+}
+
+fn scan_columns<'a>(
+    projection: &'a [String],
+    filter: Option<&'a FilterExpression>,
+) -> Vec<&'a str> {
+    let mut columns = Vec::with_capacity(projection.len() + 1);
+    for column in projection {
+        push_unique_column(&mut columns, column);
+    }
+    if let Some(filter) = filter {
+        filter_columns(filter, &mut columns);
+    }
+    push_unique_column(&mut columns, ROW_ID_COLUMN);
+    columns
+}
+
+fn group_by_columns(request: &GroupByRequest) -> Vec<&str> {
+    let mut columns = Vec::with_capacity(
+        request.group_by.len()
+            + request.aggregates.len()
+            + usize::from(request.filter.is_some())
+            + 1,
+    );
+    for column in &request.group_by {
+        push_unique_column(&mut columns, column);
+    }
+    for aggregate in &request.aggregates {
+        push_unique_column(&mut columns, &aggregate.column);
+    }
+    if let Some(filter) = &request.filter {
+        filter_columns(filter, &mut columns);
+    }
+    push_unique_column(&mut columns, ROW_ID_COLUMN);
+    columns
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum GroupKeyValue {
+    Null,
+    Boolean(bool),
+    Int64(i64),
+    UInt64(u64),
+    Float64(u64),
+    Utf8(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct GroupKey(Vec<GroupKeyValue>);
+
+impl GroupKey {
+    fn new(values: &[ResultValue]) -> QueryResult<Self> {
+        let values = values
+            .iter()
+            .map(|value| match value {
+                ResultValue::Null => Ok(GroupKeyValue::Null),
+                ResultValue::Boolean(value) => Ok(GroupKeyValue::Boolean(*value)),
+                ResultValue::Int64(value) => Ok(GroupKeyValue::Int64(*value)),
+                ResultValue::UInt64(value) => Ok(GroupKeyValue::UInt64(*value)),
+                ResultValue::Float64(value) => Ok(GroupKeyValue::Float64(value.to_bits())),
+                ResultValue::Utf8(value) => Ok(GroupKeyValue::Utf8(value.clone())),
+                ResultValue::Vector(_) => {
+                    Err(query_cast_error("group key", "scalar query type").into())
+                }
+            })
+            .collect::<QueryResult<Vec<_>>>()?;
+        Ok(Self(values))
+    }
+}
+
+#[derive(Debug, Clone)]
+enum AggregateState {
+    Count(u64),
+    Int64Sum(Option<i64>),
+    Int64Minimum(Option<i64>),
+    Int64Maximum(Option<i64>),
+    Float64Sum(Option<f64>),
+    Float64Minimum(Option<f64>),
+    Float64Maximum(Option<f64>),
+    Float64Average { sum: f64, count: u64 },
+}
+
+impl AggregateState {
+    fn new(aggregate: &Aggregate, output: &AggregateOutput) -> QueryResult<Self> {
+        let state = match (aggregate.function, output.data_type()) {
+            (AggregateFunction::Count, LogicalType::UInt64) => Self::Count(0),
+            (AggregateFunction::Sum, LogicalType::Int64) => Self::Int64Sum(None),
+            (AggregateFunction::Minimum, LogicalType::Int64) => Self::Int64Minimum(None),
+            (AggregateFunction::Maximum, LogicalType::Int64) => Self::Int64Maximum(None),
+            (AggregateFunction::Sum, LogicalType::Float64) => Self::Float64Sum(None),
+            (AggregateFunction::Minimum, LogicalType::Float64) => Self::Float64Minimum(None),
+            (AggregateFunction::Maximum, LogicalType::Float64) => Self::Float64Maximum(None),
+            (AggregateFunction::Average, LogicalType::Float64) => {
+                Self::Float64Average { sum: 0.0, count: 0 }
+            }
+            _ => {
+                return Err(
+                    query_cast_error(&aggregate.column, "validated aggregate input").into(),
+                );
+            }
+        };
+        Ok(state)
+    }
+
+    fn update(&mut self, value: &ResultValue, alias: &str) -> QueryResult<()> {
+        if matches!(value, ResultValue::Null) {
+            return Ok(());
+        }
+        match self {
+            Self::Count(count) => *count += 1,
+            Self::Int64Sum(sum) => {
+                let ResultValue::Int64(value) = value else {
+                    return Err(query_cast_error(alias, "Int64").into());
+                };
+                *sum = Some(match *sum {
+                    Some(current) => current.checked_add(*value).ok_or_else(|| {
+                        QueryExecutionError::Int64SumOverflow {
+                            alias: alias.to_owned(),
+                        }
+                    })?,
+                    None => *value,
+                });
+            }
+            Self::Int64Minimum(minimum) => {
+                let ResultValue::Int64(value) = value else {
+                    return Err(query_cast_error(alias, "Int64").into());
+                };
+                *minimum = Some(minimum.map_or(*value, |current| current.min(*value)));
+            }
+            Self::Int64Maximum(maximum) => {
+                let ResultValue::Int64(value) = value else {
+                    return Err(query_cast_error(alias, "Int64").into());
+                };
+                *maximum = Some(maximum.map_or(*value, |current| current.max(*value)));
+            }
+            Self::Float64Sum(sum) => {
+                let value = float_value(value, alias)?;
+                *sum = Some(sum.map_or(value, |current| current + value));
+            }
+            Self::Float64Minimum(minimum) => {
+                let value = float_value(value, alias)?;
+                *minimum = Some(minimum.map_or(value, |current| current.min(value)));
+            }
+            Self::Float64Maximum(maximum) => {
+                let value = float_value(value, alias)?;
+                *maximum = Some(maximum.map_or(value, |current| current.max(value)));
+            }
+            Self::Float64Average { sum, count } => {
+                *sum += float_value(value, alias)?;
+                *count += 1;
+            }
+        }
+        Ok(())
+    }
+
+    fn merge(&mut self, other: Self, alias: &str) -> QueryResult<()> {
+        match (self, other) {
+            (Self::Count(count), Self::Count(other)) => {
+                *count = count
+                    .checked_add(other)
+                    .ok_or_else(|| query_cast_error(alias, "UInt64 count"))?;
+            }
+            (Self::Int64Sum(sum), Self::Int64Sum(other)) => {
+                *sum = match (*sum, other) {
+                    (Some(current), Some(other)) => {
+                        Some(current.checked_add(other).ok_or_else(|| {
+                            QueryExecutionError::Int64SumOverflow {
+                                alias: alias.to_owned(),
+                            }
+                        })?)
+                    }
+                    (None, value) | (value, None) => value,
+                };
+            }
+            (Self::Int64Minimum(minimum), Self::Int64Minimum(other)) => {
+                *minimum = match (*minimum, other) {
+                    (Some(current), Some(other)) => Some(current.min(other)),
+                    (None, value) | (value, None) => value,
+                };
+            }
+            (Self::Int64Maximum(maximum), Self::Int64Maximum(other)) => {
+                *maximum = match (*maximum, other) {
+                    (Some(current), Some(other)) => Some(current.max(other)),
+                    (None, value) | (value, None) => value,
+                };
+            }
+            (Self::Float64Sum(sum), Self::Float64Sum(other)) => {
+                *sum = match (*sum, other) {
+                    (Some(current), Some(other)) => Some(current + other),
+                    (None, value) | (value, None) => value,
+                };
+            }
+            (Self::Float64Minimum(minimum), Self::Float64Minimum(other)) => {
+                *minimum = match (*minimum, other) {
+                    (Some(current), Some(other)) => Some(current.min(other)),
+                    (None, value) | (value, None) => value,
+                };
+            }
+            (Self::Float64Maximum(maximum), Self::Float64Maximum(other)) => {
+                *maximum = match (*maximum, other) {
+                    (Some(current), Some(other)) => Some(current.max(other)),
+                    (None, value) | (value, None) => value,
+                };
+            }
+            (
+                Self::Float64Average { sum, count },
+                Self::Float64Average {
+                    sum: other_sum,
+                    count: other_count,
+                },
+            ) => {
+                *sum += other_sum;
+                *count = count
+                    .checked_add(other_count)
+                    .ok_or_else(|| query_cast_error(alias, "UInt64 count"))?;
+            }
+            (state, _) => {
+                return Err(query_cast_error(alias, aggregate_state_type(state)).into());
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> ResultValue {
+        match self {
+            Self::Count(count) => ResultValue::UInt64(count),
+            Self::Int64Sum(value) | Self::Int64Minimum(value) | Self::Int64Maximum(value) => {
+                value.map_or(ResultValue::Null, ResultValue::Int64)
+            }
+            Self::Float64Sum(value) | Self::Float64Minimum(value) | Self::Float64Maximum(value) => {
+                value.map_or(ResultValue::Null, ResultValue::Float64)
+            }
+            Self::Float64Average { sum, count } => {
+                if count == 0 {
+                    ResultValue::Null
+                } else {
+                    #[allow(clippy::cast_precision_loss)]
+                    let count = count as f64;
+                    ResultValue::Float64(sum / count)
+                }
+            }
+        }
+    }
+}
+
+fn aggregate_state_type(state: &AggregateState) -> &'static str {
+    match state {
+        AggregateState::Count(_) => "Count",
+        AggregateState::Int64Sum(_) => "Int64Sum",
+        AggregateState::Int64Minimum(_) => "Int64Minimum",
+        AggregateState::Int64Maximum(_) => "Int64Maximum",
+        AggregateState::Float64Sum(_) => "Float64Sum",
+        AggregateState::Float64Minimum(_) => "Float64Minimum",
+        AggregateState::Float64Maximum(_) => "Float64Maximum",
+        AggregateState::Float64Average { .. } => "Float64Average",
+    }
+}
+
+fn float_value(value: &ResultValue, alias: &str) -> QueryResult<f64> {
+    match value {
+        ResultValue::Int64(value) =>
+        {
+            #[allow(clippy::cast_precision_loss)]
+            Ok(*value as f64)
+        }
+        ResultValue::Float64(value) => Ok(*value),
+        _ => Err(query_cast_error(alias, "numeric query type").into()),
+    }
+}
+
+#[derive(Debug)]
+struct GroupState {
+    keys: Vec<ResultValue>,
+    aggregates: Vec<AggregateState>,
+}
+
+fn filter_columns<'a>(filter: &'a FilterExpression, columns: &mut Vec<&'a str>) {
+    match filter {
+        FilterExpression::Compare(comparison) => push_unique_column(columns, &comparison.column),
+        FilterExpression::And(left, right) | FilterExpression::Or(left, right) => {
+            filter_columns(left, columns);
+            filter_columns(right, columns);
+        }
+        FilterExpression::Not(expression) => filter_columns(expression, columns),
+    }
+}
+
+fn push_unique_column<'a>(columns: &mut Vec<&'a str>, column: &'a str) {
+    if !columns.contains(&column) {
+        columns.push(column);
+    }
+}
+
+fn filter_mask(batch: &RecordBatch, filter: &FilterExpression) -> Result<BooleanArray> {
+    match filter {
+        FilterExpression::Compare(comparison) => comparison_mask(batch, comparison),
+        FilterExpression::And(left, right) => {
+            let left = filter_mask(batch, left)?;
+            let right = filter_mask(batch, right)?;
+            Ok(left
+                .iter()
+                .zip(right.iter())
+                .map(|(left, right)| match (left, right) {
+                    (Some(false), _) | (_, Some(false)) => Some(false),
+                    (Some(true), Some(true)) => Some(true),
+                    _ => None,
+                })
+                .collect())
+        }
+        FilterExpression::Or(left, right) => {
+            let left = filter_mask(batch, left)?;
+            let right = filter_mask(batch, right)?;
+            Ok(left
+                .iter()
+                .zip(right.iter())
+                .map(|(left, right)| match (left, right) {
+                    (Some(true), _) | (_, Some(true)) => Some(true),
+                    (Some(false), Some(false)) => Some(false),
+                    _ => None,
+                })
+                .collect())
+        }
+        FilterExpression::Not(expression) => Ok(filter_mask(batch, expression)?
+            .iter()
+            .map(|value| value.map(|value| !value))
+            .collect()),
+    }
+}
+
+fn comparison_mask(batch: &RecordBatch, comparison: &Comparison) -> Result<BooleanArray> {
+    let column_index = batch.schema_ref().index_of(&comparison.column)?;
+    let array = batch.column(column_index);
+    match &comparison.value {
+        FilterLiteral::Boolean(value) => Ok(comparison_mask_for(
+            &array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| query_cast_error(&comparison.column, "Boolean"))?,
+            *value,
+            comparison.operator,
+        )),
+        FilterLiteral::Int64(value) => Ok(comparison_mask_for(
+            &array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| query_cast_error(&comparison.column, "Int64"))?,
+            *value,
+            comparison.operator,
+        )),
+        FilterLiteral::UInt64(value) => Ok(comparison_mask_for(
+            &array
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| query_cast_error(&comparison.column, "UInt64"))?,
+            *value,
+            comparison.operator,
+        )),
+        FilterLiteral::Float64(value) => Ok(comparison_mask_for(
+            &array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| query_cast_error(&comparison.column, "Float64"))?,
+            *value,
+            comparison.operator,
+        )),
+        FilterLiteral::Utf8(value) => Ok(comparison_mask_for(
+            &array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| query_cast_error(&comparison.column, "Utf8"))?,
+            value.as_str(),
+            comparison.operator,
+        )),
+    }
+}
+
+fn comparison_mask_for<T>(
+    array: &impl arrow::array::ArrayAccessor<Item = T>,
+    value: T,
+    operator: ComparisonOperator,
+) -> BooleanArray
+where
+    T: PartialEq + PartialOrd + Copy,
+{
+    (0..array.len())
+        .map(|index| {
+            (!array.is_null(index)).then(|| {
+                let actual = array.value(index);
+                match operator {
+                    ComparisonOperator::Equal => actual == value,
+                    ComparisonOperator::NotEqual => actual != value,
+                    ComparisonOperator::LessThan => actual < value,
+                    ComparisonOperator::LessThanOrEqual => actual <= value,
+                    ComparisonOperator::GreaterThan => actual > value,
+                    ComparisonOperator::GreaterThanOrEqual => actual >= value,
+                }
+            })
+        })
+        .collect()
+}
+
+fn projected_rows(batch: &RecordBatch, projection: &[String]) -> Result<Vec<ProjectedRow>> {
+    (0..batch.num_rows())
+        .map(|row| projected_row(batch, row, projection))
+        .collect()
+}
+
+fn projected_row(batch: &RecordBatch, row: usize, projection: &[String]) -> Result<ProjectedRow> {
+    let fields = projection
+        .iter()
+        .map(|name| {
+            let column = batch.column(batch.schema_ref().index_of(name)?);
+            Ok(ProjectedField::new(name, result_value(column, row)?))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(ProjectedRow { fields })
+}
+
+fn result_value(array: &arrow::array::ArrayRef, row: usize) -> Result<ResultValue> {
+    if array.is_null(row) {
+        return Ok(ResultValue::Null);
+    }
+    let value = if let Some(array) = array.as_any().downcast_ref::<BooleanArray>() {
+        ResultValue::Boolean(array.value(row))
+    } else if let Some(array) = array.as_any().downcast_ref::<Int64Array>() {
+        ResultValue::Int64(array.value(row))
+    } else if let Some(array) = array.as_any().downcast_ref::<UInt64Array>() {
+        ResultValue::UInt64(array.value(row))
+    } else if let Some(array) = array.as_any().downcast_ref::<Float64Array>() {
+        ResultValue::Float64(array.value(row))
+    } else if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
+        ResultValue::Utf8(array.value(row).to_owned())
+    } else if let Some(array) = array.as_any().downcast_ref::<FixedSizeListArray>() {
+        let values = array.value(row);
+        let values = values
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .ok_or_else(|| query_cast_error("vector", "FixedSizeList<Float32>"))?;
+        ResultValue::Vector((0..values.len()).map(|index| values.value(index)).collect())
+    } else {
+        return Err(query_cast_error("projected column", "supported query type"));
+    };
+    Ok(value)
+}
+
+fn query_cast_error(column: &str, expected: &str) -> TxnError {
+    TxnError::Arrow(arrow::error::ArrowError::CastError(format!(
+        "query column {column:?} must be {expected}"
+    )))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    type GroupByTestRow<'a> = (Option<&'a str>, Option<i64>, bool, Option<f64>);
+
+    fn query_test_dataset(
+        rows: &[(&str, Option<i64>, bool, u64)],
+    ) -> (tempfile::TempDir, crate::Dataset) {
+        use crate::Dataset;
+        use arrow::array::{BooleanArray, Int64Array, RecordBatch, StringArray, UInt64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let temp = tempfile::tempdir().unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::Utf8, false),
+            Field::new("score", DataType::Int64, true),
+            Field::new("active", DataType::Boolean, false),
+            Field::new("rank", DataType::UInt64, false),
+        ]));
+        let dataset = Dataset::create(temp.path().join("dataset"), Arc::clone(&schema)).unwrap();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(
+                    rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|row| row.1).collect::<Vec<_>>(),
+                )),
+                Arc::new(BooleanArray::from(
+                    rows.iter().map(|row| row.2).collect::<Vec<_>>(),
+                )),
+                Arc::new(UInt64Array::from(
+                    rows.iter().map(|row| row.3).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        let mut transaction = dataset.begin();
+        transaction.insert(batch).unwrap();
+        transaction.commit().unwrap();
+        (temp, dataset)
+    }
+
+    fn group_by_test_dataset() -> (tempfile::TempDir, crate::Dataset, SchemaRef) {
+        use crate::Dataset;
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let temp = tempfile::tempdir().unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("category", DataType::Utf8, true),
+            Field::new("amount", DataType::Int64, true),
+            Field::new("selected", DataType::Boolean, false),
+            Field::new("ratio", DataType::Float64, true),
+        ]));
+        let dataset = Dataset::create(temp.path().join("dataset"), Arc::clone(&schema)).unwrap();
+        (temp, dataset, schema)
+    }
+
+    fn append_group_by_rows(
+        dataset: &crate::Dataset,
+        schema: &SchemaRef,
+        rows: &[GroupByTestRow<'_>],
+    ) {
+        use arrow::array::{BooleanArray, Float64Array, Int64Array, StringArray};
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(schema),
+            vec![
+                Arc::new(StringArray::from(
+                    rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|row| row.1).collect::<Vec<_>>(),
+                )),
+                Arc::new(BooleanArray::from(
+                    rows.iter().map(|row| row.2).collect::<Vec<_>>(),
+                )),
+                Arc::new(Float64Array::from(
+                    rows.iter().map(|row| row.3).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        let mut transaction = dataset.begin();
+        transaction.insert(batch).unwrap();
+        transaction.commit().unwrap();
+    }
 
     fn test_snapshot(tombstoned: &[u64]) -> Snapshot {
         Snapshot {
@@ -1437,5 +2349,1265 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn scan_query_reads_filter_columns_omitted_from_the_projection() {
+        use crate::{
+            Comparison, ComparisonOperator, FilterExpression, FilterLiteral, Projection,
+            ResultValue, ScanRequest,
+        };
+
+        let (_temp, dataset) =
+            query_test_dataset(&[("low", Some(3), true, 1), ("high", Some(11), false, 2)]);
+
+        let result = dataset
+            .snapshot()
+            .scan_query(&ScanRequest {
+                projection: Projection::Columns(vec!["title".into()]),
+                filter: Some(FilterExpression::Compare(Comparison {
+                    column: "score".into(),
+                    operator: ComparisonOperator::GreaterThan,
+                    value: FilterLiteral::Int64(10),
+                })),
+            })
+            .unwrap();
+
+        assert_eq!(result.projection, vec!["title"]);
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].fields.len(), 1);
+        assert_eq!(result.rows[0].fields[0].name, "title");
+        assert_eq!(
+            result.rows[0].fields[0].value,
+            ResultValue::Utf8("high".into())
+        );
+    }
+
+    #[test]
+    fn scan_query_preserves_projection_order_and_keeps_only_true_comparisons() {
+        use crate::{
+            Comparison, ComparisonOperator, FilterExpression, FilterLiteral, Projection,
+            ResultValue, ScanRequest,
+        };
+
+        let (_temp, dataset) = query_test_dataset(&[
+            ("null", None, true, 1),
+            ("low", Some(3), true, 2),
+            ("high", Some(11), false, 3),
+        ]);
+
+        let result = dataset
+            .snapshot()
+            .scan_query(&ScanRequest {
+                projection: Projection::Columns(vec!["rank".into(), "title".into()]),
+                filter: Some(FilterExpression::Compare(Comparison {
+                    column: "score".into(),
+                    operator: ComparisonOperator::GreaterThan,
+                    value: FilterLiteral::Int64(10),
+                })),
+            })
+            .unwrap();
+
+        assert_eq!(result.projection, vec!["rank", "title"]);
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(
+            result.rows[0].fields,
+            vec![
+                crate::ProjectedField::new("rank", ResultValue::UInt64(3)),
+                crate::ProjectedField::new("title", ResultValue::Utf8("high".into())),
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_query_filters_tombstones_before_returning_zero_column_rows() {
+        use crate::{Projection, ScanRequest};
+
+        let (_temp, dataset) =
+            query_test_dataset(&[("deleted", Some(11), true, 1), ("live", Some(3), false, 2)]);
+        let mut transaction = dataset.begin();
+        transaction.delete(0).unwrap();
+        transaction.commit().unwrap();
+
+        let result = dataset
+            .snapshot()
+            .scan_query(&ScanRequest {
+                projection: Projection::Columns(Vec::new()),
+                filter: None,
+            })
+            .unwrap();
+
+        assert!(result.projection.is_empty());
+        assert_eq!(result.rows.len(), 1);
+        assert!(result.rows[0].fields.is_empty());
+    }
+
+    #[test]
+    fn scan_query_remains_bound_to_the_captured_snapshot() {
+        use crate::{Projection, ResultValue, ScanRequest};
+
+        let (_temp, dataset) = query_test_dataset(&[("before", Some(1), true, 1)]);
+        let snapshot = dataset.snapshot();
+        let schema = dataset.snapshot().schema();
+        let appended = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["after"])),
+                Arc::new(arrow::array::Int64Array::from(vec![Some(2)])),
+                Arc::new(arrow::array::BooleanArray::from(vec![false])),
+                Arc::new(arrow::array::UInt64Array::from(vec![2])),
+            ],
+        )
+        .unwrap();
+        let mut transaction = dataset.begin();
+        transaction.insert(appended).unwrap();
+        transaction.commit().unwrap();
+
+        let result = snapshot
+            .scan_query(&ScanRequest {
+                projection: Projection::Columns(vec!["title".into()]),
+                filter: None,
+            })
+            .unwrap();
+
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(
+            result.rows[0].fields[0].value,
+            ResultValue::Utf8("before".into())
+        );
+    }
+
+    #[test]
+    fn scan_query_wraps_storage_failures_as_typed_engine_errors() {
+        use crate::{Projection, QueryError, QueryExecutionError, ScanRequest, TxnError};
+
+        let (temp, dataset) = query_test_dataset(&[("present", Some(1), true, 1)]);
+        let snapshot = dataset.snapshot();
+        let data_file = &snapshot.data_files()[0].name;
+        std::fs::remove_file(temp.path().join("dataset").join("data").join(data_file)).unwrap();
+
+        let error = snapshot
+            .scan_query(&ScanRequest {
+                projection: Projection::All,
+                filter: None,
+            })
+            .expect_err("a missing committed file must surface a typed engine error");
+
+        assert!(matches!(
+            error,
+            QueryError::Execution(QueryExecutionError::Engine(source))
+                if matches!(source.as_ref(), TxnError::Storage(strata_storage::StorageError::Io(_)))
+        ));
+    }
+
+    #[test]
+    fn scan_query_decodes_dictionary_columns_after_reopen_before_filtering() {
+        use crate::{
+            Comparison, ComparisonOperator, FilterExpression, FilterLiteral, Projection,
+            ResultValue, ScanRequest,
+        };
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("dataset");
+        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)]));
+        let dataset = crate::Dataset::create(&dir, Arc::clone(&schema)).unwrap();
+        let names: Vec<&str> = (0..100)
+            .map(|index| if index % 2 == 0 { "alice" } else { "bob" })
+            .collect();
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(names))]).unwrap();
+        let mut transaction = dataset.begin();
+        transaction.insert(batch).unwrap();
+        transaction.commit().unwrap();
+        drop(dataset);
+
+        let reopened = crate::Dataset::open(&dir).unwrap();
+        let result = reopened
+            .snapshot()
+            .scan_query(&ScanRequest {
+                projection: Projection::Columns(vec!["name".into()]),
+                filter: Some(FilterExpression::Compare(Comparison {
+                    column: "name".into(),
+                    operator: ComparisonOperator::Equal,
+                    value: FilterLiteral::Utf8("alice".into()),
+                })),
+            })
+            .unwrap();
+
+        assert_eq!(result.rows.len(), 50);
+        assert!(
+            result
+                .rows
+                .iter()
+                .all(|row| { row.fields[0].value == ResultValue::Utf8("alice".into()) })
+        );
+    }
+
+    #[test]
+    fn scan_query_composite_filters_keep_only_true_under_three_valued_null_semantics() {
+        use crate::{
+            Comparison, ComparisonOperator, FilterExpression, FilterLiteral, Projection,
+            ResultValue, ScanRequest,
+        };
+
+        let (_temp, dataset) = query_test_dataset(&[
+            ("null", None, true, 1),
+            ("low", Some(5), false, 2),
+            ("middle", Some(15), true, 3),
+            ("high", Some(25), false, 4),
+        ]);
+        let compare = |operator, value| {
+            FilterExpression::Compare(Comparison {
+                column: "score".into(),
+                operator,
+                value: FilterLiteral::Int64(value),
+            })
+        };
+        let scan = |filter| {
+            dataset
+                .snapshot()
+                .scan_query(&ScanRequest {
+                    projection: Projection::Columns(vec!["title".into()]),
+                    filter: Some(filter),
+                })
+                .unwrap()
+                .rows
+                .into_iter()
+                .map(|row| row.fields[0].value.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let and_rows = scan(FilterExpression::And(
+            Box::new(compare(ComparisonOperator::GreaterThan, 10)),
+            Box::new(compare(ComparisonOperator::LessThan, 20)),
+        ));
+        assert_eq!(and_rows, vec![ResultValue::Utf8("middle".into())]);
+
+        let or_rows = scan(FilterExpression::Or(
+            Box::new(compare(ComparisonOperator::Equal, 5)),
+            Box::new(compare(ComparisonOperator::GreaterThan, 20)),
+        ));
+        assert_eq!(
+            or_rows,
+            vec![
+                ResultValue::Utf8("low".into()),
+                ResultValue::Utf8("high".into()),
+            ]
+        );
+
+        let not_rows = scan(FilterExpression::Not(Box::new(compare(
+            ComparisonOperator::Equal,
+            5,
+        ))));
+        assert_eq!(
+            not_rows,
+            vec![
+                ResultValue::Utf8("middle".into()),
+                ResultValue::Utf8("high".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn row_lookup_returns_a_vectorless_live_row_in_requested_projection_order() {
+        use crate::{Projection, ResultValue, RowId, RowLookupOutcome, RowLookupRequest};
+
+        let (_temp, dataset) = query_test_dataset(&[("live", Some(7), true, 9)]);
+
+        let result = dataset
+            .snapshot()
+            .lookup_row(&RowLookupRequest {
+                row_id: RowId(0),
+                projection: Projection::Columns(vec!["rank".into(), "title".into()]),
+            })
+            .unwrap();
+
+        assert_eq!(result.row_id, RowId(0));
+        assert_eq!(result.projection, vec!["rank", "title"]);
+        assert_eq!(
+            result.outcome,
+            RowLookupOutcome::Live(ProjectedRow {
+                fields: vec![
+                    ProjectedField::new("rank", ResultValue::UInt64(9)),
+                    ProjectedField::new("title", ResultValue::Utf8("live".into())),
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn row_lookup_keeps_an_old_snapshot_live_and_reports_a_newer_delete_as_tombstoned() {
+        use crate::{Projection, ResultValue, RowId, RowLookupOutcome, RowLookupRequest};
+
+        let (_temp, dataset) = query_test_dataset(&[("before-delete", Some(1), true, 1)]);
+        let before_delete = dataset.snapshot();
+
+        let mut transaction = dataset.begin();
+        transaction.delete(0).unwrap();
+        transaction.commit().unwrap();
+
+        let request = RowLookupRequest {
+            row_id: RowId(0),
+            projection: Projection::Columns(vec!["title".into()]),
+        };
+        let old_result = before_delete.lookup_row(&request).unwrap();
+        let new_result = dataset.snapshot().lookup_row(&request).unwrap();
+
+        assert_eq!(
+            old_result.outcome,
+            RowLookupOutcome::Live(ProjectedRow {
+                fields: vec![ProjectedField::new(
+                    "title",
+                    ResultValue::Utf8("before-delete".into()),
+                )],
+            })
+        );
+        assert_eq!(new_result.projection, vec!["title"]);
+        assert_eq!(new_result.outcome, RowLookupOutcome::Tombstoned);
+    }
+
+    #[test]
+    fn row_lookup_returns_not_found_for_never_allocated_gap_and_future_ids() {
+        use crate::{Dataset, Projection, RowId, RowLookupOutcome, RowLookupRequest};
+
+        let (temp, dataset) = query_test_dataset(&[("first", Some(1), true, 1)]);
+        let dir = temp.path().join("dataset");
+        drop(dataset);
+
+        strata_storage::persist_row_id_high_water_at_least(&dir, 2).unwrap();
+        let dataset = Dataset::open(&dir).unwrap();
+        let schema = dataset.snapshot().schema();
+        let appended = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["after-gap"])),
+                Arc::new(Int64Array::from(vec![Some(2)])),
+                Arc::new(BooleanArray::from(vec![false])),
+                Arc::new(UInt64Array::from(vec![2])),
+            ],
+        )
+        .unwrap();
+        let mut transaction = dataset.begin();
+        transaction.insert(appended).unwrap();
+        transaction.commit().unwrap();
+
+        let snapshot = dataset.snapshot();
+        for row_id in [RowId(1), RowId(3), RowId(99)] {
+            let result = snapshot
+                .lookup_row(&RowLookupRequest {
+                    row_id,
+                    projection: Projection::Columns(vec!["title".into()]),
+                })
+                .unwrap();
+            assert_eq!(result.outcome, RowLookupOutcome::NotFound, "{row_id:?}");
+        }
+    }
+
+    #[test]
+    fn row_lookup_uses_the_same_projection_validation_as_scan_query() {
+        use crate::{Projection, QueryError, QueryValidationError, RowId, RowLookupRequest};
+
+        let (_temp, dataset) = query_test_dataset(&[("live", Some(1), true, 1)]);
+        let snapshot = dataset.snapshot();
+        for projection in [
+            Projection::Columns(vec!["missing".into()]),
+            Projection::Columns(vec![ROW_ID_COLUMN.into()]),
+            Projection::Columns(vec!["title".into(), "title".into()]),
+        ] {
+            let error = snapshot
+                .lookup_row(&RowLookupRequest {
+                    row_id: RowId(0),
+                    projection,
+                })
+                .expect_err("invalid projections must remain typed query errors");
+            assert!(
+                matches!(
+                    error,
+                    QueryError::Validation(
+                        QueryValidationError::UnknownColumn { .. }
+                            | QueryValidationError::ReservedColumn { .. }
+                            | QueryValidationError::DuplicateProjection { .. }
+                    )
+                ),
+                "{error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn row_lookup_decodes_dictionary_encoded_values_after_reopen() {
+        use crate::{Dataset, Projection, ResultValue, RowId, RowLookupOutcome, RowLookupRequest};
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("dataset");
+        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)]));
+        let dataset = Dataset::create(&dir, Arc::clone(&schema)).unwrap();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec!["alice"; 100]))],
+        )
+        .unwrap();
+        let mut transaction = dataset.begin();
+        transaction.insert(batch).unwrap();
+        transaction.commit().unwrap();
+        drop(dataset);
+
+        let result = Dataset::open(&dir)
+            .unwrap()
+            .snapshot()
+            .lookup_row(&RowLookupRequest {
+                row_id: RowId(0),
+                projection: Projection::Columns(vec!["name".into()]),
+            })
+            .unwrap();
+
+        assert_eq!(
+            result.outcome,
+            RowLookupOutcome::Live(ProjectedRow {
+                fields: vec![ProjectedField::new(
+                    "name",
+                    ResultValue::Utf8("alice".into()),
+                )],
+            })
+        );
+    }
+
+    #[test]
+    fn row_lookup_wraps_missing_committed_data_as_a_typed_engine_error() {
+        use crate::{
+            Projection, QueryError, QueryExecutionError, RowId, RowLookupRequest, TxnError,
+        };
+
+        let (temp, dataset) = query_test_dataset(&[("present", Some(1), true, 1)]);
+        let snapshot = dataset.snapshot();
+        let data_file = &snapshot.data_files()[0].name;
+        std::fs::remove_file(temp.path().join("dataset").join("data").join(data_file)).unwrap();
+
+        let error = snapshot
+            .lookup_row(&RowLookupRequest {
+                row_id: RowId(0),
+                projection: Projection::All,
+            })
+            .expect_err("a missing committed file must surface a typed engine error");
+
+        assert!(matches!(
+            error,
+            QueryError::Execution(QueryExecutionError::Engine(source))
+                if matches!(source.as_ref(), TxnError::Storage(strata_storage::StorageError::Io(_)))
+        ));
+    }
+
+    #[test]
+    fn group_by_query_merges_groups_across_files_in_manifest_order() {
+        use crate::{Aggregate, AggregateFunction, GroupByRequest, ResultValue};
+
+        let (_temp, dataset, schema) = group_by_test_dataset();
+        append_group_by_rows(
+            &dataset,
+            &schema,
+            &[
+                (Some("a"), Some(1), true, Some(0.5)),
+                (Some("b"), Some(2), true, Some(2.0)),
+            ],
+        );
+        append_group_by_rows(&dataset, &schema, &[(Some("a"), Some(4), true, Some(1.5))]);
+
+        let result = dataset
+            .snapshot()
+            .group_by_query(&GroupByRequest {
+                group_by: vec!["category".into()],
+                aggregates: vec![
+                    Aggregate::new("amount", AggregateFunction::Count, "count"),
+                    Aggregate::new("amount", AggregateFunction::Sum, "sum"),
+                    Aggregate::new("amount", AggregateFunction::Average, "average"),
+                    Aggregate::new("ratio", AggregateFunction::Sum, "ratio_sum"),
+                ],
+                filter: None,
+            })
+            .unwrap();
+
+        assert_eq!(result.group_by(), ["category"]);
+        assert_eq!(
+            result
+                .aggregates()
+                .iter()
+                .map(crate::AggregateOutput::alias)
+                .collect::<Vec<_>>(),
+            vec!["count", "sum", "average", "ratio_sum"]
+        );
+        assert_eq!(
+            result.rows(),
+            [
+                crate::GroupedRow {
+                    keys: vec![ResultValue::Utf8("a".into())],
+                    aggregates: vec![
+                        ResultValue::UInt64(2),
+                        ResultValue::Int64(5),
+                        ResultValue::Float64(2.5),
+                        ResultValue::Float64(2.0),
+                    ],
+                },
+                crate::GroupedRow {
+                    keys: vec![ResultValue::Utf8("b".into())],
+                    aggregates: vec![
+                        ResultValue::UInt64(1),
+                        ResultValue::Int64(2),
+                        ResultValue::Float64(2.0),
+                        ResultValue::Float64(2.0),
+                    ],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn group_by_query_preserves_null_keys_and_all_null_aggregate_contracts() {
+        use crate::{Aggregate, AggregateFunction, GroupByRequest, ResultValue};
+
+        let (_temp, dataset, schema) = group_by_test_dataset();
+        append_group_by_rows(
+            &dataset,
+            &schema,
+            &[
+                (None, None, true, None),
+                (Some("all-null"), None, true, None),
+            ],
+        );
+
+        let result = dataset
+            .snapshot()
+            .group_by_query(&GroupByRequest {
+                group_by: vec!["category".into()],
+                aggregates: vec![
+                    Aggregate::new("amount", AggregateFunction::Count, "count"),
+                    Aggregate::new("amount", AggregateFunction::Sum, "sum"),
+                    Aggregate::new("amount", AggregateFunction::Minimum, "minimum"),
+                    Aggregate::new("amount", AggregateFunction::Maximum, "maximum"),
+                    Aggregate::new("amount", AggregateFunction::Average, "average"),
+                    Aggregate::new("ratio", AggregateFunction::Sum, "ratio_sum"),
+                ],
+                filter: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            result.rows(),
+            [
+                crate::GroupedRow {
+                    keys: vec![ResultValue::Null],
+                    aggregates: vec![
+                        ResultValue::UInt64(0),
+                        ResultValue::Null,
+                        ResultValue::Null,
+                        ResultValue::Null,
+                        ResultValue::Null,
+                        ResultValue::Null,
+                    ],
+                },
+                crate::GroupedRow {
+                    keys: vec![ResultValue::Utf8("all-null".into())],
+                    aggregates: vec![
+                        ResultValue::UInt64(0),
+                        ResultValue::Null,
+                        ResultValue::Null,
+                        ResultValue::Null,
+                        ResultValue::Null,
+                        ResultValue::Null,
+                    ],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn group_by_query_returns_no_rows_when_the_snapshot_has_no_input() {
+        use crate::{Aggregate, AggregateFunction, GroupByRequest};
+
+        let (_temp, dataset, _schema) = group_by_test_dataset();
+        let result = dataset
+            .snapshot()
+            .group_by_query(&GroupByRequest {
+                group_by: vec!["category".into()],
+                aggregates: vec![Aggregate::new("amount", AggregateFunction::Count, "count")],
+                filter: None,
+            })
+            .unwrap();
+
+        assert!(result.rows().is_empty());
+    }
+
+    #[test]
+    fn group_by_query_reads_filter_only_columns_after_tombstone_filtering() {
+        use crate::{
+            Aggregate, AggregateFunction, Comparison, ComparisonOperator, FilterExpression,
+            FilterLiteral, GroupByRequest, ResultValue,
+        };
+
+        let (_temp, dataset, schema) = group_by_test_dataset();
+        append_group_by_rows(
+            &dataset,
+            &schema,
+            &[
+                (Some("deleted"), Some(100), true, Some(1.0)),
+                (Some("kept"), Some(3), true, Some(1.0)),
+                (Some("filtered"), Some(9), false, Some(1.0)),
+            ],
+        );
+        let mut transaction = dataset.begin();
+        transaction.delete(0).unwrap();
+        transaction.commit().unwrap();
+
+        let result = dataset
+            .snapshot()
+            .group_by_query(&GroupByRequest {
+                group_by: vec!["category".into()],
+                aggregates: vec![Aggregate::new("amount", AggregateFunction::Sum, "sum")],
+                filter: Some(FilterExpression::Compare(Comparison {
+                    column: "selected".into(),
+                    operator: ComparisonOperator::Equal,
+                    value: FilterLiteral::Boolean(true),
+                })),
+            })
+            .unwrap();
+
+        assert_eq!(
+            result.rows(),
+            [crate::GroupedRow {
+                keys: vec![ResultValue::Utf8("kept".into())],
+                aggregates: vec![ResultValue::Int64(3)],
+            }]
+        );
+    }
+
+    #[test]
+    fn group_by_query_decodes_dictionary_values_after_reopen() {
+        use crate::{Aggregate, AggregateFunction, Dataset, GroupByRequest, ResultValue};
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("dataset");
+        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)]));
+        let dataset = Dataset::create(&dir, Arc::clone(&schema)).unwrap();
+        let names = (0..100)
+            .map(|index| if index % 2 == 0 { "alice" } else { "bob" })
+            .collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(names))]).unwrap();
+        let mut transaction = dataset.begin();
+        transaction.insert(batch).unwrap();
+        transaction.commit().unwrap();
+        drop(dataset);
+
+        let result = Dataset::open(&dir)
+            .unwrap()
+            .snapshot()
+            .group_by_query(&GroupByRequest {
+                group_by: vec!["name".into()],
+                aggregates: vec![Aggregate::new("name", AggregateFunction::Count, "count")],
+                filter: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            result.rows(),
+            [
+                crate::GroupedRow {
+                    keys: vec![ResultValue::Utf8("alice".into())],
+                    aggregates: vec![ResultValue::UInt64(50)],
+                },
+                crate::GroupedRow {
+                    keys: vec![ResultValue::Utf8("bob".into())],
+                    aggregates: vec![ResultValue::UInt64(50)],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn group_by_query_rejects_invalid_group_contracts() {
+        use crate::{
+            Aggregate, AggregateFunction, GroupByRequest, QueryError, QueryValidationError,
+        };
+
+        let (_temp, dataset, _schema) = group_by_test_dataset();
+        for request in [
+            GroupByRequest {
+                group_by: Vec::new(),
+                aggregates: Vec::new(),
+                filter: None,
+            },
+            GroupByRequest {
+                group_by: vec![ROW_ID_COLUMN.into()],
+                aggregates: Vec::new(),
+                filter: None,
+            },
+            GroupByRequest {
+                group_by: vec!["category".into(), "category".into()],
+                aggregates: Vec::new(),
+                filter: None,
+            },
+            GroupByRequest {
+                group_by: vec!["missing".into()],
+                aggregates: Vec::new(),
+                filter: None,
+            },
+            GroupByRequest {
+                group_by: vec!["category".into()],
+                aggregates: vec![Aggregate::new("amount", AggregateFunction::Sum, "category")],
+                filter: None,
+            },
+        ] {
+            let error = dataset
+                .snapshot()
+                .group_by_query(&request)
+                .expect_err("invalid group-by contracts must remain typed errors");
+            assert!(
+                matches!(
+                    error,
+                    QueryError::Validation(
+                        QueryValidationError::EmptyGroupBy
+                            | QueryValidationError::ReservedColumn { .. }
+                            | QueryValidationError::DuplicateGroupColumn { .. }
+                            | QueryValidationError::UnknownColumn { .. }
+                            | QueryValidationError::DuplicateAggregateAlias { .. }
+                    )
+                ),
+                "{error:?}"
+            );
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new(
+                "embedding",
+                DataType::FixedSizeList(
+                    Arc::new(arrow::datatypes::Field::new(
+                        "item",
+                        DataType::Float32,
+                        false,
+                    )),
+                    2,
+                ),
+                false,
+            ),
+        ]));
+        let vector_dataset =
+            crate::Dataset::create(temp.path().join("vector-dataset"), schema).unwrap();
+        assert!(matches!(
+            vector_dataset.snapshot().group_by_query(&GroupByRequest {
+                group_by: vec!["embedding".into()],
+                aggregates: Vec::new(),
+                filter: None,
+            }),
+            Err(QueryError::Validation(
+                QueryValidationError::NonScalarGroupColumn { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn group_by_query_stays_bound_to_its_snapshot() {
+        use crate::{Aggregate, AggregateFunction, GroupByRequest, ResultValue};
+
+        let (_temp, dataset, schema) = group_by_test_dataset();
+        append_group_by_rows(
+            &dataset,
+            &schema,
+            &[(Some("before"), Some(1), true, Some(1.0))],
+        );
+        let snapshot = dataset.snapshot();
+        append_group_by_rows(
+            &dataset,
+            &schema,
+            &[(Some("after"), Some(2), true, Some(2.0))],
+        );
+
+        let result = snapshot
+            .group_by_query(&GroupByRequest {
+                group_by: vec!["category".into()],
+                aggregates: vec![Aggregate::new("amount", AggregateFunction::Sum, "sum")],
+                filter: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            result.rows(),
+            [crate::GroupedRow {
+                keys: vec![ResultValue::Utf8("before".into())],
+                aggregates: vec![ResultValue::Int64(1)],
+            }]
+        );
+    }
+
+    #[test]
+    fn group_by_query_returns_a_typed_error_for_int64_sum_overflow() {
+        use crate::{
+            Aggregate, AggregateFunction, GroupByRequest, QueryError, QueryExecutionError,
+        };
+
+        let (_temp, dataset, schema) = group_by_test_dataset();
+        append_group_by_rows(
+            &dataset,
+            &schema,
+            &[
+                (Some("overflow"), Some(i64::MAX), true, Some(1.0)),
+                (Some("overflow"), Some(1), true, Some(1.0)),
+            ],
+        );
+
+        assert!(matches!(
+            dataset.snapshot().group_by_query(&GroupByRequest {
+                group_by: vec!["category".into()],
+                aggregates: vec![Aggregate::new("amount", AggregateFunction::Sum, "sum")],
+                filter: None,
+            }),
+            Err(QueryError::Execution(QueryExecutionError::Int64SumOverflow { alias })) if alias == "sum"
+        ));
+    }
+
+    #[test]
+    fn aggregate_states_merge_independent_partials_with_checked_and_null_semantics() {
+        use crate::{Aggregate, AggregateFunction, AggregateOutput, LogicalType, ResultValue};
+
+        let count = Aggregate::new("amount", AggregateFunction::Count, "count");
+        let sum = Aggregate::new("amount", AggregateFunction::Sum, "sum");
+        let average = Aggregate::new("amount", AggregateFunction::Average, "average");
+        let count_output = AggregateOutput::new("count", LogicalType::UInt64);
+        let sum_output = AggregateOutput::new("sum", LogicalType::Int64);
+        let average_output = AggregateOutput::new("average", LogicalType::Float64);
+
+        let mut first = vec![
+            AggregateState::new(&count, &count_output).unwrap(),
+            AggregateState::new(&sum, &sum_output).unwrap(),
+            AggregateState::new(&average, &average_output).unwrap(),
+        ];
+        let mut second = first.clone();
+        for state in &mut first {
+            state.update(&ResultValue::Null, "aggregate").unwrap();
+        }
+        for state in &mut second {
+            state.update(&ResultValue::Int64(2), "aggregate").unwrap();
+            state.update(&ResultValue::Int64(4), "aggregate").unwrap();
+        }
+
+        for (left, right) in first.iter_mut().zip(second) {
+            left.merge(right, "aggregate").unwrap();
+        }
+
+        assert_eq!(first[0].clone().finish(), ResultValue::UInt64(2));
+        assert_eq!(first[1].clone().finish(), ResultValue::Int64(6));
+        assert_eq!(first[2].clone().finish(), ResultValue::Float64(3.0));
+    }
+
+    #[test]
+    fn vector_search_query_returns_nearest_hits_with_row_id_tie_order() {
+        use crate::{VectorHydration, VectorHydrationState, VectorSearchRequest};
+        use arrow::array::{Float32Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let temp = tempfile::tempdir().unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 2),
+                false,
+            ),
+        ]));
+        let dataset =
+            crate::Dataset::create(temp.path().join("dataset"), Arc::clone(&schema)).unwrap();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["exact", "left", "right"])),
+                Arc::new(FixedSizeListArray::new(
+                    Arc::new(Field::new("item", DataType::Float32, false)),
+                    2,
+                    Arc::new(Float32Array::from(vec![0.0, 0.0, -1.0, 0.0, 1.0, 0.0])),
+                    None,
+                )),
+            ],
+        )
+        .unwrap();
+        let mut transaction = dataset.begin();
+        transaction.insert(batch).unwrap();
+        transaction.commit().unwrap();
+
+        let result = dataset
+            .snapshot()
+            .vector_search_query(&VectorSearchRequest {
+                vector_column: "vector".into(),
+                query: vec![0.0, 0.0],
+                k: 3,
+                filter: None,
+                hydration: VectorHydration::NotRequested,
+            })
+            .unwrap();
+
+        assert_eq!(
+            result
+                .hits()
+                .iter()
+                .map(|hit| (hit.row_id.0, hit.squared_l2_distance))
+                .collect::<Vec<_>>(),
+            vec![(0, 0.0), (1, 1.0), (2, 1.0)]
+        );
+        assert!(
+            result
+                .hits()
+                .iter()
+                .all(|hit| matches!(hit.hydration, VectorHydrationState::NotRequested))
+        );
+    }
+
+    fn vector_query_dataset(
+        rows: &[(&str, bool, Option<[f32; 2]>)],
+    ) -> (tempfile::TempDir, crate::Dataset, SchemaRef) {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let temp = tempfile::tempdir().unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("selected", DataType::Boolean, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 2),
+                true,
+            ),
+        ]));
+        let dataset =
+            crate::Dataset::create(temp.path().join("dataset"), Arc::clone(&schema)).unwrap();
+        append_vector_query_rows(&dataset, &schema, rows);
+        (temp, dataset, schema)
+    }
+
+    fn append_vector_query_rows(
+        dataset: &crate::Dataset,
+        schema: &SchemaRef,
+        rows: &[(&str, bool, Option<[f32; 2]>)],
+    ) {
+        use arrow::array::{Float32Array, StringArray};
+
+        let values = rows
+            .iter()
+            .flat_map(|row| row.2.unwrap_or([0.0, 0.0]))
+            .collect::<Vec<_>>();
+        let vectors = FixedSizeListArray::new(
+            Arc::new(Field::new("item", DataType::Float32, false)),
+            2,
+            Arc::new(Float32Array::from(values)),
+            Some(arrow::buffer::NullBuffer::from(
+                rows.iter().map(|row| row.2.is_some()).collect::<Vec<_>>(),
+            )),
+        );
+        let batch = RecordBatch::try_new(
+            Arc::clone(schema),
+            vec![
+                Arc::new(StringArray::from(
+                    rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+                )),
+                Arc::new(BooleanArray::from(
+                    rows.iter().map(|row| row.1).collect::<Vec<_>>(),
+                )),
+                Arc::new(vectors),
+            ],
+        )
+        .unwrap();
+        let mut transaction = dataset.begin();
+        transaction.insert(batch).unwrap();
+        transaction.commit().unwrap();
+    }
+
+    #[test]
+    fn vector_search_query_rejects_zero_k_dimension_mismatch_and_non_finite_queries() {
+        use crate::{QueryError, QueryValidationError, VectorHydration, VectorSearchRequest};
+
+        let (_temp, dataset, _schema) = vector_query_dataset(&[("row", true, Some([0.0, 0.0]))]);
+        for request in [
+            VectorSearchRequest {
+                vector_column: "vector".into(),
+                query: vec![0.0, 0.0],
+                k: 0,
+                filter: None,
+                hydration: VectorHydration::NotRequested,
+            },
+            VectorSearchRequest {
+                vector_column: "vector".into(),
+                query: vec![0.0],
+                k: 1,
+                filter: None,
+                hydration: VectorHydration::NotRequested,
+            },
+            VectorSearchRequest {
+                vector_column: "vector".into(),
+                query: vec![0.0, f32::NAN],
+                k: 1,
+                filter: None,
+                hydration: VectorHydration::NotRequested,
+            },
+        ] {
+            assert!(
+                matches!(
+                    dataset.snapshot().vector_search_query(&request),
+                    Err(QueryError::Validation(
+                        QueryValidationError::InvalidVectorK
+                            | QueryValidationError::VectorDimensionMismatch { .. }
+                            | QueryValidationError::NonFiniteVectorComponent { .. }
+                    ))
+                ),
+                "{request:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn vector_search_query_filters_before_accepting_hits_and_allows_underfill() {
+        use crate::{
+            Comparison, ComparisonOperator, FilterExpression, FilterLiteral, VectorHydration,
+            VectorSearchRequest,
+        };
+
+        let (_temp, dataset, _schema) = vector_query_dataset(&[
+            ("near-but-filtered", false, Some([0.0, 0.0])),
+            ("far-and-selected", true, Some([10.0, 10.0])),
+        ]);
+        let result = dataset
+            .snapshot()
+            .vector_search_query(&VectorSearchRequest {
+                vector_column: "vector".into(),
+                query: vec![0.0, 0.0],
+                k: 4,
+                filter: Some(FilterExpression::Compare(Comparison {
+                    column: "selected".into(),
+                    operator: ComparisonOperator::Equal,
+                    value: FilterLiteral::Boolean(true),
+                })),
+                hydration: VectorHydration::NotRequested,
+            })
+            .unwrap();
+
+        assert_eq!(result.requested_k(), 4);
+        assert_eq!(result.hits().len(), 1);
+        assert_eq!(result.hits()[0].row_id.0, 1);
+        assert!((result.hits()[0].squared_l2_distance - 200.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn vector_search_query_excludes_null_vector_rows() {
+        use crate::{VectorHydration, VectorSearchRequest};
+
+        let (_temp, dataset, _schema) = vector_query_dataset(&[
+            ("indexed", true, Some([1.0, 1.0])),
+            ("null-vector", true, None),
+        ]);
+        let result = dataset
+            .snapshot()
+            .vector_search_query(&VectorSearchRequest {
+                vector_column: "vector".into(),
+                query: vec![0.0, 0.0],
+                k: 2,
+                filter: None,
+                hydration: VectorHydration::NotRequested,
+            })
+            .unwrap();
+
+        assert_eq!(result.hits().len(), 1);
+        assert_eq!(result.hits()[0].row_id.0, 0);
+    }
+
+    #[test]
+    fn vector_search_query_hydrates_requested_projection_from_the_same_snapshot() {
+        use crate::{
+            ProjectedField, Projection, ResultValue, VectorHydration, VectorHydrationState,
+            VectorSearchRequest,
+        };
+
+        let (_temp, dataset, _schema) =
+            vector_query_dataset(&[("hydrated", true, Some([0.0, 0.0]))]);
+        let result = dataset
+            .snapshot()
+            .vector_search_query(&VectorSearchRequest {
+                vector_column: "vector".into(),
+                query: vec![0.0, 0.0],
+                k: 1,
+                filter: None,
+                hydration: VectorHydration::Projection(Projection::Columns(vec!["name".into()])),
+            })
+            .unwrap();
+
+        assert_eq!(
+            result.hydration_projection(),
+            Some(["name".into()].as_slice())
+        );
+        assert!(matches!(
+            &result.hits()[0].hydration,
+            VectorHydrationState::Hydrated(ProjectedRow { fields })
+                if fields == &[ProjectedField::new("name", ResultValue::Utf8("hydrated".into()))]
+        ));
+    }
+
+    #[test]
+    fn vector_search_query_keeps_unresolved_index_hits_in_the_result() {
+        use crate::{
+            HydrationError, Projection, VectorHydration, VectorHydrationState, VectorSearchRequest,
+        };
+
+        let (_temp, dataset, _schema) =
+            vector_query_dataset(&[("indexed", true, Some([0.0, 0.0]))]);
+        let indexed_snapshot = dataset.snapshot();
+        let snapshot = Snapshot {
+            dir: indexed_snapshot.dir.clone(),
+            version: indexed_snapshot.version,
+            schema: Arc::clone(&indexed_snapshot.schema),
+            manifest: Arc::new(Manifest::empty()),
+            index: indexed_snapshot.index.clone(),
+            tombstones: Arc::clone(&indexed_snapshot.tombstones),
+            live_set_cache: LiveSetCache::new(LIVE_SET_CACHE_BYTE_BUDGET),
+        };
+
+        let result = snapshot
+            .vector_search_query(&VectorSearchRequest {
+                vector_column: "vector".into(),
+                query: vec![0.0, 0.0],
+                k: 1,
+                filter: None,
+                hydration: VectorHydration::Projection(Projection::Columns(vec!["name".into()])),
+            })
+            .unwrap();
+
+        assert_eq!(result.hits().len(), 1);
+        assert!(matches!(
+            result.hits()[0].hydration,
+            VectorHydrationState::Unresolved(HydrationError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn vector_search_query_decodes_dictionary_hydration_after_reopen() {
+        use crate::{
+            Dataset, Projection, ResultValue, VectorHydration, VectorHydrationState,
+            VectorSearchRequest,
+        };
+        use arrow::array::{Float32Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("dataset");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 2),
+                false,
+            ),
+        ]));
+        let dataset = Dataset::create(&dir, Arc::clone(&schema)).unwrap();
+        let vector_values = (0_u8..100)
+            .flat_map(|value| [f32::from(value), 0.0])
+            .collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["repeated"; 100])),
+                Arc::new(FixedSizeListArray::new(
+                    Arc::new(Field::new("item", DataType::Float32, false)),
+                    2,
+                    Arc::new(Float32Array::from(vector_values)),
+                    None,
+                )),
+            ],
+        )
+        .unwrap();
+        let mut transaction = dataset.begin();
+        transaction.insert(batch).unwrap();
+        transaction.commit().unwrap();
+        let data_file = dataset.snapshot().data_files()[0].name.clone();
+        let on_disk = read_batch(&dir.join("data").join(data_file)).unwrap();
+        assert!(matches!(
+            on_disk
+                .schema_ref()
+                .field_with_name("name")
+                .unwrap()
+                .data_type(),
+            DataType::Dictionary(_, _)
+        ));
+        drop(dataset);
+
+        let result = Dataset::open(&dir)
+            .unwrap()
+            .snapshot()
+            .vector_search_query(&VectorSearchRequest {
+                vector_column: "vector".into(),
+                query: vec![0.0, 0.0],
+                k: 1,
+                filter: None,
+                hydration: VectorHydration::Projection(Projection::Columns(vec!["name".into()])),
+            })
+            .unwrap();
+
+        assert!(matches!(
+            &result.hits()[0].hydration,
+            VectorHydrationState::Hydrated(ProjectedRow { fields })
+                if fields[0].value == ResultValue::Utf8("repeated".into())
+        ));
+    }
+
+    #[test]
+    fn vector_search_query_keeps_old_snapshot_bound_to_its_original_segments_and_rows() {
+        use crate::{
+            Projection, ResultValue, VectorHydration, VectorHydrationState, VectorSearchRequest,
+        };
+
+        let (_temp, dataset, schema) = vector_query_dataset(&[("before", true, Some([0.0, 0.0]))]);
+        let old_snapshot = dataset.snapshot();
+        append_vector_query_rows(&dataset, &schema, &[("after", true, Some([10.0, 10.0]))]);
+
+        let result = old_snapshot
+            .vector_search_query(&VectorSearchRequest {
+                vector_column: "vector".into(),
+                query: vec![10.0, 10.0],
+                k: 2,
+                filter: None,
+                hydration: VectorHydration::Projection(Projection::Columns(vec!["name".into()])),
+            })
+            .unwrap();
+
+        assert_eq!(result.hits().len(), 1);
+        assert!(matches!(
+            &result.hits()[0].hydration,
+            VectorHydrationState::Hydrated(ProjectedRow { fields })
+                if fields[0].value == ResultValue::Utf8("before".into())
+        ));
+    }
+
+    #[test]
+    fn vector_search_query_reports_missing_hydration_data_as_a_typed_engine_error() {
+        use crate::{
+            Projection, QueryError, QueryExecutionError, VectorHydration, VectorSearchRequest,
+        };
+
+        let (temp, dataset, _schema) = vector_query_dataset(&[("present", true, Some([0.0, 0.0]))]);
+        let snapshot = dataset.snapshot();
+        let data_file = &snapshot.data_files()[0].name;
+        std::fs::remove_file(temp.path().join("dataset").join("data").join(data_file)).unwrap();
+
+        let error = snapshot
+            .vector_search_query(&VectorSearchRequest {
+                vector_column: "vector".into(),
+                query: vec![0.0, 0.0],
+                k: 1,
+                filter: None,
+                hydration: VectorHydration::Projection(Projection::All),
+            })
+            .expect_err("missing committed hydration data must be a typed engine error");
+
+        assert!(matches!(
+            error,
+            QueryError::Execution(QueryExecutionError::Engine(source))
+                if matches!(source.as_ref(), TxnError::Storage(strata_storage::StorageError::Io(_)))
+        ));
     }
 }

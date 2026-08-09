@@ -37,7 +37,7 @@ fn crash_mid_write_recovers_last_committed_version() {
     let dir_str = dir.to_str().expect("temp dir path must be valid UTF-8");
 
     let status = Command::new(strata_bin)
-        .args(["create", dir_str])
+        .args(["create", dir_str, "--ack-single-writer"])
         .status()
         .unwrap();
     assert!(status.success(), "create failed");
@@ -45,7 +45,7 @@ fn crash_mid_write_recovers_last_committed_version() {
     // A huge commit count, so the child can never naturally finish before
     // we kill it — the kill always lands genuinely mid-run, not after.
     let mut child = Command::new(strata_bin)
-        .args(["crash-loop", dir_str, "1000000"])
+        .args(["crash-loop", dir_str, "1000000", "--ack-single-writer"])
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();

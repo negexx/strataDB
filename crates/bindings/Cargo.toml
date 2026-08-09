@@ -14,3 +14,7 @@ workspace = true
 
 [dependencies]
 pyo3.workspace = true
+strata-txn = { path = "../txn" }
+
+[dev-dependencies]
+tempfile.workspace = true

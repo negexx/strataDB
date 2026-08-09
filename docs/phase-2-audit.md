@@ -1,11 +1,12 @@
 # Phase 2 Query and Usability Audit
 
 **Date:** 2026-08-03
-**Status:** Read-only audit; no Phase 2 implementation approved
+**Status:** Phase 2 implemented within named bounds; D0 approved and T1-T8 integration gates passed
 **Next phase:** Query and usability
 
 This audit records the independent Sol review performed after the Phase 1 closeout work. It is a
-design and triage record, not an exit claim for Phase 1 and not approval to begin implementation.
+design and triage record, not an exit claim for Phase 1. D0 has since been approved for bounded
+implementation; this document remains the controlling scope and contract record for Phase 2.
 Phase 1 remains **Partial — blocked** until its CI, portability, and performance-evidence gates are
 closed.
 
@@ -28,13 +29,11 @@ reclamation.
 
 ## Findings
 
-### P0 — Stable query/schema API is blocked
+### P0 — Stable query/schema API (resolved for the approved Phase 2 slice)
 
-The current scan path accepts caller-supplied projection/schema context and validates requested
-fields against the persisted dataset schema by owned name, but it does not yet provide a stable,
-typed dataset-owned query contract. A supported Phase 2 query surface needs explicit schema and
-reserved-column contracts, with typed requests bound to an immutable `Snapshot`. Do not make callers
-depend on raw Arrow-shape details to form a supported query.
+The typed dataset-owned query contract is now implemented in `crates/txn/src/query.rs`, with
+explicit schema/reserved-column rules and requests bound to an immutable `Snapshot`. Client
+surfaces must use this contract rather than constructing raw Arrow query shapes.
 
 ### P0 — Duplicate openers can leave the supported concurrency boundary
 
@@ -43,11 +42,11 @@ Phase 2 facade must explicitly reject or constrain duplicate opens and CLI concu
 clearly retain the one-shared-handle precondition. Durable coordination between independent
 openers remains Phase 4 work.
 
-### P1 — A fresh Phase 2 design is required before implementation
+### P1 — Phase 2 design and implementation status
 
-Define a typed, snapshot-bound query facade before Terra implementation. The recommended nucleus is
-a `ScanRequest`/query object covering projection, predicates, aggregation, and vector options while
-remaining narrower than DataFusion or full SQL.
+The approved D0 design uses separate typed scan, lookup, group-by, and vector requests/results,
+remaining narrower than DataFusion or full SQL. T1-T5 implement and test the Rust contract; T6 and
+T7 implement the Python and CLI surfaces, while T8 covers cross-surface integration and closeout.
 
 ### P1 — Projection and filtering need an explicit internal-column contract
 
@@ -56,30 +55,32 @@ read the union of requested output columns, predicate columns, and `_row_id`; ap
 predicate filtering; then remove internal columns before returning the result. Projection must not
 leak `_row_id` or permit reserved-name collisions.
 
-### P1 — Point lookup lacks a complete contract
+### P1 — Point lookup contract (resolved for the approved Phase 2 slice)
 
-Point lookup should be snapshot-bound and use the physical `RowId` identity. The design must specify
-never-allocated and tombstoned behavior, vectorless rows, routing metadata, and compatibility with
-the manifest/catalog integrity rules.
+Point lookup is snapshot-bound and uses physical `RowId` identity. The approved contract specifies
+never-allocated/not-found, tombstoned, vectorless, projection, dictionary, and typed engine-error
+behavior; the T3 implementation covers those cases.
 
-### P1 — Group-by is not yet a stable aggregate surface
+### P1 — Group-by aggregate surface (resolved for the approved Phase 2 slice)
 
-The current primitive is a full-batch operation without mergeable partial state. Phase 2 must define
-null handling, numeric precision, ordering, empty-input behavior, and a mergeable accumulator shape
-before promising grouped query results.
+The approved group-by surface defines null handling, numeric precision, ordering, empty-input behavior,
+and mergeable typed partial accumulators. T4 implements and tests those semantics.
 
-### P1 — Vector search semantics are incomplete
+### P1 — Vector search semantics (resolved for the approved Phase 2 slice)
 
-The current path uses fixed `ef_search = 32` with arbitrary `k`, returns internal `VectorMatch`
-values, reports squared-L2 units, and the CLI can silently drop unresolved IDs. Phase 2 must define
-the public result type, distance units, underfilled-`k` behavior, filtering, vector dimensions, and
-row hydration/error behavior.
+The approved vector surface defines the public result type, squared-L2 units, underfilled-`k`
+behavior, filtering, dimensions, RowId tie ordering, and typed hydration/error behavior. T5 and the
+CLI search path implement those semantics without silently dropping unresolved IDs.
 
-### P1 — Python and CLI surfaces are placeholders
+### P1 — Python and CLI surfaces
 
-The Python binding needs typed exceptions, a documented Arrow conversion contract, GIL-release
-behavior around blocking work, and CI coverage. The CLI currently hardcodes a demo shape, has an
-exact-search filtering issue, and can report a version label inconsistent with displayed rows.
+The approved Python contract returns Arrow IPC stream bytes for tabular results, typed exceptions,
+and releases the GIL around blocking engine work. T6 implements this contract. The approved Phase 2 CLI contract uses the typed
+facade for `query-scan`, `lookup`, `group-by`, and non-exact `search`, with deterministic line output
+(`query-scan` uses result row indexes because physical `_row_id` is reserved and excluded from scan
+projections), and `--ack-single-writer` required for every mutating command. The pre-existing `scan`, `filter`,
+`inspect`, and `explain` commands remain compatibility-only MVP inspection commands; they are not
+promoted as generic schema APIs or broader supported guarantees.
 
 ### P2 — Narrow-read and layering claims need evidence
 
@@ -115,6 +116,7 @@ agent-memory features.
 
 ## Terra readiness
 
-**Not ready for implementation.** Sol design approval and the Phase 1 prerequisite gates must come
-first. Once D0 is approved, Luna can dispatch one bounded Terra task at a time with disjoint file
-scope and independent review.
+D0 is approved. T1-T7 are implemented with focused evidence and independent Terra approvals. T8
+integration gates pass: workspace tests, check, clippy, format, diff, stale-claim, and relative-link
+verification are green. The final Sol branch review approved the current bounded implementation.
+Phase 2 is implemented within these named bounds; Phase 1 remains Partial — blocked independently.

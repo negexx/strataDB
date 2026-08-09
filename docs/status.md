@@ -20,6 +20,12 @@ compaction, migration, object storage, or universal power-loss durability.
 durability, schema, API-boundary, verification, and performance-evidence blockers inside the supported
 single-process/shared-`Dataset` boundary.
 
+**Phase 2: Implemented within named bounds.** The approved T1–T5 Rust query contract, T6 Python IPC
+facade, T7 typed CLI surface, and T8 integration evidence are complete within the documented
+embedded/single-process boundary. This does not alter the independent Phase 1 blocked state or claim
+serializability, universal durability/performance/recall, cross-process coordination, or lifecycle
+reclamation.
+
 ## Capability ledger
 
 | Capability | State | Current boundary |
@@ -31,8 +37,8 @@ single-process/shared-`Dataset` boundary.
 | Query operators/pruning | Partial | Predicates, file/segment pruning, filtered ANN, and group-by primitives exist; no complete planner. |
 | Immutable vector segments | Implemented | Manifest-listed HNSW segments load and fan out across snapshots. Growth is unbounded without lifecycle work. |
 | Update/delete identity | Implemented within the supported facade | Physical live-target validation and one-row replacement cardinality are typed; logical identity remains deferred. |
-| CLI | Partial | Fixed-assumption MVP inspection/demo commands; not a stable administration surface. |
-| Python | Proposed | PyO3 scaffolding exports only `placeholder_version`; no database API exists. |
+| CLI | Partial | Typed lookup, group-by, and query-scan commands are implemented; query-scan reports deterministic result indexes because physical `_row_id` is reserved, while legacy scan/filter/inspect/explain remain compatibility commands. Mutations require explicit single-writer acknowledgement. |
+| Python | Partial | Thin PyO3 Dataset/Snapshot query facade returns Arrow IPC bytes for tabular results and typed vector matches; integration review remains. |
 | Durability/recovery | Partial | File/directory durability, immutable row-ID high-water, manifest integrity, and crash/reopen evidence exist within named local bounds; full branch verification remains. |
 | Schema/migrations | Partial | Dataset-owned schema and strict validation are implemented; schema evolution and migration remain deferred. |
 | Loom/chaos/fuzz/bench evidence | Partial | Exact-head CI run [30904907577](https://github.com/negexx/strataDB/actions/runs/30904907577) at revision `6bcd020` retains current command/outcome provenance; the manual Ubuntu run [30897605936](https://github.com/negexx/strataDB/actions/runs/30897605936) passed the named loom gates and thorough-chaos `2000/2000` seed gate; native Ubuntu/Windows checks and the validated full 100K-row pinned-fixture segmented/lifecycle matrix passed in [30881986345](https://github.com/negexx/strataDB/actions/runs/30881986345) and [30907464857](https://github.com/negexx/strataDB/actions/runs/30907464857). Universal bounds and final limitations remain open. |
