@@ -171,7 +171,10 @@ jobs:
 
       - name: Test
         id: test
-        run: cargo test --workspace
+        # The bindings crate enables PyO3's extension-module feature by
+        # default for packaging. Native Rust test binaries must disable that
+        # feature so PyO3 links the interpreter symbols they exercise.
+        run: cargo test --workspace --no-default-features
 
       - name: Test (parallel-insert feature)
         id: test_parallel

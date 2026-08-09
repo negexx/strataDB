@@ -63,12 +63,16 @@ the old C++ direction; immutable index segments are current; group commit remain
 ```text
 cargo check --workspace
 cargo build --workspace
-cargo test --workspace
+cargo test --workspace --no-default-features
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
 cargo doc --workspace --no-deps
 cargo deny check bans sources advisories
 ```
+
+`strata-bindings` keeps PyO3's `extension-module` feature enabled by default for packaging. Native
+Rust test binaries must use `--no-default-features` so the bindings tests link the Python
+interpreter instead of relying on extension-module's unresolved-symbol behavior.
 
 When relevant, also run:
 
