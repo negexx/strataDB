@@ -1,6 +1,6 @@
 # Phase 3 Lifecycle Inventory and Diagnostics Design
 
-Status: approved design; implementation plan pending.
+Status: approved design; implementation plan written and being executed.
 
 ## Goal
 
