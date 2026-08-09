@@ -89,3 +89,39 @@ This closeout uses Terra for every task review as explicitly requested. Sol is r
 ## Final verification and integration
 
 Before publication, run fresh output for formatting, build/check/test, clippy, docs, deny, metadata, all relevant loom models, fuzz discovery/smoke, checkpoint, fast and thorough chaos, benchmarks, stale-claim/link scans, and `git diff --check`. Stage only intentional files, inspect the staged diff, commit focused changes, push, open a ready-for-review PR, wait for required checks, obtain the final Sol review, merge only after all gates pass, confirm remote `main`, then remove the worktree and branch.
+
+## 2026-08-04 all-at-once closeout amendment
+
+The remaining work is executed as one coordinated closeout branch, but each deliverable remains
+independently reviewable and has a disjoint write scope. The user delegated the operating-bound
+decision, so the selected policy is:
+
+- measure the full pinned 100K-row fixture before adding a product limit;
+- report supported operating envelopes with exact workload, platform, toolchain, cache, repetition,
+  and input identity; and
+- add a typed operational guard only if a measured limit is required by an existing invariant and
+  the guard can fail closed without inventing an arbitrary cap. No benchmark result may be described
+  as a universal latency, memory, recovery, durability, or recall guarantee.
+
+The closeout workstreams are:
+
+1. **Full-scale segmented evidence.** Extend the cloud comparison workflow to dispatch the existing
+   manifest/lifecycle/segment matrix with `STRATA_SEG_ROWS=100000` and a fixed query count, verify
+   that both revisions loaded the complete pinned fixture and emitted the same input hash, and retain
+   raw logs plus machine-readable validation. The retired monolithic `HnswIndex` path remains excluded.
+2. **Remaining bounded performance evidence.** Re-run manifest growth, recovery accounting, segment
+   fan-out, and snapshot residency at the largest safe existing scales. If a workload cannot produce
+   a defensible bound, record that limitation and keep it open rather than adding a speculative guard.
+3. **Native verification provenance.** Dispatch the current CI workflow manually so the transaction,
+   cache, index loom, checkpoint, fast-chaos, thorough-chaos, fuzz, and provenance jobs execute on the
+   exact branch head. Retain the `2000/2000` assertion and distinguish skipped PR-only jobs from a
+   completed manual run.
+4. **Final branch gate.** Run the complete required local/cloud checks on the integrated branch,
+   perform fresh independent Terra reviews for every changed task, then obtain one final read-only Sol
+   review. Update the canonical audit, ledger, status, roadmap, and performance records only from
+   those fresh results.
+
+Phase 1 may be marked complete only if every remaining in-scope row has fresh implementation,
+regression, or required evidence and no P0/P1 blocker is left open. Full 100K-row evidence does not
+close lifecycle reclamation, cross-process publication, universal power-loss durability, or deferred
+Phase 2/3 findings.

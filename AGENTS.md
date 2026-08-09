@@ -63,12 +63,16 @@ the old C++ direction; immutable index segments are current; group commit remain
 ```text
 cargo check --workspace
 cargo build --workspace
-cargo test --workspace
+cargo test --workspace --no-default-features
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
 cargo doc --workspace --no-deps
 cargo deny check bans sources advisories
 ```
+
+`strata-bindings` keeps PyO3's `extension-module` feature enabled by default for packaging. Native
+Rust test binaries must use `--no-default-features` so the bindings tests link the Python
+interpreter instead of relying on extension-module's unresolved-symbol behavior.
 
 When relevant, also run:
 
@@ -105,9 +109,11 @@ Use the exact current CI/module recipe.
   Luna may answer questions and handle trivial orchestration, but routes non-trivial changes through
   Sol before Terra.
 - **Sol** owns architecture, concurrency analysis, design specs, ADRs, implementation plans, and
-  fresh independent review. In review mode Sol makes no edits.
+  the final complete-branch review. In review mode Sol makes no edits.
 - **Terra** executes one approved plan task, uses TDD for behavior changes, runs task verification,
-  and returns evidence. Terra does not redesign requirements silently.
+  and returns evidence. A separate Terra instance independently reviews each completed task; the
+  implementation worker never reviews or self-approves its own diff. Terra does not redesign
+  requirements silently.
 
 For non-trivial work:
 
@@ -119,10 +125,12 @@ For non-trivial work:
    do not allow overlapping writers.
 4. Terra returns files changed, commands/results, deviations, and blockers—never an unsupported
    whole-task completion claim.
-5. A fresh Sol reviews every non-trivial diff. `crates/txn` or `crates/index` changes always require
-   this review.
-6. Terra resolves accepted findings and reruns affected checks. Luna reads the final diff and fresh
-   verification output before reporting completion.
+5. A separate Terra reviewer independently reviews each completed implementation task, including
+   `crates/txn` or `crates/index` changes, and records concrete findings before acceptance.
+6. Sol performs the final complete-branch review before merge and reviews architecture/design work
+   or any superseding concurrency or durability decision. Terra resolves accepted findings and
+   reruns affected checks. Luna reads the final diff and fresh verification output before reporting
+   completion.
 
 Every handoff includes the objective, exact file scope, invariants, controlling spec/plan, interfaces,
 expected checks, dirty-worktree notes, authority limits, and required return evidence.

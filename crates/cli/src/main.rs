@@ -5,14 +5,37 @@
 //! flushing) "committed N" after each success, so an external harness can
 //! kill it deterministically partway through and verify recovery.
 
+use arrow::array::{Int64Array, RecordBatch, StringArray};
+use arrow::datatypes::{DataType, Schema};
 use std::env;
 use std::error::Error;
+use std::fmt;
 use std::io::Write as _;
 use std::process::ExitCode;
-use std::sync::Arc;
 
-use arrow::array::{FixedSizeListArray, Int64Array, RecordBatch, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
+const ACK_SINGLE_WRITER: &str = "--ack-single-writer";
+const SINGLE_WRITER_BOUNDARY: &str = "this acknowledges only one process using one shared Dataset handle, not cross-process coordination or serialization";
+
+#[derive(Debug)]
+enum CliError {
+    Usage(String),
+    Query { kind: &'static str, message: String },
+    VectorResolution(String),
+}
+
+impl fmt::Display for CliError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Usage(message) => write!(formatter, "usage error: {message}"),
+            Self::Query { kind, message } => {
+                write!(formatter, "query error kind={kind} message={message}")
+            }
+            Self::VectorResolution(message) => write!(formatter, "vector search error: {message}"),
+        }
+    }
+}
+
+impl Error for CliError {}
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
@@ -35,13 +58,23 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         "inspect",
         "explain",
         "crash-loop",
+        "lookup",
+        "group-by",
+        "query-scan",
     ];
 
     let Some(cmd) = args.get(1) else {
         eprintln!(
-            "usage: strata <create|insert|scan|filter|search|explain|inspect|crash-loop> <dir> [...]"
+            "usage: strata <create|insert|scan|filter|search|explain|inspect|crash-loop|lookup|group-by|query-scan> <dir> [...]"
         );
-        eprintln!("  search <dir> <v0> <v1> <v2> [k] [--exact] [--filter <column> <op> <value>]");
+        eprintln!(
+            "  search <dir> --vector <comma-separated finite floats> [--k <usize>] [--filter <column> <op> <value>]"
+        );
+        eprintln!("  lookup <dir> <row_id> [--columns <column,...>]");
+        eprintln!(
+            "  group-by <dir> <key,...> --agg <count|sum|avg:column> [--filter <column> <op> <value>]"
+        );
+        eprintln!("  query-scan <dir> --columns <column,...> [--filter <column> <op> <value>]");
         return Ok(());
     };
     if !KNOWN_COMMANDS.contains(&cmd.as_str()) {
@@ -52,20 +85,10 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
 
     match cmd.as_str() {
         "create" => {
-            strata_txn::Dataset::create(dir, strata_txn::mvp_fixtures::mvp_schema())?;
-            println!("created dataset at {dir}");
+            handle_create(args, dir)?;
         }
         "insert" => {
-            let id: i64 = args.get(3).ok_or("missing <id>")?.parse()?;
-            let name = args.get(4).ok_or("missing <name>")?;
-            let v0: f32 = args.get(5).ok_or("missing <v0>")?.parse()?;
-            let v1: f32 = args.get(6).ok_or("missing <v1>")?.parse()?;
-            let v2: f32 = args.get(7).ok_or("missing <v2>")?.parse()?;
-            let ds = strata_txn::Dataset::open(dir)?;
-            let mut txn = ds.begin();
-            txn.insert(strata_txn::mvp_fixtures::mvp_row(id, name, [v0, v1, v2])?)?;
-            txn.commit()?;
-            println!("committed version {}", ds.current_version());
+            handle_insert(args, dir)?;
         }
         "scan" => {
             let ds = strata_txn::Dataset::open(dir)?;
@@ -105,6 +128,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
             handle_explain(dir, args)?;
         }
         "crash-loop" => {
+            require_single_writer_ack(args, "crash-loop")?;
             let n: usize = args.get(3).ok_or("missing <num_commits>")?.parse()?;
             let ds = strata_txn::Dataset::open(dir)?;
             for i in 0..n {
@@ -120,9 +144,422 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
                 std::io::stdout().flush()?;
             }
         }
+        "lookup" => handle_lookup(args, dir)?,
+        "group-by" => handle_group_by(args, dir)?,
+        "query-scan" => handle_query_scan(args, dir)?,
         other => return Err(format!("unknown command: {other}").into()),
     }
 
+    Ok(())
+}
+
+fn usage_error(message: impl Into<String>) -> Box<dyn Error> {
+    Box::new(CliError::Usage(message.into()))
+}
+
+fn require_single_writer_ack(args: &[String], command: &str) -> Result<(), Box<dyn Error>> {
+    if args
+        .iter()
+        .skip(3)
+        .any(|argument| argument == ACK_SINGLE_WRITER)
+    {
+        return Ok(());
+    }
+    Err(usage_error(format!(
+        "{command} requires {ACK_SINGLE_WRITER}; {SINGLE_WRITER_BOUNDARY}"
+    )))
+}
+
+fn print_single_writer_boundary() {
+    println!(
+        "acknowledgement=single-writer scope=one-process/shared-Dataset-handle not-cross-process-coordination not-serialization"
+    );
+}
+
+fn handle_create(args: &[String], dir: &str) -> Result<(), Box<dyn Error>> {
+    require_single_writer_ack(args, "create")?;
+    strata_txn::Dataset::create(dir, strata_txn::mvp_fixtures::mvp_schema())?;
+    println!("created dataset at {dir}");
+    print_single_writer_boundary();
+    Ok(())
+}
+
+fn handle_insert(args: &[String], dir: &str) -> Result<(), Box<dyn Error>> {
+    require_single_writer_ack(args, "insert")?;
+    let payload = args
+        .iter()
+        .skip(3)
+        .filter(|argument| argument.as_str() != ACK_SINGLE_WRITER)
+        .collect::<Vec<_>>();
+    let id: i64 = payload
+        .first()
+        .ok_or_else(|| usage_error("insert requires <id> <name> <v0> <v1> <v2>"))?
+        .parse()
+        .map_err(|_| usage_error("insert <id> must be an Int64"))?;
+    let name = payload
+        .get(1)
+        .ok_or_else(|| usage_error("insert requires <id> <name> <v0> <v1> <v2>"))?;
+    let v0: f32 = payload
+        .get(2)
+        .ok_or_else(|| usage_error("insert requires <id> <name> <v0> <v1> <v2>"))?
+        .parse()
+        .map_err(|_| usage_error("insert <v0> must be a Float32"))?;
+    let v1: f32 = payload
+        .get(3)
+        .ok_or_else(|| usage_error("insert requires <id> <name> <v0> <v1> <v2>"))?
+        .parse()
+        .map_err(|_| usage_error("insert <v1> must be a Float32"))?;
+    let v2: f32 = payload
+        .get(4)
+        .ok_or_else(|| usage_error("insert requires <id> <name> <v0> <v1> <v2>"))?
+        .parse()
+        .map_err(|_| usage_error("insert <v2> must be a Float32"))?;
+    if payload.len() > 5 {
+        return Err(usage_error(
+            "insert accepts <id> <name> <v0> <v1> <v2> and --ack-single-writer",
+        ));
+    }
+    let ds = strata_txn::Dataset::open(dir)?;
+    let mut txn = ds.begin();
+    txn.insert(strata_txn::mvp_fixtures::mvp_row(id, name, [v0, v1, v2])?)?;
+    txn.commit()?;
+    println!("committed version {}", ds.current_version());
+    print_single_writer_boundary();
+    Ok(())
+}
+
+fn query_error(error: &strata_txn::QueryError) -> Box<dyn Error> {
+    let message = error.to_string();
+    let kind = match error {
+        strata_txn::QueryError::Validation(_) => "validation",
+        strata_txn::QueryError::Execution(_) => "execution",
+    };
+    Box::new(CliError::Query { kind, message })
+}
+
+fn parse_columns(value: &str) -> Result<Vec<String>, Box<dyn Error>> {
+    let columns = value
+        .split(',')
+        .map(str::trim)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if columns.is_empty() || columns.iter().any(String::is_empty) {
+        return Err(usage_error(
+            "--columns requires a non-empty comma-separated column list",
+        ));
+    }
+    Ok(columns)
+}
+
+fn parse_comparison_operator(
+    value: &str,
+) -> Result<strata_txn::ComparisonOperator, Box<dyn Error>> {
+    use strata_txn::ComparisonOperator;
+
+    match value {
+        "eq" => Ok(ComparisonOperator::Equal),
+        "neq" => Ok(ComparisonOperator::NotEqual),
+        "lt" => Ok(ComparisonOperator::LessThan),
+        "lteq" => Ok(ComparisonOperator::LessThanOrEqual),
+        "gt" => Ok(ComparisonOperator::GreaterThan),
+        "gteq" => Ok(ComparisonOperator::GreaterThanOrEqual),
+        _ => Err(usage_error("--filter <op> must be eq|neq|lt|lteq|gt|gteq")),
+    }
+}
+
+fn parse_filter_literal(
+    column: &str,
+    value: &str,
+    schema: &Schema,
+) -> Result<strata_txn::FilterLiteral, Box<dyn Error>> {
+    let field = schema
+        .field_with_name(column)
+        .map_err(|_| usage_error(format!("unknown dataset column '{column}' in --filter")))?;
+    match field.data_type() {
+        DataType::Int64 => value
+            .parse()
+            .map(strata_txn::FilterLiteral::Int64)
+            .map_err(|_| usage_error(format!("--filter value for '{column}' must be Int64"))),
+        DataType::UInt64 => value
+            .parse()
+            .map(strata_txn::FilterLiteral::UInt64)
+            .map_err(|_| usage_error(format!("--filter value for '{column}' must be UInt64"))),
+        DataType::Float64 => value
+            .parse()
+            .map(strata_txn::FilterLiteral::Float64)
+            .map_err(|_| usage_error(format!("--filter value for '{column}' must be Float64"))),
+        DataType::Boolean => value
+            .parse()
+            .map(strata_txn::FilterLiteral::Boolean)
+            .map_err(|_| usage_error(format!("--filter value for '{column}' must be Boolean"))),
+        DataType::Utf8 => Ok(strata_txn::FilterLiteral::Utf8(value.to_owned())),
+        _ => Err(usage_error(format!(
+            "--filter column '{column}' is not a scalar column in the current CLI fixture schema"
+        ))),
+    }
+}
+
+fn parse_filter(
+    args: &[String],
+    start: usize,
+    schema: &Schema,
+) -> Result<(strata_txn::FilterExpression, usize), Box<dyn Error>> {
+    let column = args
+        .get(start)
+        .ok_or_else(|| usage_error("missing <column> after --filter"))?;
+    let operator = args
+        .get(start + 1)
+        .ok_or_else(|| usage_error("missing <op> after --filter"))?;
+    let value = args
+        .get(start + 2)
+        .ok_or_else(|| usage_error("missing <value> after --filter"))?;
+    Ok((
+        strata_txn::FilterExpression::Compare(strata_txn::Comparison {
+            column: column.clone(),
+            operator: parse_comparison_operator(operator)?,
+            value: parse_filter_literal(column, value, schema)?,
+        }),
+        start + 3,
+    ))
+}
+
+fn format_value(value: &strata_txn::ResultValue) -> String {
+    match value {
+        strata_txn::ResultValue::Null => "Null".to_owned(),
+        strata_txn::ResultValue::Boolean(value) => format!("Boolean({value})"),
+        strata_txn::ResultValue::Int64(value) => format!("Int64({value})"),
+        strata_txn::ResultValue::UInt64(value) => format!("UInt64({value})"),
+        strata_txn::ResultValue::Float64(value) => format!("Float64({value})"),
+        strata_txn::ResultValue::Utf8(value) => format!("Utf8({value:?})"),
+        strata_txn::ResultValue::Vector(value) => format!("Vector({value:?})"),
+    }
+}
+
+fn format_logical_type(data_type: &strata_txn::LogicalType) -> String {
+    match data_type {
+        strata_txn::LogicalType::Boolean => "Boolean".to_owned(),
+        strata_txn::LogicalType::Int64 => "Int64".to_owned(),
+        strata_txn::LogicalType::UInt64 => "UInt64".to_owned(),
+        strata_txn::LogicalType::Float64 => "Float64".to_owned(),
+        strata_txn::LogicalType::Utf8 => "Utf8".to_owned(),
+        strata_txn::LogicalType::Vector { dimensions } => format!("Vector({dimensions})"),
+    }
+}
+
+fn projected_row_line(prefix: &str, row: &strata_txn::ProjectedRow) -> String {
+    let fields = row
+        .fields
+        .iter()
+        .map(|field| format!("{}={}", field.name, format_value(&field.value)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("{prefix} {fields}")
+}
+
+fn handle_lookup(args: &[String], dir: &str) -> Result<(), Box<dyn Error>> {
+    let row_id = args
+        .get(3)
+        .ok_or_else(|| usage_error("lookup requires <row_id>"))?
+        .parse()?;
+    let projection = match args.get(4).map(String::as_str) {
+        None => strata_txn::Projection::All,
+        Some("--columns") => strata_txn::Projection::Columns(parse_columns(
+            args.get(5)
+                .ok_or_else(|| usage_error("missing <column,...> after --columns"))?,
+        )?),
+        Some(_) => {
+            return Err(usage_error(
+                "lookup accepts only an optional --columns <column,...> argument",
+            ));
+        }
+    };
+    if args.len() > 6 {
+        return Err(usage_error(
+            "lookup accepts only an optional --columns <column,...> argument",
+        ));
+    }
+
+    let result = strata_txn::Dataset::open(dir)?
+        .snapshot()
+        .lookup_row(&strata_txn::RowLookupRequest {
+            row_id: strata_txn::RowId(row_id),
+            projection,
+        })
+        .map_err(|error| query_error(&error))?;
+    match result.outcome {
+        strata_txn::RowLookupOutcome::Live(row) => {
+            println!("lookup row_id={row_id} outcome=live");
+            for field in row.fields {
+                println!(
+                    "field name={} value={}",
+                    field.name,
+                    format_value(&field.value)
+                );
+            }
+        }
+        strata_txn::RowLookupOutcome::Tombstoned => {
+            println!("lookup row_id={row_id} outcome=tombstoned");
+        }
+        strata_txn::RowLookupOutcome::NotFound => {
+            println!("lookup row_id={row_id} outcome=not_found");
+        }
+    }
+    Ok(())
+}
+
+fn handle_query_scan(args: &[String], dir: &str) -> Result<(), Box<dyn Error>> {
+    let dataset = strata_txn::Dataset::open(dir)?;
+    let schema = dataset.schema();
+    let mut columns = None;
+    let mut filter = None;
+    let mut index = 3;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--columns" if columns.is_none() => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| usage_error("missing <column,...> after --columns"))?;
+                columns = Some(parse_columns(value)?);
+                index += 2;
+            }
+            "--filter" if filter.is_none() => {
+                let (parsed, next) = parse_filter(args, index + 1, schema.as_ref())?;
+                filter = Some(parsed);
+                index = next;
+            }
+            _ => {
+                return Err(usage_error(
+                    "query-scan requires --columns <column,...> and accepts one optional --filter <column> <op> <value>",
+                ));
+            }
+        }
+    }
+    let projection =
+        columns.ok_or_else(|| usage_error("query-scan requires --columns <column,...>"))?;
+    let result = dataset
+        .snapshot()
+        .scan_query(&strata_txn::ScanRequest {
+            projection: strata_txn::Projection::Columns(projection),
+            filter,
+        })
+        .map_err(|error| query_error(&error))?;
+
+    println!("query-scan projection={}", result.projection.join(","));
+    let mut rows = result.rows;
+    rows.sort_by_key(|row| projected_row_line("", row));
+    // The typed scan contract excludes reserved physical `_row_id`; expose a
+    // deterministic result index rather than presenting it as a physical ID.
+    for (index, row) in rows.iter().enumerate() {
+        println!("{}", projected_row_line(&format!("row index={index}"), row));
+    }
+    Ok(())
+}
+
+fn parse_aggregate(value: &str) -> Result<strata_txn::Aggregate, Box<dyn Error>> {
+    let (function, column) = value
+        .split_once(':')
+        .ok_or_else(|| usage_error("--agg must be count|sum|avg:<column>"))?;
+    let function = match function {
+        "count" => strata_txn::AggregateFunction::Count,
+        "sum" => strata_txn::AggregateFunction::Sum,
+        "avg" => strata_txn::AggregateFunction::Average,
+        _ => return Err(usage_error("--agg must be count|sum|avg:<column>")),
+    };
+    if column.is_empty() {
+        return Err(usage_error("--agg must be count|sum|avg:<column>"));
+    }
+    Ok(strata_txn::Aggregate::new(
+        column,
+        function,
+        value.replace(':', "_"),
+    ))
+}
+
+fn handle_group_by(args: &[String], dir: &str) -> Result<(), Box<dyn Error>> {
+    let dataset = strata_txn::Dataset::open(dir)?;
+    let schema = dataset.schema();
+    let keys = parse_columns(
+        args.get(3)
+            .ok_or_else(|| usage_error("group-by requires <key,...>"))?,
+    )?;
+    let mut aggregate = None;
+    let mut filter = None;
+    let mut index = 4;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--agg" if aggregate.is_none() => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| usage_error("missing <count|sum|avg:column> after --agg"))?;
+                aggregate = Some(parse_aggregate(value)?);
+                index += 2;
+            }
+            "--filter" if filter.is_none() => {
+                let (parsed, next) = parse_filter(args, index + 1, schema.as_ref())?;
+                filter = Some(parsed);
+                index = next;
+            }
+            _ => {
+                return Err(usage_error(
+                    "group-by requires --agg <count|sum|avg:column> and accepts one optional --filter <column> <op> <value>",
+                ));
+            }
+        }
+    }
+    let aggregate =
+        aggregate.ok_or_else(|| usage_error("group-by requires --agg <count|sum|avg:column>"))?;
+    let result = dataset
+        .snapshot()
+        .group_by_query(&strata_txn::GroupByRequest {
+            group_by: keys,
+            aggregates: vec![aggregate],
+            filter,
+        })
+        .map_err(|error| query_error(&error))?;
+
+    let aggregate_types = result
+        .aggregates()
+        .iter()
+        .map(|aggregate| {
+            format!(
+                "{}:{}",
+                aggregate.alias(),
+                format_logical_type(aggregate.data_type())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    println!(
+        "group-by keys={} aggregates={aggregate_types}",
+        result.group_by().join(",")
+    );
+    let mut rows = result.rows().to_vec();
+    rows.sort_by_key(|row| {
+        row.keys
+            .iter()
+            .map(format_value)
+            .collect::<Vec<_>>()
+            .join("\u{1f}")
+    });
+    for row in rows {
+        let key_fields = result
+            .group_by()
+            .iter()
+            .zip(&row.keys)
+            .map(|(name, value)| format!("{name}={}", format_value(value)));
+        let aggregate_fields = result
+            .aggregates()
+            .iter()
+            .zip(&row.aggregates)
+            .map(|(aggregate, value)| format!("{}={}", aggregate.alias(), format_value(value)));
+        println!(
+            "group {}",
+            key_fields
+                .chain(aggregate_fields)
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
     Ok(())
 }
 
@@ -143,128 +580,153 @@ fn print_batch(batch: &RecordBatch) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Resolves each vector-search match's row-id to its display `(id,
-/// squared_distance)` pair, using a `HashMap` built once so lookup is
-/// O(n+k) rather than an O(k*n) nested scan over every row for every
-/// match. Matches whose row-id isn't found in `row_ids` (which should
-/// never happen in practice, since `matches` come from searching the same
-/// index `row_ids` was scanned from) are silently skipped, same as the
-/// original nested-loop behavior.
-fn resolve_display_rows(
-    matches: &[strata_index::VectorMatch],
-    row_ids: &arrow::array::UInt64Array,
-    ids: &Int64Array,
-) -> Vec<(i64, f32)> {
-    let row_index_by_id: std::collections::HashMap<u64, usize> = (0..row_ids.len())
-        .map(|row| (row_ids.value(row), row))
-        .collect();
-    matches
-        .iter()
-        .filter_map(|m| {
-            row_index_by_id
-                .get(&m.row_id)
-                .map(|&row| (ids.value(row), m.squared_distance))
-        })
-        .collect()
-}
-
 fn handle_search(args: &[String], dir: &str) -> Result<(), Box<dyn Error>> {
     let exact = args.iter().any(|a| a == "--exact");
-    let filter_idx = args.iter().position(|a| a == "--filter");
+    if exact {
+        return Err(usage_error(
+            "search --exact is not supported; use the typed vector-search contract",
+        ));
+    }
+    let dataset = strata_txn::Dataset::open(dir)?;
+    let vector_idx = args.iter().position(|argument| argument == "--vector");
+    let k_idx = args.iter().position(|argument| argument == "--k");
+    let filter_idx = args.iter().position(|argument| argument == "--filter");
+    let mut consumed = vec![false; args.len()];
+    consumed[0..3.min(args.len())].fill(true);
 
-    let positional: Vec<&String> = args
-        .iter()
-        .skip(3)
-        .take_while(|a| !a.starts_with("--"))
-        .collect();
-    let v0: f32 = positional.first().ok_or("missing <v0>")?.parse()?;
-    let v1: f32 = positional.get(1).ok_or("missing <v1>")?.parse()?;
-    let v2: f32 = positional.get(2).ok_or("missing <v2>")?.parse()?;
-    let k: usize = positional
-        .get(3)
-        .map(|s| s.parse())
-        .transpose()?
-        .unwrap_or(3);
-
-    let predicate = match filter_idx {
-        Some(idx) => {
-            let column = args.get(idx + 1).ok_or("missing <column> after --filter")?;
-            let op = args.get(idx + 2).ok_or("missing <op> after --filter")?;
-            let value: i64 = args
-                .get(idx + 3)
-                .ok_or("missing <value> after --filter")?
-                .parse()?;
-            Some(parse_predicate(column, op, value)?)
+    let vector = if let Some(idx) = vector_idx {
+        if idx + 1 >= args.len() || args[idx + 1].starts_with("--") {
+            return Err(usage_error(
+                "--vector requires comma-separated finite floats",
+            ));
         }
-        None => None,
+        consumed[idx] = true;
+        consumed[idx + 1] = true;
+        Some(parse_search_vector(&args[idx + 1])?)
+    } else {
+        None
     };
 
-    let ds = strata_txn::Dataset::open(dir)?;
-
-    if exact {
-        let batch = ds
-            .snapshot()
-            .scan(&strata_txn::mvp_fixtures::mvp_schema())?;
-        let vec_idx = batch.schema_ref().index_of("vector")?;
-        let vectors = batch
-            .column(vec_idx)
-            .as_any()
-            .downcast_ref::<FixedSizeListArray>()
-            .ok_or("vector column has wrong type")?;
-        let ids = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or("id column has wrong type")?;
-        for n in strata_index::brute_force_search(vectors, &[v0, v1, v2], k)? {
-            println!(
-                "id={} squared_distance={}",
-                ids.value(n.row_index),
-                n.squared_distance
-            );
+    let flagged_k = if let Some(idx) = k_idx {
+        if idx + 1 >= args.len() || args[idx + 1].starts_with("--") {
+            return Err(usage_error("--k requires a usize"));
         }
-        return Ok(());
+        consumed[idx] = true;
+        consumed[idx + 1] = true;
+        Some(
+            args[idx + 1]
+                .parse()
+                .map_err(|_| usage_error("--k must be a usize"))?,
+        )
+    } else {
+        None
+    };
+
+    let predicate = if let Some(idx) = filter_idx {
+        consumed[idx] = true;
+        let (filter, next) = parse_filter(args, idx + 1, dataset.schema().as_ref())?;
+        for item in &mut consumed[idx + 1..next] {
+            *item = true;
+        }
+        Some(filter)
+    } else {
+        None
+    };
+
+    let positional = args
+        .iter()
+        .enumerate()
+        .skip(3)
+        .filter_map(|(idx, argument)| (!consumed[idx]).then_some(argument))
+        .collect::<Vec<_>>();
+    if positional.iter().any(|argument| argument.starts_with("--")) {
+        return Err(usage_error(
+            "search accepts --vector, --k, and one optional --filter <column> <op> <value>",
+        ));
     }
 
-    // Both reads below share a single snapshot, so the vector-search matches
-    // and the row-id-to-display-column translation come from exactly the
-    // same committed state.
-    let snapshot = ds.snapshot();
-    let matches = snapshot.vector_search(&[v0, v1, v2], k, predicate.as_ref())?;
+    let (query, k) = if let Some(query) = vector {
+        if !positional.is_empty() {
+            return Err(usage_error(
+                "--vector cannot be combined with positional vector components",
+            ));
+        }
+        (query, flagged_k.unwrap_or(3))
+    } else {
+        let v0: f32 = positional.first().ok_or("missing <v0>")?.parse()?;
+        let v1: f32 = positional.get(1).ok_or("missing <v1>")?.parse()?;
+        let v2: f32 = positional.get(2).ok_or("missing <v2>")?.parse()?;
+        let k = if let Some(value) = positional.get(3) {
+            value
+                .parse()
+                .map_err(|_| usage_error("legacy search k must be a usize"))?
+        } else {
+            3
+        };
+        (vec![v0, v1, v2], k)
+    };
 
-    // Scan once, requesting the hidden row-id column back, to translate
-    // vector_search's row-ids into the user-facing id/name columns for
-    // display — matches this project's "Dataset doesn't translate row-ids
-    // back to column values, that's the caller's job" design (see
-    // docs/design.md).
-    let mut display_fields = strata_txn::mvp_fixtures::mvp_schema()
-        .fields()
-        .iter()
-        .map(|f| f.as_ref().clone())
-        .collect::<Vec<_>>();
-    display_fields.push(Field::new(
-        strata_txn::ROW_ID_COLUMN,
-        DataType::UInt64,
-        false,
-    ));
-    let display_schema = Arc::new(Schema::new(display_fields));
-    let batch = snapshot.scan(&display_schema)?;
-    let row_id_idx = batch.schema_ref().index_of(strata_txn::ROW_ID_COLUMN)?;
-    let row_ids = batch
-        .column(row_id_idx)
-        .as_any()
-        .downcast_ref::<arrow::array::UInt64Array>()
-        .ok_or("row-id column has wrong type")?;
-    let ids = batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .ok_or("id column has wrong type")?;
+    // The result carries physical row ids, so the generic CLI does not depend
+    // on an optional logical `id` column or a second scan.
+    let result = dataset
+        .snapshot()
+        .vector_search_query(&strata_txn::VectorSearchRequest {
+            vector_column: "vector".to_owned(),
+            query,
+            k,
+            filter: predicate,
+            hydration: strata_txn::VectorHydration::NotRequested,
+        })
+        .map_err(|error| query_error(&error))?;
 
-    for (id, squared_distance) in resolve_display_rows(&matches, row_ids, ids) {
-        println!("id={id} squared_distance={squared_distance}");
+    // The typed result already carries physical RowIds. Keep search generic
+    // across datasets that do not define an `id` or `name` column and report
+    // the squared-L2 distance alongside each physical RowId.
+    for (row_id, squared_distance) in resolve_query_rows(&result)? {
+        println!("row_id={row_id} squared_distance={squared_distance}");
     }
     Ok(())
+}
+
+fn parse_search_vector(value: &str) -> Result<Vec<f32>, Box<dyn Error>> {
+    let vector = value
+        .split(',')
+        .map(str::trim)
+        .map(|component| {
+            component
+                .parse::<f32>()
+                .ok()
+                .filter(|value| value.is_finite())
+                .ok_or_else(|| usage_error("--vector must contain finite comma-separated floats"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if vector.is_empty() {
+        return Err(usage_error(
+            "--vector must contain finite comma-separated floats",
+        ));
+    }
+    Ok(vector)
+}
+
+fn resolve_query_rows(
+    result: &strata_txn::VectorSearchResult,
+) -> Result<Vec<(u64, f32)>, Box<dyn Error>> {
+    result
+        .hits()
+        .iter()
+        .map(|hit| match &hit.hydration {
+            strata_txn::VectorHydrationState::Unresolved(error) => {
+                Err(Box::new(CliError::VectorResolution(format!(
+                    "vector search returned unresolved row_id={} ({error})",
+                    hit.row_id.0
+                ))) as Box<dyn Error>)
+            }
+            strata_txn::VectorHydrationState::Hydrated(_)
+            | strata_txn::VectorHydrationState::NotRequested => {
+                Ok((hit.row_id.0, hit.squared_l2_distance))
+            }
+        })
+        .collect()
 }
 
 fn parse_predicate(
@@ -328,23 +790,75 @@ mod tests {
     }
 
     #[test]
-    fn resolve_display_rows_maps_row_ids_back_to_display_values() {
-        use arrow::array::UInt64Array;
-        let row_ids = UInt64Array::from(vec![10, 11, 12]);
-        let ids = Int64Array::from(vec![100, 200, 300]);
-        let matches = vec![
-            strata_index::VectorMatch {
-                row_id: 12,
-                squared_distance: 1.5,
-            },
-            strata_index::VectorMatch {
-                row_id: 10,
-                squared_distance: 2.5,
-            },
-        ];
+    fn resolve_query_rows_uses_physical_ids_and_distances() {
+        let result = strata_txn::VectorSearchResult::new(
+            2,
+            Some(vec!["id".to_owned()]),
+            vec![
+                strata_txn::VectorHit {
+                    row_id: strata_txn::RowId(12),
+                    squared_l2_distance: 1.5,
+                    hydration: strata_txn::VectorHydrationState::Hydrated(
+                        strata_txn::ProjectedRow {
+                            fields: vec![strata_txn::ProjectedField::new(
+                                "id",
+                                strata_txn::ResultValue::Int64(300),
+                            )],
+                        },
+                    ),
+                },
+                strata_txn::VectorHit {
+                    row_id: strata_txn::RowId(10),
+                    squared_l2_distance: 2.5,
+                    hydration: strata_txn::VectorHydrationState::Hydrated(
+                        strata_txn::ProjectedRow {
+                            fields: vec![strata_txn::ProjectedField::new(
+                                "id",
+                                strata_txn::ResultValue::Int64(100),
+                            )],
+                        },
+                    ),
+                },
+            ],
+        )
+        .unwrap();
 
-        let resolved = resolve_display_rows(&matches, &row_ids, &ids);
-        assert_eq!(resolved, vec![(300, 1.5), (100, 2.5)]);
+        let resolved = resolve_query_rows(&result).unwrap();
+        assert_eq!(resolved, vec![(12, 1.5), (10, 2.5)]);
+    }
+
+    #[test]
+    fn resolve_query_rows_rejects_unresolved_matches() {
+        let result = strata_txn::VectorSearchResult::new(
+            1,
+            Some(vec!["id".to_owned()]),
+            vec![strata_txn::VectorHit {
+                row_id: strata_txn::RowId(999),
+                squared_l2_distance: 1.5,
+                hydration: strata_txn::VectorHydrationState::Unresolved(
+                    strata_txn::HydrationError::NotFound,
+                ),
+            }],
+        )
+        .unwrap();
+
+        let error = resolve_query_rows(&result).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "vector search error: vector search returned unresolved row_id=999 (the matching row was not found)"
+        );
+    }
+
+    #[test]
+    fn query_error_formats_execution_kind() {
+        let error =
+            strata_txn::QueryError::from(strata_txn::QueryExecutionError::Int64SumOverflow {
+                alias: "total".to_owned(),
+            });
+        assert_eq!(
+            query_error(&error).to_string(),
+            "query error kind=execution message=checked Int64 sum overflowed for aggregate 'total'"
+        );
     }
 
     #[test]
@@ -413,7 +927,13 @@ mod tests {
             .keep();
         let dir_str = dir.to_str().unwrap().to_string();
 
-        run(&["strata".to_string(), "create".to_string(), dir_str.clone()]).unwrap();
+        run(&[
+            "strata".to_string(),
+            "create".to_string(),
+            dir_str.clone(),
+            "--ack-single-writer".to_string(),
+        ])
+        .unwrap();
         run(&[
             "strata".to_string(),
             "insert".to_string(),
@@ -423,6 +943,7 @@ mod tests {
             "1.0".to_string(),
             "2.0".to_string(),
             "3.0".to_string(),
+            "--ack-single-writer".to_string(),
         ])
         .unwrap();
         run(&[
@@ -434,6 +955,7 @@ mod tests {
             "4.0".to_string(),
             "5.0".to_string(),
             "6.0".to_string(),
+            "--ack-single-writer".to_string(),
         ])
         .unwrap();
 

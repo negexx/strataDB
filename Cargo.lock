@@ -1967,6 +1967,8 @@ name = "strata-bindings"
 version = "0.1.0"
 dependencies = [
  "pyo3",
+ "strata-txn",
+ "tempfile",
 ]
 
 [[package]]

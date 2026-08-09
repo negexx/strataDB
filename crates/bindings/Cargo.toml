@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 
+[features]
+default = ["extension-module"]
+extension-module = ["pyo3/extension-module"]
+
 [lib]
 name = "strata_ext"
 crate-type = ["cdylib"]
@@ -14,3 +18,7 @@ workspace = true
 
 [dependencies]
 pyo3.workspace = true
+strata-txn = { path = "../txn" }
+
+[dev-dependencies]
+tempfile.workspace = true

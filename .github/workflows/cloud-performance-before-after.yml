@@ -16,6 +16,16 @@ on:
         required: true
         default: false
         type: boolean
+      fixture_rows:
+        description: Rows to load for the pinned fixture comparison (use 100000 for closeout)
+        required: false
+        default: "256"
+        type: string
+      fixture_queries:
+        description: Queries to run for the pinned fixture comparison (use 200 for closeout)
+        required: false
+        default: "16"
+        type: string
 permissions:
   contents: read
 
@@ -39,6 +49,8 @@ jobs:
           BEFORE_REVISION: ${{ inputs.before_revision }}
           AFTER_REVISION: ${{ inputs.after_revision }}
           REAL_FIXTURE_REQUESTED: ${{ inputs.real_fixture && 'true' || 'false' }}
+          FIXTURE_ROWS: ${{ inputs.fixture_rows }}
+          FIXTURE_QUERIES: ${{ inputs.fixture_queries }}
         run: |
           set -euo pipefail
           mkdir -p artifacts
@@ -81,6 +93,7 @@ jobs:
             fi
             printf 'fixture_verification=passed\n' | tee -a "$fixture_log"
             STRATA_REAL_FIXTURE=1 STRATA_BENCH_FIXTURE="$(realpath "$fixture")" \
+              STRATA_FIXTURE_SEG_ROWS="$FIXTURE_ROWS" STRATA_FIXTURE_SEG_QUERIES="$FIXTURE_QUERIES" \
               bash bench/cloud-performance/run.sh "$BEFORE_REVISION" "$after" artifacts
           else
             bash bench/cloud-performance/run.sh "$BEFORE_REVISION" "$after" artifacts

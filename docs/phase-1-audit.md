@@ -13,7 +13,7 @@ source/tests as the anchor.
 
 The original remediation closeout was synchronized through merged PR #50,
 `8cd7696fdcf34f6253fb11f9e110f6632bc872de` (`Merge Phase 1 audit remediation`). The current
-gap-closure branch is based on merged PR #56, `76d12919b5234f5e089cf26e4ba469e7aaa982f0`, which
+gap-closure branch is based on merged PR #58, `21811031d0fbe3ed3f55532941c056c0c9e091b0`, which
 includes the subsequent evidence-finalization changes.
 The
 [Phase 1 closeout ledger](phase-1-closeout-ledger.md) is the mechanically scannable, row-per-finding
@@ -74,13 +74,14 @@ loom and thorough-chaos gates. Fuzz build/smoke passes locally; the merged PR #5
 declared fuzz-and-provenance job and retained `fuzz-provenance-30841989478-attempt-1`. The fresh
 portability run [30881986345](https://github.com/negexx/strataDB/actions/runs/30881986345) passed
 the native foundation matrix on Ubuntu and Windows and the pinned fixture segmented smoke on
-Ubuntu. Exact-head CI run [30865323724](https://github.com/negexx/strataDB/actions/runs/30865323724)
-supplies the retained branch-level command/outcome provenance. Task 8 and the cloud comparison
+Ubuntu. Exact-head CI run [30904907577](https://github.com/negexx/strataDB/actions/runs/30904907577)
+at revision `6bcd020` supplies the retained branch-level command/outcome provenance. Task 8 and the cloud comparison
 [30881988012](https://github.com/negexx/strataDB/actions/runs/30881988012) record bounded synthetic
 segmented/lifecycle evidence with reproduction metadata; cloud run
 [30892210202](https://github.com/negexx/strataDB/actions/runs/30892210202) additionally records a
 complete K/mode before/after matrix on a verified 256-row prefix of the pinned real fixture.
-Full 100K-row measurements, universal operating bounds, and final branch verification remain open.
+The validated full 100K-row measurements now exist in [30907464857](https://github.com/negexx/strataDB/actions/runs/30907464857);
+universal operating bounds and final branch verification remain open.
 This does not change the audit verdict from Partial and blocked.
 
 VER-04 through VER-06, PERF-01 through PERF-05, and the later/deferred findings remain separately
@@ -167,11 +168,11 @@ consolidated register above; IDs marked "merged" retain the same evidence under 
 | IDX-02 | Historical recovery-integrity counterexample; remediated with manifest-listed row/vector identity validation and regression coverage. Final branch verification remains. |
 | IDX-03 | Preserved explicitly: fixed `ef_search` can underfill `k`, including an unbounded API request above 32. Phase 1 contract decision and Phase 2 API work. |
 | IDX-04 | Merged with ARCH-04 and VER-07: recall experiment was overgeneralized. Current decisions now bound the claim to its workload. |
-| PERF-01 | Bounded cloud synthetic and pinned real-fixture segment matrices plus native Ubuntu/Windows provenance are recorded in `docs/phase-1-performance.md`; full 100K-row behavior and universal operating bounds remain open. |
+| PERF-01 | Bounded cloud synthetic and validated full pinned 100K-row segmented/lifecycle matrices plus native Ubuntu/Windows provenance are recorded in `docs/phase-1-performance.md`; universal operating bounds remain open. |
 | PERF-02 | Five-repetition manifest-growth measurements cover versions 1/10/20/40/80/160; they are evidence, not a universal bound. Incremental manifests/GC remain Phase 3. |
-| PERF-03 | Typed recovery-byte accounting and a deterministic row-ID load-boundary regression are implemented; multi-scale recovery bounds and fixture lifecycle/recovery evidence remain open. |
-| PERF-04 | A bounded Dataset/Snapshot fan-out sample covers K=1…64 synthetic segments and a verified 256-row prefix of the pinned fixture; it does not establish a supported maximum. Compaction remains Phase 3. |
-| PERF-05 | Repeated bounded synthetic evidence covers 0/1/4/16/64 retained handles with exact logical-versus-unique manifest/data/segment accounting plus labeled approximate cache/allocator observations; RSS, fixture residency, and universal residency bounds remain open. |
+| PERF-03 | Typed recovery-byte accounting and deterministic row-ID/load-boundary regressions are implemented; validated bounded synthetic and full-fixture lifecycle/recovery evidence now exists. No universal recovery-time/byte bound is claimed. |
+| PERF-04 | Validated cloud Dataset/Snapshot fan-out matrices cover K=1…64 synthetic and full pinned-fixture segments in filtered/unfiltered modes; they do not establish a supported maximum. Compaction remains Phase 3. |
+| PERF-05 | Repeated bounded synthetic evidence covers 0/1/4/16/64 retained handles and full-fixture one-pin lifecycle residency with exact logical-versus-unique manifest/data/segment accounting plus labeled approximate cache/allocator observations; RSS and universal residency bounds remain open. |
 | PERF-06 | Preserved as later Phase 2/3 query/layout work: public scans lack projection pushdown and sub-file pruning; establish an honest baseline. |
 | PERF-07 | Preserved as documentation/query work: projection avoids some array construction but not dominant file-body reads; benchmark and correct the claim. |
 | ARCH-01 | Dataset-owned schema validation is implemented and regression-covered; schema evolution and final branch verification remain. |
@@ -186,8 +187,8 @@ consolidated register above; IDs marked "merged" retain the same evidence under 
 | VER-02 | Merged with CONC-02: fresh Ubuntu WSL and manual Ubuntu GitHub Actions execution passed the nine production transaction models plus the separate compact semantic guard; native-platform and final verification remain pending. Phase 1 blocker. |
 | VER-03 | Merged with DUR-04: fresh Ubuntu WSL and manual Ubuntu GitHub Actions thorough chaos reached `2000/2000` seeds with zero violations; native-platform and final verification remain pending. Phase 1 blocker. |
 | VER-04 | Ubuntu WSL completed both declared nightly ASAN targets and deterministic parser smoke inputs with a stable fuzz lock hash; merged PR #53 also passed the declared fuzz-and-provenance job and retained `fuzz-provenance-30841989478-attempt-1`. Broader fuzz campaign and platform evidence remain open. |
-| VER-05 | The evidence workflow pins action SHAs and nightly `2026-07-25`; the merged PR #53 fuzz job retained its artifact, exact-head CI run [30865323724](https://github.com/negexx/strataDB/actions/runs/30865323724) retained branch command/outcome provenance, and native foundation evidence passed on Ubuntu/Windows in [30881986345](https://github.com/negexx/strataDB/actions/runs/30881986345). Broader native loom/chaos coverage and final verification remain open. |
-| VER-06 | Bounded cloud synthetic inputs/results, native Ubuntu/Windows foundation provenance, Ubuntu pinned-fixture smoke, and the complete K/mode matrix on a verified 256-row fixture prefix are recorded in [30892210202](https://github.com/negexx/strataDB/actions/runs/30892210202); full 100K-row behavior and universal operating bounds remain open. |
+| VER-05 | The evidence workflow pins action SHAs and nightly `2026-07-25`; the merged PR #53 fuzz job retained its artifact, exact-head CI run [30904907577](https://github.com/negexx/strataDB/actions/runs/30904907577) at revision `6bcd020` retained branch command/outcome provenance, and native foundation evidence passed on Ubuntu/Windows in [30881986345](https://github.com/negexx/strataDB/actions/runs/30881986345). Broader native loom/chaos coverage and final verification limitations remain open. |
+| VER-06 | Bounded cloud synthetic inputs/results, native Ubuntu/Windows foundation provenance, and a validated full 100K-row pinned-fixture segmented/lifecycle matrix are recorded in [30907464857](https://github.com/negexx/strataDB/actions/runs/30907464857); universal operating bounds remain open. |
 | VER-07 | Merged with ARCH-04 and DUR-05: current docs now qualify intended guarantees and retain Partial status. |
 
 ## Evidence that must be preserved

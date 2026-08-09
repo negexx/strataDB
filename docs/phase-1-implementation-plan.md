@@ -167,7 +167,7 @@ pub fn update(&mut self, row_id: u64, replacement: RecordBatch) -> Result<()>;
 
 - [x] **Step 5: Revalidate at publication.** Keep write-write OCC for stale targets, then verify the target is still live before adding the tombstone/replacement to the latest manifest. Ensure rejected operations publish neither row files nor tombstones reachable from a later snapshot.
 
-- [x] **Step 6: Migrate all callers.** Update fixtures, examples, CLI, chaos-worker, tests, and benchmarks to pass explicit schemas and handle `Result` from insert/delete/update. Do not broaden the Python binding scaffold into a client API.
+- [x] **Step 6: Migrate all callers.** Update fixtures, examples, CLI, chaos-worker, tests, and benchmarks to pass explicit schemas and handle `Result` from insert/delete/update. Phase 1 itself did not define a Python client API; the separately approved Phase 2 T6 slice now owns that work.
 
 Use `rg -l "Dataset::create|\\.insert\\(|\\.delete\\(|\\.update\\(|\\.scan\\(" crates bench tests` as the mechanical call-site audit, then inspect each match so unrelated query/index/storage matches are not changed accidentally.
 
