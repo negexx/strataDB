@@ -18,20 +18,92 @@ use crate::error::{Result, TxnError};
 /// policy may still require that object.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LifecycleReport {
-    pub observed_version: u64,
-    pub manifest_object_count: u64,
-    pub manifest_bytes: u64,
-    pub current_manifest_bytes: Option<u64>,
-    pub data_object_count: u64,
-    pub data_bytes: u64,
-    pub reachable_data_file_count: u64,
-    pub reachable_data_file_bytes: u64,
-    pub reachable_segment_count: u64,
-    pub reachable_segment_bytes: u64,
-    pub orphan_candidate_count: u64,
-    pub orphan_candidate_bytes: u64,
-    pub tombstone_count: u64,
-    pub physical_row_count: u64,
+    observed_version: u64,
+    manifest_object_count: u64,
+    manifest_bytes: u64,
+    current_manifest_bytes: Option<u64>,
+    data_object_count: u64,
+    data_bytes: u64,
+    reachable_data_file_count: u64,
+    reachable_data_file_bytes: u64,
+    reachable_segment_count: u64,
+    reachable_segment_bytes: u64,
+    orphan_candidate_count: u64,
+    orphan_candidate_bytes: u64,
+    tombstone_count: u64,
+    physical_row_count: u64,
+}
+
+impl LifecycleReport {
+    #[must_use]
+    pub const fn observed_version(&self) -> u64 {
+        self.observed_version
+    }
+
+    #[must_use]
+    pub const fn manifest_object_count(&self) -> u64 {
+        self.manifest_object_count
+    }
+
+    #[must_use]
+    pub const fn manifest_bytes(&self) -> u64 {
+        self.manifest_bytes
+    }
+
+    #[must_use]
+    pub const fn current_manifest_bytes(&self) -> Option<u64> {
+        self.current_manifest_bytes
+    }
+
+    #[must_use]
+    pub const fn data_object_count(&self) -> u64 {
+        self.data_object_count
+    }
+
+    #[must_use]
+    pub const fn data_bytes(&self) -> u64 {
+        self.data_bytes
+    }
+
+    #[must_use]
+    pub const fn reachable_data_file_count(&self) -> u64 {
+        self.reachable_data_file_count
+    }
+
+    #[must_use]
+    pub const fn reachable_data_file_bytes(&self) -> u64 {
+        self.reachable_data_file_bytes
+    }
+
+    #[must_use]
+    pub const fn reachable_segment_count(&self) -> u64 {
+        self.reachable_segment_count
+    }
+
+    #[must_use]
+    pub const fn reachable_segment_bytes(&self) -> u64 {
+        self.reachable_segment_bytes
+    }
+
+    #[must_use]
+    pub const fn orphan_candidate_count(&self) -> u64 {
+        self.orphan_candidate_count
+    }
+
+    #[must_use]
+    pub const fn orphan_candidate_bytes(&self) -> u64 {
+        self.orphan_candidate_bytes
+    }
+
+    #[must_use]
+    pub const fn tombstone_count(&self) -> u64 {
+        self.tombstone_count
+    }
+
+    #[must_use]
+    pub const fn physical_row_count(&self) -> u64 {
+        self.physical_row_count
+    }
 }
 
 struct ReachableKeys {
@@ -260,6 +332,18 @@ mod tests {
     }
 
     #[test]
+    fn checked_add_rejects_count_total_overflow() {
+        // Break caught: wrapping an object count would under-report the
+        // number of listed data objects when the count exceeds u64.
+        let result = checked_add("data_object_count", u64::MAX, 1);
+
+        assert!(matches!(
+            result,
+            Err(TxnError::ManifestOverflow(total)) if total == "data_object_count"
+        ));
+    }
+
+    #[test]
     fn reachable_keys_reject_duplicate_manifest_object_keys() {
         // Break caught: accepting two manifest entries for the same physical
         // object would double-count a reachable object and hide corruption.
@@ -299,25 +383,20 @@ mod tests {
 
         let report = collect(&manifests, &data, &manifest).unwrap();
 
-        assert_eq!(
-            report,
-            LifecycleReport {
-                observed_version: 7,
-                manifest_object_count: 2,
-                manifest_bytes: 24,
-                current_manifest_bytes: Some(13),
-                data_object_count: 3,
-                data_bytes: 59,
-                reachable_data_file_count: 1,
-                reachable_data_file_bytes: 17,
-                reachable_segment_count: 1,
-                reachable_segment_bytes: 19,
-                orphan_candidate_count: 1,
-                orphan_candidate_bytes: 23,
-                tombstone_count: 2,
-                physical_row_count: 3,
-            }
-        );
+        assert_eq!(report.observed_version(), 7);
+        assert_eq!(report.manifest_object_count(), 2);
+        assert_eq!(report.manifest_bytes(), 24);
+        assert_eq!(report.current_manifest_bytes(), Some(13));
+        assert_eq!(report.data_object_count(), 3);
+        assert_eq!(report.data_bytes(), 59);
+        assert_eq!(report.reachable_data_file_count(), 1);
+        assert_eq!(report.reachable_data_file_bytes(), 17);
+        assert_eq!(report.reachable_segment_count(), 1);
+        assert_eq!(report.reachable_segment_bytes(), 19);
+        assert_eq!(report.orphan_candidate_count(), 1);
+        assert_eq!(report.orphan_candidate_bytes(), 23);
+        assert_eq!(report.tombstone_count(), 2);
+        assert_eq!(report.physical_row_count(), 3);
     }
 
     fn object(key: &str, size: u64) -> ObjectMeta {
