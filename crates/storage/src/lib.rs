@@ -23,7 +23,8 @@ pub use encoding::encode_batch;
 pub use error::{Result, StorageError};
 pub use manifest::{
     DataFileEntry, MANIFEST_FORMAT_VERSION, Manifest, ManifestEnvelope, SegmentEntry,
-    commit_manifest, read_current, read_current_with_byte_count, read_manifest_with_byte_count,
+    commit_manifest, read_current, read_current_with_byte_count,
+    read_manifest_at_key_with_byte_count, read_manifest_with_byte_count,
 };
 #[cfg(feature = "test-fault-injection")]
 pub use row_id_high_water::test_support::set_after_row_id_read_hook;

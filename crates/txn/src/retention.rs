@@ -13,7 +13,9 @@ use loom::sync::Mutex;
 #[cfg(not(loom))]
 use std::sync::Mutex;
 
-use strata_storage::{Backend, LocalFs, ObjectMeta, StorageError, read_manifest_with_byte_count};
+use strata_storage::{
+    Backend, LocalFs, ObjectMeta, StorageError, read_manifest_at_key_with_byte_count,
+};
 
 use crate::dataset::Dataset;
 use crate::error::{Result, TxnError};
@@ -116,17 +118,24 @@ pub(crate) fn build_plan(dataset: &Dataset, policy: RetentionPolicy) -> Result<R
     let backend = LocalFs::new(dataset.retention_dir());
     let manifest_objects = backend.list("_versions/")?;
     let data_objects = backend.list("data/")?;
-    let manifest_sizes = index_manifest_objects(&manifest_objects)?;
+    let manifest_keys = index_manifest_objects(&manifest_objects)?;
 
     let mut retained_manifest_versions =
-        latest_versions(manifest_sizes.keys().copied(), policy.keep_latest_versions);
+        latest_versions(manifest_keys.keys().copied(), policy.keep_latest_versions);
     retained_manifest_versions.extend(active_snapshot_versions.iter().copied());
     retained_manifest_versions.sort_unstable();
     retained_manifest_versions.dedup();
 
     let mut retained_data_keys = BTreeSet::new();
     for &version in &retained_manifest_versions {
-        let (manifest, _) = read_manifest_with_byte_count(dataset.retention_dir(), version)?;
+        let key = manifest_keys.get(&version).ok_or_else(|| {
+            TxnError::Storage(StorageError::CorruptManifest(
+                PathBuf::from(manifest_object_key(version)),
+                "retained manifest is missing from inventory".to_string(),
+            ))
+        })?;
+        let (manifest, _) =
+            read_manifest_at_key_with_byte_count(dataset.retention_dir(), key, version)?;
         let reachable = reachable_keys(&manifest)?;
         retained_data_keys.extend(reachable.data_files);
         retained_data_keys.extend(reachable.segments);
@@ -134,7 +143,7 @@ pub(crate) fn build_plan(dataset: &Dataset, policy: RetentionPolicy) -> Result<R
 
     let (eligible_manifest_versions, older_data_keys) = older_manifest_data_keys(
         dataset.retention_dir(),
-        &manifest_sizes,
+        &manifest_keys,
         &retained_manifest_versions,
         observed_version,
     )?;
@@ -155,7 +164,7 @@ pub(crate) fn build_plan(dataset: &Dataset, policy: RetentionPolicy) -> Result<R
     })
 }
 
-fn index_manifest_objects(objects: &[ObjectMeta]) -> Result<BTreeMap<u64, u64>> {
+fn index_manifest_objects(objects: &[ObjectMeta]) -> Result<BTreeMap<u64, String>> {
     let mut versions = BTreeMap::new();
     for object in objects {
         validate_listed_key(&object.key, "_versions/")?;
@@ -169,7 +178,7 @@ fn index_manifest_objects(objects: &[ObjectMeta]) -> Result<BTreeMap<u64, u64>> 
         let Ok(version) = stem.parse::<u64>() else {
             continue;
         };
-        if versions.insert(version, object.size).is_some() {
+        if versions.insert(version, object.key.clone()).is_some() {
             return Err(TxnError::Storage(StorageError::CorruptManifest(
                 PathBuf::from(manifest_object_key(version)),
                 "duplicate listed manifest version".to_string(),
@@ -199,7 +208,10 @@ fn classify_data_objects(
     for object in objects {
         validate_listed_key(&object.key, "data/")?;
         if !seen.insert(object.key.clone()) {
-            continue;
+            return Err(TxnError::Storage(StorageError::CorruptManifest(
+                PathBuf::from(&object.key),
+                "duplicate listed data object".to_string(),
+            )));
         }
         if retained_keys.contains(&object.key) {
             retained_count = checked_add("retained_data_object_count", retained_count, 1)?;
@@ -234,18 +246,18 @@ fn ensure_reachable_objects_are_listed(
 
 fn older_manifest_data_keys(
     dataset_dir: &std::path::Path,
-    manifest_sizes: &BTreeMap<u64, u64>,
+    manifest_keys: &BTreeMap<u64, String>,
     retained_versions: &[u64],
     observed_version: u64,
 ) -> Result<(Vec<u64>, BTreeSet<String>)> {
     let retained: BTreeSet<_> = retained_versions.iter().copied().collect();
     let mut eligible_versions = Vec::new();
     let mut older_data_keys = BTreeSet::new();
-    for &version in manifest_sizes
-        .keys()
-        .filter(|version| **version < observed_version && !retained.contains(version))
+    for (&version, key) in manifest_keys
+        .iter()
+        .filter(|(version, _)| **version < observed_version && !retained.contains(version))
     {
-        let (manifest, _) = read_manifest_with_byte_count(dataset_dir, version)?;
+        let (manifest, _) = read_manifest_at_key_with_byte_count(dataset_dir, key, version)?;
         let reachable = reachable_keys(&manifest)?;
         older_data_keys.extend(reachable.data_files);
         older_data_keys.extend(reachable.segments);
@@ -334,7 +346,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_data_inventory_key_is_counted_once() {
+    fn duplicate_retained_data_inventory_key_fails_closed() {
         let retained = BTreeSet::from(["data/retained.bin".to_string()]);
         let result = classify_data_objects(
             &[
@@ -351,10 +363,38 @@ mod tests {
             &BTreeSet::new(),
         );
 
-        assert!(
-            matches!(result, Ok((1, 7, ref candidates)) if candidates.is_empty()),
-            "duplicate inventory entries must be classified once with no candidates: {result:?}"
+        assert!(matches!(
+            result,
+            Err(TxnError::Storage(StorageError::CorruptManifest(path, reason)))
+                if path == PathBuf::from("data/retained.bin")
+                    && reason == "duplicate listed data object"
+        ));
+    }
+
+    #[test]
+    fn duplicate_candidate_data_inventory_key_fails_closed() {
+        let older = BTreeSet::from(["data/older.bin".to_string()]);
+        let result = classify_data_objects(
+            &[
+                ObjectMeta {
+                    key: "data/older.bin".to_string(),
+                    size: 7,
+                },
+                ObjectMeta {
+                    key: "data/older.bin".to_string(),
+                    size: 9,
+                },
+            ],
+            &BTreeSet::new(),
+            &older,
         );
+
+        assert!(matches!(
+            result,
+            Err(TxnError::Storage(StorageError::CorruptManifest(path, reason)))
+                if path == PathBuf::from("data/older.bin")
+                    && reason == "duplicate listed data object"
+        ));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 #![allow(clippy::cast_possible_wrap, clippy::expect_used, clippy::unwrap_used)]
 
 use std::collections::BTreeMap;
+use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -76,9 +77,8 @@ struct NonCumulativeHistory {
 fn non_cumulative_history() -> NonCumulativeHistory {
     let root = tempfile::tempdir().unwrap();
     let dir = root.path().join("non-cumulative-history");
-    let dataset = Dataset::create(&dir, vector_schema()).unwrap();
-    let historical = dataset.snapshot();
-    commit_vector(&dataset);
+    let seed = Dataset::create(&dir, vector_schema()).unwrap();
+    commit_vector(&seed);
 
     let backend = LocalFs::new(&dir);
     let current = read_current(&dir).unwrap().unwrap();
@@ -101,6 +101,24 @@ fn non_cumulative_history() -> NonCumulativeHistory {
         .put(&format!("data/{historical_segment}"), &segment_bytes)
         .unwrap();
     commit_manifest(&dir, &historical_manifest).unwrap();
+
+    let current_manifest_key = "_versions/00000000000000000001.manifest";
+    backend.delete(current_manifest_key).unwrap();
+    drop(seed);
+
+    let dataset = Dataset::open(&dir).unwrap();
+    let historical = dataset.snapshot();
+    assert_eq!(historical.scan(&dataset.schema()).unwrap().num_rows(), 1);
+    assert_eq!(
+        historical
+            .vector_search(&[1.0, 0.0, 0.0], 1, None)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    commit_vector(&dataset);
+    commit_manifest(&dir, &current).unwrap();
 
     NonCumulativeHistory {
         _root: root,
@@ -165,6 +183,38 @@ fn fresh_dataset_retention_plan_keeps_the_initial_manifest() {
     assert_eq!(plan.retained_data_bytes, 0);
     assert!(plan.eligible_manifest_versions.is_empty());
     assert!(plan.eligible_data_objects.is_empty());
+}
+
+#[test]
+fn retention_plan_reads_unpadded_manifest_keys_selected_by_recovery() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("unpadded-manifests");
+    let dataset = Dataset::create(&dir, id_schema()).unwrap();
+    commit_id(&dataset, 1);
+    drop(dataset);
+
+    let versions = dir.join("_versions");
+    fs::rename(
+        versions.join("00000000000000000000.manifest"),
+        versions.join("0.manifest"),
+    )
+    .unwrap();
+    fs::rename(
+        versions.join("00000000000000000001.manifest"),
+        versions.join("1.manifest"),
+    )
+    .unwrap();
+    let reopened = Dataset::open(&dir).unwrap();
+
+    let plan = reopened
+        .retention_plan(RetentionPolicy {
+            keep_latest_versions: 1,
+        })
+        .unwrap();
+
+    assert_eq!(plan.observed_version, 1);
+    assert_eq!(plan.retained_manifest_versions, vec![1]);
+    assert_eq!(plan.eligible_manifest_versions, vec![0]);
 }
 
 #[test]

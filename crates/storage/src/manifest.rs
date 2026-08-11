@@ -374,10 +374,30 @@ pub fn read_current(dataset_dir: &Path) -> Result<Option<Manifest>> {
 /// Returns an error if the versioned manifest is missing, malformed, has an
 /// unsupported format/checksum/version, or carries an invalid schema.
 pub fn read_manifest_with_byte_count(dataset_dir: &Path, version: u64) -> Result<(Manifest, u64)> {
-    let backend = LocalFs::new(dataset_dir);
     let key = format!("_versions/{version:020}.manifest");
-    let bytes = backend.get(&key)?;
-    decode_manifest_with_byte_count(dataset_dir, &key, version, &bytes)
+    read_manifest_at_key_with_byte_count(dataset_dir, &key, version)
+}
+
+/// Reads and validates a manifest at its exact durable inventory key.
+///
+/// Callers that select a manifest key from a backend inventory must retain
+/// that key rather than reconstructing a canonical filename: recovery accepts
+/// valid numeric filenames such as `_versions/7.manifest` as well as the
+/// writer's padded form. The decoded envelope is still required to carry the
+/// supplied version.
+///
+/// # Errors
+///
+/// Returns an error if the exact manifest key is missing, malformed, has an
+/// unsupported format/checksum/version, or carries an invalid schema.
+pub fn read_manifest_at_key_with_byte_count(
+    dataset_dir: &Path,
+    key: &str,
+    version: u64,
+) -> Result<(Manifest, u64)> {
+    let backend = LocalFs::new(dataset_dir);
+    let bytes = backend.get(key)?;
+    decode_manifest_with_byte_count(dataset_dir, key, version, &bytes)
 }
 
 fn decode_manifest_with_byte_count(
@@ -958,6 +978,35 @@ mod tests {
                 .unwrap()
                 .len()
         );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn exact_key_manifest_reader_decodes_an_unpadded_key_and_validates_its_version() {
+        let dir = temp_dataset_dir("exact-key-reader");
+        let manifest = manifest(7, vec![data_file("rows.arrow")]);
+        commit_manifest(&dir, &manifest).unwrap();
+        fs::rename(
+            manifest_path(&dir, 7),
+            versions_dir(&dir).join("7.manifest"),
+        )
+        .unwrap();
+
+        let (decoded, bytes) =
+            read_manifest_at_key_with_byte_count(&dir, "_versions/7.manifest", 7).unwrap();
+
+        assert_eq!(decoded, manifest);
+        assert_eq!(
+            bytes,
+            fs::metadata(versions_dir(&dir).join("7.manifest"))
+                .unwrap()
+                .len()
+        );
+        let mismatch = read_manifest_at_key_with_byte_count(&dir, "_versions/7.manifest", 8);
+        assert!(matches!(
+            mismatch,
+            Err(StorageError::CorruptManifest(_, reason)) if reason.contains("filename version")
+        ));
         fs::remove_dir_all(&dir).ok();
     }
 
