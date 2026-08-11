@@ -366,6 +366,48 @@ pub fn read_current(dataset_dir: &Path) -> Result<Option<Manifest>> {
     Ok(read_current_with_byte_count(dataset_dir)?.map(|(manifest, _)| manifest))
 }
 
+/// Reads and validates one durable manifest version, returning its payload
+/// and exact serialized byte count.
+///
+/// # Errors
+///
+/// Returns an error if the versioned manifest is missing, malformed, has an
+/// unsupported format/checksum/version, or carries an invalid schema.
+pub fn read_manifest_with_byte_count(dataset_dir: &Path, version: u64) -> Result<(Manifest, u64)> {
+    let backend = LocalFs::new(dataset_dir);
+    let key = format!("_versions/{version:020}.manifest");
+    let bytes = backend.get(&key)?;
+    decode_manifest_with_byte_count(dataset_dir, &key, version, &bytes)
+}
+
+fn decode_manifest_with_byte_count(
+    dataset_dir: &Path,
+    key: &str,
+    version: u64,
+    bytes: &[u8],
+) -> Result<(Manifest, u64)> {
+    let path = dataset_dir.join(key);
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| StorageError::CorruptManifest(path.clone(), error.to_string()))?;
+    if !value
+        .as_object()
+        .is_some_and(|object| object.contains_key("format_version"))
+    {
+        return Err(StorageError::LegacyFormatNeedsMigration(path));
+    }
+    let envelope: ManifestEnvelope = serde_json::from_value(value)
+        .map_err(|error| StorageError::CorruptManifest(path.clone(), error.to_string()))?;
+    envelope.validate(&path, version)?;
+    envelope.manifest.schema(&path)?;
+    let byte_count = u64::try_from(bytes.len()).map_err(|error| {
+        StorageError::CorruptManifest(
+            path.clone(),
+            format!("manifest byte count overflowed u64: {error}"),
+        )
+    })?;
+    Ok((envelope.manifest, byte_count))
+}
+
 /// Returns the highest committed manifest together with the exact number of
 /// manifest bytes loaded to validate it.
 ///
@@ -402,23 +444,7 @@ pub fn read_current_with_byte_count(dataset_dir: &Path) -> Result<Option<(Manife
         return Ok(None);
     };
     let bytes = backend.get(&key)?;
-    let path = dataset_dir.join(&key);
-    let value: serde_json::Value = serde_json::from_slice(&bytes)
-        .map_err(|e| StorageError::CorruptManifest(path.clone(), e.to_string()))?;
-    if !value
-        .as_object()
-        .is_some_and(|object| object.contains_key("format_version"))
-    {
-        return Err(StorageError::LegacyFormatNeedsMigration(path));
-    }
-    let envelope: ManifestEnvelope = serde_json::from_value(value)
-        .map_err(|e| StorageError::CorruptManifest(path.clone(), e.to_string()))?;
-    envelope.validate(&path, filename_version)?;
-    // A valid envelope must still carry decodable schema bytes. Decode here
-    // so a caller that only uses `read_current` cannot accidentally treat a
-    // catalog with broken schema ownership metadata as usable.
-    envelope.manifest.schema(&path)?;
-    Ok(Some((envelope.manifest, bytes.len() as u64)))
+    decode_manifest_with_byte_count(dataset_dir, &key, filename_version, &bytes).map(Some)
 }
 
 #[cfg(test)]
@@ -910,6 +936,29 @@ mod tests {
     #[test]
     fn empty_manifest_has_no_segments() {
         assert!(Manifest::empty().segments.is_empty());
+    }
+
+    #[test]
+    fn current_recovery_decodes_the_exact_selected_manifest_key() {
+        let dir = temp_dataset_dir("exact-selected-key");
+        let manifest = manifest(7, vec![data_file("rows.arrow")]);
+        commit_manifest(&dir, &manifest).unwrap();
+        fs::rename(
+            manifest_path(&dir, 7),
+            versions_dir(&dir).join("7.manifest"),
+        )
+        .unwrap();
+
+        let (recovered, bytes) = read_current_with_byte_count(&dir).unwrap().unwrap();
+
+        assert_eq!(recovered, manifest);
+        assert_eq!(
+            bytes,
+            fs::metadata(versions_dir(&dir).join("7.manifest"))
+                .unwrap()
+                .len()
+        );
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
