@@ -35,6 +35,7 @@ use crate::query::{
 
 use crate::live_set_cache::LiveSetCache;
 pub use crate::live_set_cache::LiveSetCacheAccounting;
+use crate::retention::SnapshotLease;
 
 /// Downcasts a `SegmentSet` part's opaque zone-map payload back to the
 /// concrete type `crates/txn` is the only crate that knows it really is
@@ -63,6 +64,7 @@ fn zone_map_permits_scan(
 pub struct Snapshot {
     pub(crate) dir: PathBuf,
     pub(crate) version: u64,
+    pub(crate) lease: Arc<SnapshotLease>,
     pub(crate) schema: SchemaRef,
     pub(crate) manifest: Arc<Manifest>,
     pub(crate) index: strata_index::SegmentSet,
@@ -1454,6 +1456,7 @@ mod tests {
         Snapshot {
             dir: PathBuf::from("unused-in-these-tests"),
             version: 1,
+            lease: SnapshotLease::unregistered(1),
             schema: Arc::new(arrow::datatypes::Schema::empty()),
             manifest: Arc::new(Manifest::empty()),
             // This test exercises `is_visible`'s tombstone check only and
@@ -3461,6 +3464,7 @@ mod tests {
         let snapshot = Snapshot {
             dir: indexed_snapshot.dir.clone(),
             version: indexed_snapshot.version,
+            lease: SnapshotLease::unregistered(indexed_snapshot.version),
             schema: Arc::clone(&indexed_snapshot.schema),
             manifest: Arc::new(Manifest::empty()),
             index: indexed_snapshot.index.clone(),

@@ -44,6 +44,8 @@ work and must not be inferred from these checks.
 - Predicate pruning, filtered ANN primitives, and in-memory group-by.
 - `Dataset::lifecycle_report()`, a read-only snapshot-anchored inventory of manifest/data objects,
   reachability, and unreferenced-object candidates.
+- `Dataset::retention_plan()`, a read-only, advisory latest-version and active-snapshot planning API
+  for one shared `Dataset` handle.
 - Real-process crash/reopen tests, targeted loom models, fuzz targets, and benchmarks.
 
 These are usable slices, not a finished database API. There is no schema-evolution/migration workflow, planner,
@@ -80,9 +82,14 @@ filesystem inventory.
 
 An orphan candidate is only an object not referenced by the captured manifest. It can include data
 still required by an active snapshot, as well as temporary or unknown files. It is therefore not safe
-to delete without a later retention/cleanup design; this API implements no reclamation, compaction,
-vacuum, or retention policy. The [Phase 3 lifecycle diagnostics design](phase-3-lifecycle-inventory-design.md)
-and [focused integration test](../crates/txn/tests/lifecycle_inventory.rs) define and exercise this
+to delete without a later retention/cleanup design. `Dataset::retention_plan()` supplies a separate,
+read-only advisory retention policy for the latest-version window and active snapshots from the one
+shared handle; neither API implements reclamation, compaction, or vacuum. A future executor cannot
+make candidates authoritative merely by reacquiring `commit_lock`: the lock serializes publication,
+but does not protect row or segment files prepared before lock acquisition. It needs preparation
+leases, lifecycle epochs, or equivalent coordination through preparation, publication, and abort.
+The [Phase 3 lifecycle diagnostics design](phase-3-lifecycle-inventory-design.md) and [focused
+integration test](../crates/txn/tests/lifecycle_inventory.rs) define and exercise the lifecycle-report
 boundary.
 
 ## Reads, updates, and index behavior

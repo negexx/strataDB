@@ -23,7 +23,7 @@ storage. Existing `TxnError` and `Backend` error paths remain authoritative.
 - Do not add dependencies.
 - Use checked `u64` accumulation and typed errors; never wrap or silently omit malformed data.
 - Do not delete, rewrite, or publish any object in the diagnostics path.
-- Do not recreate `docs/superpowers/`; use the approved design and this plan under `docs/`.
+- Do not recreate the retired agent-planning tree; use the approved design and this plan under `docs/`.
 
 ## File Map
 

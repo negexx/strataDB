@@ -95,6 +95,8 @@ pub enum TxnError {
     ReservedColumnName(String),
     #[error("system clock error: {0}")]
     Clock(String),
+    #[error("keep_latest_versions must be at least one")]
+    InvalidRetentionPolicy,
 }
 
 pub type Result<T> = std::result::Result<T, TxnError>;

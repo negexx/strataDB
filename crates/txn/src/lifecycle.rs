@@ -106,9 +106,9 @@ impl LifecycleReport {
     }
 }
 
-struct ReachableKeys {
-    data_files: BTreeSet<String>,
-    segments: BTreeSet<String>,
+pub(crate) struct ReachableKeys {
+    pub(crate) data_files: BTreeSet<String>,
+    pub(crate) segments: BTreeSet<String>,
 }
 
 /// Joins captured backend listings with a captured manifest without touching
@@ -252,13 +252,13 @@ fn manifest_totals(manifest: &Manifest) -> Result<(u64, u64)> {
     Ok((tombstone_count, physical_row_count))
 }
 
-fn checked_add(total: &str, current: u64, value: u64) -> Result<u64> {
+pub(crate) fn checked_add(total: &str, current: u64, value: u64) -> Result<u64> {
     current
         .checked_add(value)
         .ok_or_else(|| TxnError::ManifestOverflow(total.to_string()))
 }
 
-fn reachable_keys(manifest: &Manifest) -> Result<ReachableKeys> {
+pub(crate) fn reachable_keys(manifest: &Manifest) -> Result<ReachableKeys> {
     let mut data_files = BTreeSet::new();
     let mut segments = BTreeSet::new();
 
@@ -296,12 +296,12 @@ fn insert_reachable_key(
     Ok(())
 }
 
-fn manifest_data_key(name: &str) -> Result<String> {
+pub(crate) fn manifest_data_key(name: &str) -> Result<String> {
     validate_manifest_relative_name(name)?;
     Ok(format!("data/{name}"))
 }
 
-fn validate_listed_key(key: &str, prefix: &str) -> Result<()> {
+pub(crate) fn validate_listed_key(key: &str, prefix: &str) -> Result<()> {
     let Some(relative_name) = key.strip_prefix(prefix) else {
         return Err(TxnError::UnsafeManifestPath(key.to_string()));
     };
@@ -320,7 +320,7 @@ fn validate_manifest_relative_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn manifest_object_key(version: u64) -> String {
+pub(crate) fn manifest_object_key(version: u64) -> String {
     format!("_versions/{version:020}.manifest")
 }
 
