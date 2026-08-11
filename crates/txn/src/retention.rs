@@ -47,6 +47,30 @@ pub struct RetentionCandidate {
     pub bytes: u64,
 }
 
+/// Fresh, lock-scoped authority for manifest-only retention execution.
+///
+/// This is deliberately separate from [`RetentionPlan`]: plans remain
+/// advisory observations, while this carries the exact backend keys and byte
+/// counts listed immediately before an executor deletes them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManifestPruneAuthority {
+    pub(crate) observed_version: u64,
+    pub(crate) candidates: Vec<ManifestPruneCandidate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManifestPruneCandidate {
+    pub(crate) version: u64,
+    pub(crate) key: String,
+    pub(crate) bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ListedManifest {
+    key: String,
+    bytes: u64,
+}
+
 /// A lease held by every production-created [`Snapshot`](crate::Snapshot).
 /// The lease is intentionally separate from the snapshot's manifest so the
 /// registry can observe Arc lifetime without keeping the snapshot alive.
@@ -136,7 +160,7 @@ pub(crate) fn build_plan(dataset: &Dataset, policy: RetentionPolicy) -> Result<R
             ))
         })?;
         let (manifest, _) =
-            read_manifest_at_key_with_byte_count(dataset.retention_dir(), key, version)?;
+            read_manifest_at_key_with_byte_count(dataset.retention_dir(), &key.key, version)?;
         let reachable = reachable_keys(&manifest)?;
         retained_data_keys.extend(reachable.data_files);
         retained_data_keys.extend(reachable.segments);
@@ -165,7 +189,36 @@ pub(crate) fn build_plan(dataset: &Dataset, policy: RetentionPolicy) -> Result<R
     })
 }
 
-fn index_manifest_objects(objects: &[ObjectMeta]) -> Result<BTreeMap<u64, String>> {
+pub(crate) fn build_manifest_prune_authority(
+    dataset: &Dataset,
+    policy: RetentionPolicy,
+) -> Result<ManifestPruneAuthority> {
+    let plan = build_plan(dataset, policy)?;
+    let backend = LocalFs::new(dataset.retention_dir());
+    let manifest_keys = index_manifest_objects(&backend.list("_versions/")?)?;
+    let mut candidates = Vec::with_capacity(plan.eligible_manifest_versions.len());
+
+    for version in plan.eligible_manifest_versions {
+        let key = manifest_keys.get(&version).ok_or_else(|| {
+            TxnError::Storage(StorageError::CorruptManifest(
+                PathBuf::from(manifest_object_key(version)),
+                "eligible manifest is missing from inventory".to_string(),
+            ))
+        })?;
+        candidates.push(ManifestPruneCandidate {
+            version,
+            key: key.key.clone(),
+            bytes: key.bytes,
+        });
+    }
+
+    Ok(ManifestPruneAuthority {
+        observed_version: plan.observed_version,
+        candidates,
+    })
+}
+
+fn index_manifest_objects(objects: &[ObjectMeta]) -> Result<BTreeMap<u64, ListedManifest>> {
     let mut versions = BTreeMap::new();
     for object in objects {
         validate_listed_key(&object.key, "_versions/")?;
@@ -179,7 +232,16 @@ fn index_manifest_objects(objects: &[ObjectMeta]) -> Result<BTreeMap<u64, String
         let Ok(version) = stem.parse::<u64>() else {
             continue;
         };
-        if versions.insert(version, object.key.clone()).is_some() {
+        if versions
+            .insert(
+                version,
+                ListedManifest {
+                    key: object.key.clone(),
+                    bytes: object.size,
+                },
+            )
+            .is_some()
+        {
             return Err(TxnError::Storage(StorageError::CorruptManifest(
                 PathBuf::from(manifest_object_key(version)),
                 "duplicate listed manifest version".to_string(),
@@ -247,7 +309,7 @@ fn ensure_reachable_objects_are_listed(
 
 fn older_manifest_data_keys(
     dataset_dir: &std::path::Path,
-    manifest_keys: &BTreeMap<u64, String>,
+    manifest_keys: &BTreeMap<u64, ListedManifest>,
     retained_versions: &[u64],
     observed_version: u64,
 ) -> Result<(Vec<u64>, BTreeSet<String>)> {
@@ -258,7 +320,7 @@ fn older_manifest_data_keys(
         .iter()
         .filter(|(version, _)| **version < observed_version && !retained.contains(version))
     {
-        let (manifest, _) = read_manifest_at_key_with_byte_count(dataset_dir, key, version)?;
+        let (manifest, _) = read_manifest_at_key_with_byte_count(dataset_dir, &key.key, version)?;
         let reachable = reachable_keys(&manifest)?;
         older_data_keys.extend(reachable.data_files);
         older_data_keys.extend(reachable.segments);

@@ -9,10 +9,12 @@ pub mod commit_log;
 pub mod dataset;
 pub mod error;
 mod lifecycle;
+mod lifecycle_coordination;
 pub(crate) mod live_set_cache;
 pub mod mvp_fixtures;
 pub mod query;
 pub(crate) mod retention;
+mod retention_executor;
 pub(crate) mod row_id;
 pub mod snapshot;
 
@@ -29,4 +31,5 @@ pub use query::{
     VectorSearchRequest, VectorSearchResult,
 };
 pub use retention::{RetentionCandidate, RetentionPlan, RetentionPolicy};
+pub use retention_executor::ManifestPruneReport;
 pub use snapshot::Snapshot;

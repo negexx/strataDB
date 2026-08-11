@@ -410,7 +410,14 @@ impl Backend for LocalFs {
     fn delete(&self, key: &str) -> Result<()> {
         Self::validate_key(key)?;
         self.validate_existing_key_path(key, false)?;
-        fs::remove_file(self.resolve(key))?;
+        let final_path = self.resolve(key);
+        fs::remove_file(&final_path)?;
+        crate::chaos::chaos_checkpoint(); // unlinked; no longer discoverable by content
+        // The namespace change is visible before its directories are synced.
+        // A sync error therefore leaves deletion durability uncertain: callers
+        // must re-list and retry rather than treating the failed delete as
+        // either durable completion or a failed unlink.
+        self.sync_containing_directory_chain(&final_path)?;
         Ok(())
     }
 }
@@ -880,6 +887,56 @@ mod tests {
 
         assert!(backend.get("a.bin").is_err());
         assert!(backend.delete("a.bin").is_err());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn delete_syncs_the_owned_parent_chain() {
+        // Break caught: unlinking a nested key without synchronizing its
+        // containing directories can report deletion before the namespace
+        // change is durable.
+        let root = temp_root("delete-owned-sync-chain");
+        let backend = LocalFs::new(&root);
+        let setup_recorder = crate::datafile::test_support::record_directory_syncs();
+        backend.put("one/two/a.bin", b"content").unwrap();
+        drop(setup_recorder);
+        let recorder = crate::datafile::test_support::record_directory_syncs();
+
+        backend.delete("one/two/a.bin").unwrap();
+
+        assert_eq!(
+            recorder.calls(),
+            vec![root.join("one").join("two"), root.join("one"), root.clone()],
+            "delete must synchronize leaf-to-root inclusive and never above LocalFs::root"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn delete_returns_the_directory_sync_failure_after_unlink() {
+        // Break caught: returning success after unlink but before the
+        // directory sync acknowledges a deletion whose durability remains
+        // uncertain.
+        let root = temp_root("delete-directory-sync-failure");
+        let backend = LocalFs::new(&root);
+        let setup_recorder = crate::datafile::test_support::record_directory_syncs();
+        backend.put("a.bin", b"content").unwrap();
+        drop(setup_recorder);
+        let _fault = crate::datafile::test_support::fail_directory_sync_on_call(
+            1,
+            std::io::ErrorKind::Other,
+        );
+
+        let result = backend.delete("a.bin");
+
+        assert!(
+            matches!(result, Err(StorageError::Io(ref error)) if error.kind() == std::io::ErrorKind::Other),
+            "expected parent-directory sync failure after unlink, got {result:?}"
+        );
+        assert!(
+            backend.get("a.bin").is_err(),
+            "the test must prove the error happened after unlink"
+        );
         fs::remove_dir_all(&root).ok();
     }
 

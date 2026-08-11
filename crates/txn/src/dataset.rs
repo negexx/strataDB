@@ -38,6 +38,7 @@ use strata_storage::{
 
 use crate::commit_log::{CommitLog, ConflictCheck};
 use crate::error::{Result, TxnError};
+use crate::lifecycle_coordination::LifecycleCoordinator;
 use crate::live_set_cache::LiveSetCache;
 use crate::retention::{RetentionPlan, RetentionPolicy, SnapshotLeaseRegistry};
 use crate::row_id::{RowIdAllocator, RowIdRange};
@@ -192,8 +193,9 @@ pub struct Dataset {
     write_attempt_counter: Arc<AtomicU64>,
     /// Serializes the conflict-check → graph-apply → manifest-commit →
     /// snapshot-swap critical section of `Transaction::commit`, and guards
-    /// the recent-write-set history that check reads. Acquired at exactly
-    /// one site (`Transaction::commit`).
+    /// the recent-write-set history that check reads. Acquired by
+    /// `Transaction::commit` and, after lifecycle exclusivity,
+    /// `Dataset::prune_manifests`.
     ///
     /// **Lock order: this, then `row_ids`' internal lock — never the
     /// reverse.** It is the outer of the crate's two locks: `commit`
@@ -201,6 +203,11 @@ pub struct Dataset {
     /// taking this one and while holding it, but nothing ever reaches for
     /// this one from inside `row_ids`. See [`crate::row_id`]'s module doc.
     commit_lock: Arc<Mutex<CommitLog>>,
+    /// Coordinates commit preparation with manifest-only lifecycle execution.
+    /// Every commit holds a preparation lease from its first operation
+    /// through manifest publication or failure. `Dataset::prune_manifests`
+    /// acquires lifecycle exclusivity before `commit_lock`.
+    lifecycle_coordinator: Arc<LifecycleCoordinator>,
     /// Counts every commit that hit `ConflictCheck::InsufficientHistory` —
     /// its read-version aged out of `COMMIT_LOG_CAPACITY` before it could
     /// commit. Pure observability, not used for any decision; exists so a
@@ -440,6 +447,7 @@ impl Dataset {
             row_ids,
             write_attempt_counter,
             commit_lock: Arc::new(Mutex::new(CommitLog::new(commit_log_capacity))),
+            lifecycle_coordinator: Arc::new(LifecycleCoordinator::default()),
             insufficient_history_conflicts: Arc::new(AtomicU64::new(0)),
             last_issued_timestamp,
         })
@@ -593,6 +601,7 @@ impl Dataset {
             row_ids,
             write_attempt_counter,
             commit_lock: Arc::new(Mutex::new(CommitLog::new(COMMIT_LOG_CAPACITY))),
+            lifecycle_coordinator: Arc::new(LifecycleCoordinator::default()),
             insufficient_history_conflicts: Arc::new(AtomicU64::new(0)),
             last_issued_timestamp,
         })
@@ -639,6 +648,28 @@ impl Dataset {
     /// unsafe, or overflowing retained state.
     pub fn retention_plan(&self, policy: RetentionPolicy) -> Result<RetentionPlan> {
         crate::retention::build_plan(self, policy)
+    }
+
+    /// Deletes only policy-eligible historical manifest objects.
+    ///
+    /// This acquires lifecycle exclusivity before `commit_lock`, then creates
+    /// fresh deletion authority while both are held. It never deletes row
+    /// files, vector segments, temporary objects, or arbitrary orphans.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error for invalid policy, malformed retention state,
+    /// or a failed delete. A post-unlink directory-sync failure is returned;
+    /// callers can safely retry because the next execution relists objects.
+    pub fn prune_manifests(&self, policy: RetentionPolicy) -> Result<crate::ManifestPruneReport> {
+        let _lifecycle_guard = self.lifecycle_coordinator.acquire_exclusive();
+        #[cfg(test)]
+        crate::retention_executor::pause_after_lifecycle_exclusive();
+        let _commit_guard = self
+            .commit_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::retention_executor::prune(self, policy)
     }
 
     pub(crate) fn retention_dir(&self) -> &Path {
@@ -689,6 +720,7 @@ impl Dataset {
             row_ids: Arc::clone(&self.row_ids),
             write_attempt_counter: Arc::clone(&self.write_attempt_counter),
             commit_lock: Arc::clone(&self.commit_lock),
+            lifecycle_coordinator: Arc::clone(&self.lifecycle_coordinator),
             insufficient_history_conflicts: Arc::clone(&self.insufficient_history_conflicts),
             last_issued_timestamp: Arc::clone(&self.last_issued_timestamp),
             #[cfg(any(test, loom))]
@@ -788,6 +820,7 @@ pub struct Transaction {
     row_ids: Arc<RowIdAllocator>,
     write_attempt_counter: Arc<AtomicU64>,
     commit_lock: Arc<Mutex<CommitLog>>,
+    lifecycle_coordinator: Arc<LifecycleCoordinator>,
     insufficient_history_conflicts: Arc<AtomicU64>,
     /// Consumed by [`Transaction::commit`] via `issue_timestamp`, as the
     /// very first step of `commit`, before `write_phase` runs.
@@ -879,14 +912,18 @@ impl Checkpoint {
 #[allow(clippy::expect_used)]
 impl CheckpointControl {
     /// Blocks until the committing thread reaches its checkpoint.
-    fn wait(&self) {
+    pub(crate) fn wait(&self) {
         self.reached
             .recv()
             .expect("committing thread dropped before reaching the checkpoint");
     }
 
+    pub(crate) fn is_reached_within(&self, timeout: std::time::Duration) -> bool {
+        self.reached.recv_timeout(timeout).is_ok()
+    }
+
     /// Lets the committing thread continue past its checkpoint.
-    fn release(&self) {
+    pub(crate) fn release(&self) {
         self.resume
             .send(())
             .expect("committing thread dropped before it could be released");
@@ -1179,6 +1216,7 @@ impl Transaction {
     /// production builds and never triggered otherwise.
     #[allow(clippy::too_many_lines)]
     pub fn commit(self) -> Result<()> {
+        let _preparation_lease = self.lifecycle_coordinator.acquire_preparation();
         let ts = issue_timestamp(&self.last_issued_timestamp)?;
         let data_dir = data_subdir(&self.dir);
 
@@ -1195,8 +1233,9 @@ impl Transaction {
 
         // Everything from here is the tightly-scoped critical section:
         // re-read latest state, conflict-check, apply, commit, swap. See
-        // design doc §5. This is the crate's *outer* lock and its only
-        // acquisition site; the row-id allocator's lock is the inner one
+        // design doc §5. This is the crate's *outer* lock for publication;
+        // the lifecycle executor acquires it only after its outer gate. The
+        // row-id allocator's lock is the inner one
         // and is taken below while this is held (never the reverse — see
         // `Dataset::commit_lock`'s doc and `crate::row_id`). A poisoned
         // lock (a prior committer panicked) is recovered rather than
@@ -2693,6 +2732,7 @@ fn append_timestamp_column(batch: &RecordBatch, ts: i64, num_rows: u64) -> Resul
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use arrow::array::{Int64Array, RecordBatchOptions};
     use arrow::datatypes::{DataType, Field, Schema};
@@ -8213,6 +8253,37 @@ mod tests {
     }
 
     #[test]
+    fn typed_manifest_failure_releases_the_commits_preparation_lease() {
+        // Break caught: a typed commit failure that retains its preparation
+        // lease blocks a lifecycle executor forever after the commit returns.
+        let dir = temp_dir("typed-manifest-failure-releases-preparation-lease");
+        let ds = Dataset::create(&dir, test_schema()).unwrap();
+        let mut failing = ds.begin();
+        failing
+            .insert(
+                RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![1_i64]))])
+                    .unwrap(),
+            )
+            .unwrap();
+        let coordinator = Arc::clone(&failing.lifecycle_coordinator);
+        failing.inject_manifest_commit_failure();
+
+        assert!(matches!(failing.commit(), Err(TxnError::Io(_))));
+
+        let (exclusive_acquired_tx, exclusive_acquired_rx) = std::sync::mpsc::channel();
+        let exclusive = std::thread::spawn(move || {
+            let _guard = coordinator.acquire_exclusive();
+            exclusive_acquired_tx.send(()).unwrap();
+        });
+        exclusive_acquired_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("typed commit failure must release the preparation lease");
+        exclusive.join().unwrap();
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn a_conflicting_commit_leaves_an_orphaned_segment_and_nothing_else() {
         // Flavor 2: a typed Conflict. The losing transaction wrote and
         // fsynced its segment in `write_phase`, before the lock, so the
@@ -8325,6 +8396,17 @@ mod tests {
             "the injected panic must actually unwind out of commit, else this \
              test proves nothing"
         );
+
+        let coordinator = Arc::clone(&ds.lifecycle_coordinator);
+        let (exclusive_acquired_tx, exclusive_acquired_rx) = std::sync::mpsc::channel();
+        let exclusive = std::thread::spawn(move || {
+            let _guard = coordinator.acquire_exclusive();
+            exclusive_acquired_tx.send(()).unwrap();
+        });
+        exclusive_acquired_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("panic unwind must release the commit's preparation lease");
+        exclusive.join().unwrap();
 
         assert_failed_commit_left_no_trace(
             &dir,

@@ -46,6 +46,8 @@ work and must not be inferred from these checks.
   reachability, and unreferenced-object candidates.
 - `Dataset::retention_plan()`, a read-only, advisory latest-version and active-snapshot planning API
   for one shared `Dataset` handle.
+- `Dataset::prune_manifests()`, a manifest-only historical-retention executor for that same shared
+  handle.
 - Real-process crash/reopen tests, targeted loom models, fuzz targets, and benchmarks.
 
 These are usable slices, not a finished database API. There is no schema-evolution/migration workflow, planner,
@@ -72,7 +74,7 @@ Publication is lock-serialized inside one `Dataset` handle. Independent handles/
 the lock, allocator, history, or in-memory snapshot, so the implementation is not a cross-process
 conditional-CAS protocol.
 
-## Lifecycle diagnostics
+## Lifecycle diagnostics and manifest retention
 
 `Dataset::lifecycle_report()` captures one immutable snapshot and reports its manifest version together
 with a best-effort backend listing of manifest/data object counts and bytes, reachable row files and
@@ -81,16 +83,20 @@ evidence only: it does not acquire the commit lock, mutate storage, or provide a
 filesystem inventory.
 
 An orphan candidate is only an object not referenced by the captured manifest. It can include data
-still required by an active snapshot, as well as temporary or unknown files. It is therefore not safe
-to delete without a later retention/cleanup design. `Dataset::retention_plan()` supplies a separate,
-read-only advisory retention policy for the latest-version window and active snapshots from the one
-shared handle; neither API implements reclamation, compaction, or vacuum. A future executor cannot
-make candidates authoritative merely by reacquiring `commit_lock`: the lock serializes publication,
-but does not protect row or segment files prepared before lock acquisition. It needs preparation
-leases, lifecycle epochs, or equivalent coordination through preparation, publication, and abort.
-The [Phase 3 lifecycle diagnostics design](phase-3-lifecycle-inventory-design.md) and [focused
-integration test](../crates/txn/tests/lifecycle_inventory.rs) define and exercise the lifecycle-report
-boundary.
+still required by an active snapshot, as well as temporary or unknown files. It is not safe to delete
+through the inventory API. `Dataset::retention_plan()` remains an advisory latest-version and
+active-snapshot policy for the shared handle.
+
+`Dataset::prune_manifests()` is the separate, manifest-only executor slice. It acquires lifecycle
+exclusivity before `commit_lock`, then rebuilds authority from the current manifest listing while
+both guards are held. That authority retains the current manifest, the latest-version window, and
+active snapshots; it carries exact listed keys and byte counts and deletes eligible historical
+manifests oldest first. It never deletes row files, segments, temporary objects, or arbitrary orphan
+objects. A post-unlink local directory-sync error is returned and a retry relists state under the same
+guards. The [inventory design](phase-3-lifecycle-inventory-design.md), [manifest executor
+design](phase-3-manifest-retention-executor-design.md), and focused [inventory](../crates/txn/tests/lifecycle_inventory.rs)
+and [executor](../crates/txn/tests/manifest_retention_executor.rs) tests define these distinct
+boundaries.
 
 ## Reads, updates, and index behavior
 
