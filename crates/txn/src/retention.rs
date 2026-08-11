@@ -261,9 +261,10 @@ fn is_temporary_data_object(key: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeSet, HashMap};
+    use std::path::PathBuf;
 
-    use strata_storage::ObjectMeta;
+    use strata_storage::{DataFileEntry, Manifest, ObjectMeta};
 
     use super::*;
 
@@ -299,31 +300,101 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_inventory_key_is_counted_once() {
-        let older = BTreeSet::from(["data/older.bin".to_string()]);
+    fn manifest_inventory_rejects_unsafe_keys() {
+        let result = index_manifest_objects(&[ObjectMeta {
+            key: "_versions/../escape.manifest".to_string(),
+            size: 1,
+        }]);
+
+        assert!(matches!(
+            result,
+            Err(TxnError::UnsafeManifestPath(path)) if path == "../escape.manifest"
+        ));
+    }
+
+    #[test]
+    fn duplicate_manifest_inventory_versions_fail_closed() {
+        let result = index_manifest_objects(&[
+            ObjectMeta {
+                key: "_versions/00000000000000000007.manifest".to_string(),
+                size: 7,
+            },
+            ObjectMeta {
+                key: "_versions/00000000000000000007.manifest".to_string(),
+                size: 9,
+            },
+        ]);
+
+        assert!(matches!(
+            result,
+            Err(TxnError::Storage(StorageError::CorruptManifest(path, reason)))
+                if path == PathBuf::from(manifest_object_key(7))
+                    && reason == "duplicate listed manifest version"
+        ));
+    }
+
+    #[test]
+    fn duplicate_data_inventory_key_is_counted_once() {
+        let retained = BTreeSet::from(["data/retained.bin".to_string()]);
         let result = classify_data_objects(
             &[
                 ObjectMeta {
-                    key: "data/older.bin".to_string(),
+                    key: "data/retained.bin".to_string(),
                     size: 7,
                 },
                 ObjectMeta {
-                    key: "data/older.bin".to_string(),
+                    key: "data/retained.bin".to_string(),
                     size: 7,
                 },
             ],
+            &retained,
             &BTreeSet::new(),
-            &older,
         )
         .unwrap();
 
-        assert_eq!(
-            result.2,
-            vec![RetentionCandidate {
-                key: "data/older.bin".to_string(),
-                bytes: 7,
-            }]
-        );
+        assert_eq!(result, (1, 7, vec![]));
+    }
+
+    #[test]
+    fn duplicate_reachable_data_file_keys_fail_closed() {
+        let mut manifest = Manifest::empty();
+        manifest.data_files = vec![
+            DataFileEntry {
+                name: "duplicate.arrow".to_string(),
+                byte_len: 0,
+                crc32c: 0,
+                row_count: 0,
+                row_id_range: None,
+                stats: HashMap::new(),
+            },
+            DataFileEntry {
+                name: "duplicate.arrow".to_string(),
+                byte_len: 0,
+                crc32c: 0,
+                row_count: 0,
+                row_id_range: None,
+                stats: HashMap::new(),
+            },
+        ];
+
+        let result = reachable_keys(&manifest);
+
+        assert!(matches!(
+            result,
+            Err(TxnError::Storage(StorageError::CorruptManifest(path, reason)))
+                if path == PathBuf::from(manifest_object_key(0))
+                    && reason == "duplicate reachable object key: data/duplicate.arrow"
+        ));
+    }
+
+    #[test]
+    fn retained_data_count_uses_checked_arithmetic() {
+        let result = checked_add("retained_data_object_count", u64::MAX, 1);
+
+        assert!(matches!(
+            result,
+            Err(TxnError::ManifestOverflow(total)) if total == "retained_data_object_count"
+        ));
     }
 
     #[test]
