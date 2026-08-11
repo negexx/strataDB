@@ -2,7 +2,7 @@
 
 > **For agentic workers:** Use the Luna → Terra task workflow. Every behavior change requires TDD;
 > every evidence task must retain raw output and exact provenance. Terra reviews task diffs; Sol reviews
-> only the complete branch at the final gate. Do not create `docs/superpowers/`.
+> only the complete branch at the final gate. Do not recreate the retired agent-planning tree.
 
 **Goal:** Close every remaining Phase 1 blocker that can be closed inside the one-process/shared-
 `Dataset` boundary, with a full pinned-fixture matrix and fresh native verification, while keeping
