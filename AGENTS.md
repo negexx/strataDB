@@ -46,6 +46,21 @@ Historical summaries preserve rationale and may describe superseded mechanisms o
 disagreements against the current documents, current code, and tests. The Rust toolchain supersedes
 the old C++ direction; immutable index segments are current; group commit remains only proposed.
 
+## Codebase knowledge graph
+
+This project uses `codebase-memory-mcp` for code discovery. Prefer its graph tools over grep, glob,
+or broad file reads when locating or understanding code:
+
+1. `search_graph` — find functions, structs, methods, routes, and variables.
+2. `trace_path` — trace callers, callees, dependencies, or data flow.
+3. `get_code_snippet` — read the exact source for a graph symbol.
+4. `query_graph` — run Cypher for multi-hop or aggregate analysis.
+5. `get_architecture` — inspect project structure, boundaries, layers, and hotspots.
+
+Use grep/glob for string literals, configuration, scripts, and non-code files, or only when the
+graph does not contain the needed result. Index the repository before discovery when the index is
+missing or stale; do not re-index unnecessarily.
+
 ## Workspace
 
 - Rust edition 2024, toolchain 1.90, Cargo workspace.
