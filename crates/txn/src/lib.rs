@@ -12,6 +12,7 @@ mod lifecycle;
 pub(crate) mod live_set_cache;
 pub mod mvp_fixtures;
 pub mod query;
+pub(crate) mod retention;
 pub(crate) mod row_id;
 pub mod snapshot;
 
@@ -27,4 +28,5 @@ pub use query::{
     RowLookupResult, ScanRequest, ScanResult, VectorHit, VectorHydration, VectorHydrationState,
     VectorSearchRequest, VectorSearchResult,
 };
+pub use retention::{RetentionCandidate, RetentionPlan, RetentionPolicy};
 pub use snapshot::Snapshot;
