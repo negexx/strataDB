@@ -7795,8 +7795,16 @@ mod tests {
             2,
             "the checkpoint must expose the prepared row and segment files"
         );
-        assert!(prepared.iter().any(|object| object.key.ends_with(".arrow")));
-        assert!(prepared.iter().any(|object| object.key.ends_with(".seg")));
+        assert!(prepared.iter().any(|object| {
+            Path::new(&object.key)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("arrow"))
+        }));
+        assert!(prepared.iter().any(|object| {
+            Path::new(&object.key)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("seg"))
+        }));
 
         let plan = ds
             .retention_plan(RetentionPolicy {

@@ -349,10 +349,12 @@ mod tests {
             ],
             &retained,
             &BTreeSet::new(),
-        )
-        .unwrap();
+        );
 
-        assert_eq!(result, (1, 7, vec![]));
+        assert!(
+            matches!(result, Ok((1, 7, ref candidates)) if candidates.is_empty()),
+            "duplicate inventory entries must be classified once with no candidates: {result:?}"
+        );
     }
 
     #[test]
