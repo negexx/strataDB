@@ -106,6 +106,39 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  phase-3-lifecycle-evidence:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master at 2026-08-03
+        with:
+          toolchain: "1.90"
+
+      - name: Run Phase 3 manifest-retention crash recovery evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          {
+            set -x
+            printf 'runner.os=%s\nrunner.arch=%s\n' "$RUNNER_OS" "$RUNNER_ARCH"
+            uname -a
+            rustc -Vv
+            cargo -Vv
+            cargo test -p strata-txn --features chaos-injection --test manifest_retention_executor -- --exact manifest_prune_abort_before_directory_sync_preserves_latest_recovery --nocapture
+          } 2>&1 | tee artifacts/phase-3-lifecycle-evidence.log
+
+      - name: Retain Phase 3 lifecycle evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: phase-3-lifecycle-evidence-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: artifacts/phase-3-lifecycle-evidence.log
+          if-no-files-found: error
+          retention-days: 14
+
   ci:
     runs-on: ubuntu-latest
     steps:
@@ -224,6 +257,7 @@ jobs:
               dataset::loom_tests::a_reader_never_sees_one_in_flight_commits_row_while_observing_an_unrelated_commits_row_id_counter
               row_id::loom_tests::concurrent_claims_publish_monotonic_high_water
               retention::loom_tests::concurrent_registration_and_final_drop_prune_after_quiescence
+              lifecycle_coordination::loom_tests::preparation_and_exclusive_execution_never_overlap
             )
             for model in "${models[@]}"; do
               "$bin" --list --format terse | grep -Fx "${model}: test"

@@ -1,7 +1,8 @@
 # Phase 3 Lifecycle Inventory and Diagnostics Implementation Plan
 
 > **For agentic workers:** Execute this plan task-by-task with an independent review after each
-> task. Do not broaden the slice into reclamation, compaction, retention, or CLI work.
+> task. Do not broaden this inventory slice into reclamation, compaction, retention execution, or
+> CLI work. These limits do not prohibit the separately approved manifest-only executor design.
 
 **Goal:** Add a read-only `Dataset::lifecycle_report()` API that reports snapshot-anchored storage
 inventory and unreferenced-object candidates within the embedded single-process boundary.
@@ -24,6 +25,10 @@ storage. Existing `TxnError` and `Backend` error paths remain authoritative.
 - Use checked `u64` accumulation and typed errors; never wrap or silently omit malformed data.
 - Do not delete, rewrite, or publish any object in the diagnostics path.
 - Do not recreate the retired agent-planning tree; use the approved design and this plan under `docs/`.
+
+The separately approved [manifest retention executor design](phase-3-manifest-retention-executor-design.md)
+governs `Dataset::prune_manifests`; it is not an inventory-plan task and does not authorize data or
+orphan reclamation.
 
 ## File Map
 

@@ -26,24 +26,23 @@ embedded/single-process boundary. This does not alter the independent Phase 1 bl
 serializability, universal durability/performance/recall, cross-process coordination, or lifecycle
 reclamation.
 
-**Phase 3: Partial.** `Dataset::lifecycle_report()` and the new
-`Dataset::retention_plan(RetentionPolicy)` are read-only diagnostic/planning evidence, not lifecycle
-management. The retention planner tracks live snapshots created by one shared `Dataset` handle,
-retains a latest-version window plus active-snapshot reachability, and reports advisory candidates;
-it does not authorize deletion, retention-by-age, cleanup, compaction, or reclamation. A future
-executor must capture and revalidate a plan under the shared commit lock, but lock reacquisition
-alone is not deletion authority: it serializes manifest publication, not row or segment files
-prepared before lock acquisition. Lifecycle execution needs preparation leases, lifecycle epochs, or
-equivalent coordination spanning preparation through publication or abort. See the [Phase 3 lifecycle
-diagnostics design](phase-3-lifecycle-inventory-design.md), the [retention planner design](superpowers/specs/2026-08-11-phase-3-retention-planner-design.md),
-and the [focused integration tests](../crates/txn/tests/lifecycle_inventory.rs) and
-[retention tests](../crates/txn/tests/retention_plan.rs).
+**Phase 3: Partial.** `Dataset::lifecycle_report()` and
+`Dataset::retention_plan(RetentionPolicy)` remain read-only diagnostic/planning evidence for one
+shared `Dataset` handle. `Dataset::prune_manifests(RetentionPolicy)` now executes the narrower
+manifest-only slice: it takes lifecycle exclusivity before `commit_lock`, rebuilds exact listed-key
+authority under both locks, retains current/latest/active-snapshot manifests, and deletes only
+eligible historical manifests. It does not reclaim rows, segments, temporary objects, or arbitrary
+orphans; compaction, retention-by-age, and cross-process lifecycle work remain later designs. See
+the [inventory design](phase-3-lifecycle-inventory-design.md), [manifest executor
+design](phase-3-manifest-retention-executor-design.md), and focused [inventory](../crates/txn/tests/lifecycle_inventory.rs),
+[planner](../crates/txn/tests/retention_plan.rs), and [executor](../crates/txn/tests/manifest_retention_executor.rs)
+tests.
 
 ## Capability ledger
 
 | Capability | State | Current boundary |
 |---|---|---|
-| Local storage/manifests | Implemented | Arrow files, manifests, statistics, and local filesystem persistence work. Lifecycle management does not. |
+| Local storage/manifests | Implemented | Arrow files, manifests, statistics, and local filesystem persistence work. Manifest-only historical-manifest pruning exists; row/segment reclamation, compaction, vacuum, and orphan cleanup do not. |
 | Transactions/conflicts | Partial | Shared-handle write-write OCC and typed row-ID conflicts exist; no serializability claim. |
 | Row/index publication | Partial | Manifest/snapshot publication now validates target, row, segment, and vector identity; final branch verification and current evidence remain. |
 | Snapshot/query reads | Partial | Immutable scan, predicate, explain, and vector-search reads exist; no read/write transaction API. |
@@ -54,7 +53,7 @@ and the [focused integration tests](../crates/txn/tests/lifecycle_inventory.rs) 
 | Python | Partial | Thin PyO3 Dataset/Snapshot query facade returns Arrow IPC bytes for tabular results and typed vector matches; integration review remains. |
 | Durability/recovery | Partial | File/directory durability, immutable row-ID high-water, manifest integrity, and crash/reopen evidence exist within named local bounds; full branch verification remains. |
 | Schema/migrations | Partial | Dataset-owned schema and strict validation are implemented; schema evolution and migration remain deferred. |
-| Lifecycle diagnostics and retention planning | Partial, diagnostic evidence only | `Dataset::lifecycle_report()` inventories one captured snapshot. `Dataset::retention_plan()` adds a latest-version policy and active-snapshot lease evidence for the shared handle, returning advisory manifest/data candidates without deleting or rewriting anything. `commit_lock` alone cannot authorize a future executor because it does not cover files prepared before lock acquisition; preparation-spanning coordination remains required. See the [lifecycle design](phase-3-lifecycle-inventory-design.md), [retention design](superpowers/specs/2026-08-11-phase-3-retention-planner-design.md), and [retention tests](../crates/txn/tests/retention_plan.rs). |
+| Lifecycle diagnostics, planning, and manifest pruning | Partial | `Dataset::lifecycle_report()` inventories one captured snapshot, and `Dataset::retention_plan()` remains advisory. `Dataset::prune_manifests()` uses preparation-spanning lifecycle exclusivity followed by `commit_lock` to rebuild exact listed-manifest authority and delete only eligible historical manifests. It preserves current/latest/active-snapshot manifests and does not delete data, segments, temporary objects, or arbitrary orphans. See the [inventory design](phase-3-lifecycle-inventory-design.md), [executor design](phase-3-manifest-retention-executor-design.md), and [executor tests](../crates/txn/tests/manifest_retention_executor.rs). |
 | Loom/chaos/fuzz/bench evidence | Partial | Exact-head CI run [30904907577](https://github.com/negexx/strataDB/actions/runs/30904907577) at revision `6bcd020` retains current command/outcome provenance; the manual Ubuntu run [30897605936](https://github.com/negexx/strataDB/actions/runs/30897605936) passed the named loom gates and thorough-chaos `2000/2000` seed gate; native Ubuntu/Windows checks and the validated full 100K-row pinned-fixture segmented/lifecycle matrix passed in [30881986345](https://github.com/negexx/strataDB/actions/runs/30881986345) and [30907464857](https://github.com/negexx/strataDB/actions/runs/30907464857). Universal bounds and final limitations remain open. |
 | Compaction/GC | Proposed | No compaction, vacuum, orphan cleanup, or bounded history implementation. |
 | Cross-process coordination | Proposed | Independent openers do not share transaction state or durable conditional publication. |

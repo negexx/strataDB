@@ -2,6 +2,10 @@
 
 Status: approved design; implementation plan written and being executed.
 
+This document governs the read-only inventory slice only. Its deletion exclusions apply to
+`Dataset::lifecycle_report()` and do not prohibit the separately approved
+[manifest retention executor](phase-3-manifest-retention-executor-design.md).
+
 ## Goal
 
 Add a read-only, snapshot-anchored lifecycle report to `Dataset` so callers can observe manifest
@@ -20,9 +24,10 @@ This slice includes:
 - unit/integration coverage for empty, committed, multi-version, vector, and failed-preparation
   states.
 
-This slice explicitly excludes deletion, compaction, vacuum, retention policy, manifest rewriting,
-segment rewriting, snapshot invalidation, cross-process coordination, and any claim that an
-unreferenced object is immediately safe to remove.
+This inventory slice explicitly excludes deletion, compaction, vacuum, retention policy, manifest
+rewriting, segment rewriting, snapshot invalidation, cross-process coordination, and any claim that
+an unreferenced object is immediately safe to remove. The separate manifest executor does not change
+that boundary for row files, segments, temporary objects, or orphan candidates.
 
 ## Recommended architecture
 
@@ -90,5 +95,6 @@ clippy, format, and diff checks. No benchmark or lifecycle reclamation claim is 
 
 The design remains embedded, single-node, and one-process/shared-`Dataset` handle. It preserves
 immutable snapshot reads plus write-write OCC, makes no serializability claim, and adds no universal
-durability, latency, memory, recovery, recall, or segment-count guarantee. Cross-process coordination,
-compaction, vacuum, retention, and orphan cleanup remain later work.
+durability, latency, memory, recovery, recall, or segment-count guarantee. Cross-process
+coordination, compaction, vacuum, row/segment retention, and orphan cleanup remain later work; see
+the separate manifest-only executor design for its narrower historical-manifest slice.
