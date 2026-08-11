@@ -15,10 +15,11 @@ compact, or republish any object.
 ## Current boundaries
 
 The supported engine boundary remains one process sharing one `Dataset` handle. `Dataset::snapshot()`
-returns a cloned `Arc<Snapshot>`, and historical snapshots remain queryable after later commits. The
-current `Dataset` stores only the latest snapshot in `SnapshotCell`; no registry currently records
-which historical `Arc<Snapshot>` values are still alive. The storage `Backend` already exposes
-`list`, `get`, and `delete`, but `delete` is not used by this slice.
+returns a cloned `Arc<Snapshot>`, and historical snapshots remain queryable after later commits.
+Before this implementation, `Dataset` stored only the latest snapshot in `SnapshotCell`; no registry
+recorded which historical `Arc<Snapshot>` values were still alive. The delivered slice adds the
+`SnapshotLeaseRegistry` described below to provide that active-snapshot evidence. The storage
+`Backend` already exposes `list`, `get`, and `delete`, but `delete` is not used by this slice.
 
 The existing `Dataset::lifecycle_report()` is observational and current-snapshot anchored. Its
 orphan candidates are not safe-to-delete claims because an older in-memory snapshot may still
