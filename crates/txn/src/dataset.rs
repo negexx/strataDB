@@ -30,8 +30,8 @@ use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use strata_index::{EfConstruction, HnswIndex, MaxConnections, MaxElements, MaxLayers};
 use strata_storage::{
-    ColumnStats, DataFileEntry, Manifest, SegmentEntry, Value, commit_manifest, compute_stats,
-    initialize_row_id_high_water, read_current, read_current_with_byte_count,
+    Backend, ColumnStats, DataFileEntry, LocalFs, Manifest, SegmentEntry, Value, commit_manifest,
+    compute_stats, initialize_row_id_high_water, read_current, read_current_with_byte_count,
     read_row_id_high_water, read_row_id_high_water_with_byte_count, sync_dir, write_batch,
     write_bytes,
 };
@@ -595,6 +595,26 @@ impl Dataset {
     #[must_use]
     pub fn snapshot(&self) -> Arc<Snapshot> {
         self.current.load_full()
+    }
+
+    /// Returns a read-only inventory anchored to one captured immutable snapshot.
+    ///
+    /// Object listings are a best-effort physical observation. The report's
+    /// `observed_version` identifies the manifest that supplied its logical
+    /// reachability rules if a concurrent commit changes the listings.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error if the backend cannot list lifecycle objects, or
+    /// if the captured manifest and object inventory contain invalid,
+    /// duplicate, missing, or overflowing lifecycle metadata.
+    pub fn lifecycle_report(&self) -> Result<crate::LifecycleReport> {
+        let snapshot = self.snapshot();
+        let backend = LocalFs::new(&self.dir);
+        let manifest_objects = backend.list("_versions/")?;
+        let data_objects = backend.list("data/")?;
+
+        crate::lifecycle::collect(&manifest_objects, &data_objects, &snapshot.manifest)
     }
 
     #[must_use]
@@ -2654,6 +2674,33 @@ mod tests {
     /// without paying that capacity's fill cost (see
     /// `create_with_commit_log_capacity`'s doc comment).
     const TEST_COMMIT_LOG_CAPACITY: usize = 8;
+
+    #[test]
+    fn lifecycle_report_inventories_a_fresh_dataset() {
+        // Break caught: bypassing the captured version or backend inventory
+        // would make a new dataset's diagnostic report misstate its durable
+        // initial manifest or empty data directory.
+        let dir = temp_dir("lifecycle-report-fresh");
+        let dataset = Dataset::create(&dir, Arc::new(Schema::empty())).unwrap();
+
+        let report = dataset.lifecycle_report().unwrap();
+
+        assert_eq!(report.observed_version(), 0);
+        assert_eq!(report.manifest_object_count(), 1);
+        assert_eq!(
+            report.current_manifest_bytes(),
+            Some(report.manifest_bytes())
+        );
+        assert_eq!(report.data_object_count(), 0);
+        assert_eq!(report.data_bytes(), 0);
+        assert_eq!(report.reachable_data_file_count(), 0);
+        assert_eq!(report.reachable_segment_count(), 0);
+        assert_eq!(report.orphan_candidate_count(), 0);
+        assert_eq!(report.tombstone_count(), 0);
+        assert_eq!(report.physical_row_count(), 0);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn create_requires_an_existing_immediate_parent() {

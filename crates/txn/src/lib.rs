@@ -8,6 +8,7 @@
 pub mod commit_log;
 pub mod dataset;
 pub mod error;
+mod lifecycle;
 pub(crate) mod live_set_cache;
 pub mod mvp_fixtures;
 pub mod query;
@@ -17,6 +18,7 @@ pub mod snapshot;
 pub use arrow;
 pub use dataset::{Dataset, ROW_ID_COLUMN, TIMESTAMP_COLUMN, Transaction};
 pub use error::{Result, TxnError};
+pub use lifecycle::LifecycleReport;
 pub use query::{
     Aggregate, AggregateFunction, AggregateOutput, Comparison, ComparisonOperator,
     FilterExpression, FilterLiteral, GroupByRequest, GroupByResult, GroupedRow, HydrationError,
