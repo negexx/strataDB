@@ -39,6 +39,7 @@ use strata_storage::{
 use crate::commit_log::{CommitLog, ConflictCheck};
 use crate::error::{Result, TxnError};
 use crate::live_set_cache::LiveSetCache;
+use crate::retention::{RetentionPlan, RetentionPolicy, SnapshotLeaseRegistry};
 use crate::row_id::{RowIdAllocator, RowIdRange};
 use crate::snapshot::Snapshot;
 
@@ -177,6 +178,7 @@ impl SnapshotCell {
 pub struct Dataset {
     dir: PathBuf,
     current: Arc<SnapshotCell>,
+    snapshot_leases: Arc<SnapshotLeaseRegistry>,
     /// Hands out contiguous row-id ranges from a single global counter.
     /// See [`crate::row_id`] for why the counter needs a lock rather than a
     /// bare `AtomicU64`, and for why this no longer also tracks which
@@ -416,9 +418,12 @@ impl Dataset {
             manifest.next_row_id.max(durable_high_water),
         ));
         let write_attempt_counter = Arc::new(AtomicU64::new(manifest.next_attempt_id));
+        let snapshot_leases = Arc::new(SnapshotLeaseRegistry::default());
+        let lease = snapshot_leases.register(manifest.version);
         let snapshot = Snapshot {
             dir: dir.clone(),
             version: manifest.version,
+            lease,
             schema,
             manifest: Arc::new(manifest),
             // A brand-new dataset has committed no vectors, so it has no
@@ -431,6 +436,7 @@ impl Dataset {
         Ok(Self {
             dir,
             current: Arc::new(SnapshotCell::new(Arc::new(snapshot))),
+            snapshot_leases,
             row_ids,
             write_attempt_counter,
             commit_lock: Arc::new(Mutex::new(CommitLog::new(commit_log_capacity))),
@@ -568,9 +574,12 @@ impl Dataset {
         let write_attempt_counter =
             Arc::new(AtomicU64::new(seed_write_attempt_counter(&manifest)?));
         let last_issued_timestamp = Arc::new(AtomicI64::new(manifest.commit_time_high_water));
+        let snapshot_leases = Arc::new(SnapshotLeaseRegistry::default());
+        let lease = snapshot_leases.register(manifest.version);
         let snapshot = Snapshot {
             dir: dir.clone(),
             version: manifest.version,
+            lease,
             schema,
             manifest: Arc::new(manifest),
             index,
@@ -580,6 +589,7 @@ impl Dataset {
         Ok(Self {
             dir,
             current: Arc::new(SnapshotCell::new(Arc::new(snapshot))),
+            snapshot_leases,
             row_ids,
             write_attempt_counter,
             commit_lock: Arc::new(Mutex::new(CommitLog::new(COMMIT_LOG_CAPACITY))),
@@ -615,6 +625,28 @@ impl Dataset {
         let data_objects = backend.list("data/")?;
 
         crate::lifecycle::collect(&manifest_objects, &data_objects, &snapshot.manifest)
+    }
+
+    /// Returns advisory retention evidence without mutating durable state.
+    ///
+    /// The active-snapshot evidence covers snapshots created by this shared
+    /// `Dataset` handle only. A future cleanup executor must capture and
+    /// revalidate a fresh plan while holding `commit_lock` before mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error for an invalid policy or any malformed, missing,
+    /// unsafe, or overflowing retained state.
+    pub fn retention_plan(&self, policy: RetentionPolicy) -> Result<RetentionPlan> {
+        crate::retention::build_plan(self, policy)
+    }
+
+    pub(crate) fn retention_dir(&self) -> &Path {
+        &self.dir
+    }
+
+    pub(crate) fn live_snapshot_versions(&self) -> Vec<u64> {
+        self.snapshot_leases.live_versions()
     }
 
     #[must_use]
@@ -653,6 +685,7 @@ impl Dataset {
             pending_tombstones: Vec::new(),
             write_set: Vec::new(),
             current: Arc::clone(&self.current),
+            snapshot_leases: Arc::clone(&self.snapshot_leases),
             row_ids: Arc::clone(&self.row_ids),
             write_attempt_counter: Arc::clone(&self.write_attempt_counter),
             commit_lock: Arc::clone(&self.commit_lock),
@@ -751,6 +784,7 @@ pub struct Transaction {
     /// against every transaction that committed after this one began.
     write_set: Vec<u64>,
     current: Arc<SnapshotCell>,
+    snapshot_leases: Arc<SnapshotLeaseRegistry>,
     row_ids: Arc<RowIdAllocator>,
     write_attempt_counter: Arc<AtomicU64>,
     commit_lock: Arc<Mutex<CommitLog>>,
@@ -1390,6 +1424,7 @@ impl Transaction {
         let snapshot = Snapshot {
             dir: self.dir,
             version: new_version,
+            lease: self.snapshot_leases.register(new_version),
             schema: Arc::clone(&self.schema),
             manifest: Arc::new(manifest),
             index,
@@ -2661,7 +2696,7 @@ mod tests {
 
     use arrow::array::{Int64Array, RecordBatchOptions};
     use arrow::datatypes::{DataType, Field, Schema};
-    use strata_storage::read_batch;
+    use strata_storage::{Backend, LocalFs, read_batch};
 
     use super::*;
 
@@ -7727,6 +7762,78 @@ mod tests {
             entries[0].row_id_range,
             Some((1, 1)),
             "the durable allocator high-water must keep row-id 0 permanently abandoned"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn retention_plan_excludes_prepared_unpublished_objects_and_stays_captured_after_commit() {
+        // Break caught: treating files written during commit preparation as
+        // eligible would let a future executor reclaim row/segment data that
+        // the in-flight commit can still publish. A plan is also an advisory
+        // capture, so its observed version must not be rewritten by that
+        // later commit.
+        let dir = temp_dir("retention-plan-prepared-unpublished");
+        let ds = Dataset::create(&dir, vector_test_schema()).unwrap();
+        let (checkpoint, control) = checkpoint_pair();
+
+        let mut transaction = ds.begin();
+        transaction
+            .insert(vector_batch(
+                vec![1_i64],
+                cluster_vectors(1, [1.0, 2.0, 3.0], 0.0),
+            ))
+            .unwrap();
+        transaction.pause_after_row_id_claim(checkpoint);
+        let commit_thread = std::thread::spawn(move || transaction.commit());
+
+        control.wait();
+        let prepared = LocalFs::new(&dir).list("data/").unwrap();
+        assert_eq!(
+            prepared.len(),
+            2,
+            "the checkpoint must expose the prepared row and segment files"
+        );
+        assert!(prepared.iter().any(|object| object.key.ends_with(".arrow")));
+        assert!(prepared.iter().any(|object| object.key.ends_with(".seg")));
+
+        let plan = ds
+            .retention_plan(RetentionPolicy {
+                keep_latest_versions: 1,
+            })
+            .unwrap();
+        assert_eq!(
+            plan.observed_version, 0,
+            "the planner observes the durable snapshot, not prepared files"
+        );
+        assert!(
+            prepared.iter().all(|prepared_object| {
+                !plan
+                    .eligible_data_objects
+                    .iter()
+                    .any(|candidate| candidate.key == prepared_object.key)
+            }),
+            "prepared objects must not become advisory retention candidates: {plan:?}"
+        );
+        let captured_plan = plan.clone();
+
+        control.release();
+        commit_thread.join().unwrap().unwrap();
+
+        assert_eq!(ds.current_version(), 1);
+        assert_eq!(
+            plan, captured_plan,
+            "a later publication must not mutate an already-captured advisory plan"
+        );
+        assert_eq!(
+            ds.retention_plan(RetentionPolicy {
+                keep_latest_versions: 1,
+            })
+            .unwrap()
+            .observed_version,
+            1,
+            "a fresh plan observes the subsequently committed snapshot"
         );
 
         std::fs::remove_dir_all(&dir).ok();

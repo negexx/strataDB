@@ -350,3 +350,59 @@ mod tests {
         ));
     }
 }
+
+#[cfg(all(test, loom))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod loom_tests {
+    use loom::sync::Arc as LoomArc;
+
+    use super::*;
+
+    #[test]
+    fn concurrent_registration_and_final_drop_prune_after_quiescence() {
+        loom::model(|| {
+            let registry = LoomArc::new(SnapshotLeaseRegistry::default());
+            let scan_registry = LoomArc::clone(&registry);
+            let scan = loom::thread::spawn(move || scan_registry.live_versions());
+            let registration_registry = LoomArc::clone(&registry);
+            let registration = loom::thread::spawn(move || registration_registry.register(41));
+
+            let observed = scan.join().unwrap();
+            let lease = registration.join().unwrap();
+
+            assert!(
+                observed.is_empty() || observed == vec![41],
+                "a scan may linearize before or after concurrent registration: {observed:?}"
+            );
+            assert_eq!(
+                registry.live_versions(),
+                vec![41],
+                "the registered lease must be visible after the registering thread quiesces"
+            );
+
+            // `std::sync::Weak` is deliberately the production lease type,
+            // so loom does not instrument its upgrade/drop internals. The
+            // model therefore proves the registry mutex's registration and
+            // pruning protocol, while allowing either observation during the
+            // final-drop race; the scan after both threads join is the
+            // deterministic pruning assertion.
+            let final_scan_registry = LoomArc::clone(&registry);
+            let final_scan = loom::thread::spawn(move || final_scan_registry.live_versions());
+            let final_drop = loom::thread::spawn(move || {
+                loom::thread::yield_now();
+                drop(lease);
+            });
+            let final_race = final_scan.join().unwrap();
+            final_drop.join().unwrap();
+
+            assert!(
+                final_race.is_empty() || final_race == vec![41],
+                "a final-drop race may scan before or after the last lease drops: {final_race:?}"
+            );
+            assert!(
+                registry.live_versions().is_empty(),
+                "a scan after all owners quiesce must exclude the dropped lease and prune its weak entry"
+            );
+        });
+    }
+}
