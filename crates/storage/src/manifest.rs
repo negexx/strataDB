@@ -387,7 +387,7 @@ fn decode_manifest_with_byte_count(
     bytes: &[u8],
 ) -> Result<(Manifest, u64)> {
     let path = dataset_dir.join(key);
-    let value: serde_json::Value = serde_json::from_slice(&bytes)
+    let value: serde_json::Value = serde_json::from_slice(bytes)
         .map_err(|error| StorageError::CorruptManifest(path.clone(), error.to_string()))?;
     if !value
         .as_object()
