@@ -78,6 +78,7 @@ impl SnapshotLeaseRegistry {
             .leases
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        leases.retain(|weak| weak.upgrade().is_some());
         leases.push(Arc::downgrade(&lease));
         lease
     }
@@ -290,6 +291,39 @@ mod tests {
         assert_eq!(registry.live_versions(), vec![3]);
         drop(second);
         assert!(registry.live_versions().is_empty());
+    }
+
+    #[test]
+    fn registry_bounds_dropped_lease_records_without_a_live_versions_scan() {
+        let registry = SnapshotLeaseRegistry::default();
+        for version in 0..128 {
+            drop(registry.register(version));
+        }
+
+        let leases = registry
+            .leases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(leases.len(), 1);
+    }
+
+    #[test]
+    fn registry_keeps_live_leases_while_registering_after_dead_leases() {
+        let registry = SnapshotLeaseRegistry::default();
+        let first = registry.register(3);
+        drop(registry.register(4));
+        let second = registry.register(5);
+
+        let leases = registry
+            .leases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(leases.len(), 2);
+        drop(leases);
+        assert_eq!(registry.live_versions(), vec![3, 5]);
+
+        drop(first);
+        drop(second);
     }
 
     #[test]
