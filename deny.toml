@@ -72,6 +72,7 @@ feature-depth = 1
 ignore = [
     { id = "RUSTSEC-2025-0141", reason = "bincode 1.3.3 is unmaintained, pulled in transitively via hnsw_rs 0.3.4 -> strata-index. No safe upgrade exists (bincode's own maintainers call 1.3.3 feature-complete); replacing it means replacing hnsw_rs, which is a larger decision than a CI-lint fix. See the audit/phase-1-2-3 dependency-lane report." },
     { id = "RUSTSEC-2024-0436", reason = "paste 1.0.15 is unmaintained (archived dtolnay proc-macro), pulled in transitively via parquet 58.3.0 -> strata-bench only (a build-time/dev path, not shipped in any library or binary). No safe upgrade exists. See the audit/phase-1-2-3 dependency-lane report." },
+    { id = "RUSTSEC-2026-0247", reason = "bitmaps 3.2.1 is unmaintained, pulled in transitively via imbl 7.0.1 -> strata-txn. imbl 7.0.1 is the latest release, and cargo-deny reports no safe upgrade; replacing imbl is a larger dependency decision than a CI-lint fix. This advisory-only ignore does not waive bans or sources." },
 ]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
 # If this is false, then it uses a built-in git library.
