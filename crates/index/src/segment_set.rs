@@ -927,6 +927,29 @@ mod tests {
     }
 
     #[test]
+    fn hybrid_compact_selector_evicts_at_capacity_and_keeps_nearer_duplicates() {
+        let mut selected = TopKSelector::new(2);
+        assert!(matches!(&selected, TopKSelector::Compact(_)));
+
+        for candidate in [(7, 2.0), (8, 2.0), (9, 1.0), (8, 1.5), (7, 2.0)] {
+            selected.consider(candidate);
+        }
+
+        assert_eq!(selected.into_sorted(), vec![(9, 1.0), (8, 1.5)]);
+    }
+
+    #[test]
+    fn hybrid_top_k_selector_keeps_no_candidates_when_k_is_zero() {
+        let mut selected = TopKSelector::new(0);
+        assert!(matches!(&selected, TopKSelector::Compact(_)));
+        for candidate in [(7, 1.0), (8, 2.0)] {
+            selected.consider(candidate);
+        }
+
+        assert!(selected.into_sorted().is_empty());
+    }
+
+    #[test]
     fn indexed_top_k_selector_bounds_candidates_updates_later_duplicates_and_orders_nearest_first()
     {
         let mut selected = IndexedTopKSelector::new(2);
