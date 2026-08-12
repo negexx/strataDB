@@ -24,6 +24,9 @@ compaction, migration, object storage, or universal power-loss durability.
 durability, schema, API-boundary, verification, and performance-evidence blockers inside the supported
 single-process/shared-`Dataset` boundary.
 
+The [remaining performance evidence gates](phase-1-performance.md#remaining-evidence-gates) distinguish
+existing bounded measurements from future decision gates; they do not change this status.
+
 **Phase 2: Implemented within named bounds.** The approved T1–T5 Rust query contract, T6 Python IPC
 facade, T7 typed CLI surface, and T8 integration evidence are complete within the documented
 embedded/single-process boundary. This does not alter the independent Phase 1 blocked state or claim
