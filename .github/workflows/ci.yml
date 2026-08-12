@@ -23,6 +23,26 @@ jobs:
           toolchain: "1.97.1"
           components: clippy, rustfmt
 
+      - name: Initialize Windows platform/restart provenance
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path artifacts -Force | Out-Null
+          @(
+            "revision=$(git rev-parse HEAD)",
+            "workflow=$env:GITHUB_WORKFLOW",
+            "run.id=$env:GITHUB_RUN_ID",
+            "run.attempt=$env:GITHUB_RUN_ATTEMPT",
+            "event=$env:GITHUB_EVENT_NAME",
+            "ref=$env:GITHUB_REF",
+            "runner.os=$env:RUNNER_OS",
+            "runner.arch=$env:RUNNER_ARCH",
+            "runner.name=$env:RUNNER_NAME",
+            "workspace=$env:GITHUB_WORKSPACE",
+            "command=cargo test -p strata-txn --features chaos-injection --test row_id_reservation_restart -- --nocapture"
+          ) | Set-Content -Path artifacts/windows-platform-restart-evidence.log
+          rustc -Vv | Add-Content -Path artifacts/windows-platform-restart-evidence.log
+          cargo -Vv | Add-Content -Path artifacts/windows-platform-restart-evidence.log
+
       - name: Test storage directory durability
         run: cargo test -p strata-storage
 
@@ -33,7 +53,24 @@ jobs:
         run: cargo test -p strata-txn --features test-fault-injection dataset::tests::create_returns_an_error_when_manifest_publication_root_sync_fails -- --exact
 
       - name: Test row-ID reservation restart durability
-        run: cargo test -p strata-txn --features chaos-injection --test row_id_reservation_restart -- --nocapture
+        id: windows_row_id_restart
+        shell: pwsh
+        run: |
+          & cargo test -p strata-txn --features chaos-injection --test row_id_reservation_restart -- --nocapture 2>&1 |
+            Tee-Object -FilePath artifacts/windows-platform-restart-evidence.log -Append
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+      - name: Retain Windows platform/restart evidence
+        id: retain_windows_restart_evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-platform-restart-evidence-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: artifacts/windows-platform-restart-evidence.log
+          if-no-files-found: error
+          retention-days: 90
 
       - name: Clippy directory durability fault injection
         run: cargo clippy -p strata-txn --all-targets --features test-fault-injection -- -D warnings

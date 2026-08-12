@@ -12,8 +12,12 @@ tracks the remaining finding-level acceptance and evidence obligations; it does 
 Partial/blocked state.
 
 **Phase 0: Implemented within named local bounds.** The local Arrow/manifest/segmented-index
-foundation and restart-safe row-ID regression are covered by local tests and the retained PR #53 CI
-artifact. This does not claim portable filesystem behavior, cross-process coordination, serializability,
+foundation and restart-safe row-ID regression are covered by local tests, retained Ubuntu foundation
+provenance. Current CI configures 90-day retention of a native Windows restart transcript on future
+workflow runs regardless of outcome, but no completed Windows run or retained artifact is linked in
+this branch; Windows execution evidence remains pending. The exact loom gates build
+and invoke crate-scoped binaries directly; normal Cargo summaries, timeouts, and interrupted jobs are
+not loom passes. This does not claim portable filesystem behavior, cross-process coordination, serializability,
 compaction, migration, object storage, or universal power-loss durability.
 
 **Phase 1: Partial — blocked.** The [seven-lane Sol audit](phase-1-audit.md) found correctness,
