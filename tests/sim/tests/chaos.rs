@@ -103,6 +103,30 @@ fn ambiguity_shape(verb: &str) -> (usize, usize) {
     }
 }
 
+struct StartedOp {
+    verb: String,
+    target_row_id: Option<u64>,
+}
+
+fn crash_tolerance<'a>(
+    started_ops: impl IntoIterator<Item = &'a StartedOp>,
+) -> (HashSet<u64>, usize) {
+    let mut tolerated_lost_target_ids = HashSet::new();
+    let mut max_tolerated_phantoms = 0usize;
+    for started_op in started_ops {
+        let (lost, phantom) = ambiguity_shape(&started_op.verb);
+        if lost > 0 {
+            tolerated_lost_target_ids.insert(
+                started_op
+                    .target_row_id
+                    .expect("Delete/Update 'starting' line must include target_row_id"),
+            );
+        }
+        max_tolerated_phantoms += phantom;
+    }
+    (tolerated_lost_target_ids, max_tolerated_phantoms)
+}
+
 /// Builds (once, lazily — `OnceLock` caches the result across every
 /// `run_worker` call in this test binary rather than re-invoking `cargo
 /// build` per iteration) and locates the `chaos-worker` binary. Uses
@@ -144,14 +168,10 @@ struct RunResult {
     /// scheduler loop starts, or the run crashed before finishing setup).
     pool_acks: u64,
     crashed: bool,
-    /// Sum of `ambiguity_shape(verb).0` over every op that printed a
-    /// "starting" line but never printed its matching completion line in
-    /// this specific run -- computed from the ACTUAL observed in-flight
-    /// set, not a flat per-run constant. Zero on a run that exited
-    /// cleanly (every started op's thread runs its own commit loop to
-    /// completion before the process exits 0, so an unmatched start is
-    /// only possible when the process was aborted mid-commit).
-    max_tolerated_lost: usize,
+    /// Exact target IDs from every in-flight Delete/Update. A lost
+    /// acknowledged row is tolerated only when its ID is in this set;
+    /// duplicate operations against one target contribute one ID.
+    tolerated_lost_target_ids: HashSet<u64>,
     /// Sum of `ambiguity_shape(verb).1` over the same in-flight set.
     max_tolerated_phantoms: usize,
 }
@@ -195,7 +215,7 @@ fn run_worker(dir: &std::path::Path, seed: u64, abort_at: Option<u64>) -> RunRes
     // one thread, so at most one entry per agent can ever be present at
     // the end of parsing (the one truly in flight when the process
     // aborted, if it aborted mid-op).
-    let mut started_agent_ops: HashMap<(u64, u64), String> = HashMap::new();
+    let mut started_agent_ops: HashMap<(u64, u64), StartedOp> = HashMap::new();
     for line in stdout.lines() {
         let words: Vec<&str> = line.split(' ').collect();
         match words.as_slice() {
@@ -206,10 +226,31 @@ fn run_worker(dir: &std::path::Path, seed: u64, abort_at: Option<u64>) -> RunRes
                 acknowledged_inserts.insert(row_id.parse().unwrap());
                 pool_acks += 1;
             }
+            [
+                "agent",
+                agent,
+                "starting",
+                verb @ ("delete" | "update"),
+                "op",
+                op,
+                "target_row_id",
+                target_row_id,
+            ] => {
+                started_agent_ops.insert(
+                    (agent.parse().unwrap(), op.parse().unwrap()),
+                    StartedOp {
+                        verb: (*verb).to_string(),
+                        target_row_id: Some(target_row_id.parse().unwrap()),
+                    },
+                );
+            }
             ["agent", agent, "starting", verb, "op", op] => {
                 started_agent_ops.insert(
                     (agent.parse().unwrap(), op.parse().unwrap()),
-                    (*verb).to_string(),
+                    StartedOp {
+                        verb: (*verb).to_string(),
+                        target_row_id: None,
+                    },
                 );
             }
             [
@@ -294,28 +335,23 @@ fn run_worker(dir: &std::path::Path, seed: u64, abort_at: Option<u64>) -> RunRes
         }
     }
 
-    // Precise crash-tolerance budget: sum ambiguity_shape over exactly the
-    // ops that started but never completed in THIS run, not a flat
-    // per-run constant. At most one pool insert can be in flight (pool
-    // setup is strictly sequential, single-threaded, and runs to
-    // completion before any agent thread spawns) and at most one op per
-    // agent (each agent's own ops run sequentially within its thread) --
-    // see design doc Part 1 and this task's own rationale.
-    let mut max_tolerated_lost = 0usize;
-    let mut max_tolerated_phantoms = 0usize;
+    // Precise crash-tolerance budget: exact lost target IDs and the sum
+    // of phantom shapes over only the ops that started but never
+    // completed in THIS run, not a flat per-run constant. At most one pool
+    // insert can be in flight (pool setup is strictly sequential,
+    // single-threaded, and runs to completion before any agent thread
+    // spawns) and at most one op per agent (each agent's own ops run
+    // sequentially within its thread) -- see design doc Part 1 and this
+    // task's own rationale.
+    let (tolerated_lost_target_ids, mut max_tolerated_phantoms) =
+        crash_tolerance(started_agent_ops.values());
     if pool_starts > pool_acks {
         debug_assert_eq!(
             pool_starts - pool_acks,
             1,
             "pool setup is strictly sequential; at most one pool insert can ever be in flight"
         );
-        let (lost, phantom) = ambiguity_shape("insert");
-        max_tolerated_lost += lost;
-        max_tolerated_phantoms += phantom;
-    }
-    for verb in started_agent_ops.values() {
-        let (lost, phantom) = ambiguity_shape(verb);
-        max_tolerated_lost += lost;
+        let (_, phantom) = ambiguity_shape("insert");
         max_tolerated_phantoms += phantom;
     }
 
@@ -325,7 +361,7 @@ fn run_worker(dir: &std::path::Path, seed: u64, abort_at: Option<u64>) -> RunRes
         total_op_slots,
         pool_acks,
         crashed: !output.status.success(),
-        max_tolerated_lost,
+        tolerated_lost_target_ids,
         max_tolerated_phantoms,
     }
 }
@@ -406,24 +442,25 @@ fn check_invariants(dir: &std::path::Path, result: &RunResult) {
     // ambiguity_shape) -- NOT a flat per-run constant. A row also present
     // in acknowledged_tombstones is correctly excluded from "lost" (that's
     // Delete/Update doing its job, not ambiguity).
-    let lost: Vec<&u64> = acknowledged
+    let lost: HashSet<u64> = acknowledged
         .difference(&visible_row_ids)
         .filter(|id| !result.acknowledged_tombstones.contains(id))
+        .copied()
         .collect();
-    let max_tolerated_lost = result.max_tolerated_lost;
     if !crashed {
-        assert_eq!(
-            max_tolerated_lost, 0,
+        assert!(
+            result.tolerated_lost_target_ids.is_empty(),
             "a clean (non-crashed) run must never have an op that started but never completed -- \
              a nonzero budget here means the 'starting'/'committed'/'dropped' ack-line protocol \
              itself is broken, not a legitimate ambiguity"
         );
     }
     assert!(
-        lost.len() <= max_tolerated_lost,
+        lost.is_subset(&result.tolerated_lost_target_ids),
         "lost commits: acknowledged but not visible after reopen: {lost:?} \
-         (tolerated at most {max_tolerated_lost}, computed from the ops genuinely in flight \
-         at abort time in this {} run)",
+         (tolerated only for in-flight Delete/Update target IDs \
+         {:?} at abort time in this {} run)",
+        result.tolerated_lost_target_ids,
         if crashed { "crashed" } else { "clean" }
     );
 
@@ -443,12 +480,12 @@ fn check_invariants(dir: &std::path::Path, result: &RunResult) {
         if crashed { "crashed" } else { "clean" }
     );
 
-    // The joint bound is exactly the sum of the two individual budgets --
-    // both are sums of ambiguity_shape(verb) over the SAME set of
-    // genuinely-in-flight ops, so no separate enumeration/reasoning is
-    // needed here (unlike the old flat-constant version, which had to
-    // reason about the worst case across UNKNOWN verbs; this version
-    // knows each in-flight op's actual verb from its "starting" line).
+    // The joint bound is the exact lost-target set cardinality plus the
+    // phantom-count budget over the SAME genuinely-in-flight ops. The
+    // subset assertion above already proves each lost ID is an exact
+    // Delete/Update target; this count check retains the joint lost-plus-
+    // phantom coverage without granting duplicate target operations extra
+    // lost-ID tolerance.
     //
     // WHY THE SUM, NOT A MAX: `commit_lock` (crates/txn/src/dataset.rs)
     // does NOT bound this to one ambiguous op. `write_phase` runs OUTSIDE
@@ -462,19 +499,7 @@ fn check_invariants(dir: &std::path::Path, result: &RunResult) {
     // NUM_AGENTS entries), not a single-op cap the way it correctly was
     // when the scheduler was sequential.
     //
-    // KNOWN RESIDUAL IMPRECISION (false-negative only, never a false
-    // failure): if 2+ in-flight ops are Delete/Update targeting the SAME
-    // pool row, this sums a `lost` budget of 2+ for that row even though
-    // only 1 row can actually go missing -- a real regression there could
-    // hide behind the extra slack. The collision probability scales with
-    // NUM_AGENTS/POOL_SIZE, so it's non-trivially higher now (8/6) than
-    // when this was first measured Minor (3/6). Inherent to the
-    // per-verb-shape model (the alternative -- printing each delete/
-    // update's target row-id in its "starting" line and tolerating an
-    // exact id-set instead of a count -- is a real fix, just not done
-    // here) and still strictly narrower than the flat constant it
-    // replaced.
-    let max_tolerated_combined = max_tolerated_lost + max_tolerated_phantoms;
+    let max_tolerated_combined = result.tolerated_lost_target_ids.len() + max_tolerated_phantoms;
     assert!(
         lost.len() + phantom.len() <= max_tolerated_combined,
         "combined lost+phantom count {} exceeds the budget computed from the ops genuinely in \
@@ -725,5 +750,24 @@ mod tests {
     #[should_panic(expected = "unrecognized verb")]
     fn ambiguity_shape_panics_on_an_unknown_verb() {
         ambiguity_shape("bogus");
+    }
+
+    #[test]
+    fn duplicate_same_target_operations_yield_one_tolerated_lost_id() {
+        let started = [
+            StartedOp {
+                verb: "delete".to_string(),
+                target_row_id: Some(7),
+            },
+            StartedOp {
+                verb: "update".to_string(),
+                target_row_id: Some(7),
+            },
+        ];
+
+        let (tolerated_lost_target_ids, max_tolerated_phantoms) = crash_tolerance(&started);
+
+        assert_eq!(tolerated_lost_target_ids, HashSet::from([7]));
+        assert_eq!(max_tolerated_phantoms, 1);
     }
 }
