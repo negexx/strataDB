@@ -20,7 +20,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master at 2026-08-03
         with:
-          toolchain: "1.90"
+          toolchain: "1.97.1"
           components: clippy, rustfmt
 
       - name: Test storage directory durability
@@ -31,6 +31,9 @@ jobs:
 
       - name: Test injected dataset creation durability boundary
         run: cargo test -p strata-txn --features test-fault-injection dataset::tests::create_returns_an_error_when_manifest_publication_root_sync_fails -- --exact
+
+      - name: Test row-ID reservation restart durability
+        run: cargo test -p strata-txn --features chaos-injection --test row_id_reservation_restart -- --nocapture
 
       - name: Clippy directory durability fault injection
         run: cargo clippy -p strata-txn --all-targets --features test-fault-injection -- -D warnings
@@ -46,7 +49,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master at 2026-08-03
         with:
-          toolchain: "1.90"
+          toolchain: "1.97.1"
 
       - name: Run retained Phase 0 foundation regressions
         shell: bash
@@ -104,7 +107,7 @@ jobs:
           name: phase-0-foundation-evidence-${{ github.run_id }}-attempt-${{ github.run_attempt }}
           path: artifacts/phase-0-foundation.log
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 90
 
   phase-3-lifecycle-evidence:
     runs-on: ubuntu-latest
@@ -114,7 +117,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master at 2026-08-03
         with:
-          toolchain: "1.90"
+          toolchain: "1.97.1"
 
       - name: Run Phase 3 manifest-retention crash recovery evidence
         shell: bash
@@ -137,7 +140,7 @@ jobs:
           name: phase-3-lifecycle-evidence-${{ github.run_id }}-attempt-${{ github.run_attempt }}
           path: artifacts/phase-3-lifecycle-evidence.log
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 90
 
   ci:
     runs-on: ubuntu-latest
@@ -175,7 +178,7 @@ jobs:
         id: install_toolchain
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master at 2026-08-03
         with:
-          toolchain: "1.90"
+          toolchain: "1.97.1"
           components: clippy, rustfmt
 
       - name: Record repository and toolchain provenance
@@ -329,7 +332,7 @@ jobs:
           name: loom-evidence-${{ github.run_id }}-attempt-${{ github.run_attempt }}
           path: artifacts/loom-*.log
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 90
 
       - name: Clippy
         id: clippy
@@ -427,7 +430,7 @@ jobs:
           name: ci-provenance-${{ github.run_id }}-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/strata-ci-provenance/ci-provenance.log
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 90
 
   fuzz-and-provenance:
     runs-on: ubuntu-latest
@@ -438,7 +441,7 @@ jobs:
       - name: Install supported Rust toolchain
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master at 2026-08-03
         with:
-          toolchain: "1.90"
+          toolchain: "1.97.1"
 
       - name: Build declared fuzz targets and run parser smoke inputs
         run: |
@@ -489,7 +492,7 @@ jobs:
           name: fuzz-provenance-${{ github.run_id }}-attempt-${{ github.run_attempt }}
           path: artifacts/fuzz-provenance.log
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 90
 
   thorough-chaos:
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
@@ -501,7 +504,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master at 2026-08-03
         with:
-          toolchain: "1.90"
+          toolchain: "1.97.1"
 
       - name: Test thorough chaos tier
         run: |
@@ -527,4 +530,4 @@ jobs:
           name: thorough-chaos-${{ github.run_id }}-attempt-${{ github.run_attempt }}
           path: artifacts/strata-chaos-thorough.log
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 90

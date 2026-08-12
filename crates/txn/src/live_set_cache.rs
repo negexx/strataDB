@@ -1,6 +1,6 @@
 //! A bounded, per-[`Snapshot`](crate::snapshot::Snapshot) cache from a
 //! predicate's identity to its resolved [`LiveSet`]. See
-//! `docs/analysis/2026-07-25-filtered-vector-search-memory-audit.md`
+//! `docs/phase-1-performance.md`
 //! for why this exists: `Snapshot::row_ids_matching` re-reads a whole data
 //! file's Arrow IPC body per query to resolve which rows match a predicate,
 //! and `HnswIndex::search_filtered` rebuilds a bitset from that result on

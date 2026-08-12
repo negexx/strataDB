@@ -39,9 +39,12 @@ The targeted foundation suites on the merged PR #53 baseline are:
 | HNSW/immutable segments | `cargo test -p strata-index --lib` | 147 passed, 0 failed, 1 intentionally ignored |
 
 The tests cover round-trip encoding, malformed input rejection, manifest envelope checksums and
-filename/version identity, local-key containment, directory-sync failure handling, row-ID high-water
-records, restart non-reuse, snapshot visibility, transaction conflict behavior, segment CRCs,
-topology validation, global row-ID mapping, and fan-out search.
+filename/version identity, local-key containment, directory-sync failure handling, row-ID ownership
+and uniqueness through high-water records and restart non-reuse, snapshot visibility, transaction
+conflict behavior, segment CRCs, topology validation, global row-ID mapping, and fan-out search.
+They establish manifest-listed metadata/checksum consistency, not byte-for-byte identity of decoded
+Arrow vector values: tampering that changes vector values while recomputing the corresponding
+metadata/checksums is outside the supported integrity boundary.
 
 These are local Windows results. The merged PR #53 CI run also passed the retained foundation
 evidence job on Ubuntu: [run 30841989478](https://github.com/negexx/strataDB/actions/runs/30841989478),
