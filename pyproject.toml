@@ -1,0 +1,14 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "strata-bindings"
+version = "0.1.0"
+description = "Python bindings for the embedded Strata database"
+requires-python = ">=3.10"
+
+[tool.maturin]
+manifest-path = "crates/bindings/Cargo.toml"
+bindings = "pyo3"
+module-name = "strata_ext"

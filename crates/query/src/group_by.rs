@@ -195,14 +195,11 @@ impl ColumnarAccumulator {
 /// Groups `batch` by `group_cols` and computes `aggs` per group. See
 /// `docs/design.md`.
 ///
-/// Null values in an agg column are skipped, not treated as zero. **A group
-/// whose agg column is entirely null is not yet handled specially** (flagged
-/// by the Phase 2 whole-branch review, not fixed — out of the spec's
-/// documented scope): `Min` returns `f64::INFINITY`, `Max` returns
-/// `f64::NEG_INFINITY`, and `Avg` returns `NaN` for such a group, rather
-/// than erroring or producing a null result cell. Callers should not rely on
-/// these values being meaningful; a future revision should either emit null
-/// for empty accumulations or document this as intentional.
+/// Null values in an agg column are skipped, not treated as zero. A group
+/// whose agg column is entirely null produces a null result for `Sum`, `Min`,
+/// `Max`, and `Avg`; `Count` produces the meaningful value zero. Numeric
+/// result fields are nullable when the input column is nullable so the
+/// all-null-group result is represented without an identity sentinel.
 ///
 /// # Errors
 ///

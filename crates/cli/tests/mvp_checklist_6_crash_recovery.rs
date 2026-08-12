@@ -1,4 +1,4 @@
-//! Phase 1 MVP checklist step 6: "Kill the process mid-write, restart,
+//! Legacy MVP checklist step 6: "Kill the process mid-write, restart,
 //! confirm the dataset opens and returns the last successfully committed
 //! version." This is the one checklist item that genuinely needs a real OS
 //! process to kill — nothing in-process can exercise actual crash safety,

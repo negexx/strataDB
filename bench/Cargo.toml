@@ -55,3 +55,11 @@ harness = false
 [[bench]]
 name = "ef_construction_sweep_bench"
 harness = false
+
+[[bench]]
+name = "projected_read_bench"
+harness = false
+
+[[bench]]
+name = "query_concurrency_bench"
+harness = false

@@ -1,4 +1,4 @@
-//! Shared fixtures for the Phase 1 MVP demo schema (id: `Int64`, name: `Utf8`,
+//! Shared fixtures for the legacy demo schema (id: `Int64`, name: `Utf8`,
 //! vector: `FixedSizeList<Float32, 3>`) — used by the CLI binary, the MVP
 //! checklist integration test, and this crate's own unit tests, so the
 //! schema shape has exactly one definition instead of independent copies
