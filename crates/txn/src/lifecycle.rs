@@ -377,7 +377,7 @@ mod tests {
         assert!(matches!(
             result,
             Err(TxnError::Storage(StorageError::CorruptManifest(path, reason)))
-                if path == std::path::PathBuf::from("_versions/00000000000000000000.manifest")
+                if path.as_path() == Path::new("_versions/00000000000000000000.manifest")
                     && reason.contains("duplicate reachable object key: data/shared.bin")
         ));
     }

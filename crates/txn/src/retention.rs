@@ -337,7 +337,7 @@ fn is_temporary_data_object(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeSet, HashMap};
-    use std::path::PathBuf;
+    use std::path::Path;
 
     use strata_storage::{DataFileEntry, Manifest, ObjectMeta};
 
@@ -436,7 +436,7 @@ mod tests {
         assert!(matches!(
             result,
             Err(TxnError::Storage(StorageError::CorruptManifest(path, reason)))
-                if path == PathBuf::from(manifest_object_key(7))
+                if path.as_path() == Path::new(manifest_object_key(7).as_str())
                     && reason == "duplicate listed manifest version"
         ));
     }
@@ -462,7 +462,7 @@ mod tests {
         assert!(matches!(
             result,
             Err(TxnError::Storage(StorageError::CorruptManifest(path, reason)))
-                if path == PathBuf::from("data/retained.bin")
+                if path.as_path() == Path::new("data/retained.bin")
                     && reason == "duplicate listed data object"
         ));
     }
@@ -488,7 +488,7 @@ mod tests {
         assert!(matches!(
             result,
             Err(TxnError::Storage(StorageError::CorruptManifest(path, reason)))
-                if path == PathBuf::from("data/older.bin")
+                if path.as_path() == Path::new("data/older.bin")
                     && reason == "duplicate listed data object"
         ));
     }
@@ -520,7 +520,7 @@ mod tests {
         assert!(matches!(
             result,
             Err(TxnError::Storage(StorageError::CorruptManifest(path, reason)))
-                if path == PathBuf::from(manifest_object_key(0))
+                if path.as_path() == Path::new(manifest_object_key(0).as_str())
                     && reason == "duplicate reachable object key: data/duplicate.arrow"
         ));
     }

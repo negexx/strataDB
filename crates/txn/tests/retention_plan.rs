@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 
 use arrow::array::{FixedSizeListArray, Float32Array, Int64Array, RecordBatch};
@@ -381,7 +381,7 @@ fn missing_data_referenced_only_by_an_older_manifest_fails_closed() {
     assert!(matches!(
         error,
         TxnError::Storage(StorageError::CorruptManifest(path, reason))
-            if path == PathBuf::from("_versions")
+            if path.as_path() == Path::new("_versions")
                 && reason == "reachable object is missing from inventory: data/missing-older.bin"
     ));
 }
@@ -405,7 +405,7 @@ fn missing_retained_data_fails_closed() {
     assert!(matches!(
         error,
         TxnError::Storage(StorageError::CorruptManifest(path, reason))
-            if path == PathBuf::from("_versions")
+            if path.as_path() == Path::new("_versions")
                 && reason == format!("reachable object is missing from inventory: data/{data_file}")
     ));
 }

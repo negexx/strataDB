@@ -220,18 +220,19 @@ fn main() {
 ///
 /// **The `starting`/`committed`/`dropped` ack-line contract is
 /// load-bearing, not just logging.** Every op prints exactly one
-/// `"agent {agent} starting {verb} op {op}"` line, via [`print_line`],
-/// IMMEDIATELY before its `execute_*` call -- using the FINAL resolved
-/// verb (after any Delete/Update-to-Insert downgrade), never the
-/// originally-drawn one -- and exactly one `committed`/`dropped`
+/// `"agent {agent} starting {verb} op {op}"` line, with
+/// `"target_row_id {id}"` appended for resolved Delete/Update targets,
+/// via [`print_line`], IMMEDIATELY before its `execute_*` call -- using
+/// the FINAL resolved verb (after any Delete/Update-to-Insert downgrade),
+/// never the originally-drawn one -- and exactly one `committed`/`dropped`
 /// completion line (via [`commit_ops::print_outcome`]) immediately after.
 /// `tests/sim/tests/chaos.rs`'s entire crash-tolerance budget for the
 /// lost/phantom-commit invariants is computed by matching these two
 /// lines: any `starting` line with no matching completion line by the end
 /// of a run's captured stdout is treated as the op that was genuinely in
-/// flight when a chaos abort fired, and its `ambiguity_shape(verb)` is
-/// summed into that run's tolerance (see `chaos.rs`'s `run_worker`/
-/// `ambiguity_shape`). Moving a `starting` print after its `execute_*`
+/// flight when a chaos abort fired. Its verb controls phantom tolerance;
+/// a Delete/Update target controls the exact lost-ID tolerance (see
+/// `chaos.rs`'s `run_worker`/`crash_tolerance`). Moving a `starting` print after its `execute_*`
 /// call, adding a new op path that skips it, or printing the
 /// pre-downgrade verb instead of the resolved one would silently corrupt
 /// that budget without failing to compile or necessarily failing any
@@ -290,7 +291,9 @@ fn run_agent(
                 };
                 if let Some(target_row_id) = resolve_target(&mut target_rng, &pool_rows, &own_rows)
                 {
-                    print_line(&format!("agent {agent} starting delete op {op}"));
+                    print_line(&format!(
+                        "agent {agent} starting delete op {op} target_row_id {target_row_id}"
+                    ));
                     execute_delete(dataset, target_row_id)
                 } else {
                     // No eligible target yet -- downgrade to Insert per design doc §3.1.
@@ -314,7 +317,9 @@ fn run_agent(
                 {
                     let global_id = agent * ops_per_agent + op;
                     let vector = vectors[usize::try_from(op).unwrap()];
-                    print_line(&format!("agent {agent} starting update op {op}"));
+                    print_line(&format!(
+                        "agent {agent} starting update op {op} target_row_id {target_row_id}"
+                    ));
                     execute_update(
                         dataset,
                         target_row_id,

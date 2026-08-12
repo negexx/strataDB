@@ -4,8 +4,8 @@
 **Baseline:** `eb48519` (merged PR #53)
 **Scope:** embedded, single-node, local-disk foundation used by one process and one shared
 `Dataset` handle.
-**Status:** Evidence complete within the named local-filesystem bounds; later-phase limitations
-remain tracked separately.
+**Status:** Implementation closure is within the named local-filesystem bounds; platform and loom
+evidence remains incomplete, and later-phase limitations remain tracked separately.
 **Verdict:** Phase 0 is **Foundation implemented within named local bounds**.
 
 This audit applies the same evidence-first review to the foundation that the Phase 1 audit applied
@@ -39,14 +39,43 @@ The targeted foundation suites on the merged PR #53 baseline are:
 | HNSW/immutable segments | `cargo test -p strata-index --lib` | 147 passed, 0 failed, 1 intentionally ignored |
 
 The tests cover round-trip encoding, malformed input rejection, manifest envelope checksums and
-filename/version identity, local-key containment, directory-sync failure handling, row-ID high-water
-records, restart non-reuse, snapshot visibility, transaction conflict behavior, segment CRCs,
-topology validation, global row-ID mapping, and fan-out search.
+filename/version identity, local-key containment, directory-sync failure handling, row-ID ownership
+and uniqueness through high-water records and restart non-reuse, snapshot visibility, transaction
+conflict behavior, segment CRCs, topology validation, global row-ID mapping, and fan-out search.
+They establish manifest-listed metadata/checksum consistency, not byte-for-byte identity of decoded
+Arrow vector values: tampering that changes vector values while recomputing the corresponding
+metadata/checksums is outside the supported integrity boundary.
 
 These are local Windows results. The merged PR #53 CI run also passed the retained foundation
 evidence job on Ubuntu: [run 30841989478](https://github.com/negexx/strataDB/actions/runs/30841989478),
 with retained artifact `phase-0-foundation-evidence-30841989478-attempt-1`. This is not a portable
 filesystem matrix or a universal power-loss guarantee.
+
+## CI evidence and provenance boundary
+
+The CI workflow keeps the Linux and Windows evidence distinct. The Ubuntu
+`phase-0-foundation-evidence` job records the revision, runner OS/architecture, host and toolchain
+details, and focused foundation-command output. The native `windows-directory-durability` job runs
+the same row-ID restart regression and is configured to retain
+`windows-platform-restart-evidence-<run-id>-attempt-<attempt>` with its revision, runner, toolchain,
+and command transcript for 90 days on future workflow runs regardless of outcome. No completed
+Windows run or retained Windows artifact is linked in this branch, so Windows execution evidence
+remains pending. An expiring artifact is supporting provenance, not the sole
+record of what was executed.
+
+The workflow's loom gate builds `strata-txn` and `strata-index` separately with crate-scoped
+`cargo rustc -p <crate> --lib --profile test -- --cfg loom`, discovers the resulting test binary,
+and invokes each named model directly with `--exact --test-threads=1`. Normal `cargo test` summaries
+are not loom evidence, and the workflow never sets workspace-wide `RUSTFLAGS=--cfg loom`. A timeout,
+missing binary, missing named test, interrupted job, or nonzero result is incomplete evidence rather
+than a pass. In particular,
+`dataset::loom_tests::a_reader_never_sees_one_in_flight_commits_row_while_observing_an_unrelated_commits_row_id_counter`
+has a recorded Windows commit-charge timeout; it remains a platform limitation unless a retained CI
+run completes it.
+
+These logs identify the tested GitHub-hosted runner and revision only. They do not characterize every
+Windows or Linux filesystem, model a physical power interruption, or establish portable durability,
+cross-process publication, or a universal power-loss guarantee.
 
 ## Finding register
 
@@ -58,7 +87,7 @@ filesystem matrix or a universal power-loss guarantee.
 | F0-04 | P1 | Transaction primitive scope | Shared-handle commit locking, write-write OCC, immutable snapshots, and typed conflict errors exist and are regression-covered. The API intentionally has no read-your-own-writes or serializable read/write transaction interface. | Keep the supported boundary explicit. Full snapshot transactions and stronger isolation require a new design decision and are not Phase 0 work. |
 | F0-05 | P1 | Preparation failures and unreachable artifacts | A failed commit can leave an unreferenced row file or segment because publication is manifest-based and cleanup is not implemented. This does not make the artifact visible to a later snapshot. | Track reclamation, orphan cleanup, compaction, and bounded growth in Phase 3. Add no implicit cleanup to Phase 0. |
 | F0-06 | P1 | Immutable vector-segment foundation | The segmented design is coherent: each vector-bearing commit produces an immutable segment, manifests list segments, readers validate them, and search maps local ordinals back to global physical row IDs. | Preserve segment format tests and current segmented benchmarks. Recall/latency bounds, segment-count limits, and compaction are separate Phase 1 evidence and Phase 3 lifecycle work. |
-| F0-07 | P1 | Foundation verification visibility | Targeted storage, transaction, and index suites pass locally, and the merged PR #53 CI run retained the targeted evidence artifact. Portable/native evidence remains incomplete. | Keep platform/fixture limitations explicit. Phase 0 is closed only within the named local bounds, not as a universal portability claim. |
+| F0-07 | P1 | Foundation verification visibility | Targeted storage, transaction, and index suites pass locally; the merged PR #53 Ubuntu job retained focused foundation output. Current CI configures 90-day retention of a native Windows restart transcript with revision/runner/toolchain provenance on future workflow runs regardless of outcome, but no completed Windows run or retained artifact is linked in this branch. Windows execution evidence remains pending. Direct crate-scoped loom binaries, not normal Cargo summaries, are the CI loom evidence. Portable/native evidence remains incomplete, including the named Windows loom timeout. | Keep platform/fixture limitations explicit. Phase 0 is closed only within the named local bounds, not as a universal portability claim. |
 | F0-08 | P2 | Backend abstraction completeness | `Backend`/`LocalFs` provide the current local implementation, but object-store semantics and independent opener coordination are not implemented. | Keep object storage in Phase 6 and cross-process coordination in Phase 4. The Phase 0 contract should say local backend, not generic remote durability. |
 
 ## Audit conclusions
@@ -71,7 +100,8 @@ filesystem matrix or a universal power-loss guarantee.
 4. The largest remaining limitations are not missing Phase 0 mechanisms: they are Phase 1 evidence
    provenance/portability and later lifecycle, query, cross-process, and deployment work.
 5. Phase 0 is **Foundation implemented within the named local bounds**. Its local filesystem and
-   single-process/shared-handle limits remain part of the contract.
+   single-process/shared-handle limits remain part of the contract; platform and loom evidence is
+   still incomplete.
 
 ## Recommended next action
 

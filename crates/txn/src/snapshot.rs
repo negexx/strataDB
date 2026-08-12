@@ -70,7 +70,7 @@ pub struct Snapshot {
     pub(crate) index: strata_index::SegmentSet,
     pub(crate) tombstones: Arc<imbl::HashSet<u64>>,
     /// Per-predicate resolved-row-id cache — see
-    /// `docs/analysis/2026-07-25-filtered-vector-search-memory-audit.md`
+    /// `docs/phase-1-performance.md`
     /// and `crate::live_set_cache`'s module doc for why this is sound (this
     /// `Snapshot` is immutable) and how it's bounded (a byte budget, not an
     /// entry count).
@@ -801,7 +801,7 @@ impl Snapshot {
         // per-snapshot cache keyed by predicate identity instead of calling
         // it directly, so a live `Snapshot` queried with the same predicate
         // more than once pays that cost at most once. See
-        // `docs/analysis/2026-07-25-filtered-vector-search-memory-audit.md`.
+        // `docs/phase-1-performance.md`.
         //
         // Zone-map pruning (S1 W4b) shrinks the fan-out/search side of that
         // cost only — it does nothing for `row_ids_matching`/
@@ -851,7 +851,7 @@ impl Snapshot {
         // uncached call, at ~1.5GB/s. `resolve_live_set`'s cache is what
         // amortizes this now for a snapshot queried with the same predicate
         // more than once — see
-        // `docs/analysis/2026-07-25-filtered-vector-search-memory-audit.md`.
+        // `docs/phase-1-performance.md`.
         //
         // Eliminating the underlying per-call cost needs a genuinely
         // column-chunked file format so a single column can be read without

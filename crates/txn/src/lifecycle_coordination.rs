@@ -60,6 +60,23 @@ impl LifecycleCoordinator {
         LifecycleExclusiveGuard { coordinator: self }
     }
 
+    #[cfg(test)]
+    pub(crate) fn wait_for_executor_to_queue(&self) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let state = self.lock();
+            if state.waiting_executors > 0 {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "exclusive acquisition never joined the writer-preference queue"
+            );
+            drop(state);
+            std::thread::yield_now();
+        }
+    }
+
     #[cfg(not(loom))]
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state
@@ -136,31 +153,12 @@ impl Drop for LifecycleExclusiveGuard<'_> {
 mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::{Arc, mpsc};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use super::LifecycleCoordinator;
 
     const WAIT: Duration = Duration::from_millis(100);
     const DEADLINE: Duration = Duration::from_secs(2);
-
-    fn wait_for_executor_to_queue(coordinator: &LifecycleCoordinator) {
-        let deadline = Instant::now() + DEADLINE;
-        loop {
-            let state = coordinator
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.waiting_executors > 0 {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "exclusive acquisition never joined the writer-preference queue"
-            );
-            drop(state);
-            std::thread::yield_now();
-        }
-    }
 
     #[test]
     fn exclusive_acquisition_waits_for_the_last_preparation_lease() {
@@ -196,7 +194,7 @@ mod tests {
             let _guard = exclusive_coordinator.acquire_exclusive();
             exclusive_acquired_tx.send(()).unwrap();
         });
-        wait_for_executor_to_queue(&coordinator);
+        coordinator.wait_for_executor_to_queue();
 
         let (preparation_acquired_tx, preparation_acquired_rx) = mpsc::channel();
         let preparation_coordinator = Arc::clone(&coordinator);

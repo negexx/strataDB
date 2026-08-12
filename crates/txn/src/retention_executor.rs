@@ -246,6 +246,7 @@ mod tests {
                 keep_latest_versions: 1,
             }))
         });
+        dataset.wait_for_executor_to_queue();
 
         let (later_checkpoint, later_control) = checkpoint_pair();
         let mut later = pending_transaction(&dataset);

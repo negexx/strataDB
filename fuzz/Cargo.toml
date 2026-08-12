@@ -24,6 +24,9 @@ arrow-ipc = "=58.3.0"
 [dependencies.strata-storage]
 path = "../crates/storage"
 
+[dependencies.strata-index]
+path = "../crates/index"
+
 [[bin]]
 name = "manifest_parse"
 path = "fuzz_targets/manifest_parse.rs"
@@ -34,6 +37,20 @@ bench = false
 [[bin]]
 name = "datafile_parse"
 path = "fuzz_targets/datafile_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "manifest_current_parse"
+path = "fuzz_targets/manifest_current_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "segment_parse"
+path = "fuzz_targets/segment_parse.rs"
 test = false
 doc = false
 bench = false
