@@ -58,9 +58,10 @@
 
 **Interfaces:** `SegmentSet::fan_out` keeps its signature and `VectorMatch` output. Global row-ID mapping, nearest-first order, duplicate nearest-wins behavior, filters, and zone-map pruning remain unchanged.
 
-- [ ] Add a regression test with duplicate row IDs across segments where the nearest occurrence is not encountered first.
-- [ ] Run the regression and record the pre-change behavior as the compatibility oracle.
-- [ ] Replace the final full sort with a selection/merge that only fully orders the retained top-k results while preserving duplicate nearest-wins semantics.
+- [ ] Add a failing unit test for a bounded selector helper that retains at most `k` unique `(row_id, distance)` candidates and updates a duplicate when a nearer occurrence arrives later.
+- [ ] Run the helper test and confirm it fails because the bounded selector is not yet implemented.
+- [ ] Implement the bounded selector, then retain the duplicate-row scenario as a compatibility oracle for `fan_out` integration.
+- [ ] Replace the final full sort with the selector so only the retained top-k results are fully ordered while preserving duplicate nearest-wins semantics.
 - [ ] Run index unit tests, filtered search tests, the relevant loom model if the implementation changes shared state, and the existing segment recall benchmark smoke check.
 
 ### Task 4: Make lifecycle admission tests deterministic
