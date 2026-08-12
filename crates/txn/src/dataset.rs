@@ -672,6 +672,11 @@ impl Dataset {
         crate::retention_executor::prune(self, policy)
     }
 
+    #[cfg(test)]
+    pub(crate) fn wait_for_executor_to_queue(&self) {
+        self.lifecycle_coordinator.wait_for_executor_to_queue();
+    }
+
     pub(crate) fn retention_dir(&self) -> &Path {
         &self.dir
     }
@@ -754,7 +759,7 @@ fn validate_dataset_schema(schema: &SchemaRef) -> Result<()> {
     for field in schema.fields() {
         let name = field.name();
         if HIDDEN_COLUMNS.contains(&name.as_str()) {
-            return Err(TxnError::ReservedColumnName(name.to_string()));
+            return Err(TxnError::ReservedColumnName(name.clone()));
         }
         if !names.insert(name.clone()) {
             return Err(TxnError::BatchSchemaMismatch {
