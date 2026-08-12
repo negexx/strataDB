@@ -30,13 +30,10 @@
 //! would grow for as long as a caller holds this `Snapshot` across many
 //! distinct ad-hoc predicates) — bounded *per live `Snapshot`*: N
 //! long-lived readers cost up to N × `byte_budget`, not one shared
-//! ceiling. The accounting is still an approximation, not exact (it
-//! doesn't count `HashMap` bucket overhead or allocator metadata), and the
-//! budget is soft in one more way: concurrent misses that both observe
-//! "under budget" can push the total slightly over it before either
-//! finishes; this is intentional (an atomic read-then-conditionally-insert
-//! under the same lock closes that gap, but isn't worth the extra
-//! complexity for a soft memory cap).
+//! ceiling. `charged_bytes` is atomically hard-capped at `byte_budget`, even
+//! across concurrent misses. The charge remains an approximation of resident
+//! memory: it excludes `HashMap` buckets, mutexes, `Arc` headers, allocator
+//! metadata, and other implementation overhead.
 //!
 //! **Lock discipline.** The outer `slots` map lock is held only to look up
 //! or insert a per-key slot — never across `compute`, which does the actual
@@ -61,9 +58,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use strata_index::LiveSet;
 use strata_query::PredicateKey;
 
-/// One cache entry's storage: `None` until the first caller for this key
-/// fills it.
-type Slot = Arc<Mutex<Option<Arc<LiveSet>>>>;
+/// One cache entry's storage, including an eviction marker so callers never
+/// compute into a slot that has been removed from the outer map.
+type Slot = Arc<Mutex<SlotState>>;
+
+enum SlotState {
+    Vacant,
+    Cached(Arc<LiveSet>),
+    Evicted,
+}
 
 /// Fixed per-entry charge against `byte_budget`, applied at slot-creation
 /// time regardless of whether `compute` later succeeds. Two reasons this
@@ -86,7 +89,7 @@ type Slot = Arc<Mutex<Option<Arc<LiveSet>>>>;
 /// This is a deliberately rough estimate, not a precise accounting —
 /// getting it exactly right would need `std::mem::size_of` on types this
 /// module doesn't own (`PredicateKey`'s internals) plus allocator overhead,
-/// which isn't worth it for a soft admission-control budget.
+/// which isn't worth it for this bounded cache.
 const ENTRY_OVERHEAD_BYTES: usize = 256;
 
 pub(crate) struct LiveSetCache {
@@ -97,7 +100,7 @@ pub(crate) struct LiveSetCache {
 
 /// A best-effort observation of one snapshot's live-set cache.
 ///
-/// `charged_bytes` is the cache's soft admission-control charge, not an
+/// `charged_bytes` is atomically hard-capped at `byte_budget`, but is not an
 /// allocator measurement: it excludes `HashMap` buckets, mutexes, `Arc`
 /// headers, and allocator metadata. Concurrent misses may make the fields
 /// describe slightly different instants; benchmark callers sample while no
@@ -108,7 +111,7 @@ pub struct LiveSetCacheAccounting {
     pub entry_count: usize,
     /// Approximate bytes charged to retained slots and successful live sets.
     pub charged_bytes: usize,
-    /// The per-snapshot soft admission-control budget.
+    /// The per-snapshot hard cap on `charged_bytes`.
     pub byte_budget: usize,
 }
 
@@ -144,15 +147,48 @@ impl LiveSetCache {
     }
 
     #[cfg(not(loom))]
-    fn lock_slot(slot: &Slot) -> std::sync::MutexGuard<'_, Option<Arc<LiveSet>>> {
+    fn lock_slot(slot: &Slot) -> std::sync::MutexGuard<'_, SlotState> {
         slot.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     #[cfg(loom)]
-    fn lock_slot(slot: &Slot) -> loom::sync::MutexGuard<'_, Option<Arc<LiveSet>>> {
+    fn lock_slot(slot: &Slot) -> loom::sync::MutexGuard<'_, SlotState> {
         slot.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn try_reserve_bytes(&self, bytes: usize) -> bool {
+        let mut charged_bytes = self.bytes.load(Ordering::Relaxed);
+        loop {
+            let Some(next_charged_bytes) = charged_bytes.checked_add(bytes) else {
+                return false;
+            };
+            if next_charged_bytes > self.byte_budget {
+                return false;
+            }
+            match self.bytes.compare_exchange(
+                charged_bytes,
+                next_charged_bytes,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual_charged_bytes) => charged_bytes = actual_charged_bytes,
+            }
+        }
+    }
+
+    fn remove_evicted_slot(&self, slot: &Slot, entry_charge: usize) {
+        let removed = {
+            let mut slots = self.lock_slots();
+            let entry_count = slots.len();
+            slots.retain(|_, current_slot| !Arc::ptr_eq(current_slot, slot));
+            slots.len() != entry_count
+        };
+        if removed {
+            self.bytes.fetch_sub(entry_charge, Ordering::Relaxed);
+        }
     }
 
     /// Returns the cached `LiveSet` for `key`, calling `compute` on a miss.
@@ -175,6 +211,7 @@ impl LiveSetCache {
         key: PredicateKey,
         compute: impl FnOnce() -> Result<LiveSet, E>,
     ) -> Result<Arc<LiveSet>, E> {
+        let entry_charge = ENTRY_OVERHEAD_BYTES + key.variable_byte_size();
         // Lock order: `slots` (this block) then, if needed, one slot
         // (below) — never the reverse, and never both held at once past
         // this block's end. This block's only job is to decide which slot
@@ -185,12 +222,10 @@ impl LiveSetCache {
             let mut slots = self.lock_slots();
             if let Some(slot) = slots.get(&key) {
                 Lookup::Slot(Arc::clone(slot))
-            } else if self.bytes.load(Ordering::Relaxed) < self.byte_budget {
-                // `Relaxed`: `bytes` is an approximate admission-control
-                // counter, not a value anything synchronizes with — the
-                // actual publication of a computed `LiveSet` happens
-                // through the per-slot `Mutex` below, which provides all
-                // the ordering this cache needs.
+            } else {
+                // `Relaxed`: compare-exchange makes this charged-byte
+                // reservation atomic, while the per-slot `Mutex` below
+                // provides the ordering for publishing a computed `LiveSet`.
                 //
                 // Charged now, before `compute` runs and win or lose — see
                 // `ENTRY_OVERHEAD_BYTES`'s doc comment for why a failed
@@ -200,13 +235,13 @@ impl LiveSetCache {
                 // long column name or a long `Utf8` value can't slip past
                 // the budget uncounted — see `PredicateKey::variable_byte_size`'s
                 // doc comment.
-                let charge = ENTRY_OVERHEAD_BYTES + key.variable_byte_size();
-                self.bytes.fetch_add(charge, Ordering::Relaxed);
-                let slot: Slot = Arc::new(Mutex::new(None));
-                slots.insert(key, Arc::clone(&slot));
-                Lookup::Slot(slot)
-            } else {
-                Lookup::OverBudget
+                if self.try_reserve_bytes(entry_charge) {
+                    let slot: Slot = Arc::new(Mutex::new(SlotState::Vacant));
+                    slots.insert(key, Arc::clone(&slot));
+                    Lookup::Slot(slot)
+                } else {
+                    Lookup::OverBudget
+                }
             }
         };
 
@@ -216,17 +251,23 @@ impl LiveSetCache {
         };
 
         let mut guard = Self::lock_slot(&slot);
-        if let Some(live_set) = guard.as_ref() {
-            return Ok(Arc::clone(live_set));
+        match &*guard {
+            SlotState::Cached(live_set) => return Ok(Arc::clone(live_set)),
+            SlotState::Evicted => return compute().map(Arc::new),
+            SlotState::Vacant => {}
         }
         let live_set = Arc::new(compute()?);
-        // `Relaxed`: same reasoning as the overhead charge above — this is
-        // an approximate admission-control counter, and `guard` (the
-        // per-slot `Mutex`, locked for this whole scope) is what actually
-        // publishes `live_set` to later readers, not this counter.
-        self.bytes
-            .fetch_add(live_set.byte_size(), Ordering::Relaxed);
-        *guard = Some(Arc::clone(&live_set));
+        let live_set_bytes = live_set.byte_size();
+        if !self.try_reserve_bytes(live_set_bytes) {
+            *guard = SlotState::Evicted;
+            drop(guard);
+            self.remove_evicted_slot(&slot, entry_charge);
+            return Ok(live_set);
+        }
+        // The payload charge was atomically reserved above; `guard` (the
+        // per-slot `Mutex`, locked for this whole scope) publishes `live_set`
+        // to later readers.
+        *guard = SlotState::Cached(Arc::clone(&live_set));
         Ok(live_set)
     }
 
@@ -400,6 +441,41 @@ mod tests {
     }
 
     #[test]
+    fn an_oversized_live_set_is_returned_without_being_retained() {
+        let cache = LiveSetCache::new(ENTRY_OVERHEAD_BYTES + "category".len());
+        let calls = AtomicUsize::new(0);
+        let compute = || -> Result<LiveSet, Unreachable> {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Ok(LiveSet::from_row_ids(&[1_000_000]))
+        };
+
+        let first = cache.get_or_try_compute(key(3), compute).unwrap();
+        assert!(first.contains(1_000_000));
+
+        let accounting = cache.accounting();
+        assert!(
+            accounting.charged_bytes <= accounting.byte_budget,
+            "an oversized live set must not leave cache accounting over budget"
+        );
+        assert_eq!(
+            accounting.entry_count, 0,
+            "an oversized live set must not retain an empty predicate slot"
+        );
+        assert_eq!(
+            accounting.charged_bytes, 0,
+            "an oversized live set must release its entry-overhead reservation"
+        );
+
+        let second = cache.get_or_try_compute(key(3), compute).unwrap();
+        assert!(second.contains(1_000_000));
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            2,
+            "an oversized live set must be returned but recomputed instead of retained"
+        );
+    }
+
+    #[test]
     fn a_compute_error_is_not_cached_and_is_retried_next_call() {
         let cache = LiveSetCache::new(64 * 1024 * 1024);
         let calls = AtomicUsize::new(0);
@@ -504,6 +580,73 @@ mod loom_tests {
             assert!(
                 StdArc::ptr_eq(&results[0], &results[1]),
                 "both threads must observe the same cached Arc"
+            );
+        });
+    }
+
+    #[test]
+    fn concurrent_different_key_payloads_do_not_exceed_the_budget() {
+        loom::model(|| {
+            let payload_bytes = LiveSet::from_row_ids(&[63]).byte_size();
+            let entry_charge = ENTRY_OVERHEAD_BYTES + "category".len();
+            let cache = StdArc::new(LiveSetCache::new(entry_charge * 2 + payload_bytes));
+
+            let first_cache = StdArc::clone(&cache);
+            let first = loom::thread::spawn(move || {
+                first_cache
+                    .get_or_try_compute(key(1), || -> Result<LiveSet, Unreachable> {
+                        Ok(LiveSet::from_row_ids(&[63]))
+                    })
+                    .unwrap()
+            });
+            let second_cache = StdArc::clone(&cache);
+            let second = loom::thread::spawn(move || {
+                second_cache
+                    .get_or_try_compute(key(2), || -> Result<LiveSet, Unreachable> {
+                        Ok(LiveSet::from_row_ids(&[63]))
+                    })
+                    .unwrap()
+            });
+
+            assert!(first.join().unwrap().contains(63));
+            assert!(second.join().unwrap().contains(63));
+            let accounting = cache.accounting();
+            assert!(
+                accounting.charged_bytes <= accounting.byte_budget,
+                "concurrent payload admission must not exceed the cache budget"
+            );
+        });
+    }
+
+    #[test]
+    fn concurrent_different_key_entry_charges_do_not_exceed_the_budget() {
+        loom::model(|| {
+            let entry_charge = ENTRY_OVERHEAD_BYTES + "category".len();
+            let cache = StdArc::new(LiveSetCache::new(entry_charge * 2 - 1));
+
+            let first_cache = StdArc::clone(&cache);
+            let first = loom::thread::spawn(move || {
+                first_cache
+                    .get_or_try_compute(key(1), || -> Result<LiveSet, Unreachable> {
+                        Ok(LiveSet::from_row_ids(&[1]))
+                    })
+                    .unwrap()
+            });
+            let second_cache = StdArc::clone(&cache);
+            let second = loom::thread::spawn(move || {
+                second_cache
+                    .get_or_try_compute(key(2), || -> Result<LiveSet, Unreachable> {
+                        Ok(LiveSet::from_row_ids(&[2]))
+                    })
+                    .unwrap()
+            });
+
+            assert!(first.join().unwrap().contains(1));
+            assert!(second.join().unwrap().contains(2));
+            let accounting = cache.accounting();
+            assert!(
+                accounting.charged_bytes <= accounting.byte_budget,
+                "concurrent entry admission must not exceed the cache budget"
             );
         });
     }
