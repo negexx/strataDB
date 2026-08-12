@@ -927,15 +927,19 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_compact_selector_evicts_at_capacity_and_keeps_nearer_duplicates() {
-        let mut selected = TopKSelector::new(2);
-        assert!(matches!(&selected, TopKSelector::Compact(_)));
+    fn hybrid_selector_paths_keep_retained_nearer_duplicates_after_capacity() {
+        let candidates = [(7, 3.0), (8, 2.0), (7, 1.5), (9, 1.0)];
+        let mut compact = TopKSelector::Compact(CompactTopKSelector::new(2));
+        let mut indexed = TopKSelector::Indexed(IndexedTopKSelector::new(2));
 
-        for candidate in [(7, 2.0), (8, 2.0), (9, 1.0), (8, 1.5), (7, 2.0)] {
-            selected.consider(candidate);
+        for candidate in candidates {
+            compact.consider(candidate);
+            indexed.consider(candidate);
         }
 
-        assert_eq!(selected.into_sorted(), vec![(9, 1.0), (8, 1.5)]);
+        let expected = vec![(9, 1.0), (7, 1.5)];
+        assert_eq!(compact.into_sorted(), expected);
+        assert_eq!(indexed.into_sorted(), expected);
     }
 
     #[test]
