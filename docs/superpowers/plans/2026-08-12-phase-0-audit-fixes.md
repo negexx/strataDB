@@ -68,9 +68,10 @@
 
 **Files:**
 - Modify: `crates/txn/src/retention_executor.rs`
-- Modify: nearby lifecycle test helpers only if required
+- Modify: `crates/txn/src/lifecycle_coordination.rs` for a test-only queue rendezvous helper if required
+- Modify: `crates/txn/src/dataset.rs` for a test-only forwarding hook if required
 
-**Interfaces:** No production lifecycle API change. The test must establish the pruning executor's queued state before releasing the first preparation or starting the later preparation.
+**Interfaces:** No production lifecycle API change. Test-only hooks may expose the coordinator queue rendezvous within the crate. The test must establish the pruning executor's queued state before releasing the first preparation or starting the later preparation.
 
 - [ ] Add a failing synchronization assertion or rendezvous that proves pruning has entered the coordinator wait state.
 - [ ] Run the focused regression repeatedly, including `cargo test -p strata-txn --features parallel-insert`, and confirm the old scheduling window is removed.
