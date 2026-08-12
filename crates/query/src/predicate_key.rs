@@ -1,4 +1,4 @@
-//! A hashable, structurally-exact identity key for [`Predicate`](crate::Predicate).
+//! A hashable, structurally-exact identity key for [`Predicate`].
 //!
 //! `Predicate` derives `Debug`/`Clone`/`PartialEq` but not `Eq`/`Hash`, because
 //! `f64` (inside `Value::Float64`) has no `Hash` impl at all.

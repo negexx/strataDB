@@ -1,5 +1,14 @@
 # Phase 1 performance evidence
 
+## Phase 1 bounded closeout
+
+The exact-head cloud comparison [31647664161](https://github.com/negexx/strataDB/actions/runs/31647664161)
+completed successfully on Rust 1.97.1 and Ubuntu 24.04. It validated the synthetic manifest-growth,
+segment fan-out, and retained-snapshot matrices plus the pinned 100,000-row/200-query fixture
+comparison, with matching fixture hash, runner/toolchain provenance, and retained raw artifacts.
+These results close the Phase 1 performance evidence gate within the named workload envelope; they
+do not establish universal latency, memory, durability, segment-count, or lifecycle bounds.
+
 ## Task 5 manifest-growth evidence (fresh, bounded)
 
 **Run date:** 2026-08-02
@@ -149,8 +158,8 @@ changes rather than a production optimization, so these results must not be attr
 product performance fix or generalized into a universal regression.
 They are now full-fixture bounded evidence for PERF-01 and the named PERF-03/PERF-04/PERF-05
 protocols. They do not establish universal latency, memory, recovery, RSS, statistics/projection,
-segment-count, or lifecycle-reclamation bounds; compaction, vacuum, retention, orphan cleanup, and
-cross-process durability remain deferred.
+segment-count, or lifecycle-reclamation bounds; compaction, vacuum, retention, and orphan cleanup
+remain deferred.
 
 ## Task 6 recovery-byte accounting evidence (fresh, bounded)
 
@@ -427,5 +436,5 @@ them.
 | Recovery | **Existing:** Task 6 payload accounting and bounded synthetic/full-fixture reopen observations. **Future gate:** cold reopen across named data, segment, and retained-history scales. | Reopen p50/p95 latency, loaded/validated bytes, and process memory. | Establish the recovery objective and decide whether it requires lazy recovery, a format/migration change, or an operational retention policy. | [Task 6 evidence](#task-6-recovery-byte-accounting-evidence-fresh-bounded); [full-fixture comparison](#cloud-beforeafter-comparison-fresh-full-pinned-100k-row-fixture). |
 | Lifecycle cleanup/fairness | **Existing:** manifest-only pruning is a bounded executor slice; no cleanup or fairness result is claimed. **Future gate:** sustained commits plus retained snapshots while lifecycle preparation/execution is contended. | Eligible/reclaimed objects and bytes, lifecycle wait time, commit wait time, and starvation/completion observations. | Name the lifecycle owner and deletion authority, then decide reclamation scope and fairness policy before claiming cleanup or starvation bounds. | [status](status.md#overall-state); [roadmap](roadmap.md#deferred-and-refused-scope); [Phase 1 audit](phase-1-audit.md). |
 | Memory/RSS | **Existing:** Task 8 reports logical/unique retained payload and cache-charge accounting, not RSS. **Future gate:** cold and steady-state process measurements at named fixture, segment, and retained-snapshot counts. | RSS/peak RSS, allocator/live-set accounting, and retained logical/unique payload. | Choose the memory budget and measurement platform; do not promote accounting values to an RSS limit without the corresponding process evidence. | [Task 8 evidence](#task-8-retained-snapshotcache-footprint-evidence-fresh-bounded); [full-fixture comparison](#cloud-beforeafter-comparison-fresh-full-pinned-100k-row-fixture). |
-| Concurrency | **Existing:** bounded shared-handle lifecycle observations include concurrent commits; independent openers remain unsupported. **Future gate:** named shared-`Dataset` read/write and lifecycle-contention mixes. | Commit/read p50/p95/p99 latency, conflict rate, queue/wait time, and completion under contention. | Set the shared-handle workload objective and fairness policy; a separate-process requirement is a Phase 4 decision, not a Phase 1 benchmark extension. | [Task 6 evidence](#task-6-recovery-byte-accounting-evidence-fresh-bounded); [status concurrency scope](status.md#concurrency-scope); [decision 0010](decisions.md#0010---deferred-cross-process-coordination-seam). |
+| Concurrency | **Existing:** bounded shared-handle lifecycle observations include concurrent commits. **Future gate:** named shared-`Dataset` read/write and lifecycle-contention mixes. | Commit/read p50/p95/p99 latency, conflict rate, queue/wait time, and completion under contention. | Set the shared-handle workload objective and fairness policy. | [Task 6 evidence](#task-6-recovery-byte-accounting-evidence-fresh-bounded); [status concurrency scope](status.md#concurrency-scope). |
 | Portability | **Existing:** native Ubuntu/Windows foundation checks and Ubuntu cloud evidence; neither is a portable performance bound. **Future gate:** a declared supported local-filesystem/OS matrix using the same pinned workload and cache policy. | Per-platform correctness outcome, latency/memory variation, filesystem/cache-policy provenance. | Name the supported platform/filesystem matrix and operating owner before setting portable criteria; remote backends remain out of scope. | [Task 5 evidence](#task-5-manifest-growth-evidence-fresh-bounded); [status](status.md#capability-ledger); [roadmap](roadmap.md#deferred-and-refused-scope). |

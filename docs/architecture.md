@@ -53,7 +53,9 @@ work and must not be inferred from these checks.
 These are usable slices, not a finished database API. There is no schema-evolution/migration workflow, planner,
 stable Python API, compaction, vacuum, orphan cleanup, time
 travel, or cross-process protocol. The Phase 2 Python/CLI surfaces are partial and remain subject to
-their documented typed contracts and integration verification.
+their documented typed contracts and integration verification. “Partial” here describes client/API
+maturity, not a claim that completed Phase 2 slices are outside their documented embedded,
+single-process boundary.
 
 ## Commit lifecycle
 

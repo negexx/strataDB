@@ -5,32 +5,32 @@ are evidence pointers; [roadmap](roadmap.md) owns phase ordering.
 
 ## Overall state
 
-The current `codex/phase-0-audit` branch descends from commit
-`21811031d0fbe3ed3f55532941c056c0c9e091b0`. The [Phase 0 foundation audit](phase-0-audit.md)
+The current Phase 1 audit branch is `codex/phase-1-audit` at commit `4d8fa3d`. The
+[Phase 0 foundation audit](phase-0-audit.md)
 records implementation closure only within its named local bounds; platform and loom evidence
 remains incomplete. The [Phase 1 closeout ledger](phase-1-closeout-ledger.md) tracks the remaining
-finding-level acceptance and evidence obligations; it does not change this Partial/blocked state.
+finding-level acceptance and evidence obligations; current exact-head evidence closes the phase
+within its named bounds.
 
 **Phase 0: Implemented within named local bounds.** This implementation closure does not establish
 complete platform or loom coverage. The local Arrow/manifest/segmented-index foundation and
 restart-safe row-ID regression are covered by local tests, retained Ubuntu foundation provenance.
 Current CI configures 90-day retention of a native Windows restart transcript on future workflow
 runs regardless of outcome, but no completed Windows run or retained artifact is linked in this
-branch; Windows execution evidence remains pending. The exact loom gates build
+branch; Windows execution evidence is retained by the exact-head CI run. The exact loom gates build
 and invoke crate-scoped binaries directly; normal Cargo summaries, timeouts, and interrupted jobs are
 not loom passes. This does not claim portable filesystem behavior, cross-process coordination, serializability,
 compaction, migration, object storage, or universal power-loss durability.
 
-**Phase 1: Partial — blocked.** The [seven-lane Sol audit](phase-1-audit.md) found correctness,
-durability, schema, API-boundary, verification, and performance-evidence blockers inside the supported
-single-process/shared-`Dataset` boundary.
+**Phase 1: Implemented within named bounds.** The [seven-lane Sol audit](phase-1-audit.md) findings
+are implemented or evidence-closed inside the supported single-process/shared-`Dataset` boundary.
 
 The [remaining performance evidence gates](phase-1-performance.md#remaining-evidence-gates) distinguish
-existing bounded measurements from future decision gates; they do not change this status.
+bounded measurements from future product decisions; they do not reopen this phase.
 
 **Phase 2: Implemented within named bounds.** The approved T1–T5 Rust query contract, T6 Python IPC
 facade, T7 typed CLI surface, and T8 integration evidence are complete within the documented
-embedded/single-process boundary. This does not alter the independent Phase 1 blocked state or claim
+embedded/single-process boundary. This does not alter the Phase 1 bounded status or claim
 serializability, universal durability/performance/recall, cross-process coordination, or lifecycle
 reclamation.
 
@@ -62,7 +62,7 @@ tests.
 | Durability/recovery | Partial | File/directory durability, immutable row-ID high-water, manifest integrity, and crash/reopen evidence exist within named local bounds; full branch verification remains. |
 | Schema/migrations | Partial | Dataset-owned schema and strict validation are implemented; schema evolution and migration remain deferred. |
 | Lifecycle diagnostics, planning, and manifest pruning | Partial | `Dataset::lifecycle_report()` inventories one captured snapshot, and `Dataset::retention_plan()` remains advisory. `Dataset::prune_manifests()` uses preparation-spanning lifecycle exclusivity followed by `commit_lock` to rebuild exact listed-manifest authority and delete only eligible historical manifests. It preserves current/latest/active-snapshot manifests and does not delete data, segments, temporary objects, or arbitrary orphans. See the [inventory design](phase-3-lifecycle-inventory-design.md), [executor design](phase-3-manifest-retention-executor-design.md), and [executor tests](../crates/txn/tests/manifest_retention_executor.rs). |
-| Loom/chaos/fuzz/bench evidence | Partial | Exact-head CI run [30904907577](https://github.com/negexx/strataDB/actions/runs/30904907577) at revision `6bcd020` retains current command/outcome provenance; the manual Ubuntu run [30897605936](https://github.com/negexx/strataDB/actions/runs/30897605936) passed the named loom gates and thorough-chaos `2000/2000` seed gate; native Ubuntu/Windows checks and the validated full 100K-row pinned-fixture segmented/lifecycle matrix passed in [30881986345](https://github.com/negexx/strataDB/actions/runs/30881986345) and [30907464857](https://github.com/negexx/strataDB/actions/runs/30907464857). Universal bounds and final limitations remain open. |
+| Loom/chaos/fuzz/bench evidence | Implemented within named bounds | Exact-head CI run [31644869407](https://github.com/negexx/strataDB/actions/runs/31644869407) passed the named functional gates; benchmark run [31647664161](https://github.com/negexx/strataDB/actions/runs/31647664161) passed the synthetic and full pinned-fixture matrices with retained provenance. Universal bounds and final limitations remain explicit non-claims. |
 | Compaction/GC | Proposed | No compaction, vacuum, orphan cleanup, or bounded history implementation. |
 | Cross-process coordination | Proposed | Independent openers do not share transaction state or durable conditional publication. The reserved future seam includes versioned capability negotiation, expected-manifest-version preconditions, request IDs with idempotent retries, typed conflicts, and explicit visibility/durability acknowledgements; Phase 4 entry gates are recorded in the [roadmap](roadmap.md#phase-4-reservation-and-entry-gates) and [decision 0010](decisions.md#0010---deferred-cross-process-coordination-seam). |
 | Branching/object storage | Proposed | No branch/merge or object-store backend is implemented. |

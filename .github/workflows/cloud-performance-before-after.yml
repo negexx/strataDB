@@ -41,7 +41,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master at 2026-08-03
         with:
-          toolchain: "1.90"
+          toolchain: "1.97.1"
 
       - name: Run before/after matrix
         shell: bash

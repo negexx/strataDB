@@ -18,9 +18,9 @@ storage. Existing `TxnError` and `Backend` error paths remain authoritative.
 ## Global Constraints
 
 - Preserve the embedded, single-node, one-process/shared-`Dataset` handle boundary.
-- Preserve immutable snapshot reads plus write-write OCC; do not add serializability.
+- Preserve immutable snapshot reads plus write-write OCC.
 - Do not claim universal durability, latency, memory, recovery, recall, or segment-count guarantees.
-- Do not add cross-process coordination, compaction, vacuum, retention, or orphan cleanup.
+- Do not add compaction, vacuum, retention, or orphan cleanup.
 - Do not add dependencies.
 - Use checked `u64` accumulation and typed errors; never wrap or silently omit malformed data.
 - Do not delete, rewrite, or publish any object in the diagnostics path.

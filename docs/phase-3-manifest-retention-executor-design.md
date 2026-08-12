@@ -55,7 +55,7 @@ deletion. This is a bounded local-filesystem durability statement, not a univers
 The supported boundary remains one process with one shared `Dataset` handle. Active lease tracking
 does not cover independent `Dataset::open` handles or other processes. The operation preserves
 immutable snapshots, write-write OCC, and the existing snapshot-isolation ceiling; it adds neither
-serializability nor cross-process conditional publication.
+stronger isolation nor process-boundary conditional publication.
 
 ## Relationship to lifecycle inventory
 

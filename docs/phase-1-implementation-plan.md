@@ -4,9 +4,9 @@
 
 **Goal:** Close the approved Phase 1 correctness, durability, schema, recovery, facade, verification, and current segmented-evidence blockers within Strata's one-process/shared-`Dataset` boundary.
 
-**Architecture:** Keep immutable manifest-listed vector segments and snapshot reads. Add a versioned, checksummed recovery catalog for the dataset schema, row-file ownership, and row/index integrity; add a separate durable row-ID high-water record; and make `Dataset` the supported strict facade for schema validation and physical-row target semantics. Directory durability fails closed, while compaction and cross-process coordination remain deferred.
+**Architecture:** Keep immutable manifest-listed vector segments and snapshot reads. Add a versioned, checksummed recovery catalog for the dataset schema, row-file ownership, and row/index integrity; add a separate durable row-ID high-water record; and make `Dataset` the supported strict facade for schema validation and physical-row target semantics. Directory durability fails closed, while compaction remains deferred.
 
-**Tech Stack:** Rust 1.90, Cargo workspace, Arrow 58, serde/serde_json, CRC32C, loom, real-process chaos tests, GitHub Actions, and Criterion benchmarks.
+**Tech Stack:** Rust 1.97.1, Cargo workspace, Arrow 58, serde/serde_json, CRC32C, loom, real-process chaos tests, GitHub Actions, and Criterion benchmarks.
 
 ## Global Constraints
 
@@ -16,7 +16,7 @@
 - Legacy datasets without the new schema/integrity metadata return typed `LegacyFormatNeedsMigration` rather than opening unverified.
 - Directory synchronization errors are returned; no write is acknowledged before the ordered durability boundary succeeds.
 - The manifest remains the atomic visibility boundary for row files, tombstones, and immutable vector segments.
-- Cross-process publication, compaction, orphan cleanup, authenticated tamper protection, and stable client API work remain deferred.
+- Compaction, orphan cleanup, authenticated tamper protection, and stable client API work remain deferred.
 - No new external dependency is added without recording why it is required and obtaining approval; prefer the already-resolved `crc32c` package used by `strata-index`.
 - `crates/txn/src/dataset.rs`, `crates/txn/src/snapshot.rs`, and `crates/storage/src/manifest.rs` have one serialized writer at a time.
 - Tasks 2 and 4 form one serialized compatibility stream, not two independently landing formats: write their failing schema/API and catalog tests together, then land schema ownership, the manifest envelope, and recovery validation as one implementation gate before migrating callers. No commit may persist a temporary schema representation that a later task replaces; the task labels only organize review scope.
