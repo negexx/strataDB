@@ -110,6 +110,79 @@ impl Ord for RankedCandidate {
     }
 }
 
+const COMPACT_SELECTOR_MAX_K: usize = 32;
+
+/// Retains the best `k` unique row candidates in a compact vector.
+///
+/// This is faster than the indexed representation for the normal small-`k`
+/// query path, where the bounded linear scans stay tiny.
+struct CompactTopKSelector {
+    k: usize,
+    selected: Vec<(u64, f32)>,
+}
+
+impl CompactTopKSelector {
+    fn new(k: usize) -> Self {
+        Self {
+            k,
+            selected: Vec::with_capacity(k),
+        }
+    }
+
+    fn consider(&mut self, candidate: (u64, f32)) {
+        if self.k == 0 {
+            return;
+        }
+
+        if let Some(existing_index) = self
+            .selected
+            .iter()
+            .position(|(row_id, _)| *row_id == candidate.0)
+        {
+            if !candidate
+                .1
+                .total_cmp(&self.selected[existing_index].1)
+                .is_lt()
+            {
+                return;
+            }
+            self.selected.remove(existing_index);
+        }
+
+        if self.selected.len() == self.k {
+            let farthest_index = self.selected.iter().enumerate().fold(
+                0,
+                |farthest_index, (index, (_, retained_distance))| {
+                    if retained_distance
+                        .total_cmp(&self.selected[farthest_index].1)
+                        .is_ge()
+                    {
+                        index
+                    } else {
+                        farthest_index
+                    }
+                },
+            );
+            if !candidate
+                .1
+                .total_cmp(&self.selected[farthest_index].1)
+                .is_lt()
+            {
+                return;
+            }
+            self.selected.remove(farthest_index);
+        }
+
+        self.selected.push(candidate);
+    }
+
+    fn into_sorted(mut self) -> Vec<(u64, f32)> {
+        self.selected
+            .sort_by(|left, right| left.1.total_cmp(&right.1));
+        self.selected
+    }
+}
+
 /// Retains the best `k` unique row candidates with indexed duplicate lookup
 /// and farthest-entry removal.
 struct IndexedTopKSelector {
@@ -165,6 +238,37 @@ impl IndexedTopKSelector {
             .into_iter()
             .map(|candidate| (candidate.row_id, candidate.distance))
             .collect()
+    }
+}
+
+/// Uses the compact selector for normal small-`k` searches and the indexed
+/// selector when the request is large enough to need bounded indexed storage.
+enum TopKSelector {
+    Compact(CompactTopKSelector),
+    Indexed(IndexedTopKSelector),
+}
+
+impl TopKSelector {
+    fn new(k: usize) -> Self {
+        if k <= COMPACT_SELECTOR_MAX_K {
+            Self::Compact(CompactTopKSelector::new(k))
+        } else {
+            Self::Indexed(IndexedTopKSelector::new(k))
+        }
+    }
+
+    fn consider(&mut self, candidate: (u64, f32)) {
+        match self {
+            Self::Compact(selector) => selector.consider(candidate),
+            Self::Indexed(selector) => selector.consider(candidate),
+        }
+    }
+
+    fn into_sorted(self) -> Vec<(u64, f32)> {
+        match self {
+            Self::Compact(selector) => selector.into_sorted(),
+            Self::Indexed(selector) => selector.into_sorted(),
+        }
     }
 }
 
@@ -264,7 +368,7 @@ impl SegmentSet {
         F: Fn(u64) -> bool,
         G: Fn(&(dyn Any + Send + Sync)) -> bool,
     {
-        let mut selected = IndexedTopKSelector::new(k);
+        let mut selected = TopKSelector::new(k);
         for part in self.parts.iter() {
             match part {
                 IndexPart::Sealed { reader, zone_map } => {
@@ -798,6 +902,28 @@ mod tests {
                 m.row_id
             );
         }
+    }
+
+    #[test]
+    fn hybrid_top_k_selector_uses_compact_small_path_with_indexed_path_parity() {
+        // Both capacities retain this entire stream, so their different
+        // selector representations must preserve the same deduplication,
+        // nearest-first ordering, and equal-distance stability semantics.
+        let candidates = [(7, 6.0), (8, 5.0), (7, 5.0), (9, 4.0), (10, 4.0), (8, 3.0)];
+        let mut small = TopKSelector::new(32);
+        let mut large = TopKSelector::new(33);
+
+        assert!(matches!(&small, TopKSelector::Compact(_)));
+        assert!(matches!(&large, TopKSelector::Indexed(_)));
+
+        for candidate in candidates {
+            small.consider(candidate);
+            large.consider(candidate);
+        }
+
+        let expected = vec![(8, 3.0), (9, 4.0), (10, 4.0), (7, 5.0)];
+        assert_eq!(small.into_sorted(), expected);
+        assert_eq!(large.into_sorted(), expected);
     }
 
     #[test]
