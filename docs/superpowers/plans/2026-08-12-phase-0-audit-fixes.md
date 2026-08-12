@@ -98,6 +98,7 @@
 - Create: `fuzz/fuzz_targets/manifest_current_parse.rs`
 - Create: `fuzz/fuzz_targets/segment_parse.rs`
 - Modify: `fuzz/Cargo.toml` only if target registration is required by the existing fuzz workspace
+- Modify: `.github/workflows/ci.yml` for target discovery/build/smoke registration
 
 **Interfaces:** Fuzz targets use existing public/internal parser entry points and introduce no runtime dependency.
 
