@@ -13,11 +13,11 @@ use crate::error::Result;
 
 /// Below this distinct-value ratio (distinct / total rows), a column is
 /// dictionary-encoded. Matches the range real columnar engines (Parquet)
-/// default to.
+/// default to. The threshold is an internal implementation detail.
 const DICTIONARY_ENCODING_THRESHOLD: f64 = 0.4;
 
 /// Casts each column of `batch` to `DictionaryArray<Int32Type>` if its
-/// distinct-value ratio is below [`DICTIONARY_ENCODING_THRESHOLD`], leaving
+/// distinct-value ratio is below the internal dictionary-encoding threshold, leaving
 /// higher-cardinality columns untouched. See
 /// `docs/design.md`.
 ///

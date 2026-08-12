@@ -63,7 +63,7 @@ missing or stale; do not re-index unnecessarily.
 
 ## Workspace
 
-- Rust edition 2024, toolchain 1.90, Cargo workspace.
+- Rust edition 2024, pinned Rust toolchain 1.97.1, Cargo workspace.
 - `crates/storage`: columnar files, manifest/versioning, backend abstraction.
 - `crates/txn`: OCC, snapshots, commit protocol, row/index atomicity—the flagship subsystem.
 - `crates/index`: from-scratch HNSW and immutable on-disk segments.

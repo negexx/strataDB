@@ -1,5 +1,15 @@
 # Phase 1 Sol audit
 
+> **2026-08-12 audit refresh:** The requested lane reports, evidence matrix, implementation
+> disposition plan, and fresh verification report are in `phase-1-correctness-audit.md`,
+> `phase-1-performance-audit.md`, `phase-1-memory-audit.md`, `phase-1-concurrency-audit.md`,
+> `phase-1-test-coverage-audit.md`, `phase-1-documentation-audit.md`,
+> `phase-1-refactoring-audit.md`, `phase-1-evidence-matrix.md`,
+> `phase-1-audit-implementation-plan.md`, and `phase-1-verification-report.md`. The fresh local run
+> found no new confirmed runtime defect, but native runtime/loom/benchmark gates are blocked by the
+> missing MSVC linker and `cargo deny` is blocked by a read-only advisory database. The verdict
+> remains Partial and blocked; no Rust behavior was changed.
+
 **Date:** 2026-08-01
 **Scope:** embedded local-disk engine, one process, one shared `Dataset` handle.
 **Verdict:** Phase 1 is Partial and blocked.

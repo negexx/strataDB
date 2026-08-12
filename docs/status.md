@@ -5,8 +5,8 @@ are evidence pointers; [roadmap](roadmap.md) owns phase ordering.
 
 ## Overall state
 
-The current `codex/phase-0-audit` branch descends from commit
-`21811031d0fbe3ed3f55532941c056c0c9e091b0`. The [Phase 0 foundation audit](phase-0-audit.md)
+The current Phase 1 audit branch is `codex/phase-1-audit` at commit `224ea42`. The
+[Phase 0 foundation audit](phase-0-audit.md)
 records implementation closure only within its named local bounds; platform and loom evidence
 remains incomplete. The [Phase 1 closeout ledger](phase-1-closeout-ledger.md) tracks the remaining
 finding-level acceptance and evidence obligations; it does not change this Partial/blocked state.

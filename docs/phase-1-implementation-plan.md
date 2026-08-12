@@ -6,7 +6,7 @@
 
 **Architecture:** Keep immutable manifest-listed vector segments and snapshot reads. Add a versioned, checksummed recovery catalog for the dataset schema, row-file ownership, and row/index integrity; add a separate durable row-ID high-water record; and make `Dataset` the supported strict facade for schema validation and physical-row target semantics. Directory durability fails closed, while compaction and cross-process coordination remain deferred.
 
-**Tech Stack:** Rust 1.90, Cargo workspace, Arrow 58, serde/serde_json, CRC32C, loom, real-process chaos tests, GitHub Actions, and Criterion benchmarks.
+**Tech Stack:** Rust 1.97.1, Cargo workspace, Arrow 58, serde/serde_json, CRC32C, loom, real-process chaos tests, GitHub Actions, and Criterion benchmarks.
 
 ## Global Constraints
 
