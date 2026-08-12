@@ -756,7 +756,7 @@ mod tests {
     fn duplicate_same_target_operations_yield_one_tolerated_lost_id() {
         let started = [
             StartedOp {
-                verb: "delete".to_string(),
+                verb: "update".to_string(),
                 target_row_id: Some(7),
             },
             StartedOp {
@@ -768,6 +768,6 @@ mod tests {
         let (tolerated_lost_target_ids, max_tolerated_phantoms) = crash_tolerance(&started);
 
         assert_eq!(tolerated_lost_target_ids, HashSet::from([7]));
-        assert_eq!(max_tolerated_phantoms, 1);
+        assert_eq!(max_tolerated_phantoms, 2);
     }
 }
