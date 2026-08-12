@@ -14,4 +14,4 @@
 
 The governing docs consistently preserve the one-process/shared-handle boundary, reject universal
 durability/performance claims, distinguish intended guarantees from current evidence, and keep
-cross-process coordination and compaction out of Phase 1.
+compaction out of Phase 1.

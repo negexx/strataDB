@@ -31,7 +31,7 @@ The closeout does not absorb explicitly later work:
 - PERF-06 and PERF-07 projection/pruning query work;
 - IDX-03 underfilled ANN requests and broader Phase 2 API work;
 - compaction, vacuum, orphan cleanup, retention, incremental manifests, and indefinite-growth guarantees;
-- cross-process publication, distributed operation, full SQL, and additional ANN families.
+- distributed operation, full SQL, and additional ANN families.
 
 ## Closure lanes
 
@@ -123,5 +123,5 @@ The closeout workstreams are:
 
 Phase 1 may be marked complete only if every remaining in-scope row has fresh implementation,
 regression, or required evidence and no P0/P1 blocker is left open. Full 100K-row evidence does not
-close lifecycle reclamation, cross-process publication, universal power-loss durability, or deferred
+close lifecycle reclamation, universal power-loss durability, or deferred
 Phase 2/3 findings.

@@ -35,7 +35,6 @@
 The exact-head functional Phase 1 CI gate is green in GitHub Actions run
 [31644869407](https://github.com/negexx/strataDB/actions/runs/31644869407), including workspace tests,
 feature tests, transaction/cache/index loom models, checkpoint/fast/thorough chaos, fuzz smoke,
-Windows durability, clippy, docs, and cargo-deny. Phase 1 remains **Partial** for explicitly
-deferred product-boundary work (compaction/reclamation, universal durability/performance claims,
-cross-process coordination, and pending full-fixture benchmark evidence), not because a newly
-confirmed runtime correctness defect is failing.
+Windows durability, clippy, docs, and cargo-deny. Phase 1 is implemented within these named bounds;
+compaction/reclamation and universal durability/performance claims remain explicit non-claims, not
+failing Phase 1 defects.

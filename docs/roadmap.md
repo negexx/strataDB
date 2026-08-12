@@ -6,12 +6,15 @@ in [documentation history](history/README.md). Current implementation claims liv
 | Phase | Status | Scope | Exit signal |
 |---|---|---|---|
 | 0 — Foundation | Implemented within named local bounds | Local format, manifests, row allocation, and bounded transaction primitives. See the [Phase 0 foundation audit](phase-0-audit.md). | Restart-safe row-ID non-reuse and retained foundation evidence pass within the named local-filesystem boundary. |
-| 1 — Correctness and durability baseline | Partial — blocked | Shared-handle commits, immutable snapshots, typed conflicts, recovery/integrity, schema/error semantics, supported facade, and boundedness evidence. | All asserted guarantees have scope, implementation evidence, regression coverage, and current performance bounds. |
+| 1 — Correctness and durability baseline | Implemented within named bounds | Shared-handle commits, immutable snapshots, typed conflicts, recovery/integrity, schema/error semantics, supported facade, and boundedness evidence. | All asserted guarantees have scope, implementation evidence, regression coverage, and current bounded performance evidence. |
 | 2 — Query and usability | Implemented within named bounds | Stable schema/query APIs, scan/projection/filter/group-by integration, point lookup, CLI, and Python surface. See the [Phase 2 audit](phase-2-audit.md). | Supported query/client behavior is documented and integration-tested within the embedded single-process boundary. |
-| 3 — Operational lifecycle | Partial | Read-only lifecycle diagnostics and advisory retention planning are implemented. `Dataset::prune_manifests()` also deletes only policy-eligible historical manifests for one shared handle, after lifecycle exclusivity and `commit_lock` rebuild exact listed-key authority. It preserves current/latest/active manifests and does not reclaim data, segments, temporary objects, or arbitrary orphans; vacuum, compaction, migrations, index reclamation, and cross-process lifecycle work remain future work. See the [inventory design](phase-3-lifecycle-inventory-design.md), [executor design](phase-3-manifest-retention-executor-design.md), and [executor tests](../crates/txn/tests/manifest_retention_executor.rs). | Sustained operation safely bounds manifest/segment growth and manages retained data. |
+| 3 — Operational lifecycle | Partial | Read-only lifecycle diagnostics and advisory retention planning are implemented. `Dataset::prune_manifests()` also deletes only policy-eligible historical manifests for one shared handle, after lifecycle exclusivity and `commit_lock` rebuild exact listed-key authority. It preserves current/latest/active manifests and does not reclaim data, segments, temporary objects, or arbitrary orphans; vacuum, compaction, migrations, and index reclamation remain future work. See the [inventory design](phase-3-lifecycle-inventory-design.md), [executor design](phase-3-manifest-retention-executor-design.md), and [executor tests](../crates/txn/tests/manifest_retention_executor.rs). | Sustained operation safely bounds manifest/segment growth and manages retained data. |
 | 4 — Cross-process coordination | Proposed | Durable conditional publication, independent opener semantics, shared allocation, and process-boundary guarantees. | Separate processes coordinate without violating visibility, conflict, or durability invariants. |
 | 5 — Branching and merge | Proposed | Fork, abort, merge, conflict reporting, and branch-aware manifests. | Branch behavior is correct under concurrency and recovery tests. |
 | 6 — Object storage and deployment | Proposed | Object-store conditional writes, S3-compatible backends, remote recovery, and durability testing. | The supported correctness suite passes against supported remote backends. |
+
+Cross-process coordination is owned exclusively by Phase 4. It is not an implementation task,
+exit criterion, or blocker for Phases 0–3.
 
 ## Phase 4 reservation and entry gates
 
@@ -33,11 +36,17 @@ The preferred first slice is an optional single-owner actor/IPC/RPC bridge aroun
 protocol remain out of scope until a superseding decision and evidence approve them. See [active
 decision 0010](decisions.md#0010---deferred-cross-process-coordination-seam).
 
-## Phase 1 blockers
+## Phase 1 closeout
 
-The [Phase 1 audit](phase-1-audit.md) is complete. Phase 1 remains Partial and blocked by:
+The [Phase 1 audit](phase-1-audit.md) is complete within its named bounds. Exact-head functional CI
+[31644869407](https://github.com/negexx/strataDB/actions/runs/31644869407) and the full pinned-fixture
+benchmark [31647664161](https://github.com/negexx/strataDB/actions/runs/31647664161) passed their
+documented gates. Universal durability/performance bounds and later lifecycle work remain explicit
+non-claims, not Phase 1 blockers.
 
-- incomplete VER-01 direct-regression inventory and final branch verification; the manual Ubuntu CI run [30897605936](https://github.com/negexx/strataDB/actions/runs/30897605936) passed the named loom and thorough-chaos gates, including `2000/2000` chaos seeds;
+Historical evidence references retained below:
+
+- the manual Ubuntu CI run [30897605936](https://github.com/negexx/strataDB/actions/runs/30897605936) passed the named loom and thorough-chaos gates, including `2000/2000` chaos seeds;
 - the completed exact-head branch CI run [30904907577](https://github.com/negexx/strataDB/actions/runs/30904907577) at revision `6bcd020` supplies retained command/outcome provenance, while the fresh native matrix [30881986345](https://github.com/negexx/strataDB/actions/runs/30881986345) covers Ubuntu and Windows; and
 - universal operating-bound evidence and final limitations remain open; the validated full 100K-row segmented/lifecycle before/after matrix passed in [30907464857](https://github.com/negexx/strataDB/actions/runs/30907464857), showed mixed bounded results rather than a generalized product performance win, and does not establish universal bounds.
 
@@ -52,7 +61,7 @@ directory handles and Windows directory handles opened with `FILE_FLAG_BACKUP_SE
 or failed directory flushing returns `DurabilityUnsupported`. Legacy datasets without the required schema and
 integrity metadata are rejected with `LegacyFormatNeedsMigration`, rather than opened unverified.
 
-These are not requests for cross-process transactions, serializability, or compaction in Phase 1.
+These are not requests for compaction in Phase 1.
 
 ## Deferred and refused scope
 

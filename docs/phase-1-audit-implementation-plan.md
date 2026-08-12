@@ -51,5 +51,5 @@ change no format. Run targeted red/green tests, normal tests, and loom models.
 ## Acceptance
 
 Phase 1 remains Partial/blocked until the runtime and exact-head evidence gates are fresh and green.
-No task authorizes cross-process coordination, serializability, compaction, on-disk format changes,
+No task authorizes stronger isolation, compaction, on-disk format changes,
 or a universal durability/performance claim.

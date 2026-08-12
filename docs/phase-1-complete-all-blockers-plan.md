@@ -6,7 +6,7 @@
 
 **Goal:** Close every remaining Phase 1 blocker that can be closed inside the one-process/shared-
 `Dataset` boundary, with a full pinned-fixture matrix and fresh native verification, while keeping
-unsupported lifecycle, cross-process, and universal-guarantee claims explicit.
+unsupported lifecycle and universal-guarantee claims explicit.
 
 **Architecture:** Preserve the manifest-listed immutable segment path and current API boundary. Add no
 arbitrary global performance cap. Extend only the evidence orchestration needed to run the complete
@@ -21,7 +21,7 @@ loom, chaos-worker, and cargo-fuzz.
 - Work only in `codex/phase-1-complete-all-blockers`, never the dirty local `main` checkout.
 - Keep the supported scope at one process using one shared `Dataset` handle.
 - Never reintroduce the retired direct `HnswIndex` benchmark path.
-- Do not add dependencies, compaction, vacuum, cross-process publication, SQL, or new ANN families.
+- Do not add dependencies, compaction, vacuum, SQL, or new ANN families.
 - Every Rust concurrency/index behavior change gets a targeted loom model and normal regression tests.
 - Every evidence result names revision, runner, toolchain, filesystem, cache policy, input, seed/hash,
   warmup/repetition policy, command, and artifact.

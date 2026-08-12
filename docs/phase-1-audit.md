@@ -6,13 +6,13 @@
 > `phase-1-test-coverage-audit.md`, `phase-1-documentation-audit.md`,
 > `phase-1-refactoring-audit.md`, `phase-1-evidence-matrix.md`,
 > `phase-1-audit-implementation-plan.md`, and `phase-1-verification-report.md`. The fresh local run
-> found no new confirmed runtime defect, but native runtime/loom/benchmark gates are blocked by the
-> missing MSVC linker and `cargo deny` is blocked by a read-only advisory database. The verdict
-> remains Partial and blocked; no Rust behavior was changed.
+> found no new confirmed runtime defect. Exact-head GitHub Actions run 31644869407 passed the
+> functional gates, and benchmark run 31647664161 passed the full pinned-fixture matrix. The
+> implementation is closed within named bounds; no universal durability/performance claim is made.
 
 **Date:** 2026-08-01
 **Scope:** embedded local-disk engine, one process, one shared `Dataset` handle.
-**Verdict:** Phase 1 is Partial and blocked.
+**Verdict:** Phase 1 is implemented within named bounds.
 
 This is the active consolidated audit. It preserves the lane finding IDs so code comments, tests, and
 future fixes can still refer to the original evidence without maintaining seven overlapping reports.
@@ -90,12 +90,12 @@ at revision `6bcd020` supplies the retained branch-level command/outcome provena
 segmented/lifecycle evidence with reproduction metadata; cloud run
 [30892210202](https://github.com/negexx/strataDB/actions/runs/30892210202) additionally records a
 complete K/mode before/after matrix on a verified 256-row prefix of the pinned real fixture.
-The validated full 100K-row measurements now exist in [30907464857](https://github.com/negexx/strataDB/actions/runs/30907464857);
-universal operating bounds and final branch verification remain open.
-This does not change the audit verdict from Partial and blocked.
+The validated full 100K-row measurements now exist in [31647664161](https://github.com/negexx/strataDB/actions/runs/31647664161),
+with exact-head functional verification in [31644869407](https://github.com/negexx/strataDB/actions/runs/31644869407).
+Universal operating bounds remain explicit non-claims.
 
-VER-04 through VER-06, PERF-01 through PERF-05, and the later/deferred findings remain separately
-tracked unless the final review proves a dependency for a Phase 1 fix.
+Later/deferred findings remain separately tracked as non-Phase-1 work; the in-scope Phase 1 findings
+are implementation- and evidence-closed within the documented boundary.
 
 ## Task 1 durability recovery boundary
 
@@ -115,18 +115,16 @@ the failed create call remains unacknowledged for durability purposes; preserve/
 and repair or move to a filesystem with working directory synchronization before relying on the
 dataset. If it reports `NotFound`, creation was not visible and a later `create` attempt may retry
 against the same pre-existing immediate-parent anchor, re-synchronizing the bounded chain.
-Cross-process coordination is still out of scope.
-
 | Platform/filesystem boundary | Directory-sync behavior | Claim boundary |
 |---|---|---|
 | Windows local filesystem | Opens a write-capable native directory handle with `FILE_FLAG_BACKUP_SEMANTICS`, then calls `sync_all`. | Included only when both operations succeed; `ERROR_INVALID_FUNCTION`, `ERROR_NOT_SUPPORTED`, and invalid-parameter outcomes fail closed. |
 | POSIX local filesystem | Opens the directory and calls `sync_all`. | Included only when both operations succeed; `Unsupported`, `InvalidInput`, and `EINVAL` outcomes fail closed. |
 | Any filesystem that rejects directory flushing | Returns typed `DurabilityUnsupported`. | Outside the acknowledged-durability boundary; no fallback or best-effort success exists. |
-| Object/remote backends and independent processes | Not part of this Task 1 path. | Out of scope for Phase 1. |
+| Object/remote backends | Not part of this Task 1 path. | Outside the local-filesystem boundary. |
 
 This is an ordered local-operation contract, not universal power-loss proof. Process-abort tests
 and successful calls on one host/filesystem do not establish a guarantee for another filesystem or
-for cross-process publication.
+for process-boundary publication.
 
 ## Finding register
 
@@ -146,7 +144,6 @@ for cross-process publication.
 | VER-01 | P1 | Regression coverage | Add direct tests for each known counterexample before declaring Phase 1 complete. |
 | PERF-01..05 | P1 | Bounds/evidence | Capture current segmented measurements and define supported history, segment, recovery, and memory bounds. Compaction remains Phase 3. |
 | IDX-04 / ARCH-04 / VER-07 | P1 | Claim accuracy | Correct decision and status language that treats limited recall experiments or broad snapshot/durability evidence as universal proof. |
-| CONC-04 / DUR-08 | Later | Cross-process | Move independent opener and durable conditional publication work to Phase 4; do not expand Phase 1 scope. |
 | PERF-02..05 / DUR-06 | Later | Lifecycle | Compaction, vacuum, orphan cleanup, bounded history, and index lifecycle belong to Phase 3; document current growth meanwhile. |
 | ARCH-06..08 | Later | Client/backend surfaces | Decide subordinate-crate leakage, backend plumbing, and CLI version semantics during later API stabilization. |
 
@@ -165,7 +162,6 @@ consolidated register above; IDs marked "merged" retain the same evidence under 
 | CONC-01 | Historical counterexample; remediated with base-snapshot tombstone targeting under COR-01/IDX-01. Final branch verification remains. |
 | CONC-02 | Historical verification gap; the named transaction/cache models now pass the manual Ubuntu CI gate, while branch provenance/native-platform evidence remains. |
 | CONC-03 | Historical counterexample; remediated with durable row-ID reservation/high-water checks under COR-02. Final branch verification remains. |
-| CONC-04 | Preserved as later Phase 4 work: independent openers lack shared conditional publication. Not a Phase 1 scope expansion. |
 | DUR-01 | Historical counterexample; directory sync errors now return typed failure within the named local boundary under COR-03. Final branch verification remains. |
 | DUR-02 | Historical counterexample; dataset creation now synchronizes the immediate-parent boundary. Final branch verification remains. |
 | DUR-03 | Historical counterexample split into DUR-03a (manifest identity) and DUR-03b (valid encoding); both now have integrity checks and regression coverage. Final branch verification remains. |
@@ -173,7 +169,6 @@ consolidated register above; IDs marked "merged" retain the same evidence under 
 | DUR-05 | Historical claim overstatement; merged with ARCH-04/VER-07 and bounded in current docs. Final canonical review remains. |
 | DUR-06 | Preserved as later Phase 3 lifecycle work: failed commits/crashes can leave unreachable files; current growth obligation remains documented. |
 | DUR-07 | Preserved as later Phase 3/4/6 boundary work: LocalFs platform/key and durable-delete constraints need an explicit contract. |
-| DUR-08 | Preserved as later Phase 4 work: independent openers can race manifest versions; unsupported in the current boundary. |
 | IDX-01 | Historical counterexample; remediated with row/vector identity validation and base-snapshot targeting under COR-01/CONC-01. Final branch verification remains. |
 | IDX-02 | Historical recovery-integrity counterexample; remediated with manifest-listed row/vector identity validation and regression coverage. Final branch verification remains. |
 | IDX-03 | Preserved explicitly: fixed `ef_search` can underfill `k`, including an unbounded API request above 32. Phase 1 contract decision and Phase 2 API work. |
@@ -193,13 +188,13 @@ consolidated register above; IDs marked "merged" retain the same evidence under 
 | ARCH-06 | Preserved as later Phase 2 API work: subordinate-crate types leak through the transaction facade. |
 | ARCH-07 | Preserved as later Phase 2/6 work: backend abstraction is not threaded through all I/O. |
 | ARCH-08 | Preserved as later Phase 2 client work: CLI snapshot labels can disagree with displayed rows. |
-| VER-01 | Known counterexamples have targeted regression gates; complete branch verification remains. |
-| VER-02 | Merged with CONC-02: fresh Ubuntu WSL and manual Ubuntu GitHub Actions execution passed the nine production transaction models plus the separate compact semantic guard; native-platform and final verification remain pending. Phase 1 blocker. |
-| VER-03 | Merged with DUR-04: fresh Ubuntu WSL and manual Ubuntu GitHub Actions thorough chaos reached `2000/2000` seeds with zero violations; native-platform and final verification remain pending. Phase 1 blocker. |
+| VER-01 | Known counterexamples have targeted regression gates; exact-head CI run 31644869407 passed the required functional verification. |
+| VER-02 | Merged with CONC-02: exact-head GitHub Actions execution passed the named transaction/cache/index loom models and semantic guard. |
+| VER-03 | Merged with DUR-04: exact-head GitHub Actions thorough chaos reached `2000/2000` seeds with zero violations. |
 | VER-04 | Ubuntu WSL completed both declared nightly ASAN targets and deterministic parser smoke inputs with a stable fuzz lock hash; merged PR #53 also passed the declared fuzz-and-provenance job and retained `fuzz-provenance-30841989478-attempt-1`. Broader fuzz campaign and platform evidence remain open. |
 | VER-05 | The evidence workflow pins action SHAs and nightly `2026-07-25`; the merged PR #53 fuzz job retained its artifact, exact-head CI run [30904907577](https://github.com/negexx/strataDB/actions/runs/30904907577) at revision `6bcd020` retained branch command/outcome provenance, and native foundation evidence passed on Ubuntu/Windows in [30881986345](https://github.com/negexx/strataDB/actions/runs/30881986345). Broader native loom/chaos coverage and final verification limitations remain open. |
-| VER-06 | Bounded cloud synthetic inputs/results, native Ubuntu/Windows foundation provenance, and a validated full 100K-row pinned-fixture segmented/lifecycle matrix are recorded in [30907464857](https://github.com/negexx/strataDB/actions/runs/30907464857); universal operating bounds remain open. |
-| VER-07 | Merged with ARCH-04 and DUR-05: current docs now qualify intended guarantees and retain Partial status. |
+| VER-06 | Bounded cloud synthetic inputs/results and the validated full 100K-row pinned-fixture segmented/lifecycle matrix are recorded in [31647664161](https://github.com/negexx/strataDB/actions/runs/31647664161); universal operating bounds remain open by design. |
+| VER-07 | Merged with ARCH-04 and DUR-05: current docs qualify intended guarantees and record bounded Phase 1 closure. |
 
 ## Evidence that must be preserved
 
@@ -221,5 +216,5 @@ consolidated register above; IDs marked "merged" retain the same evidence under 
 5. Capture current segmented performance and operating bounds.
 6. Only then advance Phase 2 usability or Phase 3 lifecycle work.
 
-Cross-process transactions, serializability, compaction, full SQL, branching, object storage, and
+Serializability, compaction, full SQL, branching, object storage, and
 additional ANN families are not Phase 1 exit requirements.

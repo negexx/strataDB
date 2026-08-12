@@ -25,7 +25,7 @@ This slice includes:
   states.
 
 This inventory slice explicitly excludes deletion, compaction, vacuum, retention policy, manifest
-rewriting, segment rewriting, snapshot invalidation, cross-process coordination, and any claim that
+rewriting, segment rewriting, snapshot invalidation, and any claim that
 an unreferenced object is immediately safe to remove. The separate manifest executor does not change
 that boundary for row files, segments, temporary objects, or orphan candidates.
 
@@ -94,7 +94,7 @@ clippy, format, and diff checks. No benchmark or lifecycle reclamation claim is 
 ## Boundary preservation
 
 The design remains embedded, single-node, and one-process/shared-`Dataset` handle. It preserves
-immutable snapshot reads plus write-write OCC, makes no serializability claim, and adds no universal
-durability, latency, memory, recovery, recall, or segment-count guarantee. Cross-process
+immutable snapshot reads plus write-write OCC, and adds no universal
+durability, latency, memory, recovery, recall, or segment-count guarantee.
 coordination, compaction, vacuum, row/segment retention, and orphan cleanup remain later work; see
 the separate manifest-only executor design for its narrower historical-manifest slice.

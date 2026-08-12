@@ -24,7 +24,7 @@ Phase 0 establishes:
 - immutable HNSW segment construction, serialization, loading, and fan-out search.
 
 Phase 0 does not establish a complete query/client API, compaction, bounded history or segment
-growth, cross-process coordination, serializability, object storage, or universal power-loss
+growth, object storage, or universal power-loss
 durability. Those boundaries belong to Phase 1 or later roadmap phases and must not be pulled into
 this audit as closure requirements.
 
@@ -75,7 +75,7 @@ run completes it.
 
 These logs identify the tested GitHub-hosted runner and revision only. They do not characterize every
 Windows or Linux filesystem, model a physical power interruption, or establish portable durability,
-cross-process publication, or a universal power-loss guarantee.
+or a universal power-loss guarantee.
 
 ## Finding register
 
@@ -84,11 +84,11 @@ cross-process publication, or a universal power-loss guarantee.
 | F0-01 | P0 | Restart-safe physical row-ID allocation | Implemented, locally regression-covered, and retained in the merged PR #53 CI artifact. The durable high-water record is created with the dataset and prevents abandoned pre-publication claims from being reused after reopen. | Preserve the named local-filesystem/platform boundary. This Phase 0 exit assertion is satisfied. |
 | F0-02 | P1 | On-disk format compatibility | Manifest and segment formats have explicit version checks; row files use Arrow IPC directly and have no Strata-owned version discriminator. Dataset recovery adds schema, physical-column, length, and CRC validation. Legacy or unsupported manifest/segment state is rejected rather than silently relabeled; manifest envelope, manifest, and entry structures reject unknown fields. There is no general migration framework. | Document the supported format versions and rejection behavior for each artifact, including the delegated Arrow IPC boundary. Migration/evolution remains later work unless a new compatibility requirement is approved. |
 | F0-03 | P1 | Manifest and file publication | The manifest is the intended visibility boundary; preparation writes immutable row files/segments before publication. Directory synchronization and acknowledgement semantics are already tracked by the Phase 1 audit. | Do not broaden Phase 0 into universal durability. Close the remaining Phase 1 CI and platform evidence gates before claiming the publication contract is proven. |
-| F0-04 | P1 | Transaction primitive scope | Shared-handle commit locking, write-write OCC, immutable snapshots, and typed conflict errors exist and are regression-covered. The API intentionally has no read-your-own-writes or serializable read/write transaction interface. | Keep the supported boundary explicit. Full snapshot transactions and stronger isolation require a new design decision and are not Phase 0 work. |
+| F0-04 | P1 | Transaction primitive scope | Shared-handle commit locking, write-write OCC, immutable snapshots, and typed conflict errors exist and are regression-covered. The API intentionally exposes no read-your-own-writes transaction interface. | Keep the supported boundary explicit. Full snapshot transactions and stronger isolation require a new design decision and are not Phase 0 work. |
 | F0-05 | P1 | Preparation failures and unreachable artifacts | A failed commit can leave an unreferenced row file or segment because publication is manifest-based and cleanup is not implemented. This does not make the artifact visible to a later snapshot. | Track reclamation, orphan cleanup, compaction, and bounded growth in Phase 3. Add no implicit cleanup to Phase 0. |
 | F0-06 | P1 | Immutable vector-segment foundation | The segmented design is coherent: each vector-bearing commit produces an immutable segment, manifests list segments, readers validate them, and search maps local ordinals back to global physical row IDs. | Preserve segment format tests and current segmented benchmarks. Recall/latency bounds, segment-count limits, and compaction are separate Phase 1 evidence and Phase 3 lifecycle work. |
 | F0-07 | P1 | Foundation verification visibility | Targeted storage, transaction, and index suites pass locally; the merged PR #53 Ubuntu job retained focused foundation output. Current CI configures 90-day retention of a native Windows restart transcript with revision/runner/toolchain provenance on future workflow runs regardless of outcome, but no completed Windows run or retained artifact is linked in this branch. Windows execution evidence remains pending. Direct crate-scoped loom binaries, not normal Cargo summaries, are the CI loom evidence. Portable/native evidence remains incomplete, including the named Windows loom timeout. | Keep platform/fixture limitations explicit. Phase 0 is closed only within the named local bounds, not as a universal portability claim. |
-| F0-08 | P2 | Backend abstraction completeness | `Backend`/`LocalFs` provide the current local implementation, but object-store semantics and independent opener coordination are not implemented. | Keep object storage in Phase 6 and cross-process coordination in Phase 4. The Phase 0 contract should say local backend, not generic remote durability. |
+| F0-08 | P2 | Backend abstraction completeness | `Backend`/`LocalFs` provide the current local implementation; object-store semantics are not implemented. | Keep object storage outside Phase 0. The Phase 0 contract should say local backend, not generic remote durability. |
 
 ## Audit conclusions
 
@@ -98,7 +98,7 @@ cross-process publication, or a universal power-loss guarantee.
 3. No monolithic index path is required or recommended. The foundation is the current immutable,
    manifest-listed segmented design.
 4. The largest remaining limitations are not missing Phase 0 mechanisms: they are Phase 1 evidence
-   provenance/portability and later lifecycle, query, cross-process, and deployment work.
+   provenance/portability and later lifecycle, query, and deployment work.
 5. Phase 0 is **Foundation implemented within the named local bounds**. Its local filesystem and
    single-process/shared-handle limits remain part of the contract; platform and loom evidence is
    still incomplete.
@@ -111,4 +111,4 @@ blockers while preserving the distinction between:
 - Phase 0 foundation: locally implemented and regression-covered;
 - Phase 1 correctness/durability: still blocked by retained CI, portability, and performance
   evidence; and
-- later phases: lifecycle, query/client, cross-process, branching, and object storage.
+- later phases: lifecycle, query/client, branching, and object storage.
