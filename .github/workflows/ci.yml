@@ -466,9 +466,11 @@ jobs:
             printf 'fuzz.Cargo.lock.sha256.before=%s\n' "$fuzz_lock_sha_before"
             cd fuzz
             targets="$(cargo +nightly-2026-07-25 fuzz list | sort)"
-            test "$targets" = $'datafile_parse\nmanifest_parse'
+            test "$targets" = $'datafile_parse\nmanifest_current_parse\nmanifest_parse\nsegment_parse'
             CARGO_BUILD_JOBS=1 cargo +nightly-2026-07-25 fuzz build manifest_parse
             CARGO_BUILD_JOBS=1 cargo +nightly-2026-07-25 fuzz build datafile_parse
+            CARGO_BUILD_JOBS=1 cargo +nightly-2026-07-25 fuzz build manifest_current_parse
+            CARGO_BUILD_JOBS=1 cargo +nightly-2026-07-25 fuzz build segment_parse
             sha256sum Cargo.lock
             fuzz_lock_sha_after="$(sha256sum Cargo.lock | awk '{print $1}')"
             printf 'fuzz.Cargo.lock.sha256.after=%s\n' "$fuzz_lock_sha_after"
@@ -483,6 +485,10 @@ jobs:
             done
             printf '%s\n' '{"version":0}' > "$RUNNER_TEMP/manifest-parse-smoke.json"
             CARGO_BUILD_JOBS=1 cargo +nightly-2026-07-25 fuzz run manifest_parse "$RUNNER_TEMP/manifest-parse-smoke.json" -- -runs=1 -seed=24740
+            printf '%s\n' '{"version":0}' > "$RUNNER_TEMP/manifest-current-parse-smoke.json"
+            CARGO_BUILD_JOBS=1 cargo +nightly-2026-07-25 fuzz run manifest_current_parse "$RUNNER_TEMP/manifest-current-parse-smoke.json" -- -runs=1 -seed=24740
+            printf '%s' 'strata-segment-smoke' > "$RUNNER_TEMP/segment-parse-smoke.seg"
+            CARGO_BUILD_JOBS=1 cargo +nightly-2026-07-25 fuzz run segment_parse "$RUNNER_TEMP/segment-parse-smoke.seg" -- -runs=1 -seed=24740
           } 2>&1 | tee artifacts/fuzz-provenance.log
 
       - name: Retain fuzz provenance
