@@ -48,6 +48,8 @@
 //! unstated invariant.
 
 use std::any::Any;
+use std::cmp::Ordering;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use crate::graph::k_nn_search_generic;
@@ -74,40 +76,95 @@ pub struct SegmentSet {
     parts: Arc<[IndexPart]>,
 }
 
-fn select_top_k_unique(selected: &mut Vec<(u64, f32)>, candidate: (u64, f32), k: usize) {
-    if k == 0 {
-        return;
+/// One retained candidate, ordered from nearest/oldest to farthest/newest.
+///
+/// The sequence makes equal-distance eviction match the prior vector-based
+/// selector: it removed the last farthest candidate, then appended a
+/// replacement. It also supplies stable equal-distance final ordering.
+#[derive(Clone, Copy, Debug)]
+struct RankedCandidate {
+    row_id: u64,
+    distance: f32,
+    sequence: u64,
+}
+
+impl PartialEq for RankedCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.distance.to_bits() == other.distance.to_bits() && self.sequence == other.sequence
+    }
+}
+
+impl Eq for RankedCandidate {}
+
+impl PartialOrd for RankedCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RankedCandidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.distance
+            .total_cmp(&other.distance)
+            .then_with(|| self.sequence.cmp(&other.sequence))
+    }
+}
+
+/// Retains the best `k` unique row candidates with indexed duplicate lookup
+/// and farthest-entry removal.
+struct IndexedTopKSelector {
+    k: usize,
+    next_sequence: u64,
+    by_row_id: HashMap<u64, RankedCandidate>,
+    ranked: BTreeSet<RankedCandidate>,
+}
+
+impl IndexedTopKSelector {
+    fn new(k: usize) -> Self {
+        Self {
+            k,
+            next_sequence: 0,
+            by_row_id: HashMap::new(),
+            ranked: BTreeSet::new(),
+        }
     }
 
-    let (row_id, distance) = candidate;
-    if let Some(existing_index) = selected
-        .iter()
-        .position(|(retained_row_id, _)| *retained_row_id == row_id)
-    {
-        if distance.total_cmp(&selected[existing_index].1).is_lt() {
-            selected.remove(existing_index);
-            selected.push(candidate);
+    fn consider(&mut self, (row_id, distance): (u64, f32)) {
+        if self.k == 0 {
+            return;
         }
-    } else if selected.len() < k {
-        selected.push(candidate);
-    } else {
-        let farthest_index = selected.iter().enumerate().fold(
-            0,
-            |farthest_index, (index, (_, retained_distance))| {
-                if retained_distance
-                    .total_cmp(&selected[farthest_index].1)
-                    .is_ge()
-                {
-                    index
-                } else {
-                    farthest_index
-                }
-            },
-        );
-        if distance.total_cmp(&selected[farthest_index].1).is_lt() {
-            selected.remove(farthest_index);
-            selected.push(candidate);
+
+        if let Some(existing) = self.by_row_id.get(&row_id).copied() {
+            if !distance.total_cmp(&existing.distance).is_lt() {
+                return;
+            }
+            self.ranked.remove(&existing);
+        } else if self.ranked.len() == self.k {
+            let Some(farthest) = self.ranked.last().copied() else {
+                return;
+            };
+            if !distance.total_cmp(&farthest.distance).is_lt() {
+                return;
+            }
+            self.ranked.remove(&farthest);
+            self.by_row_id.remove(&farthest.row_id);
         }
+
+        let candidate = RankedCandidate {
+            row_id,
+            distance,
+            sequence: self.next_sequence,
+        };
+        self.next_sequence += 1;
+        self.by_row_id.insert(row_id, candidate);
+        self.ranked.insert(candidate);
+    }
+
+    fn into_sorted(self) -> Vec<(u64, f32)> {
+        self.ranked
+            .into_iter()
+            .map(|candidate| (candidate.row_id, candidate.distance))
+            .collect()
     }
 }
 
@@ -207,7 +264,7 @@ impl SegmentSet {
         F: Fn(u64) -> bool,
         G: Fn(&(dyn Any + Send + Sync)) -> bool,
     {
-        let mut selected = Vec::new();
+        let mut selected = IndexedTopKSelector::new(k);
         for part in self.parts.iter() {
             match part {
                 IndexPart::Sealed { reader, zone_map } => {
@@ -228,14 +285,14 @@ impl SegmentSet {
                     // `search_returns_global_row_ids_not_segment_local_ordinals`.
                     for (local, distance) in raw {
                         if let Some(row_id) = reader.row_id_at(local) {
-                            select_top_k_unique(&mut selected, (row_id, distance), k);
+                            selected.consider((row_id, distance));
                         }
                     }
                 }
             }
         }
-        selected.sort_by(|left, right| left.1.total_cmp(&right.1));
         Ok(selected
+            .into_sorted()
             .into_iter()
             .map(|(row_id, dist)| VectorMatch {
                 row_id,
@@ -744,58 +801,93 @@ mod tests {
     }
 
     #[test]
-    fn select_top_k_unique_bounds_candidates_updates_later_duplicates_and_orders_nearest_first() {
-        let mut selected = Vec::new();
+    fn indexed_top_k_selector_bounds_candidates_updates_later_duplicates_and_orders_nearest_first()
+    {
+        let mut selected = IndexedTopKSelector::new(2);
         for candidate in [(7, 2.0), (8, 3.0), (9, 4.0), (7, 1.0)] {
-            select_top_k_unique(&mut selected, candidate, 2);
+            selected.consider(candidate);
         }
 
-        selected.sort_by(|left, right| left.1.total_cmp(&right.1));
-        assert_eq!(selected, vec![(7, 1.0), (8, 3.0)]);
+        assert_eq!(selected.into_sorted(), vec![(7, 1.0), (8, 3.0)]);
     }
 
     #[test]
-    fn select_top_k_unique_defers_sorting_until_finalization() {
-        let mut selected = Vec::new();
+    fn indexed_top_k_selector_sorts_stably_at_finalization() {
+        let mut selected = IndexedTopKSelector::new(2);
         for candidate in [(8, 2.0), (7, 1.0)] {
-            select_top_k_unique(&mut selected, candidate, 2);
+            selected.consider(candidate);
         }
 
-        assert_eq!(selected, vec![(8, 2.0), (7, 1.0)]);
-        selected.sort_by(|left, right| left.1.total_cmp(&right.1));
-        assert_eq!(selected, vec![(7, 1.0), (8, 2.0)]);
+        assert_eq!(selected.into_sorted(), vec![(7, 1.0), (8, 2.0)]);
     }
 
     #[test]
-    fn select_top_k_unique_keeps_no_candidates_when_k_is_zero() {
-        let mut selected = Vec::new();
+    fn indexed_top_k_selector_keeps_no_candidates_when_k_is_zero() {
+        let mut selected = IndexedTopKSelector::new(0);
         for candidate in [(7, 1.0), (8, 2.0)] {
-            select_top_k_unique(&mut selected, candidate, 0);
+            selected.consider(candidate);
         }
 
-        assert!(selected.is_empty());
+        assert!(selected.into_sorted().is_empty());
     }
 
     #[test]
-    fn select_top_k_unique_preserves_first_seen_equal_distance_ties() {
-        let mut selected = Vec::new();
+    fn indexed_top_k_selector_accepts_a_huge_k_before_candidates_arrive() {
+        let selected = IndexedTopKSelector::new(usize::MAX);
+
+        assert!(selected.into_sorted().is_empty());
+    }
+
+    #[test]
+    fn indexed_top_k_selector_preserves_first_seen_equal_distance_ties() {
+        let mut selected = IndexedTopKSelector::new(2);
         for candidate in [(7, 1.0), (8, 1.0), (9, 1.0)] {
-            select_top_k_unique(&mut selected, candidate, 2);
+            selected.consider(candidate);
         }
 
-        selected.sort_by(|left, right| left.1.total_cmp(&right.1));
-        assert_eq!(selected, vec![(7, 1.0), (8, 1.0)]);
+        assert_eq!(selected.into_sorted(), vec![(7, 1.0), (8, 1.0)]);
     }
 
     #[test]
-    fn select_top_k_unique_reencounters_nearer_duplicates_at_their_latest_position() {
-        let mut selected = Vec::new();
+    fn indexed_top_k_selector_reencounters_nearer_duplicates_at_their_latest_position() {
+        let mut selected = IndexedTopKSelector::new(2);
         for candidate in [(7, 6.0), (8, 5.0), (7, 5.0), (9, 4.0)] {
-            select_top_k_unique(&mut selected, candidate, 2);
+            selected.consider(candidate);
         }
 
-        selected.sort_by(|left, right| left.1.total_cmp(&right.1));
-        assert_eq!(selected, vec![(9, 4.0), (8, 5.0)]);
+        assert_eq!(selected.into_sorted(), vec![(9, 4.0), (8, 5.0)]);
+    }
+
+    #[test]
+    fn indexed_top_k_selector_preserves_duplicate_and_equal_distance_eviction_semantics() {
+        // Removing the latest equal-distance candidate is observable: the
+        // existing selector walked left-to-right and chose the last farthest
+        // entry. A heap must encode that tie-breaker rather than evicting an
+        // arbitrary equal-distance row.
+        let mut selected = IndexedTopKSelector::new(3);
+        for candidate in [(7, 2.0), (8, 2.0), (9, 2.0), (10, 1.0), (8, 1.5), (7, 2.0)] {
+            selected.consider(candidate);
+        }
+
+        assert_eq!(selected.into_sorted(), vec![(10, 1.0), (8, 1.5), (7, 2.0)]);
+    }
+
+    #[test]
+    fn indexed_top_k_selector_retains_large_bounded_unique_candidate_sets() {
+        let k = 1_024;
+        let mut selected = IndexedTopKSelector::new(k);
+        for row_id in 0_u64..4_096 {
+            selected.consider((row_id, 20_000.0 + (4_096 - row_id) as f32));
+        }
+
+        for row_id in 0_u64..1_024 {
+            selected.consider((row_id, row_id as f32 - 0.5));
+        }
+
+        let expected: Vec<(u64, f32)> = (0_u64..1_024)
+            .map(|row_id| (row_id, row_id as f32 - 0.5))
+            .collect();
+        assert_eq!(selected.into_sorted(), expected);
     }
 
     #[test]

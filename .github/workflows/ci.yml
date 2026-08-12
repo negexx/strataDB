@@ -321,9 +321,15 @@ jobs:
               echo "::error::no test binary produced by the --cfg loom build"
               exit 1
             fi
-            model=live_set_cache::loom_tests::two_concurrent_misses_on_the_same_key_compute_exactly_once
-            "$bin" --list --format terse | grep -Fx "${model}: test"
-            "$bin" --exact "$model" --test-threads=1
+            models=(
+              live_set_cache::loom_tests::two_concurrent_misses_on_the_same_key_compute_exactly_once
+              live_set_cache::loom_tests::concurrent_different_key_payloads_do_not_exceed_the_budget
+              live_set_cache::loom_tests::concurrent_different_key_entry_charges_do_not_exceed_the_budget
+            )
+            for model in "${models[@]}"; do
+              "$bin" --list --format terse | grep -Fx "${model}: test"
+              "$bin" --exact "$model" --test-threads=1
+            done
           } 2>&1 | tee artifacts/loom-txn-cache-evidence.log
 
       - name: Loom tests (strata-index)

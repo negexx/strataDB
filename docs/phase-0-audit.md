@@ -4,8 +4,8 @@
 **Baseline:** `eb48519` (merged PR #53)
 **Scope:** embedded, single-node, local-disk foundation used by one process and one shared
 `Dataset` handle.
-**Status:** Evidence complete within the named local-filesystem bounds; later-phase limitations
-remain tracked separately.
+**Status:** Implementation closure is within the named local-filesystem bounds; platform and loom
+evidence remains incomplete, and later-phase limitations remain tracked separately.
 **Verdict:** Phase 0 is **Foundation implemented within named local bounds**.
 
 This audit applies the same evidence-first review to the foundation that the Phase 1 audit applied
@@ -100,7 +100,8 @@ cross-process publication, or a universal power-loss guarantee.
 4. The largest remaining limitations are not missing Phase 0 mechanisms: they are Phase 1 evidence
    provenance/portability and later lifecycle, query, cross-process, and deployment work.
 5. Phase 0 is **Foundation implemented within the named local bounds**. Its local filesystem and
-   single-process/shared-handle limits remain part of the contract.
+   single-process/shared-handle limits remain part of the contract; platform and loom evidence is
+   still incomplete.
 
 ## Recommended next action
 

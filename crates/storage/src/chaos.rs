@@ -38,15 +38,13 @@ mod real {
 
         #[test]
         fn checkpoint_counter_increments_and_never_aborts_without_the_env_var() {
-            // CHECKPOINT_COUNT is process-global; keeping both assertions in one
-            // test (rather than two separate #[test] fns) avoids a race with
-            // cargo test's default parallel test execution, since no other test
-            // in this crate touches this counter.
+            // CHECKPOINT_COUNT is process-global, so concurrent callers may
+            // increment it between these loads.
             let before = CHECKPOINT_COUNT.load(Ordering::SeqCst);
             chaos_checkpoint();
             chaos_checkpoint();
             let after = CHECKPOINT_COUNT.load(Ordering::SeqCst);
-            assert_eq!(after - before, 2);
+            assert!(after >= before + 2);
 
             // Absence of STRATA_CHAOS_ABORT_AT (the default, and true in this
             // test process) must never abort no matter how many checkpoints

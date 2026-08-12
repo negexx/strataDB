@@ -5,17 +5,18 @@ are evidence pointers; [roadmap](roadmap.md) owns phase ordering.
 
 ## Overall state
 
-The current baseline is merged PR #58 commit `21811031d0fbe3ed3f55532941c056c0c9e091b0`. The
-[Phase 0 foundation audit](phase-0-audit.md) records the foundation as implemented within its named
-local bounds, with retained CI evidence. The [Phase 1 closeout ledger](phase-1-closeout-ledger.md)
-tracks the remaining finding-level acceptance and evidence obligations; it does not change this
-Partial/blocked state.
+The current `codex/phase-0-audit` branch descends from commit
+`21811031d0fbe3ed3f55532941c056c0c9e091b0`. The [Phase 0 foundation audit](phase-0-audit.md)
+records implementation closure only within its named local bounds; platform and loom evidence
+remains incomplete. The [Phase 1 closeout ledger](phase-1-closeout-ledger.md) tracks the remaining
+finding-level acceptance and evidence obligations; it does not change this Partial/blocked state.
 
-**Phase 0: Implemented within named local bounds.** The local Arrow/manifest/segmented-index
-foundation and restart-safe row-ID regression are covered by local tests, retained Ubuntu foundation
-provenance. Current CI configures 90-day retention of a native Windows restart transcript on future
-workflow runs regardless of outcome, but no completed Windows run or retained artifact is linked in
-this branch; Windows execution evidence remains pending. The exact loom gates build
+**Phase 0: Implemented within named local bounds.** This implementation closure does not establish
+complete platform or loom coverage. The local Arrow/manifest/segmented-index foundation and
+restart-safe row-ID regression are covered by local tests, retained Ubuntu foundation provenance.
+Current CI configures 90-day retention of a native Windows restart transcript on future workflow
+runs regardless of outcome, but no completed Windows run or retained artifact is linked in this
+branch; Windows execution evidence remains pending. The exact loom gates build
 and invoke crate-scoped binaries directly; normal Cargo summaries, timeouts, and interrupted jobs are
 not loom passes. This does not claim portable filesystem behavior, cross-process coordination, serializability,
 compaction, migration, object storage, or universal power-loss durability.
