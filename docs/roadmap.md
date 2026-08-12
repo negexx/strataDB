@@ -13,6 +13,26 @@ in [documentation history](history/README.md). Current implementation claims liv
 | 5 — Branching and merge | Proposed | Fork, abort, merge, conflict reporting, and branch-aware manifests. | Branch behavior is correct under concurrency and recovery tests. |
 | 6 — Object storage and deployment | Proposed | Object-store conditional writes, S3-compatible backends, remote recovery, and durability testing. | The supported correctness suite passes against supported remote backends. |
 
+## Phase 4 reservation and entry gates
+
+Phase 4 remains Proposed. The project reserves a future, versioned coordination seam without
+implementing native cross-process writers now. The seam must carry dataset identity, capability and
+protocol-version negotiation, expected-manifest-version preconditions, request IDs for idempotent
+retries, typed row conflicts, and explicit visibility/durability acknowledgement semantics.
+
+Phase 4 should begin only when all of these product and engineering signals are present:
+
+- validated separate-process workloads rather than market momentum alone;
+- measured evidence that the current shared-handle concurrency model is a bottleneck;
+- an IPC/RPC design that fits the product's p95/p99 commit-latency budget;
+- specified crash recovery, stale-participant, retry, and restart behavior; and
+- a named operational owner for availability, security, observability, upgrades, and incident recovery.
+
+The preferred first slice is an optional single-owner actor/IPC/RPC bridge around one authoritative
+`Dataset`. Native independent multi-writer publication, distributed transactions, and a second commit
+protocol remain out of scope until a superseding decision and evidence approve them. See [active
+decision 0010](decisions.md#0010---deferred-cross-process-coordination-seam).
+
 ## Phase 1 blockers
 
 The [Phase 1 audit](phase-1-audit.md) is complete. Phase 1 remains Partial and blocked by:

@@ -48,6 +48,32 @@ index, and query crates are internal implementation layers and are marked non-pu
 use of those layers does not carry the facade's schema, conflict, or recovery guarantees. This
 decision does not create a stable Python or administration API.
 
+## 0010 - Deferred cross-process coordination seam
+
+**Status:** Accepted as a future-design reservation; Phase 4 implementation is not approved.
+
+Strata preserves the embedded, one-process/shared-`Dataset` boundary while Phase 1 correctness and
+durability remain Partial and Phase 3 lifecycle growth is not yet bounded. The storage core must not
+add native cross-process locks, independent multi-writer publication, distributed transactions, or a
+second commit protocol at this stage.
+
+The future coordination boundary must be versioned and typed. Its reserved contract includes:
+
+- dataset identity and capability negotiation;
+- protocol-version negotiation;
+- expected-manifest-version preconditions for conditional publication;
+- request IDs and idempotent retry semantics;
+- typed contested-row conflicts and other typed failure results; and
+- explicit visibility and durability acknowledgement semantics.
+
+Phase 4 should begin only after evidence shows that separate-process workloads are real, current
+shared-handle concurrency is a bottleneck, an IPC/RPC design fits the commit-latency budget, crash
+recovery and stale-participant behavior are specified, and an operational owner exists for the
+coordinator. The preferred first implementation is an optional single-owner actor/IPC/RPC bridge
+around one authoritative `Dataset`, not independent openers or a distributed transaction engine.
+
+This decision does not authorize implementation, dependency additions, or a new isolation level.
+
 ## Decision rules
 
 - Preserve the embedded, single-node scope and the one-process/shared-`Dataset` concurrency boundary.

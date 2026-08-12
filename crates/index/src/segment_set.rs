@@ -91,10 +91,9 @@ fn select_top_k_unique(selected: &mut Vec<(u64, f32)>, candidate: (u64, f32), k:
     } else if selected.len() < k {
         selected.push(candidate);
     } else {
-        let farthest_index = selected
-            .iter()
-            .enumerate()
-            .fold(0, |farthest_index, (index, (_, retained_distance))| {
+        let farthest_index = selected.iter().enumerate().fold(
+            0,
+            |farthest_index, (index, (_, retained_distance))| {
                 if retained_distance
                     .total_cmp(&selected[farthest_index].1)
                     .is_ge()
@@ -103,7 +102,8 @@ fn select_top_k_unique(selected: &mut Vec<(u64, f32)>, candidate: (u64, f32), k:
                 } else {
                     farthest_index
                 }
-            });
+            },
+        );
         if distance.total_cmp(&selected[farthest_index].1).is_lt() {
             selected.remove(farthest_index);
             selected.push(candidate);
