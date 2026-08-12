@@ -74,6 +74,43 @@ pub struct SegmentSet {
     parts: Arc<[IndexPart]>,
 }
 
+fn select_top_k_unique(selected: &mut Vec<(u64, f32)>, candidate: (u64, f32), k: usize) {
+    if k == 0 {
+        return;
+    }
+
+    let (row_id, distance) = candidate;
+    if let Some(existing_index) = selected
+        .iter()
+        .position(|(retained_row_id, _)| *retained_row_id == row_id)
+    {
+        if distance.total_cmp(&selected[existing_index].1).is_lt() {
+            selected.remove(existing_index);
+            selected.push(candidate);
+        }
+    } else if selected.len() < k {
+        selected.push(candidate);
+    } else {
+        let farthest_index = selected
+            .iter()
+            .enumerate()
+            .fold(0, |farthest_index, (index, (_, retained_distance))| {
+                if retained_distance
+                    .total_cmp(&selected[farthest_index].1)
+                    .is_ge()
+                {
+                    index
+                } else {
+                    farthest_index
+                }
+            });
+        if distance.total_cmp(&selected[farthest_index].1).is_lt() {
+            selected.remove(farthest_index);
+            selected.push(candidate);
+        }
+    }
+}
+
 impl SegmentSet {
     /// A set with no parts — a freshly created dataset, or one whose
     /// commits have all been vector-less. Searches to an empty result.
@@ -170,7 +207,7 @@ impl SegmentSet {
         F: Fn(u64) -> bool,
         G: Fn(&(dyn Any + Send + Sync)) -> bool,
     {
-        let mut merged: Vec<(u64, f32)> = Vec::new();
+        let mut selected = Vec::new();
         for part in self.parts.iter() {
             match part {
                 IndexPart::Sealed { reader, zone_map } => {
@@ -189,20 +226,16 @@ impl SegmentSet {
                     // segment. Returning it unmapped would hand the caller
                     // a plausible-looking wrong row-id -- see this task's
                     // `search_returns_global_row_ids_not_segment_local_ordinals`.
-                    merged.extend(
-                        raw.into_iter()
-                            .filter_map(|(local, dist)| Some((reader.row_id_at(local)?, dist))),
-                    );
+                    for (local, distance) in raw {
+                        if let Some(row_id) = reader.row_id_at(local) {
+                            select_top_k_unique(&mut selected, (row_id, distance), k);
+                        }
+                    }
                 }
             }
         }
-        merged.sort_by(|a, b| a.1.total_cmp(&b.1));
-        // Nearest-first order means the retained occurrence of a duplicated
-        // row-id is always its nearest one.
-        let mut seen = std::collections::HashSet::with_capacity(merged.len());
-        merged.retain(|&(row_id, _)| seen.insert(row_id));
-        merged.truncate(k);
-        Ok(merged
+        selected.sort_by(|left, right| left.1.total_cmp(&right.1));
+        Ok(selected
             .into_iter()
             .map(|(row_id, dist)| VectorMatch {
                 row_id,
@@ -708,6 +741,61 @@ mod tests {
                 m.row_id
             );
         }
+    }
+
+    #[test]
+    fn select_top_k_unique_bounds_candidates_updates_later_duplicates_and_orders_nearest_first() {
+        let mut selected = Vec::new();
+        for candidate in [(7, 2.0), (8, 3.0), (9, 4.0), (7, 1.0)] {
+            select_top_k_unique(&mut selected, candidate, 2);
+        }
+
+        selected.sort_by(|left, right| left.1.total_cmp(&right.1));
+        assert_eq!(selected, vec![(7, 1.0), (8, 3.0)]);
+    }
+
+    #[test]
+    fn select_top_k_unique_defers_sorting_until_finalization() {
+        let mut selected = Vec::new();
+        for candidate in [(8, 2.0), (7, 1.0)] {
+            select_top_k_unique(&mut selected, candidate, 2);
+        }
+
+        assert_eq!(selected, vec![(8, 2.0), (7, 1.0)]);
+        selected.sort_by(|left, right| left.1.total_cmp(&right.1));
+        assert_eq!(selected, vec![(7, 1.0), (8, 2.0)]);
+    }
+
+    #[test]
+    fn select_top_k_unique_keeps_no_candidates_when_k_is_zero() {
+        let mut selected = Vec::new();
+        for candidate in [(7, 1.0), (8, 2.0)] {
+            select_top_k_unique(&mut selected, candidate, 0);
+        }
+
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn select_top_k_unique_preserves_first_seen_equal_distance_ties() {
+        let mut selected = Vec::new();
+        for candidate in [(7, 1.0), (8, 1.0), (9, 1.0)] {
+            select_top_k_unique(&mut selected, candidate, 2);
+        }
+
+        selected.sort_by(|left, right| left.1.total_cmp(&right.1));
+        assert_eq!(selected, vec![(7, 1.0), (8, 1.0)]);
+    }
+
+    #[test]
+    fn select_top_k_unique_reencounters_nearer_duplicates_at_their_latest_position() {
+        let mut selected = Vec::new();
+        for candidate in [(7, 6.0), (8, 5.0), (7, 5.0), (9, 4.0)] {
+            select_top_k_unique(&mut selected, candidate, 2);
+        }
+
+        selected.sort_by(|left, right| left.1.total_cmp(&right.1));
+        assert_eq!(selected, vec![(9, 4.0), (8, 5.0)]);
     }
 
     #[test]
