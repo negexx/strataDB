@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-12
 **Branch:** `codex/phase-1-audit`
-**HEAD:** `224ea42`
+**HEAD:** `96dc632`
 **Toolchain:** `rustc 1.97.1`, `cargo 1.97.1`, `x86_64-pc-windows-msvc`
 
 ## Fresh command results
@@ -16,12 +16,12 @@
 | `cargo clippy -p strata-txn --all-targets --features test-fault-injection -- -D warnings` | PASS | Feature gate checked. |
 | `cargo doc --workspace --no-deps` | PASS with 2 warnings | Redundant intra-doc link; private-item link. |
 | `cargo metadata --no-deps --format-version 1` | PASS | Workspace boundaries and Rust 1.97.1 manifests parsed. |
-| `cargo test --workspace --no-default-features` | BLOCKED | `link.exe` not found while linking `strata-bindings`. |
-| `cargo test -p strata-txn --features parallel-insert` | BLOCKED | `link.exe` not found. |
-| `cargo test -p strata-txn --features test-fault-injection` | BLOCKED | `link.exe` not found. |
+| `cargo test --workspace --no-default-features` | PASS in GitHub Actions | Ubuntu CI run `31644869407` passed; local MSVC execution remains unavailable. |
+| `cargo test -p strata-txn --features parallel-insert` | PASS in GitHub Actions | Exact feature gate passed in CI run `31644869407`; local MSVC execution remains unavailable. |
+| `cargo test -p strata-txn --features test-fault-injection` | PASS in GitHub Actions | Exact fault-injection gate passed in CI run `31644869407`; local MSVC execution remains unavailable. |
 | `cargo test -p strata-index --lib` | PASS | 158 passed, 0 failed, 1 ignored. |
-| `cargo rustc -p strata-index --lib --profile test -- --cfg loom` | BLOCKED | `link.exe` not found. |
-| `cargo deny check bans sources advisories` | BLOCKED | Read-only advisory DB lock path. |
+| `cargo rustc -p strata-index --lib --profile test -- --cfg loom` | PASS in GitHub Actions | Exact index loom models passed in CI run `31644869407`; local MSVC execution remains unavailable. |
+| `cargo deny check bans sources advisories` | PASS in GitHub Actions | Passed in CI run `31644869407`; the local advisory DB lock remains read-only. |
 | Criterion benchmarks | NOT RUN | Native linking unavailable; no before/after claim. |
 
 ## Environment blockers
@@ -32,6 +32,10 @@
 
 ## Final verdict
 
-Phase 1 is **Partial and blocked**. The audit found no newly confirmed runtime correctness defect,
-but the branch cannot claim complete correctness, concurrency, chaos, fuzz, binding, CLI, or benchmark
-verification from this host. There was no performance change, so before/after measurements are N/A.
+The exact-head functional Phase 1 CI gate is green in GitHub Actions run
+[31644869407](https://github.com/negexx/strataDB/actions/runs/31644869407), including workspace tests,
+feature tests, transaction/cache/index loom models, checkpoint/fast/thorough chaos, fuzz smoke,
+Windows durability, clippy, docs, and cargo-deny. Phase 1 remains **Partial** for explicitly
+deferred product-boundary work (compaction/reclamation, universal durability/performance claims,
+cross-process coordination, and pending full-fixture benchmark evidence), not because a newly
+confirmed runtime correctness defect is failing.
