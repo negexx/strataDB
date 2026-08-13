@@ -48,7 +48,10 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          /usr/bin/time -v cargo bench --locked -p strata-bench --bench query_concurrency_bench -- --noplot 2>&1 |
+          cargo bench --locked -p strata-bench --bench query_concurrency_bench --no-run
+          binary=$(find target/release/deps -maxdepth 1 -type f -name 'query_concurrency_bench-*' -perm -111 | head -n 1)
+          test -n "$binary"
+          /usr/bin/time -v "$binary" --noplot 2>&1 |
             tee artifacts/query-concurrency-benchmark.log
 
       - name: Retain query evidence
