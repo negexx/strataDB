@@ -343,6 +343,52 @@ fn parse_attempt_id_prefix(file_name: &str) -> Option<u64> {
     file_name.split('-').next()?.parse().ok()
 }
 
+/// Test-only controls for deterministic compaction crash/reopen coverage.
+///
+/// This module is deliberately absent from default and production builds.
+/// Its thread-local guard can only affect the test thread that armed it.
+#[cfg(feature = "test-fault-injection")]
+#[doc(hidden)]
+pub mod test_support {
+    use std::cell::Cell;
+    use std::marker::PhantomData;
+    use std::rc::Rc;
+
+    thread_local! {
+        static FAIL_AFTER_COMPACTION_MANIFEST_PUBLICATION: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Restores the calling test thread's prior compaction fault state.
+    pub struct PostPublicationFaultGuard {
+        previous: bool,
+        // The state is thread-local, so the guard must be dropped on the
+        // thread that installed it. Rc makes this guard !Send and !Sync.
+        _thread_affine: PhantomData<Rc<()>>,
+    }
+
+    impl Drop for PostPublicationFaultGuard {
+        fn drop(&mut self) {
+            FAIL_AFTER_COMPACTION_MANIFEST_PUBLICATION.with(|fault| fault.set(self.previous));
+        }
+    }
+
+    /// Causes one compaction on this test thread to return a typed I/O error
+    /// immediately after its manifest is durable and before in-memory
+    /// installation or reclamation.
+    #[must_use]
+    pub fn fail_after_compaction_manifest_publication() -> PostPublicationFaultGuard {
+        let previous = FAIL_AFTER_COMPACTION_MANIFEST_PUBLICATION.with(|fault| fault.replace(true));
+        PostPublicationFaultGuard {
+            previous,
+            _thread_affine: PhantomData,
+        }
+    }
+
+    pub(super) fn consume_after_compaction_manifest_publication() -> bool {
+        FAIL_AFTER_COMPACTION_MANIFEST_PUBLICATION.with(|fault| fault.replace(false))
+    }
+}
+
 impl Dataset {
     /// Rewrites the current logical snapshot into a compacted physical layout.
     ///
@@ -497,6 +543,12 @@ impl Dataset {
         // publication precondition used by the normal commit path.
         sync_dir(&data_dir)?;
         commit_manifest(&self.dir, &manifest)?;
+        #[cfg(feature = "test-fault-injection")]
+        if test_support::consume_after_compaction_manifest_publication() {
+            return Err(TxnError::Io(std::io::Error::other(
+                "injected post-publication compaction failure (test fault injection)",
+            )));
+        }
         let report = CompactionReport {
             source_version,
             published_version,

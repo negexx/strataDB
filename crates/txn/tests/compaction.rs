@@ -2,6 +2,8 @@
 
 use strata_query::Predicate;
 use strata_storage::Value;
+#[cfg(feature = "test-fault-injection")]
+use strata_txn::TxnError;
 use strata_txn::mvp_fixtures::{mvp_batch, mvp_schema};
 use strata_txn::{CompactionPolicy, Dataset};
 
@@ -197,5 +199,175 @@ fn compaction_records_an_empty_occ_history_entry_for_preexisting_transactions() 
     assert_eq!(
         dataset.snapshot().scan(&mvp_schema()).unwrap().num_rows(),
         0
+    );
+}
+
+#[cfg(feature = "test-fault-injection")]
+#[test]
+fn compaction_prepublication_directory_sync_failure_reopens_old_state_and_allows_a_unique_commit() {
+    // Break caught: publishing a compacted manifest after its replacement
+    // directory entry failed to sync would expose a manifest whose objects
+    // are not durable. Recovery must instead retain the old manifest.
+    let directory = temp_dataset("prepublication-crash-reopen");
+    let dataset = Dataset::create(directory.path(), mvp_schema()).unwrap();
+    for id in 0..3_i64 {
+        let mut transaction = dataset.begin();
+        transaction
+            .insert(mvp_batch(&[(id, "row", [id as f32, 0.0, 1.0])]).unwrap())
+            .unwrap();
+        transaction.commit().unwrap();
+    }
+    let old_manifest = strata_storage::read_current(directory.path())
+        .unwrap()
+        .unwrap();
+
+    let directory_sync_fault = strata_storage::datafile::test_support::fail_directory_sync_on_call(
+        1,
+        std::io::ErrorKind::Other,
+    );
+    let error = dataset
+        .compact(CompactionPolicy::retain_snapshots())
+        .expect_err("the replacement-data directory sync must fail before manifest publication");
+    assert!(matches!(error, TxnError::Storage(_)));
+    drop(directory_sync_fault);
+    drop(dataset);
+
+    let reopened = Dataset::open(directory.path()).unwrap();
+    let reopened_manifest = strata_storage::read_current(directory.path())
+        .unwrap()
+        .unwrap();
+    assert_eq!(reopened_manifest.version, old_manifest.version);
+    assert_eq!(reopened_manifest.next_row_id, old_manifest.next_row_id);
+    assert_eq!(
+        reopened_manifest.next_attempt_id,
+        old_manifest.next_attempt_id
+    );
+    assert_eq!(
+        reopened.snapshot().scan(&mvp_schema()).unwrap().num_rows(),
+        3
+    );
+    assert_eq!(
+        reopened
+            .snapshot()
+            .vector_search(&[0.0, 0.0, 1.0], 3, None)
+            .unwrap()
+            .iter()
+            .map(|hit| hit.row_id)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+
+    let mut later = reopened.begin();
+    later
+        .insert(mvp_batch(&[(99, "later", [99.0, 0.0, 1.0])]).unwrap())
+        .unwrap();
+    later.commit().unwrap();
+    assert_eq!(reopened.current_version(), old_manifest.version + 1);
+    assert_eq!(
+        reopened.snapshot().scan(&mvp_schema()).unwrap().num_rows(),
+        4
+    );
+    assert_eq!(
+        reopened
+            .snapshot()
+            .vector_search(&[99.0, 0.0, 1.0], 4, None)
+            .unwrap()
+            .iter()
+            .map(|hit| hit.row_id)
+            .collect::<Vec<_>>(),
+        vec![3, 2, 1, 0]
+    );
+}
+
+#[cfg(feature = "test-fault-injection")]
+#[test]
+fn compaction_postpublication_fault_reopens_new_manifest_and_retains_old_objects() {
+    // Break caught: doing in-memory installation or reclamation before the
+    // durable manifest boundary would either lose the new state on reopen or
+    // delete objects still required to recover from a post-publication crash.
+    let directory = temp_dataset("postpublication-crash-reopen");
+    let dataset = Dataset::create(directory.path(), mvp_schema()).unwrap();
+    for id in 0..3_i64 {
+        let mut transaction = dataset.begin();
+        transaction
+            .insert(mvp_batch(&[(id, "row", [id as f32, 0.0, 1.0])]).unwrap())
+            .unwrap();
+        transaction.commit().unwrap();
+    }
+    let old_manifest = strata_storage::read_current(directory.path())
+        .unwrap()
+        .unwrap();
+    let old_objects = old_manifest
+        .data_files
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .chain(
+            old_manifest
+                .segments
+                .iter()
+                .map(|entry| entry.name.as_str()),
+        )
+        .map(|name| directory.path().join("data").join(name))
+        .collect::<Vec<_>>();
+
+    let _directory_syncs = strata_storage::datafile::test_support::record_directory_syncs();
+    let _post_publication_fault =
+        strata_txn::test_support::fail_after_compaction_manifest_publication();
+    let error = dataset
+        .compact(CompactionPolicy::retain_snapshots())
+        .expect_err("the test seam must stop compaction after durable manifest publication");
+    assert!(matches!(error, TxnError::Io(_)));
+    drop(dataset);
+
+    for object in &old_objects {
+        assert!(
+            object.exists(),
+            "post-publication failure must not reclaim old object {object:?}"
+        );
+    }
+    let reopened = Dataset::open(directory.path()).unwrap();
+    let reopened_manifest = strata_storage::read_current(directory.path())
+        .unwrap()
+        .unwrap();
+    assert_eq!(reopened_manifest.version, old_manifest.version + 1);
+    assert_eq!(reopened_manifest.next_row_id, old_manifest.next_row_id);
+    assert_eq!(
+        reopened_manifest.next_attempt_id,
+        old_manifest.next_attempt_id + 1
+    );
+    assert_eq!(
+        reopened.snapshot().scan(&mvp_schema()).unwrap().num_rows(),
+        3
+    );
+    assert_eq!(
+        reopened
+            .snapshot()
+            .vector_search(&[0.0, 0.0, 1.0], 3, None)
+            .unwrap()
+            .iter()
+            .map(|hit| hit.row_id)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+
+    let mut later = reopened.begin();
+    later
+        .insert(mvp_batch(&[(99, "later", [99.0, 0.0, 1.0])]).unwrap())
+        .unwrap();
+    later.commit().unwrap();
+    assert_eq!(reopened.current_version(), old_manifest.version + 2);
+    assert_eq!(
+        reopened.snapshot().scan(&mvp_schema()).unwrap().num_rows(),
+        4
+    );
+    assert_eq!(
+        reopened
+            .snapshot()
+            .vector_search(&[99.0, 0.0, 1.0], 4, None)
+            .unwrap()
+            .iter()
+            .map(|hit| hit.row_id)
+            .collect::<Vec<_>>(),
+        vec![3, 2, 1, 0]
     );
 }

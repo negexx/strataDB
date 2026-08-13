@@ -23,6 +23,9 @@ pub mod vacuum;
 
 pub use arrow;
 pub use compaction::{CompactionPolicy, CompactionReport};
+#[cfg(feature = "test-fault-injection")]
+#[doc(hidden)]
+pub use dataset::test_support;
 pub use dataset::{Dataset, ROW_ID_COLUMN, TIMESTAMP_COLUMN, Transaction};
 pub use error::{Result, TxnError};
 pub use lifecycle::LifecycleReport;
