@@ -26,7 +26,7 @@ storage. Existing `TxnError` and `Backend` error paths remain authoritative.
 - Do not delete, rewrite, or publish any object in the diagnostics path.
 - Do not recreate the retired agent-planning tree; use the approved design and this plan under `docs/`.
 
-The separately approved [manifest retention executor design](phase-3-manifest-retention-executor-design.md)
+The separately approved [manifest retention executor design](../../../designs/phase-3/manifest-retention-executor.md)
 governs `Dataset::prune_manifests`; it is not an inventory-plan task and does not authorize data or
 orphan reclamation.
 

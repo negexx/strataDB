@@ -1,7 +1,8 @@
 # Phase 2 verification report
 
 **Run date:** 2026-08-13
-**Branch:** `codex/phase-1-audit`
+**Execution branch:** historical `codex/phase-1-audit`
+**Current merged branch:** `main` at `65449a9` (PR #68)
 
 ## Evidence
 
@@ -12,8 +13,10 @@
   sample, and benchmark-only RSS capture.
 - `cargo fmt --check` passed locally.
 - `git diff --check` passed locally.
-- Local Cargo runtime tests were attempted but could not link because this host does not have
-  MSVC `link.exe`; this is an environment limitation, not a test assertion failure.
+- Local Cargo runtime tests were attempted with the installed Visual Studio Build Tools. The
+  x64 compiler and linker were found, but the installation lacks the x64 MSVC library directory
+  and `msvcrt.lib`, so native linking still cannot complete. This is an environment limitation,
+  not a test assertion failure.
 
 ## Conclusion
 

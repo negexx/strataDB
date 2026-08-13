@@ -78,5 +78,5 @@ This decision does not authorize implementation, dependency additions, or a new 
 
 - Preserve the embedded, single-node scope and the one-process/shared-`Dataset` concurrency boundary.
 - Do not claim durability, atomicity, or index consistency beyond the blockers in [status](status.md)
-  and [phase-1-audit](phase-1-audit.md).
+  and [phase-1-audit](audit/phase-1/audit.md).
 - Supersede decisions with a new dated record when the design changes; do not rewrite history silently.

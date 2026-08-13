@@ -7,7 +7,7 @@ and the Phase 1 audit's in-scope correctness, durability, and integrity blockers
 or evidence-closed within named local filesystem and shared-handle limits. The Phase 1 contract is
 implemented with named limits, not a universal guarantee.
 
-Read [status](status.md) for evidence, [roadmap](roadmap.md) for phases, and [phase-1-audit](phase-1-audit.md)
+Read [status](status.md) for evidence, [roadmap](roadmap.md) for phases, and [phase-1-audit](audit/phase-1/audit.md)
 for the audit trail and named limits.
 
 ## Components
@@ -100,8 +100,8 @@ both guards are held. Durable manifest authority means the recovery-recognized n
 closed. The authority retains the current manifest, the latest-version window, and active snapshots;
 it carries exact listed keys and byte counts and deletes eligible historical manifests oldest first.
 It never deletes row files, segments, temporary objects, or arbitrary orphan objects. A post-unlink
-local directory-sync error is returned and a retry relists state under the same guards. The [inventory design](phase-3-lifecycle-inventory-design.md), [manifest executor
-design](phase-3-manifest-retention-executor-design.md), and focused [inventory](../crates/txn/tests/lifecycle_inventory.rs)
+local directory-sync error is returned and a retry relists state under the same guards. The [inventory design](designs/phase-3/lifecycle-inventory.md), [manifest executor
+design](designs/phase-3/manifest-retention-executor.md), and focused [inventory](../crates/txn/tests/lifecycle_inventory.rs)
 and [executor](../crates/txn/tests/manifest_retention_executor.rs) tests define these distinct
 boundaries.
 

@@ -5,10 +5,10 @@ in [documentation history](history/README.md). Current implementation claims liv
 
 | Phase | Status | Scope | Exit signal |
 |---|---|---|---|
-| 0 — Foundation | Implemented within named local bounds | Local format, manifests, row allocation, and bounded transaction primitives. See the [Phase 0 foundation audit](phase-0-audit.md). | Restart-safe row-ID non-reuse and retained foundation evidence pass within the named local-filesystem boundary. |
+| 0 — Foundation | Implemented within named local bounds | Local format, manifests, row allocation, and bounded transaction primitives. See the [Phase 0 foundation audit](audit/phase-0/audit.md). | Restart-safe row-ID non-reuse and retained foundation evidence pass within the named local-filesystem boundary. |
 | 1 — Correctness and durability baseline | Implemented within named bounds | Shared-handle commits, immutable snapshots, typed conflicts, recovery/integrity, schema/error semantics, supported facade, and boundedness evidence. | All asserted guarantees have scope, implementation evidence, regression coverage, and current bounded performance evidence. |
-| 2 — Query and usability | Implemented within named bounds | Stable schema/query APIs, scan/projection/filter/group-by integration, point lookup, CLI, and Python surface. See the [Phase 2 audit](phase-2-audit.md). | Supported query/client behavior is documented and integration-tested within the embedded single-process boundary. |
-| 3 — Operational lifecycle | Partial | Lifecycle diagnostics, explicit snapshot-preserving compaction, manifest retention including age policy, recognized orphan vacuum, and `Dataset::maintain(LifecycleMaintenancePolicy)` are implemented for one shared handle. Maintenance reports whether requested data-object and segment bounds were met; active snapshots and unknown object types remain explicit limitations. See the [inventory design](phase-3-lifecycle-inventory-design.md), [executor design](phase-3-manifest-retention-executor-design.md), [vacuum design](phase-3-vacuum-design.md), and focused lifecycle tests. | Sustained operation safely bounds manifest/segment growth and manages retained data within an explicit supported policy. |
+| 2 — Query and usability | Implemented within named bounds | Stable schema/query APIs, scan/projection/filter/group-by integration, point lookup, CLI, and Python surface. See the [Phase 2 audit](audit/phase-2/audit.md). | Supported query/client behavior is documented and integration-tested within the embedded single-process boundary. |
+| 3 — Operational lifecycle | Partial | Lifecycle diagnostics, explicit snapshot-preserving compaction, manifest retention including age policy, recognized orphan vacuum, and `Dataset::maintain(LifecycleMaintenancePolicy)` are implemented for one shared handle. Maintenance reports whether requested data-object and segment bounds were met; active snapshots and unknown object types remain explicit limitations. See the [inventory design](designs/phase-3/lifecycle-inventory.md), [executor design](designs/phase-3/manifest-retention-executor.md), [vacuum design](designs/phase-3/vacuum.md), and focused lifecycle tests. | Sustained operation safely bounds manifest/segment growth and manages retained data within an explicit supported policy. |
 | 4 — Cross-process coordination | Proposed | Durable conditional publication, independent opener semantics, shared allocation, and process-boundary guarantees. | Separate processes coordinate without violating visibility, conflict, or durability invariants. |
 | 5 — Branching and merge | Proposed | Fork, abort, merge, conflict reporting, and branch-aware manifests. | Branch behavior is correct under concurrency and recovery tests. |
 | 6 — Object storage and deployment | Proposed | Object-store conditional writes, S3-compatible backends, remote recovery, and durability testing. | The supported correctness suite passes against supported remote backends. |
@@ -49,7 +49,7 @@ decision 0010](decisions.md#0010---deferred-cross-process-coordination-seam).
 
 ## Phase 1 closeout
 
-The [Phase 1 audit](phase-1-audit.md) is complete within its named bounds. Exact-head functional CI
+The [Phase 1 audit](audit/phase-1/audit.md) is complete within its named bounds. Exact-head functional CI
 [31644869407](https://github.com/negexx/strataDB/actions/runs/31644869407) and the full pinned-fixture
 benchmark [31647664161](https://github.com/negexx/strataDB/actions/runs/31647664161) passed their
 documented gates. Universal durability/performance bounds and later lifecycle work remain explicit

@@ -5,12 +5,14 @@ are evidence pointers; [roadmap](roadmap.md) owns phase ordering.
 
 ## Overall state
 
-The current Phase 1 audit branch is `codex/phase-1-audit` at commit `4d8fa3d`. The
-[Phase 0 foundation audit](phase-0-audit.md)
+The historical Phase 1 audit branch was `codex/phase-1-audit` at commit `4d8fa3d`; its
+[Phase 0 foundation audit](audit/phase-0/audit.md)
 records implementation closure only within its named local bounds; platform and loom evidence
 remains incomplete. The [Phase 1 closeout ledger](phase-1-closeout-ledger.md) tracks the remaining
 finding-level acceptance and evidence obligations; current exact-head evidence closes the phase
 within its named bounds.
+
+The closeout work is merged into `main` at `65449a9` (PR #68).
 
 **Phase 0: Implemented within named local bounds.** This implementation closure does not establish
 complete platform or loom coverage. The local Arrow/manifest/segmented-index foundation and
@@ -22,7 +24,7 @@ and invoke crate-scoped binaries directly; normal Cargo summaries, timeouts, and
 not loom passes. This does not claim portable filesystem behavior, cross-process coordination, serializability,
 compaction, migration, object storage, or universal power-loss durability.
 
-**Phase 1: Implemented within named bounds.** The [seven-lane Sol audit](phase-1-audit.md) findings
+**Phase 1: Implemented within named bounds.** The [seven-lane Sol audit](audit/phase-1/audit.md) findings
 are implemented or evidence-closed inside the supported single-process/shared-`Dataset` boundary.
 
 The [remaining performance evidence gates](phase-1-performance.md#remaining-evidence-gates) distinguish
@@ -52,8 +54,8 @@ provide explicit history and one final inventory observation of requested storag
 as preventing the requested bound rather than being deleted. Cross-process lifecycle work remains
 later design. Fresh exact-head lifecycle evidence is recorded in the
 [Phase 3 verification report](phase-3-verification-report.md). See
-the [inventory design](phase-3-lifecycle-inventory-design.md), [manifest executor
-design](phase-3-manifest-retention-executor-design.md), and focused [inventory](../crates/txn/tests/lifecycle_inventory.rs),
+the [inventory design](designs/phase-3/lifecycle-inventory.md), [manifest executor
+design](designs/phase-3/manifest-retention-executor.md), and focused [inventory](../crates/txn/tests/lifecycle_inventory.rs),
 [planner](../crates/txn/tests/retention_plan.rs), and [executor](../crates/txn/tests/manifest_retention_executor.rs)
 tests.
 
@@ -101,7 +103,7 @@ A final dataset-directory sync failure can occur after the initial manifest beco
 `Dataset::create` call still fails and must not be treated as acknowledged. Callers must first use
 `Dataset::open` before retrying creation: if it opens, preserve/report the failed creation and repair
 the filesystem boundary before relying on the dataset; only `NotFound` permits a later retry, which
-again synchronizes the bounded dataset/parent chain. See the [Phase 1 audit](phase-1-audit.md#task-1-durability-recovery-boundary)
+again synchronizes the bounded dataset/parent chain. See the [Phase 1 audit](audit/phase-1/audit.md#task-1-durability-recovery-boundary)
 for the recovery procedure.
 
 ## Status vocabulary
