@@ -16,6 +16,10 @@ fn temp_dataset(label: &str) -> tempfile::TempDir {
 fn compacting_an_empty_dataset_publishes_a_new_version() {
     let directory = temp_dataset("empty");
     let dataset = Dataset::create(directory.path(), mvp_schema()).unwrap();
+    let source_timestamp = strata_storage::read_current(directory.path())
+        .unwrap()
+        .unwrap()
+        .committed_at_us;
 
     let report = dataset
         .compact(CompactionPolicy::retain_snapshots())
@@ -28,6 +32,14 @@ fn compacting_an_empty_dataset_publishes_a_new_version() {
         0
     );
     assert!(dataset.data_files().is_empty());
+    assert!(
+        strata_storage::read_current(directory.path())
+            .unwrap()
+            .unwrap()
+            .committed_at_us
+            > source_timestamp,
+        "compaction must issue a fresh manifest publication timestamp"
+    );
 }
 
 #[test]

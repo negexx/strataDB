@@ -491,9 +491,7 @@ impl Dataset {
             .write_attempt_counter
             .load(std::sync::atomic::Ordering::SeqCst);
         manifest.next_row_id = self.row_ids.next_row_id();
-        manifest.committed_at_us = self
-            .last_issued_timestamp
-            .load(std::sync::atomic::Ordering::SeqCst);
+        manifest.committed_at_us = issue_timestamp(&self.last_issued_timestamp)?;
         // The manifest must not become durable before the directory entry
         // for every replacement object is durable. This is the same
         // publication precondition used by the normal commit path.
@@ -679,10 +677,11 @@ impl Dataset {
             return Err(TxnError::AlreadyExists(dir));
         }
         sync_dataset_directory_anchor(&dir)?;
-        let manifest = Manifest::empty_with_schema(schema.as_ref());
+        let mut manifest = Manifest::empty_with_schema(schema.as_ref());
+        let last_issued_timestamp = Arc::new(AtomicI64::new(manifest.commit_time_high_water));
+        manifest.committed_at_us = issue_timestamp(&last_issued_timestamp)?;
         initialize_row_id_high_water(&dir)?;
         commit_manifest(&dir, &manifest)?;
-        let last_issued_timestamp = Arc::new(AtomicI64::new(manifest.commit_time_high_water));
         let durable_high_water = read_row_id_high_water(&dir)?.unwrap_or(0);
         let row_ids = Arc::new(RowIdAllocator::new(
             dir.clone(),
