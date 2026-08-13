@@ -23,7 +23,7 @@ fn maintenance_reduces_unprotected_history_and_reports_the_bound() {
         .maintain(LifecycleMaintenancePolicy {
             keep_latest_versions: 1,
             max_age_us: 0,
-            max_data_objects: 1,
+            max_data_objects: 2,
             max_segments: 1,
         })
         .unwrap();
