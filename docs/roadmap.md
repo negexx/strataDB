@@ -78,7 +78,7 @@ These are not requests for compaction in Phase 1.
 
 | Capability | Placement | Current boundary |
 |---|---|---|
-| Compaction, vacuum, orphan cleanup, bounded history | Phase 3 | Explicit compaction rewrites the current live snapshot, age retention removes eligible historical manifests, vacuum removes recognized unprotected `.arrow`/`.seg` and temporary objects, and `Dataset::maintain()` reports conditional storage-bound enforcement. Unknown object types and cross-process universal bounds remain out of scope. |
+| Compaction, vacuum, orphan cleanup, bounded history | Phase 3 | Explicit compaction rewrites the current live snapshot, age retention removes eligible historical manifests, vacuum removes recognized unprotected `.arrow`/`.seg` and temporary objects, and `Dataset::maintain()` reports a final inventory observation of requested storage bounds; it is neither atomic nor continuing enforcement. Unknown object types and cross-process universal bounds remain out of scope. |
 | Schema catalog, migrations, point lookup, time travel, stable query API | Phase 2–3 | Current Arrow batches/manifests are not a complete catalog or migration layer. |
 | Independent-open and cross-process coordination | Phase 4 | Shared-handle locking is not durable conditional publication. |
 | Fork, abort, branch reads, and merge | Phase 5 | Immutable segments are a prerequisite, not a delivered feature. |
