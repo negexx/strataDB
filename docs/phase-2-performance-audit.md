@@ -14,3 +14,8 @@ the manifest-listed segment path. This is an evidence gap, not a confirmed runti
 
 The Phase 1 pinned benchmark run `31647664161` is supporting repository evidence, not a Phase 2
 query-operator benchmark.
+
+The first Phase 2 query-evidence run [31652917305](https://github.com/negexx/strataDB/actions/runs/31652917305)
+passed on the pinned Ubuntu 24.04/Rust 1.97.1 environment. Its 100,000-row, 3,638,554-byte
+fixture measured approximately 620 microseconds for a full read and 399 microseconds for a
+one-column read. This is a bounded comparison, not a universal latency claim.
