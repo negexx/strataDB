@@ -426,11 +426,9 @@ impl Dataset {
             columns.push(Arc::new(UInt64Array::from(row_id_values)) as ArrayRef);
             columns.push(Arc::new(Int64Array::from(timestamp_values)) as ArrayRef);
             let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
-            let mut stats = compute_stats(&logical_batch);
             for (index, entry) in old_data_files.iter().enumerate() {
                 merge_zone_map_stats(&mut zone_map, &entry.stats, index == 0);
             }
-            stats.extend(zone_map.clone());
             let row_ids = batch
                 .column(batch.schema_ref().index_of(ROW_ID_COLUMN)?)
                 .as_any()
@@ -439,21 +437,30 @@ impl Dataset {
                     expected: "physical _row_id UInt64".to_owned(),
                     actual: format!("{:?}", batch.schema_ref()),
                 })?;
-            let row_id_range = if row_ids.is_empty() {
-                None
-            } else {
-                Some((row_ids.value(0), row_ids.value(row_ids.len() - 1)))
-            };
-            let file_name = format!("{attempt_id:020}-0.arrow");
-            let metadata = write_batch(&data_dir.join(&file_name), &batch)?;
-            new_data_files.push(DataFileEntry {
-                name: file_name,
-                byte_len: metadata.byte_len,
-                crc32c: metadata.crc32c,
-                row_count: u64::try_from(batch.num_rows())?,
-                row_id_range,
-                stats,
-            });
+            let mut run_start = 0;
+            let mut run_index = 0;
+            while run_start < row_ids.len() {
+                let mut run_end = run_start + 1;
+                while run_end < row_ids.len()
+                    && row_ids.value(run_end) == row_ids.value(run_end - 1).saturating_add(1)
+                {
+                    run_end += 1;
+                }
+                let run_len = run_end - run_start;
+                let run_batch = batch.slice(run_start, run_len);
+                let file_name = format!("{attempt_id:020}-{run_index}.arrow");
+                let metadata = write_batch(&data_dir.join(&file_name), &run_batch)?;
+                new_data_files.push(DataFileEntry {
+                    name: file_name,
+                    byte_len: metadata.byte_len,
+                    crc32c: metadata.crc32c,
+                    row_count: u64::try_from(run_len)?,
+                    row_id_range: Some((row_ids.value(run_start), row_ids.value(run_end - 1))),
+                    stats: compute_stats(&logical_batch.slice(run_start, run_len)),
+                });
+                run_start = run_end;
+                run_index += 1;
+            }
             vector_inserts = build_vector_inserts_with_physical_row_ids(&batch)?;
         }
         let new_segment =
@@ -562,20 +569,24 @@ impl Dataset {
         let mut objects_deleted = 0_u64;
         let mut bytes_deleted = 0_u64;
         for key in manifest_listed_objects {
-            let Some(bytes) = listed_data_objects.get(&key).copied() else {
-                return Err(TxnError::Storage(
-                    strata_storage::StorageError::CorruptManifest(
-                        self.dir.join(&key),
-                        "manifest-listed data object is missing from inventory".to_owned(),
-                    ),
-                ));
-            };
             let name = key.strip_prefix("data/").ok_or_else(|| {
                 TxnError::Storage(strata_storage::StorageError::CorruptManifest(
                     self.dir.join(&key),
                     "manifest-listed object has an invalid data prefix".to_owned(),
                 ))
             })?;
+            let Some(bytes) = listed_data_objects.get(&key).copied() else {
+                if protected_data.contains(name) || protected_segments.contains(name) {
+                    return Err(TxnError::Storage(
+                        strata_storage::StorageError::CorruptManifest(
+                            self.dir.join(&key),
+                            "protected manifest-listed data object is missing from inventory"
+                                .to_owned(),
+                        ),
+                    ));
+                }
+                continue;
+            };
             if !protected_data.contains(name) && !protected_segments.contains(name) {
                 backend.delete(&key)?;
                 objects_deleted = objects_deleted

@@ -130,6 +130,43 @@ fn compaction_drops_tombstone_history_that_no_longer_has_physical_owners() {
 }
 
 #[test]
+fn compaction_splits_noncontiguous_row_ids_into_valid_catalog_ranges() {
+    let directory = temp_dataset("gapped-rows");
+    let dataset = Dataset::create(directory.path(), mvp_schema()).unwrap();
+    let mut transaction = dataset.begin();
+    transaction
+        .insert(
+            mvp_batch(&[
+                (0, "row", [0.0, 0.0, 1.0]),
+                (1, "row", [1.0, 0.0, 1.0]),
+                (2, "row", [2.0, 0.0, 1.0]),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+    transaction.commit().unwrap();
+
+    let mut delete = dataset.begin();
+    delete.delete(1).unwrap();
+    delete.commit().unwrap();
+
+    dataset
+        .compact(CompactionPolicy::retain_snapshots())
+        .unwrap();
+    let reopened = Dataset::open(directory.path()).unwrap();
+    let ranges = reopened
+        .data_files()
+        .iter()
+        .map(|entry| entry.row_id_range)
+        .collect::<Vec<_>>();
+    assert_eq!(ranges, vec![Some((0, 0)), Some((2, 2))]);
+    assert_eq!(
+        reopened.snapshot().scan(&mvp_schema()).unwrap().num_rows(),
+        2
+    );
+}
+
+#[test]
 fn compaction_records_an_empty_occ_history_entry_for_preexisting_transactions() {
     let directory = temp_dataset("occ-gap");
     let dataset = Dataset::create(directory.path(), mvp_schema()).unwrap();
