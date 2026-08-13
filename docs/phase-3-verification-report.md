@@ -2,13 +2,13 @@
 
 **Run date:** 2026-08-13
 **Branch:** `codex/phase-3-vacuum`
-**Remediation head:** `12478ebace5dae1bd527b3450e6a841a6ce5a772`
+**Remediation head:** `5a08bab096416b02b64fcb492b7d0114b1e192f4`
 
 ## Fresh cloud provenance
 
 Canonical final exact-head GitHub Actions run
-[31705066942](https://github.com/negexx/strataDB/actions/runs/31705066942) completed successfully
-for final remediation head `12478ebace5dae1bd527b3450e6a841a6ce5a772`. The controller reported all
+[31711298549](https://github.com/negexx/strataDB/actions/runs/31711298549) completed successfully
+for final remediation head `5a08bab096416b02b64fcb492b7d0114b1e192f4`. The controller reported all
 workflow jobs successful:
 
 - `ci`;
@@ -18,9 +18,14 @@ workflow jobs successful:
 - `thorough-chaos`; and
 - `windows-directory-durability`.
 
-This is the canonical final exact-head evidence for the Task 1–4 remediation aggregate, including manifest-publication
-timestamps, recovery-recognized numeric manifest authority, constrained vacuum cleanup, lifecycle
-inventory compatibility, and compaction crash/reopen coverage.
+This is the canonical final exact-head evidence for the Task 1–6 remediation aggregate, including
+manifest-publication timestamps; Task 6 exact-key protection for recovery-recognized numeric manifest
+keys, with duplicate padded/unpadded aliases rejected fail-closed; constrained vacuum cleanup; lifecycle
+inventory compatibility; and compaction crash/reopen coverage. It also covers the unpadded current-manifest
+vacuum regression: both the protected row file and vector segment survive, and after reopening the
+dataset the vector search returns physical row ID `0`. The active-snapshot compaction regression now
+correctly asserts that two unprotected superseded objects are reclaimed while the historical snapshot's
+row file and vector segment remain readable.
 
 ## Prior cloud provenance
 
@@ -36,10 +41,11 @@ listed above. It remains retained provenance for the earlier Task 1–4 remediat
 
 ## Local limitation
 
-The local Windows host has no MSVC `link.exe`; the Task 1–4 native `cargo test` attempts stopped at
-linking before test assertions ran. Their targeted compile-only checks passed where recorded in the
-task ledgers. This is an environment limitation, not a local test-pass claim; the exact-head cloud
-run above supplies the completed functional evidence.
+The local Windows host has no MSVC `link.exe`; the Task 1–6 native `cargo test` attempts, including
+the strengthened unpadded vacuum/vector regression, stopped at linking before test assertions ran.
+Their targeted compile-only checks passed where recorded in the task ledgers. This is an environment
+limitation, not a local test-pass claim; the exact-head cloud run above supplies the completed
+functional evidence.
 
 ## Claim boundary
 

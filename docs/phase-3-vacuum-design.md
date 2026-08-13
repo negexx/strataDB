@@ -1,10 +1,10 @@
 # Phase 3 Vacuum Design
 
-**Status:** implementation plan for the next bounded lifecycle slice
+**Status:** Implemented and accepted for the bounded Phase 3 lifecycle scope; Phase 3 remains Partial.
 
 ## Goal
 
-Add an explicit, shared-handle vacuum operation that removes only safely classified unreferenced
+Provide an explicit, shared-handle vacuum operation that removes only safely classified unreferenced
 data objects and temporary files, while preserving every manifest-listed object reachable from any
 durable manifest and validating the current manifest and active snapshot leases.
 
@@ -14,7 +14,7 @@ Vacuum remains embedded and single-process. It does not coordinate independent `
 delete manifests, rewrite rows, compact segments, apply age-based retention, or claim a universal
 storage-growth bound. Unknown files and malformed authority remain fail-closed.
 
-## Proposed API
+## Supported API
 
 ```rust
 pub struct VacuumReport {
@@ -46,8 +46,10 @@ reported as unknown and left untouched.
 
 ## Verification
 
-Tests must cover empty vacuum, orphan row/segment cleanup, temporary-file cleanup, active snapshot
-protection, malformed/missing protected objects, unknown-file preservation, deletion counts/bytes,
-and retry after a post-unlink synchronization error. The existing lifecycle coordination loom model
-covers the unchanged exclusive/preparation lock contract; a filesystem-level vacuum loom model is
-not applicable because the behavior depends on backend listings and durable directory operations.
+Regression coverage includes empty vacuum, orphan row/segment cleanup, temporary-file cleanup,
+active snapshot protection, malformed/missing protected objects, unknown-file preservation,
+deletion counts/bytes, retry after a post-unlink synchronization error, exact recovery-recognized
+manifest-key protection, and unpadded current-manifest row/segment preservation across reopen and
+vector search. The existing lifecycle coordination loom model covers the unchanged
+exclusive/preparation lock contract; a filesystem-level vacuum loom model is not applicable because
+the behavior depends on backend listings and durable directory operations.
