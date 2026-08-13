@@ -75,8 +75,8 @@ pub(crate) struct ManifestPruneCandidate {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ListedManifest {
-    key: String,
+pub(crate) struct ListedManifest {
+    pub(crate) key: String,
     bytes: u64,
 }
 
@@ -279,7 +279,9 @@ pub(crate) fn build_age_manifest_prune_authority(
     })
 }
 
-fn index_manifest_objects(objects: &[ObjectMeta]) -> Result<BTreeMap<u64, ListedManifest>> {
+pub(crate) fn index_manifest_objects(
+    objects: &[ObjectMeta],
+) -> Result<BTreeMap<u64, ListedManifest>> {
     let mut versions = BTreeMap::new();
     for object in objects {
         validate_listed_key(&object.key, "_versions/")?;

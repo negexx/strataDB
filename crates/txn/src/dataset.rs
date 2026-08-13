@@ -32,7 +32,7 @@ use strata_index::{EfConstruction, HnswIndex, MaxConnections, MaxElements, MaxLa
 use strata_storage::{
     Backend, ColumnStats, DataFileEntry, LocalFs, Manifest, SegmentEntry, Value, commit_manifest,
     compute_stats, initialize_row_id_high_water, read_current, read_current_with_byte_count,
-    read_manifest_at_key_with_byte_count, read_manifest_with_byte_count, read_row_id_high_water,
+    read_manifest_at_key_with_byte_count, read_row_id_high_water,
     read_row_id_high_water_with_byte_count, sync_dir, write_batch, write_bytes,
 };
 
@@ -41,7 +41,10 @@ use crate::compaction::{CompactionPolicy, CompactionReport};
 use crate::error::{Result, TxnError};
 use crate::lifecycle_coordination::LifecycleCoordinator;
 use crate::live_set_cache::LiveSetCache;
-use crate::retention::{AgeRetentionPolicy, RetentionPlan, RetentionPolicy, SnapshotLeaseRegistry};
+use crate::retention::{
+    AgeRetentionPolicy, RetentionPlan, RetentionPolicy, SnapshotLeaseRegistry,
+    index_manifest_objects,
+};
 use crate::row_id::{RowIdAllocator, RowIdRange};
 use crate::snapshot::Snapshot;
 
@@ -575,31 +578,28 @@ impl Dataset {
         self.current.store(Arc::new(snapshot));
         drop(source);
 
+        let backend = LocalFs::new(&self.dir);
+        let manifest_keys = index_manifest_objects(&backend.list("_versions/")?)?;
         let mut protected_data = HashSet::new();
         let mut protected_segments = HashSet::new();
         for version in self.live_snapshot_versions() {
-            let (manifest, _) = read_manifest_with_byte_count(&self.dir, version)?;
+            let key = manifest_keys.get(&version).ok_or_else(|| {
+                TxnError::Storage(strata_storage::StorageError::CorruptManifest(
+                    self.dir.join(format!("_versions/{version:020}.manifest")),
+                    "protected manifest is missing from inventory".to_owned(),
+                ))
+            })?;
+            let (manifest, _) = read_manifest_at_key_with_byte_count(&self.dir, &key.key, version)?;
             let owned_rows = validate_data_files(&self.dir, &manifest, &logical_schema, None)?;
             validate_tombstones(&self.dir, &manifest, &owned_rows)?;
             let _ = load_segments(&self.dir, &manifest, &owned_rows, None)?;
             protected_data.extend(manifest.data_files.into_iter().map(|entry| entry.name));
             protected_segments.extend(manifest.segments.into_iter().map(|entry| entry.name));
         }
-        let backend = LocalFs::new(&self.dir);
         let mut manifest_listed_objects = HashSet::new();
-        for object in backend.list("_versions/")? {
-            let Some(stem) = object
-                .key
-                .strip_prefix("_versions/")
-                .and_then(|key| key.strip_suffix(".manifest"))
-            else {
-                continue;
-            };
-            let Ok(version) = stem.parse::<u64>() else {
-                continue;
-            };
+        for (version, key) in manifest_keys {
             let (historical, _) =
-                read_manifest_at_key_with_byte_count(&self.dir, &object.key, version)?;
+                read_manifest_at_key_with_byte_count(&self.dir, &key.key, version)?;
             let reachable = crate::lifecycle::reachable_keys(&historical)?;
             manifest_listed_objects.extend(reachable.data_files);
             manifest_listed_objects.extend(reachable.segments);

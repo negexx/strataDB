@@ -120,6 +120,56 @@ fn compaction_reclaims_superseded_objects_after_old_snapshot_drops() {
 }
 
 #[test]
+fn compaction_reads_an_unpadded_active_snapshot_manifest_key_and_preserves_its_objects() {
+    // Break caught: rebuilding a padded key for an active snapshot rejects a
+    // recovery-recognized unpadded manifest after publication, leaving
+    // compaction unable to preserve that snapshot's physical objects.
+    let directory = temp_dataset("unpadded-active-snapshot");
+    let dataset = Dataset::create(directory.path(), mvp_schema()).unwrap();
+    let mut first = dataset.begin();
+    first
+        .insert(mvp_batch(&[(1, "first", [1.0, 0.0, 1.0])]).unwrap())
+        .unwrap();
+    first.commit().unwrap();
+    let historical = dataset.snapshot();
+    let protected = strata_storage::read_current(directory.path())
+        .unwrap()
+        .unwrap()
+        .data_files
+        .into_iter()
+        .map(|entry| dataset.data_dir().join(entry.name))
+        .collect::<Vec<_>>();
+
+    let mut second = dataset.begin();
+    second
+        .insert(mvp_batch(&[(2, "second", [2.0, 0.0, 1.0])]).unwrap())
+        .unwrap();
+    second.commit().unwrap();
+    std::fs::rename(
+        directory
+            .path()
+            .join("_versions/00000000000000000001.manifest"),
+        directory.path().join("_versions/1.manifest"),
+    )
+    .unwrap();
+
+    let report = dataset
+        .compact(CompactionPolicy::retain_snapshots())
+        .unwrap();
+
+    assert_eq!(report.objects_deleted, 0);
+    assert!(protected.iter().all(|path| path.exists()));
+    assert_eq!(historical.scan(&mvp_schema()).unwrap().num_rows(), 1);
+    assert_eq!(
+        historical
+            .vector_search(&[1.0, 0.0, 1.0], 1, None)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
 fn compaction_drops_tombstone_history_that_no_longer_has_physical_owners() {
     let directory = temp_dataset("tombstones");
     let dataset = Dataset::create(directory.path(), mvp_schema()).unwrap();

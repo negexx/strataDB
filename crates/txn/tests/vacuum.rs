@@ -1,7 +1,10 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use strata_txn::Dataset;
+use std::path::Path;
+
+use strata_storage::StorageError;
 use strata_txn::mvp_fixtures::{mvp_batch, mvp_schema};
+use strata_txn::{Dataset, TxnError};
 
 fn temp_dataset(label: &str) -> tempfile::TempDir {
     tempfile::Builder::new()
@@ -76,6 +79,68 @@ fn vacuum_preserves_active_snapshot_objects() {
 
     assert_eq!(report.objects_deleted, 0);
     assert_eq!(historical.scan(&mvp_schema()).unwrap().num_rows(), 1);
+}
+
+#[test]
+fn vacuum_reads_an_unpadded_current_manifest_key_and_preserves_its_objects() {
+    // Break caught: reconstructing the padded spelling for the current
+    // manifest rejects recovery-recognized unpadded authority and prevents
+    // vacuum from protecting its referenced data.
+    let directory = temp_dataset("unpadded-current");
+    let dataset = Dataset::create(directory.path(), mvp_schema()).unwrap();
+    let mut transaction = dataset.begin();
+    transaction
+        .insert(mvp_batch(&[(1, "row", [1.0, 0.0, 1.0])]).unwrap())
+        .unwrap();
+    transaction.commit().unwrap();
+    let snapshot = dataset.snapshot();
+    let protected = strata_storage::read_current(directory.path())
+        .unwrap()
+        .unwrap()
+        .data_files
+        .into_iter()
+        .map(|entry| dataset.data_dir().join(entry.name))
+        .collect::<Vec<_>>();
+    std::fs::rename(
+        directory
+            .path()
+            .join("_versions/00000000000000000001.manifest"),
+        directory.path().join("_versions/1.manifest"),
+    )
+    .unwrap();
+    let orphan = dataset.data_dir().join("unprotected.arrow");
+    std::fs::write(&orphan, b"orphan").unwrap();
+
+    let report = dataset.vacuum().unwrap();
+
+    assert_eq!(report.objects_deleted, 1);
+    assert!(!orphan.exists());
+    assert!(protected.iter().all(|path| path.exists()));
+    assert_eq!(snapshot.scan(&mvp_schema()).unwrap().num_rows(), 1);
+}
+
+#[test]
+fn vacuum_fails_closed_for_duplicate_padded_and_unpadded_manifest_aliases() {
+    // Break caught: accepting both spellings for one numeric version creates
+    // conflicting durable authority over the objects vacuum must protect.
+    let directory = temp_dataset("duplicate-manifest-alias");
+    let dataset = Dataset::create(directory.path(), mvp_schema()).unwrap();
+    std::fs::copy(
+        directory
+            .path()
+            .join("_versions/00000000000000000000.manifest"),
+        directory.path().join("_versions/0.manifest"),
+    )
+    .unwrap();
+
+    let error = dataset.vacuum().unwrap_err();
+
+    assert!(matches!(
+        error,
+        TxnError::Storage(StorageError::CorruptManifest(path, reason))
+            if path == Path::new("_versions/00000000000000000000.manifest")
+                && reason == "duplicate listed manifest version"
+    ));
 }
 
 #[test]

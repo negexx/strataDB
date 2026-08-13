@@ -2,12 +2,11 @@
 
 use std::collections::HashSet;
 
-use strata_storage::{
-    Backend, LocalFs, read_manifest_at_key_with_byte_count, read_manifest_with_byte_count,
-};
+use strata_storage::{Backend, LocalFs, read_manifest_at_key_with_byte_count};
 
 use crate::dataset::{Dataset, load_segments, validate_data_files, validate_tombstones};
 use crate::error::{Result, TxnError};
+use crate::retention::index_manifest_objects;
 
 /// Result of one vacuum operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,9 +38,19 @@ impl Dataset {
         protected_versions.push(observed_version);
         protected_versions.sort_unstable();
         protected_versions.dedup();
+        let backend = LocalFs::new(self.retention_dir());
+        let manifest_keys = index_manifest_objects(&backend.list("_versions/")?)?;
 
         for version in protected_versions {
-            let (manifest, _) = read_manifest_with_byte_count(self.retention_dir(), version)?;
+            let key = manifest_keys.get(&version).ok_or_else(|| {
+                TxnError::Storage(strata_storage::StorageError::CorruptManifest(
+                    self.retention_dir()
+                        .join(format!("_versions/{version:020}.manifest")),
+                    "protected manifest is missing from inventory".to_owned(),
+                ))
+            })?;
+            let (manifest, _) =
+                read_manifest_at_key_with_byte_count(self.retention_dir(), &key.key, version)?;
             let owned_rows =
                 validate_data_files(self.retention_dir(), &manifest, &current.schema, None)?;
             validate_tombstones(self.retention_dir(), &manifest, &owned_rows)?;
@@ -60,20 +69,9 @@ impl Dataset {
             );
         }
 
-        let backend = LocalFs::new(self.retention_dir());
-        for object in backend.list("_versions/")? {
-            let Some(stem) = object
-                .key
-                .strip_prefix("_versions/")
-                .and_then(|key| key.strip_suffix(".manifest"))
-            else {
-                continue;
-            };
-            let Ok(version) = stem.parse::<u64>() else {
-                continue;
-            };
+        for (version, key) in manifest_keys {
             let (manifest, _) =
-                read_manifest_at_key_with_byte_count(self.retention_dir(), &object.key, version)?;
+                read_manifest_at_key_with_byte_count(self.retention_dir(), &key.key, version)?;
             let reachable = crate::lifecycle::reachable_keys(&manifest)?;
             protected.extend(reachable.data_files.into_iter().chain(reachable.segments));
         }
