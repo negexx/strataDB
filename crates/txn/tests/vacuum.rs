@@ -72,6 +72,7 @@ fn vacuum_fails_closed_when_the_current_manifest_object_is_missing() {
 
     assert!(matches!(
         error,
-        strata_txn::TxnError::Storage(strata_storage::StorageError::Io(_))
+        strata_txn::TxnError::Io(ref source)
+            if source.kind() == std::io::ErrorKind::NotFound
     ));
 }
