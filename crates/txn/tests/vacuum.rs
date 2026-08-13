@@ -94,12 +94,19 @@ fn vacuum_reads_an_unpadded_current_manifest_key_and_preserves_its_objects() {
         .unwrap();
     transaction.commit().unwrap();
     let snapshot = dataset.snapshot();
-    let protected = strata_storage::read_current(directory.path())
+    let manifest = strata_storage::read_current(directory.path())
         .unwrap()
-        .unwrap()
+        .unwrap();
+    let protected = manifest
         .data_files
-        .into_iter()
-        .map(|entry| dataset.data_dir().join(entry.name))
+        .iter()
+        .map(|entry| dataset.data_dir().join(&entry.name))
+        .chain(
+            manifest
+                .segments
+                .iter()
+                .map(|entry| dataset.data_dir().join(&entry.name)),
+        )
         .collect::<Vec<_>>();
     std::fs::rename(
         directory
@@ -117,6 +124,19 @@ fn vacuum_reads_an_unpadded_current_manifest_key_and_preserves_its_objects() {
     assert!(!orphan.exists());
     assert!(protected.iter().all(|path| path.exists()));
     assert_eq!(snapshot.scan(&mvp_schema()).unwrap().num_rows(), 1);
+
+    drop(snapshot);
+    drop(dataset);
+    let reopened = Dataset::open(directory.path()).unwrap();
+    let hits = reopened
+        .snapshot()
+        .vector_search(&[1.0, 0.0, 1.0], 1, None)
+        .unwrap();
+    assert_eq!(
+        hits.iter().map(|hit| hit.row_id).collect::<Vec<_>>(),
+        vec![0],
+        "vacuum must preserve the unpadded current manifest's loadable vector segment and its valid physical row ID"
+    );
 }
 
 #[test]
