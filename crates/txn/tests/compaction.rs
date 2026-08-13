@@ -132,12 +132,19 @@ fn compaction_reads_an_unpadded_active_snapshot_manifest_key_and_preserves_its_o
         .unwrap();
     first.commit().unwrap();
     let historical = dataset.snapshot();
-    let protected = strata_storage::read_current(directory.path())
+    let protected_manifest = strata_storage::read_current(directory.path())
         .unwrap()
-        .unwrap()
+        .unwrap();
+    let protected = protected_manifest
         .data_files
-        .into_iter()
-        .map(|entry| dataset.data_dir().join(entry.name))
+        .iter()
+        .map(|entry| dataset.data_dir().join(&entry.name))
+        .chain(
+            protected_manifest
+                .segments
+                .iter()
+                .map(|entry| dataset.data_dir().join(&entry.name)),
+        )
         .collect::<Vec<_>>();
 
     let mut second = dataset.begin();
@@ -157,7 +164,7 @@ fn compaction_reads_an_unpadded_active_snapshot_manifest_key_and_preserves_its_o
         .compact(CompactionPolicy::retain_snapshots())
         .unwrap();
 
-    assert_eq!(report.objects_deleted, 0);
+    assert_eq!(report.objects_deleted, 2);
     assert!(protected.iter().all(|path| path.exists()));
     assert_eq!(historical.scan(&mvp_schema()).unwrap().num_rows(), 1);
     assert_eq!(
