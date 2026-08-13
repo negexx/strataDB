@@ -113,8 +113,9 @@ already-dead targets return typed errors. Logical identity remains deferred.
 
 Each vector-carrying commit creates an immutable HNSW segment. Search asks applicable segments for local
 candidates, merges them into global top-k, and applies live/tombstone filtering. This provides a coherent
-segment set, not a universal ANN recall or performance guarantee. Segment count grows with commits and
-is not currently bounded by compaction.
+segment set, not a universal ANN recall or performance guarantee. Segment count grows with commits
+until explicit compaction is requested; no universal supported segment-count or storage-growth bound
+is claimed.
 
 Predicates and statistics can prune files or segments that cannot match. Filtered ANN uses predicate
 pruning and a live-set constraint. These are query primitives, not a planner-integrated SQL engine or a

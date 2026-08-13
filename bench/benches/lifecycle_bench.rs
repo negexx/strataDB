@@ -52,7 +52,7 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use strata_bench::{ManifestListedFile, SnapshotFootprint, pinned_snapshot_footprint_diagnostics};
 use strata_query::{AggFunc, Predicate};
 use strata_storage::{Value, read_current_with_byte_count};
-use strata_txn::{Dataset, Snapshot};
+use strata_txn::{CompactionPolicy, Dataset, Snapshot};
 
 // ---- counting allocator ---------------------------------------------------
 
@@ -550,6 +550,31 @@ fn main() {
             recovery_bytes.row_data_bytes,
             recovery_bytes.row_id_catalog_bytes,
             recovery_bytes.segment_bytes,
+        ),
+        mem: phase_end(m),
+    });
+
+    // ---- Phase 2b: explicit compaction ----------------------------------
+    // Drop benchmark-only historical pins so this measures the reclaiming
+    // path as well as replacement-file/index construction. The residency
+    // phase below recreates its pins after compaction.
+    retained_snapshots.clear();
+    let m = phase_start();
+    let t = Instant::now();
+    let compacted = ds.compact(CompactionPolicy::retain_snapshots()).unwrap();
+    let wall = t.elapsed();
+    results.push(PhaseResult {
+        name: "compaction+reclaim",
+        kind: "HNSW rebuild + row rewrite + fsync + reclamation",
+        wall,
+        detail: format!(
+            "published v{} from v{}; wrote {} row files + {} segments; deleted {} objects ({} bytes)",
+            compacted.published_version,
+            compacted.source_version,
+            compacted.row_files_written,
+            compacted.segments_written,
+            compacted.objects_deleted,
+            compacted.bytes_deleted,
         ),
         mem: phase_end(m),
     });

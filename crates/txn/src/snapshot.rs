@@ -277,6 +277,10 @@ impl Snapshot {
             .collect()
     }
 
+    pub(crate) fn read_surviving_physical_batches(&self) -> Result<Vec<RecordBatch>> {
+        self.read_surviving_files(None, None, Ok)
+    }
+
     /// Removes every row whose `ROW_ID_COLUMN` value is in
     /// `self.tombstones` from `batch`. A no-op that returns `batch`
     /// unchanged (no allocation, no column scan) when this snapshot has no

@@ -6,6 +6,7 @@
 //! storage, index, and query crates are internal implementation layers.
 
 pub mod commit_log;
+pub mod compaction;
 pub mod dataset;
 pub mod error;
 mod lifecycle;
@@ -19,6 +20,7 @@ pub(crate) mod row_id;
 pub mod snapshot;
 
 pub use arrow;
+pub use compaction::{CompactionPolicy, CompactionReport};
 pub use dataset::{Dataset, ROW_ID_COLUMN, TIMESTAMP_COLUMN, Transaction};
 pub use error::{Result, TxnError};
 pub use lifecycle::LifecycleReport;

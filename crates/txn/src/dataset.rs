@@ -25,18 +25,19 @@ use std::sync::Mutex;
 // to avoid an unused-import warning in the loom build.
 #[cfg(not(loom))]
 use arc_swap::ArcSwap;
-use arrow::array::{Array, ArrayRef, RecordBatch, RecordBatchOptions, UInt64Array};
-use arrow::compute::cast;
+use arrow::array::{Array, ArrayRef, Int64Array, RecordBatch, RecordBatchOptions, UInt64Array};
+use arrow::compute::{cast, concat_batches};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use strata_index::{EfConstruction, HnswIndex, MaxConnections, MaxElements, MaxLayers};
 use strata_storage::{
     Backend, ColumnStats, DataFileEntry, LocalFs, Manifest, SegmentEntry, Value, commit_manifest,
     compute_stats, initialize_row_id_high_water, read_current, read_current_with_byte_count,
-    read_row_id_high_water, read_row_id_high_water_with_byte_count, sync_dir, write_batch,
-    write_bytes,
+    read_manifest_with_byte_count, read_row_id_high_water, read_row_id_high_water_with_byte_count,
+    sync_dir, write_batch, write_bytes,
 };
 
 use crate::commit_log::{CommitLog, ConflictCheck};
+use crate::compaction::{CompactionPolicy, CompactionReport};
 use crate::error::{Result, TxnError};
 use crate::lifecycle_coordination::LifecycleCoordinator;
 use crate::live_set_cache::LiveSetCache;
@@ -343,6 +344,220 @@ fn parse_attempt_id_prefix(file_name: &str) -> Option<u64> {
 }
 
 impl Dataset {
+    /// Rewrites the current logical snapshot into a compacted physical layout.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed storage, manifest, schema, or index error if the
+    /// replacement objects cannot be written or the durable publication
+    /// fails.
+    #[allow(clippy::too_many_lines)]
+    pub fn compact(&self, policy: CompactionPolicy) -> Result<CompactionReport> {
+        if !policy.retain_snapshots {
+            return Err(TxnError::InvalidCompactionPolicy);
+        }
+        let _lifecycle_guard = self.lifecycle_coordinator.acquire_exclusive();
+        let mut commit_log = self
+            .commit_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let source = self.current.load_full();
+        let source_version = source.version;
+        let old_data_files = source.manifest.data_files.clone();
+        let old_segments = source.manifest.segments.clone();
+        let physical_batches = source
+            .read_surviving_physical_batches()?
+            .into_iter()
+            .filter(|batch| batch.num_rows() != 0)
+            .collect::<Vec<_>>();
+        let mut manifest = source.manifest.as_ref().clone();
+        let logical_schema = Arc::clone(&source.schema);
+        let published_version = source_version
+            .checked_add(1)
+            .ok_or_else(|| TxnError::ManifestOverflow(format!("version {source_version} + 1")))?;
+        let attempt_id = self
+            .write_attempt_counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let data_dir = data_subdir(&self.dir);
+        std::fs::create_dir_all(&data_dir)?;
+
+        let mut new_data_files = Vec::new();
+        let mut vector_inserts = Vec::new();
+        let mut zone_map = std::collections::HashMap::new();
+        if !physical_batches.is_empty() {
+            let mut logical_batches = Vec::with_capacity(physical_batches.len());
+            let mut row_id_values = Vec::new();
+            let mut timestamp_values = Vec::new();
+            for physical in &physical_batches {
+                let row_ids = physical
+                    .column(physical.schema_ref().index_of(ROW_ID_COLUMN)?)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or_else(|| TxnError::BatchSchemaMismatch {
+                        expected: "physical _row_id UInt64".to_owned(),
+                        actual: format!("{:?}", physical.schema_ref()),
+                    })?;
+                let timestamps = physical
+                    .column(physical.schema_ref().index_of(TIMESTAMP_COLUMN)?)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| TxnError::BatchSchemaMismatch {
+                        expected: "physical _timestamp Int64".to_owned(),
+                        actual: format!("{:?}", physical.schema_ref()),
+                    })?;
+                row_id_values.extend(row_ids.values().iter().copied());
+                timestamp_values.extend(timestamps.values().iter().copied());
+                logical_batches.push(cast_batch_to_schema(physical, &source.schema)?);
+            }
+            let logical_batch = concat_batches(&source.schema, &logical_batches)?;
+            let encoded = if logical_batch.num_columns() == 0 {
+                logical_batch.clone()
+            } else {
+                strata_storage::encode_batch(&logical_batch)?
+            };
+            let mut fields: Vec<Field> = encoded
+                .schema_ref()
+                .fields()
+                .iter()
+                .map(|field| field.as_ref().clone())
+                .collect();
+            fields.push(Field::new(ROW_ID_COLUMN, DataType::UInt64, false));
+            fields.push(Field::new(TIMESTAMP_COLUMN, DataType::Int64, false));
+            let mut columns = encoded.columns().to_vec();
+            columns.push(Arc::new(UInt64Array::from(row_id_values)) as ArrayRef);
+            columns.push(Arc::new(Int64Array::from(timestamp_values)) as ArrayRef);
+            let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
+            let mut stats = compute_stats(&logical_batch);
+            for (index, entry) in old_data_files.iter().enumerate() {
+                merge_zone_map_stats(&mut zone_map, &entry.stats, index == 0);
+            }
+            stats.extend(zone_map.clone());
+            let row_ids = batch
+                .column(batch.schema_ref().index_of(ROW_ID_COLUMN)?)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| TxnError::BatchSchemaMismatch {
+                    expected: "physical _row_id UInt64".to_owned(),
+                    actual: format!("{:?}", batch.schema_ref()),
+                })?;
+            let row_id_range = if row_ids.is_empty() {
+                None
+            } else {
+                Some((row_ids.value(0), row_ids.value(row_ids.len() - 1)))
+            };
+            let file_name = format!("{attempt_id:020}-0.arrow");
+            let metadata = write_batch(&data_dir.join(&file_name), &batch)?;
+            new_data_files.push(DataFileEntry {
+                name: file_name,
+                byte_len: metadata.byte_len,
+                crc32c: metadata.crc32c,
+                row_count: u64::try_from(batch.num_rows())?,
+                row_id_range,
+                stats,
+            });
+            vector_inserts = build_vector_inserts_with_physical_row_ids(&batch)?;
+        }
+        let new_segment =
+            Transaction::build_and_write_segment(&data_dir, attempt_id, vector_inserts, zone_map)?;
+        let index = match &new_segment {
+            Some(segment) => {
+                let zone_map: Arc<dyn std::any::Any + Send + Sync> =
+                    Arc::new(segment.entry.zone_map.clone());
+                strata_index::SegmentSet::from_segments(vec![(
+                    Arc::clone(&segment.reader),
+                    zone_map,
+                )])
+            }
+            None => strata_index::SegmentSet::empty(),
+        };
+        manifest.version = published_version;
+        manifest.data_files = new_data_files;
+        manifest.segments = new_segment
+            .as_ref()
+            .map(|segment| vec![segment.entry.clone()])
+            .unwrap_or_default();
+        // Compaction removes the physical owners of deleted rows. Keeping
+        // those tombstone IDs would make the new manifest fail recovery's
+        // owner validation, so the compacted manifest starts a fresh live
+        // physical layout with no historical tombstone records.
+        manifest.tombstones.clear();
+        manifest.next_attempt_id = self
+            .write_attempt_counter
+            .load(std::sync::atomic::Ordering::SeqCst);
+        manifest.next_row_id = self.row_ids.next_row_id();
+        // The manifest must not become durable before the directory entry
+        // for every replacement object is durable. This is the same
+        // publication precondition used by the normal commit path.
+        sync_dir(&data_dir)?;
+        commit_manifest(&self.dir, &manifest)?;
+        let report = CompactionReport {
+            source_version,
+            published_version,
+            row_files_written: u64::try_from(manifest.data_files.len())?,
+            segments_written: u64::try_from(manifest.segments.len())?,
+            objects_deleted: 0,
+            bytes_deleted: 0,
+        };
+        // Compaction advances the manifest version without changing any
+        // logical row ownership. Record an empty write-set entry so the
+        // bounded OCC history has no version gap for transactions that
+        // began before compaction.
+        commit_log.push(published_version, Vec::new());
+        let snapshot = Snapshot {
+            dir: self.dir.clone(),
+            version: published_version,
+            lease: self.snapshot_leases.register(published_version),
+            schema: Arc::clone(&source.schema),
+            manifest: Arc::new(manifest),
+            index,
+            tombstones: Arc::new(imbl::HashSet::new()),
+            live_set_cache: LiveSetCache::new(crate::snapshot::LIVE_SET_CACHE_BYTE_BUDGET),
+        };
+        self.current.store(Arc::new(snapshot));
+        drop(source);
+
+        let mut protected_data = HashSet::new();
+        let mut protected_segments = HashSet::new();
+        for version in self.live_snapshot_versions() {
+            let (manifest, _) = read_manifest_with_byte_count(&self.dir, version)?;
+            let owned_rows = validate_data_files(&self.dir, &manifest, &logical_schema, None)?;
+            validate_tombstones(&self.dir, &manifest, &owned_rows)?;
+            let _ = load_segments(&self.dir, &manifest, &owned_rows, None)?;
+            protected_data.extend(manifest.data_files.into_iter().map(|entry| entry.name));
+            protected_segments.extend(manifest.segments.into_iter().map(|entry| entry.name));
+        }
+        let backend = LocalFs::new(&self.dir);
+        let mut objects_deleted = 0_u64;
+        let mut bytes_deleted = 0_u64;
+        for entry in old_data_files {
+            if !protected_data.contains(&entry.name) {
+                backend.delete(&format!("data/{}", entry.name))?;
+                objects_deleted = objects_deleted
+                    .checked_add(1)
+                    .ok_or_else(|| TxnError::ManifestOverflow("objects_deleted".to_owned()))?;
+                bytes_deleted = bytes_deleted
+                    .checked_add(entry.byte_len)
+                    .ok_or_else(|| TxnError::ManifestOverflow("bytes_deleted".to_owned()))?;
+            }
+        }
+        for entry in old_segments {
+            if !protected_segments.contains(&entry.name) {
+                backend.delete(&format!("data/{}", entry.name))?;
+                objects_deleted = objects_deleted
+                    .checked_add(1)
+                    .ok_or_else(|| TxnError::ManifestOverflow("objects_deleted".to_owned()))?;
+                bytes_deleted = bytes_deleted
+                    .checked_add(entry.byte_len)
+                    .ok_or_else(|| TxnError::ManifestOverflow("bytes_deleted".to_owned()))?;
+            }
+        }
+        Ok(CompactionReport {
+            objects_deleted,
+            bytes_deleted,
+            ..report
+        })
+    }
+
     /// Creates a brand-new, empty dataset at `dir`. Errors if one already
     /// exists there.
     ///
@@ -2562,6 +2777,61 @@ fn build_vector_inserts(batch: &RecordBatch, row_id_base: u64) -> Result<Vec<Vec
         });
     }
     Ok(entries)
+}
+
+fn build_vector_inserts_with_physical_row_ids(batch: &RecordBatch) -> Result<Vec<VectorInsert>> {
+    let Ok(vector_index) = batch.schema_ref().index_of("vector") else {
+        return Ok(Vec::new());
+    };
+    let row_id_index =
+        batch
+            .schema_ref()
+            .index_of(ROW_ID_COLUMN)
+            .map_err(|_| TxnError::BatchSchemaMismatch {
+                expected: "physical _row_id UInt64".to_owned(),
+                actual: format!("{:?}", batch.schema_ref()),
+            })?;
+    let vectors = batch
+        .column(vector_index)
+        .as_any()
+        .downcast_ref::<arrow::array::FixedSizeListArray>()
+        .ok_or_else(|| {
+            TxnError::Arrow(arrow::error::ArrowError::CastError(
+                "vector column must be FixedSizeList".to_string(),
+            ))
+        })?;
+    let row_ids = batch
+        .column(row_id_index)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .ok_or_else(|| TxnError::BatchSchemaMismatch {
+            expected: "physical _row_id UInt64".to_owned(),
+            actual: format!("{:?}", batch.schema_ref()),
+        })?;
+    let flat = vectors
+        .values()
+        .as_any()
+        .downcast_ref::<arrow::array::Float32Array>()
+        .ok_or_else(|| {
+            TxnError::Arrow(arrow::error::ArrowError::CastError(
+                "vector column's inner type must be Float32".to_string(),
+            ))
+        })?;
+    let value_length = usize::try_from(vectors.value_length()).unwrap_or(0);
+    let mut inserts = Vec::with_capacity(vectors.len());
+    for row in 0..vectors.len() {
+        if vectors.is_null(row) {
+            continue;
+        }
+        let start = row * value_length;
+        let vector = flat.values()[start..start + value_length].to_vec();
+        let row_id = row_ids.value(row);
+        if vector.iter().any(|component| !component.is_finite()) {
+            return Err(TxnError::NonFiniteVectorComponent { row_id });
+        }
+        inserts.push(VectorInsert { row_id, vector });
+    }
+    Ok(inserts)
 }
 
 /// Validates that every vector in `inserts` shares one consistent
