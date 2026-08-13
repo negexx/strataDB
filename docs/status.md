@@ -40,7 +40,10 @@ shared `Dataset` handle. `Dataset::prune_manifests(RetentionPolicy)` now execute
 manifest-only slice: it takes lifecycle exclusivity before `commit_lock`, rebuilds exact listed-key
 authority under both locks, retains current/latest/active-snapshot manifests, and deletes only
 eligible historical manifests. It does not reclaim rows, segments, temporary objects, or arbitrary
-orphans; compaction, retention-by-age, and cross-process lifecycle work remain later designs. See
+orphans. `Dataset::compact(CompactionPolicy)` now publishes one replacement row file and vector
+segment for the captured live snapshot, preserves active historical snapshots, and reclaims only
+superseded listed objects after publication. Retention-by-age, arbitrary orphan cleanup, and
+cross-process lifecycle work remain later designs. See
 the [inventory design](phase-3-lifecycle-inventory-design.md), [manifest executor
 design](phase-3-manifest-retention-executor-design.md), and focused [inventory](../crates/txn/tests/lifecycle_inventory.rs),
 [planner](../crates/txn/tests/retention_plan.rs), and [executor](../crates/txn/tests/manifest_retention_executor.rs)
@@ -50,20 +53,20 @@ tests.
 
 | Capability | State | Current boundary |
 |---|---|---|
-| Local storage/manifests | Implemented | Arrow files, manifests, statistics, and local filesystem persistence work. Manifest-only historical-manifest pruning exists; row/segment reclamation, compaction, vacuum, and orphan cleanup do not. |
+| Local storage/manifests | Implemented | Arrow files, manifests, statistics, and local filesystem persistence work. Manifest pruning and explicit snapshot-preserving compaction/reclamation exist; vacuum and arbitrary orphan cleanup do not. |
 | Transactions/conflicts | Partial | Shared-handle write-write OCC and typed row-ID conflicts exist; no serializability claim. |
 | Row/index publication | Partial | Manifest/snapshot publication validates row ownership/uniqueness, manifest-listed metadata and checksums, and row/index consistency. It does not establish byte-for-byte identity of decoded Arrow vector values: tampering that changes vector values while recomputing the corresponding metadata/checksums is outside the supported integrity boundary. Final branch verification and current evidence remain. |
 | Snapshot/query reads | Partial | Immutable scan, predicate, explain, and vector-search reads exist; no read/write transaction API. |
 | Query operators/pruning | Partial | Predicates, file/segment pruning, filtered ANN, and group-by primitives exist; no complete planner. |
-| Immutable vector segments | Implemented | Manifest-listed HNSW segments load and fan out across snapshots. Growth is unbounded without lifecycle work. |
+| Immutable vector segments | Implemented | Manifest-listed HNSW segments load and fan out across snapshots; explicit compaction can replace the current segment set while preserving active historical snapshots. |
 | Update/delete identity | Implemented within the supported facade | Physical live-target validation and one-row replacement cardinality are typed; logical identity remains deferred. |
 | CLI | Partial | Typed lookup, group-by, and query-scan commands are implemented; query-scan reports deterministic result indexes because physical `_row_id` is reserved, while legacy scan/filter/inspect/explain remain compatibility commands. Mutations require explicit single-writer acknowledgement. |
 | Python | Partial | Thin PyO3 Dataset/Snapshot query facade returns Arrow IPC bytes for tabular results and typed vector matches; integration review remains. |
 | Durability/recovery | Partial | File/directory durability, immutable row-ID high-water, manifest integrity, and crash/reopen evidence exist within named local bounds; full branch verification remains. |
 | Schema/migrations | Partial | Dataset-owned schema and strict validation are implemented; schema evolution and migration remain deferred. |
-| Lifecycle diagnostics, planning, and manifest pruning | Partial | `Dataset::lifecycle_report()` inventories one captured snapshot, and `Dataset::retention_plan()` remains advisory. `Dataset::prune_manifests()` uses preparation-spanning lifecycle exclusivity followed by `commit_lock` to rebuild exact listed-manifest authority and delete only eligible historical manifests. It preserves current/latest/active-snapshot manifests and does not delete data, segments, temporary objects, or arbitrary orphans. See the [inventory design](phase-3-lifecycle-inventory-design.md), [executor design](phase-3-manifest-retention-executor-design.md), and [executor tests](../crates/txn/tests/manifest_retention_executor.rs). |
+| Lifecycle diagnostics, planning, pruning, and compaction | Partial | `Dataset::lifecycle_report()` inventories one captured snapshot, `Dataset::retention_plan()` remains advisory, `Dataset::prune_manifests()` deletes only eligible historical manifests, and `Dataset::compact()` publishes replacement row/index objects while protecting active snapshots and reclaiming only superseded listed objects. Vacuum, arbitrary orphan cleanup, age-based retention, and universal storage-growth bounds remain open. See the lifecycle design documents and focused tests. |
 | Loom/chaos/fuzz/bench evidence | Implemented within named bounds | Exact-head CI run [31644869407](https://github.com/negexx/strataDB/actions/runs/31644869407) passed the named functional gates; benchmark run [31647664161](https://github.com/negexx/strataDB/actions/runs/31647664161) passed the synthetic and full pinned-fixture matrices with retained provenance. Universal bounds and final limitations remain explicit non-claims. |
-| Compaction/GC | Proposed | No compaction, vacuum, orphan cleanup, or bounded history implementation. |
+| Compaction/GC | Partial | Explicit snapshot-preserving row/segment compaction and post-publication reclamation are implemented. Vacuum, arbitrary orphan cleanup, age-based retention, and a supported storage-growth bound remain open. |
 | Cross-process coordination | Proposed | Independent openers do not share transaction state or durable conditional publication. The reserved future seam includes versioned capability negotiation, expected-manifest-version preconditions, request IDs with idempotent retries, typed conflicts, and explicit visibility/durability acknowledgements; Phase 4 entry gates are recorded in the [roadmap](roadmap.md#phase-4-reservation-and-entry-gates) and [decision 0010](decisions.md#0010---deferred-cross-process-coordination-seam). |
 | Branching/object storage | Proposed | No branch/merge or object-store backend is implemented. |
 

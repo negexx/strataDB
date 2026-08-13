@@ -16,6 +16,10 @@ in [documentation history](history/README.md). Current implementation claims liv
 Cross-process coordination is owned exclusively by Phase 4. It is not an implementation task,
 exit criterion, or blocker for Phases 0–3.
 
+Phase 3 lifecycle now also includes explicit snapshot-preserving compaction and reclamation through
+`Dataset::compact(CompactionPolicy)`. The remaining lifecycle gaps are vacuum, age-based retention,
+arbitrary orphan cleanup, and supported universal storage-growth bounds.
+
 ## Phase 4 reservation and entry gates
 
 Phase 4 remains Proposed. The project reserves a future, versioned coordination seam without
@@ -67,7 +71,7 @@ These are not requests for compaction in Phase 1.
 
 | Capability | Placement | Current boundary |
 |---|---|---|
-| Compaction, vacuum, orphan cleanup, bounded history | Phase 3 | Manifest-only pruning now deletes eligible historical manifests under preparation-spanning coordination. It does not delete or compact row files, segments, temporary objects, or arbitrary orphan candidates, and does not establish a segment-count or storage-growth bound. |
+| Compaction, vacuum, orphan cleanup, bounded history | Phase 3 | Explicit compaction now rewrites the current live snapshot and reclaims superseded listed row/segment objects after active-snapshot checks. Vacuum, arbitrary orphan cleanup, age-based retention, and a supported storage-growth bound remain open. |
 | Schema catalog, migrations, point lookup, time travel, stable query API | Phase 2–3 | Current Arrow batches/manifests are not a complete catalog or migration layer. |
 | Independent-open and cross-process coordination | Phase 4 | Shared-handle locking is not durable conditional publication. |
 | Fork, abort, branch reads, and merge | Phase 5 | Immutable segments are a prerequisite, not a delivered feature. |

@@ -12,8 +12,9 @@ tombstones, statistics, and immutable vector segments visible in a snapshot. Loc
 operations are behind the `Backend`/`LocalFs` boundary, although some paths remain local-disk-specific.
 The manifest is intended to be the single publication boundary for row and index visibility.
 
-The current design does not provide compaction, vacuum, orphan cleanup, bounded segment growth, or
-time-travel retention. Dataset-owned schema, manifest identity, row/file integrity, and durable
+The current design provides explicit snapshot-preserving compaction, but does not provide vacuum,
+arbitrary orphan cleanup, bounded segment growth, or time-travel retention. Dataset-owned schema,
+manifest identity, row/file integrity, and durable
 row-ID high-water checks are implemented within the named local bounds; schema evolution and
 universal power-loss claims remain deferred. See the audit rather than treating the format as
 corruption proof.
@@ -40,7 +41,8 @@ The index crate owns HNSW construction, distance kernels, segment encoding, defe
 checks, bounds checks, and checksums. A segment maps local ordinals to global physical row IDs. A
 snapshot loads the manifest-listed segment set; search fans out to applicable segments, merges top-k,
 and filters tombstoned rows. This is a coherent segment-set design, not a universal recall or latency
-claim. There is no compaction path yet.
+claim. Explicit compaction rewrites the current live snapshot into replacement row/index objects and
+reclaims superseded listed objects only after publication and active-snapshot checks.
 
 ## Query primitives
 

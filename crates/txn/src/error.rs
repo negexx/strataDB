@@ -97,6 +97,8 @@ pub enum TxnError {
     Clock(String),
     #[error("keep_latest_versions must be at least one")]
     InvalidRetentionPolicy,
+    #[error("unsupported compaction policy")]
+    InvalidCompactionPolicy,
 }
 
 pub type Result<T> = std::result::Result<T, TxnError>;
