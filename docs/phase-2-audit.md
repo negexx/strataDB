@@ -1,16 +1,20 @@
 # Phase 2 Query and Usability Audit
 
-**Date:** 2026-08-03
-**Status:** Phase 2 implemented within named bounds; D0 approved and T1-T8 integration gates passed
+**Date:** 2026-08-13
+**Status:** Phase 2 audit complete: implemented within named bounds; no open P0/P1 runtime defect confirmed
 **Next phase:** Query and usability
 
 This audit records the independent Sol review performed after the Phase 1 closeout work. It is a
 design and triage record, not an exit claim for Phase 1. D0 has since been approved for bounded
 implementation; this document remains the controlling scope and contract record for Phase 2.
-Phase 1 remains **Partial — blocked** until its CI, portability, and performance-evidence gates are
-closed.
+The historical Phase 1 status sentence above is superseded by the current Phase 1 closeout ledger;
+it is retained only as review history.
 
 ## Scope and controlling sources
+
+The current audit result supersedes the historical intake wording above: Phase 2 is implemented
+within the documented single-process/shared-handle boundary. Cross-process coordination and
+serializability are not Phase 2 work and remain reserved/non-claimed for Phase 4.
 
 The review covered the current source tree and these canonical documents:
 
@@ -24,7 +28,7 @@ The review covered the current source tree and these canonical documents:
 
 The supported boundary remains an embedded, single-node database used by one process through a
 shared `Dataset` handle, with immutable snapshot reads and write-write OCC. Phase 2 must not imply
-serializability, a read/write transaction API, distributed coordination, full SQL, or lifecycle
+a read/write transaction API, distributed coordination, full SQL, or lifecycle
 reclamation.
 
 ## Findings
@@ -110,13 +114,23 @@ the canonical architecture and decision documents.
 
 ## Explicit non-goals
 
-Phase 2 does not include read/write transactions, serializability, full SQL, compaction or GC,
-schema migration, cross-process publication, branches, object storage, additional ANN families, or
+Phase 2 does not include read/write transactions, full SQL, compaction or GC,
+schema migration, branches, object storage, additional ANN families, or
 agent-memory features.
+
+## Current audit disposition
+
+No open P0/P1 runtime defect was confirmed. Remaining findings are P2 evidence/API-boundary
+improvements and P3 documentation cleanup. The all-null `Min`/`Max`/`Avg` aggregate edge is
+implemented with nullable result cells and regression coverage. Projected-read, shared-reader
+fairness/RSS, and packaged-wheel smoke evidence paths are now implemented; their cloud results
+remain evidence rather than universal product guarantees.
 
 ## Terra readiness
 
 D0 is approved. T1-T7 are implemented with focused evidence and independent Terra approvals. T8
 integration gates pass: workspace tests, check, clippy, format, diff, stale-claim, and relative-link
 verification are green. The final Sol branch review approved the current bounded implementation.
-Phase 2 is implemented within these named bounds; Phase 1 remains Partial — blocked independently.
+Phase 2 is implemented within these named bounds. Exact-head GitHub Actions evidence is recorded in
+the companion verification report; local native runtime execution remains unavailable on hosts
+without the MSVC linker.

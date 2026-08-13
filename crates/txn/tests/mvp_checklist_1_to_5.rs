@@ -1,4 +1,4 @@
-//! Phase 1 MVP checklist, steps 1-5. Step 6 (kill -9 mid-write, restart,
+//! Legacy MVP checklist, steps 1-5. Step 6 (kill -9 mid-write, restart,
 //! recover) lives in `crates/cli/tests/` since it needs the real `strata`
 //! binary as a killable subprocess — nothing in-process can exercise actual
 //! crash safety. See the MVP definition in `docs/architecture.md`'s
