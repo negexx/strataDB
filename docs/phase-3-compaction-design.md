@@ -1,6 +1,6 @@
 # Phase 3 Compaction and Reclamation Design
 
-**Status:** Proposed for implementation review
+**Status:** Implemented and accepted for the bounded Phase 3 lifecycle scope; Phase 3 remains Partial.
 **Branch:** `codex/phase-3-lifecycle`
 
 ## Goal
@@ -10,7 +10,7 @@ snapshots, crash recovery, typed errors, and the one-process/shared-`Dataset` bo
 
 ## Scope
 
-This slice adds an explicit `Dataset::compact(CompactionPolicy)` operation for one shared handle.
+This implemented slice provides an explicit `Dataset::compact(CompactionPolicy)` operation for one shared handle.
 It compacts the current logical snapshot into new row data and vector-index objects, publishes one
 new manifest, and reclaims only superseded objects proven unreachable from the current manifest and
 active snapshot leases held by that same handle.
@@ -54,6 +54,14 @@ The initial policy is deliberately narrow: `retain_snapshots = true` preserves e
 historical snapshot lease. A future policy may release leases explicitly, but compaction must never
 invalidate a live snapshot implicitly.
 
+## Amendment — 2026-08-13: supported output shape
+
+The supported compaction contract is run-aware: an empty live set produces zero row files. A
+nonempty live set produces one row file for each maximal contiguous run of live physical row IDs,
+and compaction produces at most one vector segment. Tombstone gaps therefore may require more than
+one replacement row file. This amendment supersedes this document's earlier “one replacement set”
+shorthand; it does not expand the shared-handle concurrency boundary or introduce serializability.
+
 ## Protocol
 
 1. Acquire lifecycle exclusivity, then the existing commit lock in the same order as manifest
@@ -88,12 +96,13 @@ invalidate a live snapshot implicitly.
 
 ## Verification
 
-Required tests, written before implementation:
+Implemented regression coverage includes:
 
 1. Compacting an empty dataset publishes a valid replacement manifest.
 2. Compaction preserves row values, physical row IDs, tombstone visibility, and vector-search
    results.
-3. Compaction reduces multiple row files/segments to one replacement set.
+3. Compaction produces the supported run-aware replacement row-file shape and at most one vector
+   segment.
 4. An active historical snapshot remains readable after compaction and its referenced objects are
    not deleted.
 5. A crash/failure before publication leaves the old snapshot and manifest readable.

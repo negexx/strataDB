@@ -45,7 +45,11 @@ assert!(report.published_version > report.source_version);
 assert_eq!(dataset.snapshot().scan(&schema()).unwrap().num_rows(), expected_rows);
 ```
 
-Cover empty datasets, two committed row batches, three vector commits, and report field invariants. Assert that the current manifest has one replacement row file and at most one replacement vector segment after compaction.
+Cover empty datasets, two committed row batches, three vector commits, and report field invariants.
+**Superseded assertion (2026-08-13):** this plan's former requirement of one replacement row file
+is no longer the supported contract. Assert zero row files for an empty live set or one row file per
+maximal contiguous live physical-row-ID run for a nonempty set, with at most one replacement vector
+segment after compaction.
 
 - [ ] **Step 2: Run the focused tests to verify the correct failure**
 

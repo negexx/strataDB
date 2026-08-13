@@ -12,18 +12,24 @@ pub mod error;
 mod lifecycle;
 mod lifecycle_coordination;
 pub(crate) mod live_set_cache;
+pub mod maintenance;
 pub mod mvp_fixtures;
 pub mod query;
 pub(crate) mod retention;
 mod retention_executor;
 pub(crate) mod row_id;
 pub mod snapshot;
+pub mod vacuum;
 
 pub use arrow;
 pub use compaction::{CompactionPolicy, CompactionReport};
+#[cfg(feature = "test-fault-injection")]
+#[doc(hidden)]
+pub use dataset::test_support;
 pub use dataset::{Dataset, ROW_ID_COLUMN, TIMESTAMP_COLUMN, Transaction};
 pub use error::{Result, TxnError};
 pub use lifecycle::LifecycleReport;
+pub use maintenance::{LifecycleMaintenancePolicy, LifecycleMaintenanceReport};
 pub use query::{
     Aggregate, AggregateFunction, AggregateOutput, Comparison, ComparisonOperator,
     FilterExpression, FilterLiteral, GroupByRequest, GroupByResult, GroupedRow, HydrationError,
@@ -32,6 +38,7 @@ pub use query::{
     RowLookupResult, ScanRequest, ScanResult, VectorHit, VectorHydration, VectorHydrationState,
     VectorSearchRequest, VectorSearchResult,
 };
-pub use retention::{RetentionCandidate, RetentionPlan, RetentionPolicy};
+pub use retention::{AgeRetentionPolicy, RetentionCandidate, RetentionPlan, RetentionPolicy};
 pub use retention_executor::ManifestPruneReport;
 pub use snapshot::Snapshot;
+pub use vacuum::VacuumReport;

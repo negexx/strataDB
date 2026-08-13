@@ -32,7 +32,7 @@ use strata_index::{EfConstruction, HnswIndex, MaxConnections, MaxElements, MaxLa
 use strata_storage::{
     Backend, ColumnStats, DataFileEntry, LocalFs, Manifest, SegmentEntry, Value, commit_manifest,
     compute_stats, initialize_row_id_high_water, read_current, read_current_with_byte_count,
-    read_manifest_at_key_with_byte_count, read_manifest_with_byte_count, read_row_id_high_water,
+    read_manifest_at_key_with_byte_count, read_row_id_high_water,
     read_row_id_high_water_with_byte_count, sync_dir, write_batch, write_bytes,
 };
 
@@ -41,7 +41,10 @@ use crate::compaction::{CompactionPolicy, CompactionReport};
 use crate::error::{Result, TxnError};
 use crate::lifecycle_coordination::LifecycleCoordinator;
 use crate::live_set_cache::LiveSetCache;
-use crate::retention::{RetentionPlan, RetentionPolicy, SnapshotLeaseRegistry};
+use crate::retention::{
+    AgeRetentionPolicy, RetentionPlan, RetentionPolicy, SnapshotLeaseRegistry,
+    index_manifest_objects,
+};
 use crate::row_id::{RowIdAllocator, RowIdRange};
 use crate::snapshot::Snapshot;
 
@@ -203,12 +206,12 @@ pub struct Dataset {
     /// acquires `row_ids`' lock (via `claim`/`next_row_id`) both before
     /// taking this one and while holding it, but nothing ever reaches for
     /// this one from inside `row_ids`. See [`crate::row_id`]'s module doc.
-    commit_lock: Arc<Mutex<CommitLog>>,
+    pub(crate) commit_lock: Arc<Mutex<CommitLog>>,
     /// Coordinates commit preparation with manifest-only lifecycle execution.
     /// Every commit holds a preparation lease from its first operation
     /// through manifest publication or failure. `Dataset::prune_manifests`
     /// acquires lifecycle exclusivity before `commit_lock`.
-    lifecycle_coordinator: Arc<LifecycleCoordinator>,
+    pub(crate) lifecycle_coordinator: Arc<LifecycleCoordinator>,
     /// Counts every commit that hit `ConflictCheck::InsufficientHistory` —
     /// its read-version aged out of `COMMIT_LOG_CAPACITY` before it could
     /// commit. Pure observability, not used for any decision; exists so a
@@ -341,6 +344,52 @@ fn seed_write_attempt_counter(manifest: &Manifest) -> Result<u64> {
 /// generates (version-prefixed or attempt-id-prefixed) matches this shape.
 fn parse_attempt_id_prefix(file_name: &str) -> Option<u64> {
     file_name.split('-').next()?.parse().ok()
+}
+
+/// Test-only controls for deterministic compaction crash/reopen coverage.
+///
+/// This module is deliberately absent from default and production builds.
+/// Its thread-local guard can only affect the test thread that armed it.
+#[cfg(feature = "test-fault-injection")]
+#[doc(hidden)]
+pub mod test_support {
+    use std::cell::Cell;
+    use std::marker::PhantomData;
+    use std::rc::Rc;
+
+    thread_local! {
+        static FAIL_AFTER_COMPACTION_MANIFEST_PUBLICATION: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Restores the calling test thread's prior compaction fault state.
+    pub struct PostPublicationFaultGuard {
+        previous: bool,
+        // The state is thread-local, so the guard must be dropped on the
+        // thread that installed it. Rc makes this guard !Send and !Sync.
+        _thread_affine: PhantomData<Rc<()>>,
+    }
+
+    impl Drop for PostPublicationFaultGuard {
+        fn drop(&mut self) {
+            FAIL_AFTER_COMPACTION_MANIFEST_PUBLICATION.with(|fault| fault.set(self.previous));
+        }
+    }
+
+    /// Causes one compaction on this test thread to return a typed I/O error
+    /// immediately after its manifest is durable and before in-memory
+    /// installation or reclamation.
+    #[must_use]
+    pub fn fail_after_compaction_manifest_publication() -> PostPublicationFaultGuard {
+        let previous = FAIL_AFTER_COMPACTION_MANIFEST_PUBLICATION.with(|fault| fault.replace(true));
+        PostPublicationFaultGuard {
+            previous,
+            _thread_affine: PhantomData,
+        }
+    }
+
+    pub(super) fn consume_after_compaction_manifest_publication() -> bool {
+        FAIL_AFTER_COMPACTION_MANIFEST_PUBLICATION.with(|fault| fault.replace(false))
+    }
 }
 
 impl Dataset {
@@ -491,11 +540,18 @@ impl Dataset {
             .write_attempt_counter
             .load(std::sync::atomic::Ordering::SeqCst);
         manifest.next_row_id = self.row_ids.next_row_id();
+        manifest.committed_at_us = issue_timestamp(&self.last_issued_timestamp)?;
         // The manifest must not become durable before the directory entry
         // for every replacement object is durable. This is the same
         // publication precondition used by the normal commit path.
         sync_dir(&data_dir)?;
         commit_manifest(&self.dir, &manifest)?;
+        #[cfg(feature = "test-fault-injection")]
+        if test_support::consume_after_compaction_manifest_publication() {
+            return Err(TxnError::Io(std::io::Error::other(
+                "injected post-publication compaction failure (test fault injection)",
+            )));
+        }
         let report = CompactionReport {
             source_version,
             published_version,
@@ -522,31 +578,28 @@ impl Dataset {
         self.current.store(Arc::new(snapshot));
         drop(source);
 
+        let backend = LocalFs::new(&self.dir);
+        let manifest_keys = index_manifest_objects(&backend.list("_versions/")?)?;
         let mut protected_data = HashSet::new();
         let mut protected_segments = HashSet::new();
         for version in self.live_snapshot_versions() {
-            let (manifest, _) = read_manifest_with_byte_count(&self.dir, version)?;
+            let key = manifest_keys.get(&version).ok_or_else(|| {
+                TxnError::Storage(strata_storage::StorageError::CorruptManifest(
+                    self.dir.join(format!("_versions/{version:020}.manifest")),
+                    "protected manifest is missing from inventory".to_owned(),
+                ))
+            })?;
+            let (manifest, _) = read_manifest_at_key_with_byte_count(&self.dir, &key.key, version)?;
             let owned_rows = validate_data_files(&self.dir, &manifest, &logical_schema, None)?;
             validate_tombstones(&self.dir, &manifest, &owned_rows)?;
             let _ = load_segments(&self.dir, &manifest, &owned_rows, None)?;
             protected_data.extend(manifest.data_files.into_iter().map(|entry| entry.name));
             protected_segments.extend(manifest.segments.into_iter().map(|entry| entry.name));
         }
-        let backend = LocalFs::new(&self.dir);
         let mut manifest_listed_objects = HashSet::new();
-        for object in backend.list("_versions/")? {
-            let Some(stem) = object
-                .key
-                .strip_prefix("_versions/")
-                .and_then(|key| key.strip_suffix(".manifest"))
-            else {
-                continue;
-            };
-            let Ok(version) = stem.parse::<u64>() else {
-                continue;
-            };
+        for (version, key) in manifest_keys {
             let (historical, _) =
-                read_manifest_at_key_with_byte_count(&self.dir, &object.key, version)?;
+                read_manifest_at_key_with_byte_count(&self.dir, &key.key, version)?;
             let reachable = crate::lifecycle::reachable_keys(&historical)?;
             manifest_listed_objects.extend(reachable.data_files);
             manifest_listed_objects.extend(reachable.segments);
@@ -676,10 +729,11 @@ impl Dataset {
             return Err(TxnError::AlreadyExists(dir));
         }
         sync_dataset_directory_anchor(&dir)?;
-        let manifest = Manifest::empty_with_schema(schema.as_ref());
+        let mut manifest = Manifest::empty_with_schema(schema.as_ref());
+        let last_issued_timestamp = Arc::new(AtomicI64::new(manifest.commit_time_high_water));
+        manifest.committed_at_us = issue_timestamp(&last_issued_timestamp)?;
         initialize_row_id_high_water(&dir)?;
         commit_manifest(&dir, &manifest)?;
-        let last_issued_timestamp = Arc::new(AtomicI64::new(manifest.commit_time_high_water));
         let durable_high_water = read_row_id_high_water(&dir)?.unwrap_or(0);
         let row_ids = Arc::new(RowIdAllocator::new(
             dir.clone(),
@@ -931,6 +985,25 @@ impl Dataset {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::retention_executor::prune(self, policy)
+    }
+
+    /// Deletes historical manifests older than the supplied age policy while
+    /// preserving the latest window and active snapshots.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error if the age policy is invalid, retention state is
+    /// malformed, or a manifest deletion fails.
+    pub fn prune_manifests_by_age(
+        &self,
+        policy: AgeRetentionPolicy,
+    ) -> Result<crate::ManifestPruneReport> {
+        let _lifecycle_guard = self.lifecycle_coordinator.acquire_exclusive();
+        let _commit_guard = self
+            .commit_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::retention_executor::prune_by_age(self, policy)
     }
 
     #[cfg(test)]
@@ -1652,6 +1725,7 @@ impl Transaction {
         // row's own captured value — see
         // docs/design.md for why that decoupling is deliberate, not a gap.
         manifest.commit_time_high_water = manifest.commit_time_high_water.max(ts);
+        manifest.committed_at_us = ts;
         // Dedup against both the current in-memory tombstone set and
         // duplicates within this same transaction's own pending_tombstones
         // (e.g. two delete() calls on the same row): without this check,
@@ -2495,7 +2569,7 @@ fn catalog_row_id_range(
     }
 }
 
-fn validate_data_files(
+pub(crate) fn validate_data_files(
     dir: &Path,
     manifest: &Manifest,
     logical_schema: &SchemaRef,
@@ -2571,7 +2645,11 @@ fn validate_data_files(
     Ok(owned_rows)
 }
 
-fn validate_tombstones(dir: &Path, manifest: &Manifest, owned_rows: &HashSet<u64>) -> Result<()> {
+pub(crate) fn validate_tombstones(
+    dir: &Path,
+    manifest: &Manifest,
+    owned_rows: &HashSet<u64>,
+) -> Result<()> {
     let mut seen = HashSet::with_capacity(manifest.tombstones.len());
     for &row_id in &manifest.tombstones {
         if !owned_rows.contains(&row_id) {
@@ -2617,7 +2695,7 @@ fn validate_tombstones(dir: &Path, manifest: &Manifest, owned_rows: &HashSet<u64
 /// the corruption the original race could produce — would pass every one
 /// of them; only this cross-segment check catches it), or
 /// [`TxnError::Index`] if a segment fails its own header/body validation.
-fn load_segments(
+pub(crate) fn load_segments(
     dir: &Path,
     manifest: &Manifest,
     owned_rows: &HashSet<u64>,
@@ -4800,6 +4878,7 @@ mod tests {
             tombstones: Vec::new(),
             next_attempt_id: 0,
             commit_time_high_water: 0,
+            committed_at_us: 0,
             segments: Vec::new(),
         };
         strata_storage::initialize_row_id_high_water(&dir).unwrap();
@@ -4830,6 +4909,7 @@ mod tests {
             tombstones: Vec::new(),
             next_attempt_id: 0,
             commit_time_high_water: 0,
+            committed_at_us: 0,
             segments: Vec::new(),
         };
         strata_storage::initialize_row_id_high_water(&dir).unwrap();

@@ -3,11 +3,12 @@
 Strata is an embedded, single-node, local-disk research/prototype database for structured Arrow data
 and vector embeddings. Its supported concurrency boundary is concurrent writers in one process sharing
 one `Dataset` handle. The intended commit contract is atomic row/index publication through a manifest,
-but the Phase 1 audit found in-scope correctness, durability, and integrity blockers; this contract is
-Partial and blocked, not a universal guarantee.
+and the Phase 1 audit's in-scope correctness, durability, and integrity blockers are now remediated
+or evidence-closed within named local filesystem and shared-handle limits. The Phase 1 contract is
+implemented with named limits, not a universal guarantee.
 
 Read [status](status.md) for evidence, [roadmap](roadmap.md) for phases, and [phase-1-audit](phase-1-audit.md)
-for the current blockers.
+for the audit trail and named limits.
 
 ## Components
 
@@ -48,10 +49,13 @@ work and must not be inferred from these checks.
   for one shared `Dataset` handle.
 - `Dataset::prune_manifests()`, a manifest-only historical-retention executor for that same shared
   handle.
+- Explicit shared-handle lifecycle operations: snapshot-preserving `Dataset::compact()`,
+  age-based `Dataset::prune_manifests_by_age()`, `Dataset::vacuum()` of recognized unprotected
+  objects, and `Dataset::maintain()` for one coordinated maintenance run.
 - Real-process crash/reopen tests, targeted loom models, fuzz targets, and benchmarks.
 
 These are usable slices, not a finished database API. There is no schema-evolution/migration workflow, planner,
-stable Python API, compaction, vacuum, orphan cleanup, time
+stable Python API, arbitrary orphan cleanup, time
 travel, or cross-process protocol. The Phase 2 Python/CLI surfaces are partial and remain subject to
 their documented typed contracts and integration verification. “Partial” here describes client/API
 maturity, not a claim that completed Phase 2 slices are outside their documented embedded,
@@ -91,14 +95,23 @@ active-snapshot policy for the shared handle.
 
 `Dataset::prune_manifests()` is the separate, manifest-only executor slice. It acquires lifecycle
 exclusivity before `commit_lock`, then rebuilds authority from the current manifest listing while
-both guards are held. That authority retains the current manifest, the latest-version window, and
-active snapshots; it carries exact listed keys and byte counts and deletes eligible historical
-manifests oldest first. It never deletes row files, segments, temporary objects, or arbitrary orphan
-objects. A post-unlink local directory-sync error is returned and a retry relists state under the same
-guards. The [inventory design](phase-3-lifecycle-inventory-design.md), [manifest executor
+both guards are held. Durable manifest authority means the recovery-recognized numeric
+`_versions/<version>.manifest` keys in that listing; malformed or duplicate numeric versions fail
+closed. The authority retains the current manifest, the latest-version window, and active snapshots;
+it carries exact listed keys and byte counts and deletes eligible historical manifests oldest first.
+It never deletes row files, segments, temporary objects, or arbitrary orphan objects. A post-unlink
+local directory-sync error is returned and a retry relists state under the same guards. The [inventory design](phase-3-lifecycle-inventory-design.md), [manifest executor
 design](phase-3-manifest-retention-executor-design.md), and focused [inventory](../crates/txn/tests/lifecycle_inventory.rs)
 and [executor](../crates/txn/tests/manifest_retention_executor.rs) tests define these distinct
 boundaries.
+
+`Dataset::compact()` publishes replacement row/index objects before reclaiming superseded listed
+objects that are not protected by active snapshots. `Dataset::prune_manifests_by_age()` retains the
+current/latest/active versions and protects legacy manifests whose publication timestamp is zero.
+`Dataset::vacuum()` deletes only recognized temporary names or unprotected `.arrow`/`.seg` objects;
+unknown objects, including unknown dotfiles, remain outside its authority. `Dataset::maintain()`
+composes those operations and returns `storage_bound_met` from its final inventory. That field is an
+observation from one completed run, not atomic or continuing storage-bound enforcement.
 
 ## Reads, updates, and index behavior
 

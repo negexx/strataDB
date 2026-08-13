@@ -52,7 +52,7 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use strata_bench::{ManifestListedFile, SnapshotFootprint, pinned_snapshot_footprint_diagnostics};
 use strata_query::{AggFunc, Predicate};
 use strata_storage::{Value, read_current_with_byte_count};
-use strata_txn::{CompactionPolicy, Dataset, Snapshot};
+use strata_txn::{CompactionPolicy, Dataset, LifecycleMaintenancePolicy, Snapshot};
 
 // ---- counting allocator ---------------------------------------------------
 
@@ -575,6 +575,36 @@ fn main() {
             compacted.segments_written,
             compacted.objects_deleted,
             compacted.bytes_deleted,
+        ),
+        mem: phase_end(m),
+    });
+
+    // ---- Phase 2c: bounded lifecycle maintenance -----------------------
+    // Seed a recognized orphan so the measurement covers the complete
+    // compact -> retain -> vacuum path, not only compaction.
+    std::fs::write(ds.data_dir().join(".benchmark-orphan.arrow"), b"orphan").unwrap();
+    let m = phase_start();
+    let t = Instant::now();
+    let maintained = ds
+        .maintain(LifecycleMaintenancePolicy {
+            keep_latest_versions: 1,
+            max_age_us: 0,
+            max_data_objects: 1,
+            max_segments: 1,
+        })
+        .unwrap();
+    let wall = t.elapsed();
+    results.push(PhaseResult {
+        name: "bounded lifecycle maintenance",
+        kind: "compact + age retention + vacuum + inventory",
+        wall,
+        detail: format!(
+            "bound_met={}; data_objects={}; segments={}; deleted={} objects ({} bytes)",
+            maintained.storage_bound_met,
+            maintained.inventory.data_object_count(),
+            maintained.inventory.reachable_segment_count(),
+            maintained.vacuum.objects_deleted,
+            maintained.vacuum.bytes_deleted,
         ),
         mem: phase_end(m),
     });

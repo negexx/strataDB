@@ -12,9 +12,9 @@ tombstones, statistics, and immutable vector segments visible in a snapshot. Loc
 operations are behind the `Backend`/`LocalFs` boundary, although some paths remain local-disk-specific.
 The manifest is intended to be the single publication boundary for row and index visibility.
 
-The current design provides explicit snapshot-preserving compaction, but does not provide vacuum,
-arbitrary orphan cleanup, bounded segment growth, or time-travel retention. Dataset-owned schema,
-manifest identity, row/file integrity, and durable
+The current design provides explicit snapshot-preserving compaction, age-based manifest retention,
+and vacuum of recognized unprotected objects. It does not provide arbitrary orphan cleanup,
+guaranteed bounded segment growth, or time-travel retention. Dataset-owned schema, manifest identity, row/file integrity, and durable
 row-ID high-water checks are implemented within the named local bounds; schema evolution and
 universal power-loss claims remain deferred. See the audit rather than treating the format as
 corruption proof.

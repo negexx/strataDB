@@ -2,7 +2,8 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow::array::{FixedSizeListArray, Float32Array, Int64Array, RecordBatch};
@@ -74,6 +75,50 @@ fn fresh_dataset_inventories_its_durable_initial_manifest() {
     assert_eq!(report.orphan_candidate_bytes(), 0);
     assert_eq!(report.tombstone_count(), 0);
     assert_eq!(report.physical_row_count(), 0);
+}
+
+#[test]
+fn current_manifest_bytes_uses_an_unpadded_recovery_recognized_manifest_key() {
+    // Break caught: reconstructing the canonical padded key would omit the
+    // byte count for a valid current manifest that recovery selected by its
+    // numeric version after its filename was unpadded.
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("unpadded-current-manifest");
+    let dataset = Dataset::create(&dir, id_schema()).unwrap();
+    for value in 1..=7 {
+        commit(&dataset, id_batch(&[value]));
+    }
+
+    let padded = dir.join("_versions/00000000000000000007.manifest");
+    let unpadded = dir.join("_versions/7.manifest");
+    let expected_bytes = fs::metadata(&padded).unwrap().len();
+    fs::rename(padded, &unpadded).unwrap();
+
+    let report = dataset.lifecycle_report().unwrap();
+
+    assert_eq!(report.observed_version(), 7);
+    assert_eq!(report.current_manifest_bytes(), Some(expected_bytes));
+}
+
+#[test]
+fn duplicate_padded_and_unpadded_manifest_versions_fail_closed() {
+    // Break caught: choosing either filename when two listed manifest keys
+    // resolve to the same numeric version would hide duplicate authority.
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("duplicate-manifest-version");
+    let dataset = Dataset::create(&dir, id_schema()).unwrap();
+    let padded = dir.join("_versions/00000000000000000000.manifest");
+    let unpadded = dir.join("_versions/0.manifest");
+    fs::copy(&padded, unpadded).unwrap();
+
+    let result = dataset.lifecycle_report();
+
+    assert!(matches!(
+        result,
+        Err(TxnError::Storage(StorageError::CorruptManifest(path, reason)))
+            if path == Path::new("_versions/00000000000000000000.manifest")
+                && reason == "duplicate listed manifest version"
+    ));
 }
 
 #[test]

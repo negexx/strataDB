@@ -4,7 +4,7 @@
 |---|---|---|---|
 | Rust query contract | `crates/txn/src/query.rs` and focused tests | Implemented within bounds | Local execution unavailable without MSVC linker |
 | CLI | `crates/cli/tests/phase_2_cli.rs` | Implemented within bounds | Legacy compatibility commands are not generic query APIs |
-| Python | In-process PyO3 tests in `crates/bindings/src/lib.rs` | Implemented within bounds | No wheel/install smoke test |
+| Python | In-process PyO3 tests in `crates/bindings/src/lib.rs`; packaged-wheel import smoke in [Phase 2 evidence run 31652917305](https://github.com/negexx/strataDB/actions/runs/31652917305) | Passed within documented bounds | Cloud smoke evidence only; it does not establish release packaging or unsupported-platform support |
 | Integration | Exact-head GitHub Actions run `31644869407`; Phase 2 evidence run `31652917305` | Passed | Cloud evidence, not local reproduction |
 | Narrow reads/pruning | `bench/benches/projected_read_bench.rs`; `.github/workflows/phase-2-query-evidence.yml`; Phase 3 pruning tests | Implemented evidence path | A successful run supplies evidence, not a product SLO |
 | Memory/concurrency | `query_concurrency_bench`; Phase 2 workflow `/usr/bin/time -v` capture | Implemented evidence path | Measurements are bounded observations, not RSS or fairness guarantees |
