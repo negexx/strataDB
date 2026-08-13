@@ -775,7 +775,7 @@ mod tests {
     fn manifest_without_committed_at_field_deserializes_with_default_zero() {
         let old_json = serde_json::json!({
             "version": 7,
-            "schema_ipc": "",
+            "schema_ipc": Manifest::empty().schema_ipc,
             "data_files": [],
             "next_row_id": 0,
             "tombstones": [],
