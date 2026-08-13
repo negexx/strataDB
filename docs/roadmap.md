@@ -22,6 +22,11 @@ Phase 3 lifecycle now also includes explicit snapshot-preserving compaction and 
 inventory evidence. Universal growth enforcement across independent processes or unknown object
 types remains outside the embedded single-process product boundary.
 
+The Phase 3 exit signal above denotes evidence from one completed maintenance run. In particular,
+`storage_bound_met` is the final inventory observation, not atomic or continuing storage-bound
+enforcement; active snapshots, protected history, and unknown object types can keep physical growth
+above a requested limit.
+
 ## Phase 4 reservation and entry gates
 
 Phase 4 remains Proposed. The project reserves a future, versioned coordination seam without

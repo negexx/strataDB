@@ -10,13 +10,15 @@ Strata is an embedded, single-node Rust database for concurrent AI-agent access 
 columns and vector embeddings. Its supported concurrency scope is one process using a shared
 `Dataset` handle. The intended target is immutable snapshot reads, write-write optimistic conflict
 detection, durable manifest publication, and row/index consistency without silent buffering; the
-2026-08-01 Phase 1 audit records counterexamples and keeps this boundary Partial and blocked.
+2026-08-01 Phase 1 audit records counterexamples and an implemented-with-named-limits verdict.
+That verdict is limited to the documented local, single-process/shared-`Dataset` boundary; Phase 3
+lifecycle work remains Partial.
 
 Non-negotiable target invariants:
 
-- A write must be acknowledged only after it is durable, conflict-checked, and visible. The current
-  implementation does not yet prove every part of this target; see `docs/status.md` and the Phase 1
-  audit before describing it as achieved behavior.
+- A write must be acknowledged only after it is durable, conflict-checked, and visible. Describe
+  the implementation only within the named local durability and shared-handle limits in
+  `docs/status.md` and the Phase 1 audit; do not turn that evidence into a universal guarantee.
 - Row data and vector-index changes share one transaction boundary and manifest publication.
 - The vector index uses immutable per-commit segments listed in the manifest; do not reintroduce the
   retired pre-S1 shared-index mechanism.
@@ -25,9 +27,9 @@ Non-negotiable target invariants:
   transaction interface or add another isolation level without a superseding ADR.
 - Conflicts are typed errors that identify contested row IDs; never silently resolve them.
 - Row IDs are intended to be dataset-global physical allocation values: monotonically allocated,
-  never reused; gaps are safe. Restart non-reuse is regression-covered, while final CI and
-  platform evidence remain part of the Phase 1 gate. `update` tombstones an old physical row and
-  inserts a replacement with a new ID.
+  never reused; gaps are safe. Restart non-reuse is regression-covered with exact-head CI evidence
+  within the named bounds. `update` tombstones an old physical row and inserts a replacement with
+  a new ID.
 - Strata remains embedded and single-node. Distributed transactions, full SQL, and additional ANN
   index families are out of scope.
 
