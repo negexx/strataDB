@@ -3,7 +3,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow::array::{FixedSizeListArray, Float32Array, Int64Array, RecordBatch};
@@ -116,7 +116,7 @@ fn duplicate_padded_and_unpadded_manifest_versions_fail_closed() {
     assert!(matches!(
         result,
         Err(TxnError::Storage(StorageError::CorruptManifest(path, reason)))
-            if path == PathBuf::from("_versions/00000000000000000000.manifest")
+            if path == Path::new("_versions/00000000000000000000.manifest")
                 && reason == "duplicate listed manifest version"
     ));
 }
