@@ -28,6 +28,15 @@ pub struct RetentionPolicy {
     pub keep_latest_versions: u64,
 }
 
+/// Age-based manifest retention policy. The newest versions and active
+/// snapshots are always retained; older manifests are eligible once their
+/// per-manifest publication timestamp reaches `max_age_us`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgeRetentionPolicy {
+    pub keep_latest_versions: u64,
+    pub max_age_us: u64,
+}
+
 /// Read-only retention evidence captured from one filesystem observation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetentionPlan {
@@ -214,6 +223,58 @@ pub(crate) fn build_manifest_prune_authority(
 
     Ok(ManifestPruneAuthority {
         observed_version: plan.observed_version,
+        candidates,
+    })
+}
+
+pub(crate) fn build_age_manifest_prune_authority(
+    dataset: &Dataset,
+    policy: AgeRetentionPolicy,
+) -> Result<ManifestPruneAuthority> {
+    if policy.keep_latest_versions == 0 {
+        return Err(TxnError::InvalidRetentionPolicy);
+    }
+    let snapshot = dataset.snapshot();
+    let observed_version = snapshot.version;
+    let mut protected_versions = dataset.live_snapshot_versions();
+    protected_versions.push(observed_version);
+    protected_versions.extend(latest_versions(
+        index_manifest_objects(&LocalFs::new(dataset.retention_dir()).list("_versions/")?)?
+            .keys()
+            .copied(),
+        policy.keep_latest_versions,
+    ));
+    protected_versions.sort_unstable();
+    protected_versions.dedup();
+    let protected: BTreeSet<_> = protected_versions.into_iter().collect();
+    let backend = LocalFs::new(dataset.retention_dir());
+    let manifest_keys = index_manifest_objects(&backend.list("_versions/")?)?;
+    let now_us = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| TxnError::Clock(error.to_string()))?
+            .as_micros(),
+    )?;
+    let mut candidates = Vec::new();
+    for (&version, key) in &manifest_keys {
+        if version >= observed_version || protected.contains(&version) {
+            continue;
+        }
+        let (manifest, _) =
+            read_manifest_at_key_with_byte_count(dataset.retention_dir(), &key.key, version)?;
+        if manifest.committed_at_us == 0
+            || now_us.saturating_sub(manifest.committed_at_us) < i64::try_from(policy.max_age_us)?
+        {
+            continue;
+        }
+        candidates.push(ManifestPruneCandidate {
+            version,
+            key: key.key.clone(),
+            bytes: key.bytes,
+        });
+    }
+    Ok(ManifestPruneAuthority {
+        observed_version,
         candidates,
     })
 }

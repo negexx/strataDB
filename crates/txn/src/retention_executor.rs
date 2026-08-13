@@ -9,7 +9,10 @@ use strata_storage::{Backend, LocalFs};
 use crate::dataset::Dataset;
 use crate::error::Result;
 use crate::lifecycle::checked_add;
-use crate::retention::{ManifestPruneCandidate, RetentionPolicy, build_manifest_prune_authority};
+use crate::retention::{
+    AgeRetentionPolicy, ManifestPruneCandidate, RetentionPolicy,
+    build_age_manifest_prune_authority, build_manifest_prune_authority,
+};
 
 #[cfg(test)]
 use std::sync::{Mutex, mpsc};
@@ -34,6 +37,23 @@ pub(crate) fn prune(dataset: &Dataset, policy: RetentionPolicy) -> Result<Manife
             Ok(backend.delete(&candidate.key)?)
         })?;
 
+    Ok(ManifestPruneReport {
+        observed_version: authority.observed_version,
+        deleted_manifest_versions,
+        deleted_manifest_bytes,
+    })
+}
+
+pub(crate) fn prune_by_age(
+    dataset: &Dataset,
+    policy: AgeRetentionPolicy,
+) -> Result<ManifestPruneReport> {
+    let authority = build_age_manifest_prune_authority(dataset, policy)?;
+    let backend = LocalFs::new(dataset.retention_dir());
+    let (deleted_manifest_versions, deleted_manifest_bytes) =
+        delete_authorized_manifests(&authority.candidates, |candidate| {
+            Ok(backend.delete(&candidate.key)?)
+        })?;
     Ok(ManifestPruneReport {
         observed_version: authority.observed_version,
         deleted_manifest_versions,

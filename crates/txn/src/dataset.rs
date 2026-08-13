@@ -41,7 +41,7 @@ use crate::compaction::{CompactionPolicy, CompactionReport};
 use crate::error::{Result, TxnError};
 use crate::lifecycle_coordination::LifecycleCoordinator;
 use crate::live_set_cache::LiveSetCache;
-use crate::retention::{RetentionPlan, RetentionPolicy, SnapshotLeaseRegistry};
+use crate::retention::{AgeRetentionPolicy, RetentionPlan, RetentionPolicy, SnapshotLeaseRegistry};
 use crate::row_id::{RowIdAllocator, RowIdRange};
 use crate::snapshot::Snapshot;
 
@@ -203,12 +203,12 @@ pub struct Dataset {
     /// acquires `row_ids`' lock (via `claim`/`next_row_id`) both before
     /// taking this one and while holding it, but nothing ever reaches for
     /// this one from inside `row_ids`. See [`crate::row_id`]'s module doc.
-    commit_lock: Arc<Mutex<CommitLog>>,
+    pub(crate) commit_lock: Arc<Mutex<CommitLog>>,
     /// Coordinates commit preparation with manifest-only lifecycle execution.
     /// Every commit holds a preparation lease from its first operation
     /// through manifest publication or failure. `Dataset::prune_manifests`
     /// acquires lifecycle exclusivity before `commit_lock`.
-    lifecycle_coordinator: Arc<LifecycleCoordinator>,
+    pub(crate) lifecycle_coordinator: Arc<LifecycleCoordinator>,
     /// Counts every commit that hit `ConflictCheck::InsufficientHistory` —
     /// its read-version aged out of `COMMIT_LOG_CAPACITY` before it could
     /// commit. Pure observability, not used for any decision; exists so a
@@ -491,6 +491,9 @@ impl Dataset {
             .write_attempt_counter
             .load(std::sync::atomic::Ordering::SeqCst);
         manifest.next_row_id = self.row_ids.next_row_id();
+        manifest.committed_at_us = self
+            .last_issued_timestamp
+            .load(std::sync::atomic::Ordering::SeqCst);
         // The manifest must not become durable before the directory entry
         // for every replacement object is durable. This is the same
         // publication precondition used by the normal commit path.
@@ -931,6 +934,25 @@ impl Dataset {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::retention_executor::prune(self, policy)
+    }
+
+    /// Deletes historical manifests older than the supplied age policy while
+    /// preserving the latest window and active snapshots.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error if the age policy is invalid, retention state is
+    /// malformed, or a manifest deletion fails.
+    pub fn prune_manifests_by_age(
+        &self,
+        policy: AgeRetentionPolicy,
+    ) -> Result<crate::ManifestPruneReport> {
+        let _lifecycle_guard = self.lifecycle_coordinator.acquire_exclusive();
+        let _commit_guard = self
+            .commit_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::retention_executor::prune_by_age(self, policy)
     }
 
     #[cfg(test)]
@@ -1652,6 +1674,7 @@ impl Transaction {
         // row's own captured value — see
         // docs/design.md for why that decoupling is deliberate, not a gap.
         manifest.commit_time_high_water = manifest.commit_time_high_water.max(ts);
+        manifest.committed_at_us = ts;
         // Dedup against both the current in-memory tombstone set and
         // duplicates within this same transaction's own pending_tombstones
         // (e.g. two delete() calls on the same row): without this check,
@@ -2495,7 +2518,7 @@ fn catalog_row_id_range(
     }
 }
 
-fn validate_data_files(
+pub(crate) fn validate_data_files(
     dir: &Path,
     manifest: &Manifest,
     logical_schema: &SchemaRef,
@@ -2571,7 +2594,11 @@ fn validate_data_files(
     Ok(owned_rows)
 }
 
-fn validate_tombstones(dir: &Path, manifest: &Manifest, owned_rows: &HashSet<u64>) -> Result<()> {
+pub(crate) fn validate_tombstones(
+    dir: &Path,
+    manifest: &Manifest,
+    owned_rows: &HashSet<u64>,
+) -> Result<()> {
     let mut seen = HashSet::with_capacity(manifest.tombstones.len());
     for &row_id in &manifest.tombstones {
         if !owned_rows.contains(&row_id) {
@@ -2617,7 +2644,7 @@ fn validate_tombstones(dir: &Path, manifest: &Manifest, owned_rows: &HashSet<u64
 /// the corruption the original race could produce — would pass every one
 /// of them; only this cross-segment check catches it), or
 /// [`TxnError::Index`] if a segment fails its own header/body validation.
-fn load_segments(
+pub(crate) fn load_segments(
     dir: &Path,
     manifest: &Manifest,
     owned_rows: &HashSet<u64>,
@@ -4800,6 +4827,7 @@ mod tests {
             tombstones: Vec::new(),
             next_attempt_id: 0,
             commit_time_high_water: 0,
+            committed_at_us: 0,
             segments: Vec::new(),
         };
         strata_storage::initialize_row_id_high_water(&dir).unwrap();
@@ -4830,6 +4858,7 @@ mod tests {
             tombstones: Vec::new(),
             next_attempt_id: 0,
             commit_time_high_water: 0,
+            committed_at_us: 0,
             segments: Vec::new(),
         };
         strata_storage::initialize_row_id_high_water(&dir).unwrap();

@@ -167,7 +167,9 @@ jobs:
             uname -a
             rustc -Vv
             cargo -Vv
+            cargo test -p strata-txn --no-default-features --test retention_age --test vacuum --test maintenance --nocapture
             cargo test -p strata-txn --features chaos-injection --test manifest_retention_executor -- --exact manifest_prune_abort_before_directory_sync_preserves_latest_recovery --nocapture
+            STRATA_BENCH_SOURCE=synthetic STRATA_BENCH_SEED=20260801 STRATA_LIFECYCLE_ROWS=64 STRATA_LIFECYCLE_BATCH_ROWS=8 cargo bench -p strata-bench --bench lifecycle_bench --no-default-features
           } 2>&1 | tee artifacts/phase-3-lifecycle-evidence.log
 
       - name: Retain Phase 3 lifecycle evidence

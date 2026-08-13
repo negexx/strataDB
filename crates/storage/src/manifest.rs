@@ -172,6 +172,11 @@ pub struct Manifest {
     /// still deserialize, same reasoning as `tombstones`/`next_attempt_id`.
     #[serde(default)]
     pub commit_time_high_water: i64,
+    /// Timestamp captured for this manifest publication, in Unix microseconds.
+    /// Legacy manifests default to zero and are retained conservatively by
+    /// age-based cleanup.
+    #[serde(default)]
+    pub committed_at_us: i64,
     /// Immutable index segments as of this version — see
     /// `docs/design.md`. Empty only when no vector-bearing commit is visible.
     /// `#[serde(default)]` so manifests written before this field existed
@@ -196,6 +201,7 @@ impl Manifest {
             tombstones: Vec::new(),
             next_attempt_id: 0,
             commit_time_high_water: 0,
+            committed_at_us: 0,
             segments: Vec::new(),
         }
     }
@@ -763,6 +769,22 @@ mod tests {
         });
         let deserialized: Manifest = serde_json::from_value(old_json).unwrap();
         assert_eq!(deserialized.commit_time_high_water, 0);
+    }
+
+    #[test]
+    fn manifest_without_committed_at_field_deserializes_with_default_zero() {
+        let old_json = serde_json::json!({
+            "version": 7,
+            "schema_ipc": "",
+            "data_files": [],
+            "next_row_id": 0,
+            "tombstones": [],
+            "next_attempt_id": 0,
+            "commit_time_high_water": 0,
+            "segments": []
+        });
+        let deserialized: Manifest = serde_json::from_value(old_json).unwrap();
+        assert_eq!(deserialized.committed_at_us, 0);
     }
 
     #[test]

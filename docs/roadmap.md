@@ -8,7 +8,7 @@ in [documentation history](history/README.md). Current implementation claims liv
 | 0 — Foundation | Implemented within named local bounds | Local format, manifests, row allocation, and bounded transaction primitives. See the [Phase 0 foundation audit](phase-0-audit.md). | Restart-safe row-ID non-reuse and retained foundation evidence pass within the named local-filesystem boundary. |
 | 1 — Correctness and durability baseline | Implemented within named bounds | Shared-handle commits, immutable snapshots, typed conflicts, recovery/integrity, schema/error semantics, supported facade, and boundedness evidence. | All asserted guarantees have scope, implementation evidence, regression coverage, and current bounded performance evidence. |
 | 2 — Query and usability | Implemented within named bounds | Stable schema/query APIs, scan/projection/filter/group-by integration, point lookup, CLI, and Python surface. See the [Phase 2 audit](phase-2-audit.md). | Supported query/client behavior is documented and integration-tested within the embedded single-process boundary. |
-| 3 — Operational lifecycle | Partial | Read-only lifecycle diagnostics and advisory retention planning are implemented. `Dataset::prune_manifests()` also deletes only policy-eligible historical manifests for one shared handle, after lifecycle exclusivity and `commit_lock` rebuild exact listed-key authority. It preserves current/latest/active manifests and does not reclaim data, segments, temporary objects, or arbitrary orphans; vacuum, compaction, migrations, and index reclamation remain future work. See the [inventory design](phase-3-lifecycle-inventory-design.md), [executor design](phase-3-manifest-retention-executor-design.md), and [executor tests](../crates/txn/tests/manifest_retention_executor.rs). | Sustained operation safely bounds manifest/segment growth and manages retained data. |
+| 3 — Operational lifecycle | Partial | Lifecycle diagnostics, explicit snapshot-preserving compaction, manifest retention including age policy, recognized orphan vacuum, and `Dataset::maintain(LifecycleMaintenancePolicy)` are implemented for one shared handle. Maintenance reports whether requested data-object and segment bounds were met; active snapshots and unknown object types remain explicit limitations. See the [inventory design](phase-3-lifecycle-inventory-design.md), [executor design](phase-3-manifest-retention-executor-design.md), [vacuum design](phase-3-vacuum-design.md), and focused lifecycle tests. | Sustained operation safely bounds manifest/segment growth and manages retained data within an explicit supported policy. |
 | 4 — Cross-process coordination | Proposed | Durable conditional publication, independent opener semantics, shared allocation, and process-boundary guarantees. | Separate processes coordinate without violating visibility, conflict, or durability invariants. |
 | 5 — Branching and merge | Proposed | Fork, abort, merge, conflict reporting, and branch-aware manifests. | Branch behavior is correct under concurrency and recovery tests. |
 | 6 — Object storage and deployment | Proposed | Object-store conditional writes, S3-compatible backends, remote recovery, and durability testing. | The supported correctness suite passes against supported remote backends. |
@@ -17,8 +17,10 @@ Cross-process coordination is owned exclusively by Phase 4. It is not an impleme
 exit criterion, or blocker for Phases 0–3.
 
 Phase 3 lifecycle now also includes explicit snapshot-preserving compaction and reclamation through
-`Dataset::compact(CompactionPolicy)`. The remaining lifecycle gaps are vacuum, age-based retention,
-arbitrary orphan cleanup, and supported universal storage-growth bounds.
+`Dataset::compact(CompactionPolicy)` plus bounded recognized-object cleanup through `Dataset::vacuum()`.
+`Dataset::maintain(LifecycleMaintenancePolicy)` composes compaction, age retention, vacuum, and
+inventory evidence. Universal growth enforcement across independent processes or unknown object
+types remains outside the embedded single-process product boundary.
 
 ## Phase 4 reservation and entry gates
 
@@ -71,7 +73,7 @@ These are not requests for compaction in Phase 1.
 
 | Capability | Placement | Current boundary |
 |---|---|---|
-| Compaction, vacuum, orphan cleanup, bounded history | Phase 3 | Explicit compaction now rewrites the current live snapshot and reclaims superseded listed row/segment objects after active-snapshot checks. Vacuum, arbitrary orphan cleanup, age-based retention, and a supported storage-growth bound remain open. |
+| Compaction, vacuum, orphan cleanup, bounded history | Phase 3 | Explicit compaction rewrites the current live snapshot, age retention removes eligible historical manifests, vacuum removes recognized unprotected `.arrow`/`.seg` and temporary objects, and `Dataset::maintain()` reports conditional storage-bound enforcement. Unknown object types and cross-process universal bounds remain out of scope. |
 | Schema catalog, migrations, point lookup, time travel, stable query API | Phase 2–3 | Current Arrow batches/manifests are not a complete catalog or migration layer. |
 | Independent-open and cross-process coordination | Phase 4 | Shared-handle locking is not durable conditional publication. |
 | Fork, abort, branch reads, and merge | Phase 5 | Immutable segments are a prerequisite, not a delivered feature. |
