@@ -121,11 +121,10 @@ pub(crate) fn collect(
     data_objects: &[ObjectMeta],
     manifest: &Manifest,
 ) -> Result<LifecycleReport> {
-    let expected_manifest_key = manifest_object_key(manifest.version);
     let reachable = reachable_keys(manifest)?;
 
     let (manifest_object_count, manifest_bytes, current_manifest_bytes) =
-        collect_manifest_objects(manifest_objects, manifest, &expected_manifest_key)?;
+        collect_manifest_objects(manifest_objects, manifest)?;
 
     let mut data_object_count = 0;
     let mut data_bytes = 0;
@@ -209,12 +208,12 @@ pub(crate) fn collect(
 fn collect_manifest_objects(
     manifest_objects: &[ObjectMeta],
     manifest: &Manifest,
-    expected_manifest_key: &str,
 ) -> Result<(u64, u64, Option<u64>)> {
     let mut manifest_object_count = 0;
     let mut manifest_bytes = 0;
     let mut current_manifest_bytes = None;
     let mut listed_manifest_keys = BTreeSet::new();
+    let mut listed_manifest_versions = BTreeSet::new();
     for object in manifest_objects {
         validate_listed_key(&object.key, "_versions/")?;
         if !listed_manifest_keys.insert(object.key.clone()) {
@@ -225,7 +224,16 @@ fn collect_manifest_objects(
         }
         manifest_object_count = checked_add("manifest_object_count", manifest_object_count, 1)?;
         manifest_bytes = checked_add("manifest_bytes", manifest_bytes, object.size)?;
-        if object.key == expected_manifest_key {
+        let Some(version) = listed_manifest_version(&object.key) else {
+            continue;
+        };
+        if !listed_manifest_versions.insert(version) {
+            return Err(TxnError::Storage(StorageError::CorruptManifest(
+                PathBuf::from(manifest_object_key(version)),
+                "duplicate listed manifest version".to_string(),
+            )));
+        }
+        if version == manifest.version {
             current_manifest_bytes = Some(object.size);
         }
     }
@@ -234,6 +242,12 @@ fn collect_manifest_objects(
         manifest_bytes,
         current_manifest_bytes,
     ))
+}
+
+fn listed_manifest_version(key: &str) -> Option<u64> {
+    key.strip_prefix("_versions/")
+        .and_then(|name| name.strip_suffix(".manifest"))
+        .and_then(|stem| stem.parse().ok())
 }
 
 fn manifest_totals(manifest: &Manifest) -> Result<(u64, u64)> {
