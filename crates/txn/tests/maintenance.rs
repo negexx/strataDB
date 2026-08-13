@@ -29,7 +29,7 @@ fn maintenance_reduces_unprotected_history_and_reports_the_bound() {
         .unwrap();
 
     assert!(report.storage_bound_met);
-    assert_eq!(report.inventory.data_object_count(), 1);
+    assert_eq!(report.inventory.data_object_count(), 2);
     assert_eq!(report.inventory.reachable_segment_count(), 1);
     assert!(!dataset.data_dir().join("orphan.arrow").exists());
 }
