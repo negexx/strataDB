@@ -9,7 +9,7 @@
 //! visibility and read-set tracking are explicit non-goals for this slice,
 //! not gaps.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64};
@@ -32,8 +32,8 @@ use strata_index::{EfConstruction, HnswIndex, MaxConnections, MaxElements, MaxLa
 use strata_storage::{
     Backend, ColumnStats, DataFileEntry, LocalFs, Manifest, SegmentEntry, Value, commit_manifest,
     compute_stats, initialize_row_id_high_water, read_current, read_current_with_byte_count,
-    read_manifest_with_byte_count, read_row_id_high_water, read_row_id_high_water_with_byte_count,
-    sync_dir, write_batch, write_bytes,
+    read_manifest_at_key_with_byte_count, read_manifest_with_byte_count, read_row_id_high_water,
+    read_row_id_high_water_with_byte_count, sync_dir, write_batch, write_bytes,
 };
 
 use crate::commit_log::{CommitLog, ConflictCheck};
@@ -364,7 +364,6 @@ impl Dataset {
         let source = self.current.load_full();
         let source_version = source.version;
         let old_data_files = source.manifest.data_files.clone();
-        let old_segments = source.manifest.segments.clone();
         let physical_batches = source
             .read_surviving_physical_batches()?
             .into_iter()
@@ -527,27 +526,63 @@ impl Dataset {
             protected_segments.extend(manifest.segments.into_iter().map(|entry| entry.name));
         }
         let backend = LocalFs::new(&self.dir);
-        let mut objects_deleted = 0_u64;
-        let mut bytes_deleted = 0_u64;
-        for entry in old_data_files {
-            if !protected_data.contains(&entry.name) {
-                backend.delete(&format!("data/{}", entry.name))?;
-                objects_deleted = objects_deleted
-                    .checked_add(1)
-                    .ok_or_else(|| TxnError::ManifestOverflow("objects_deleted".to_owned()))?;
-                bytes_deleted = bytes_deleted
-                    .checked_add(entry.byte_len)
-                    .ok_or_else(|| TxnError::ManifestOverflow("bytes_deleted".to_owned()))?;
+        let mut manifest_listed_objects = HashSet::new();
+        for object in backend.list("_versions/")? {
+            let Some(stem) = object
+                .key
+                .strip_prefix("_versions/")
+                .and_then(|key| key.strip_suffix(".manifest"))
+            else {
+                continue;
+            };
+            let Ok(version) = stem.parse::<u64>() else {
+                continue;
+            };
+            let (historical, _) =
+                read_manifest_at_key_with_byte_count(&self.dir, &object.key, version)?;
+            let reachable = crate::lifecycle::reachable_keys(&historical)?;
+            manifest_listed_objects.extend(reachable.data_files);
+            manifest_listed_objects.extend(reachable.segments);
+        }
+        let data_objects = backend.list("data/")?;
+        let mut listed_data_objects = HashMap::with_capacity(data_objects.len());
+        for object in data_objects {
+            if listed_data_objects
+                .insert(object.key.clone(), object.size)
+                .is_some()
+            {
+                return Err(TxnError::Storage(
+                    strata_storage::StorageError::CorruptManifest(
+                        self.dir.join("data"),
+                        "duplicate listed data object key".to_owned(),
+                    ),
+                ));
             }
         }
-        for entry in old_segments {
-            if !protected_segments.contains(&entry.name) {
-                backend.delete(&format!("data/{}", entry.name))?;
+        let mut objects_deleted = 0_u64;
+        let mut bytes_deleted = 0_u64;
+        for key in manifest_listed_objects {
+            let Some(bytes) = listed_data_objects.get(&key).copied() else {
+                return Err(TxnError::Storage(
+                    strata_storage::StorageError::CorruptManifest(
+                        self.dir.join(&key),
+                        "manifest-listed data object is missing from inventory".to_owned(),
+                    ),
+                ));
+            };
+            let name = key.strip_prefix("data/").ok_or_else(|| {
+                TxnError::Storage(strata_storage::StorageError::CorruptManifest(
+                    self.dir.join(&key),
+                    "manifest-listed object has an invalid data prefix".to_owned(),
+                ))
+            })?;
+            if !protected_data.contains(name) && !protected_segments.contains(name) {
+                backend.delete(&key)?;
                 objects_deleted = objects_deleted
                     .checked_add(1)
                     .ok_or_else(|| TxnError::ManifestOverflow("objects_deleted".to_owned()))?;
                 bytes_deleted = bytes_deleted
-                    .checked_add(entry.byte_len)
+                    .checked_add(bytes)
                     .ok_or_else(|| TxnError::ManifestOverflow("bytes_deleted".to_owned()))?;
             }
         }
