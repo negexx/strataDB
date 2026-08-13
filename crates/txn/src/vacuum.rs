@@ -83,7 +83,7 @@ impl Dataset {
             let Some(name) = object.key.strip_prefix("data/") else {
                 continue;
             };
-            let recognized_orphan = name.starts_with('.')
+            let recognized_orphan = is_strata_temporary_name(name)
                 || std::path::Path::new(name)
                     .extension()
                     .is_some_and(|extension| {
@@ -108,4 +108,30 @@ impl Dataset {
             bytes_deleted,
         })
     }
+}
+
+fn is_strata_temporary_name(name: &str) -> bool {
+    let Some(name) = std::path::Path::new(name)
+        .file_name()
+        .and_then(|name| name.to_str())
+    else {
+        return false;
+    };
+    let Some(name) = name.strip_prefix(".tmp-") else {
+        return false;
+    };
+    let mut parts = name.splitn(3, '-');
+    let (Some(process_id), Some(counter), Some(final_name)) =
+        (parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+
+    !final_name.is_empty()
+        && process_id
+            .parse::<u32>()
+            .is_ok_and(|value| value.to_string() == process_id)
+        && counter
+            .parse::<u64>()
+            .is_ok_and(|value| value.to_string() == counter)
 }
