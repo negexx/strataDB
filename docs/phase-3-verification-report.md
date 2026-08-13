@@ -2,13 +2,13 @@
 
 **Run date:** 2026-08-13
 **Branch:** `codex/phase-3-vacuum`
-**Remediation head:** `0141355d1261ee20d8128cbc11c38b23e83045c9`
+**Remediation head:** `105c24f74dc68d8c4c552bfa9d4b63b1a4c79a2c`
 
 ## Fresh cloud provenance
 
 Exact-head GitHub Actions run
-[31698710652](https://github.com/negexx/strataDB/actions/runs/31698710652) completed successfully
-for remediation head `0141355d1261ee20d8128cbc11c38b23e83045c9`. The controller reported all
+[31701969422](https://github.com/negexx/strataDB/actions/runs/31701969422) completed successfully
+for final remediation head `105c24f74dc68d8c4c552bfa9d4b63b1a4c79a2c`. The controller reported all
 workflow jobs successful:
 
 - `ci`;
@@ -18,9 +18,17 @@ workflow jobs successful:
 - `thorough-chaos`; and
 - `windows-directory-durability`.
 
-This is the fresh evidence for the Task 1–4 remediation aggregate, including manifest-publication
+This is the final exact-head evidence for the Task 1–4 remediation aggregate, including manifest-publication
 timestamps, recovery-recognized numeric manifest authority, constrained vacuum cleanup, lifecycle
 inventory compatibility, and compaction crash/reopen coverage.
+
+## Prior cloud provenance
+
+The earlier exact-head GitHub Actions run
+[31698710652](https://github.com/negexx/strataDB/actions/runs/31698710652) completed successfully
+for remediation head `0141355d1261ee20d8128cbc11c38b23e83045c9`, with the same controller job set
+listed above. It remains retained provenance for the earlier Task 1–4 remediation aggregate; the
+final exact-head run above is the current evidence.
 
 ## Local limitation
 

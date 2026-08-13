@@ -3,11 +3,12 @@
 Strata is an embedded, single-node, local-disk research/prototype database for structured Arrow data
 and vector embeddings. Its supported concurrency boundary is concurrent writers in one process sharing
 one `Dataset` handle. The intended commit contract is atomic row/index publication through a manifest,
-but the Phase 1 audit found in-scope correctness, durability, and integrity blockers; this contract is
-Partial and blocked, not a universal guarantee.
+and the Phase 1 audit's in-scope correctness, durability, and integrity blockers are now remediated
+or evidence-closed within named local filesystem and shared-handle limits. The Phase 1 contract is
+implemented with named limits, not a universal guarantee.
 
 Read [status](status.md) for evidence, [roadmap](roadmap.md) for phases, and [phase-1-audit](phase-1-audit.md)
-for the current blockers.
+for the audit trail and named limits.
 
 ## Components
 
