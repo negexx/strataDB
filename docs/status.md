@@ -36,7 +36,7 @@ embedded/single-process boundary. This does not alter the Phase 1 bounded status
 serializability, universal durability/performance/recall, cross-process coordination, or lifecycle
 reclamation.
 
-**Phase 3: Partial.** `Dataset::lifecycle_report()` and
+**Phase 3: Implemented within named bounds.** `Dataset::lifecycle_report()` and
 `Dataset::retention_plan(RetentionPolicy)` remain read-only diagnostic/planning evidence for one
 shared `Dataset` handle. `Dataset::prune_manifests(RetentionPolicy)` now executes the narrower
 manifest-only slice: it takes lifecycle exclusivity before `commit_lock`, rebuilds exact listed-key
@@ -53,6 +53,7 @@ provide explicit history and one final inventory observation of requested storag
 `storage_bound_met` is neither atomic nor continuing enforcement, and active snapshots are reported
 as preventing the requested bound rather than being deleted. Cross-process lifecycle work remains
 later design. Fresh exact-head lifecycle evidence is recorded in the
+[Phase 3 closeout audit](audit/phase-3/audit.md) and
 [Phase 3 verification report](phase-3-verification-report.md). See
 the [inventory design](designs/phase-3/lifecycle-inventory.md), [manifest executor
 design](designs/phase-3/manifest-retention-executor.md), and focused [inventory](../crates/txn/tests/lifecycle_inventory.rs),
@@ -74,9 +75,9 @@ tests.
 | Python | Partial | Thin PyO3 Dataset/Snapshot query facade returns Arrow IPC bytes for tabular results and typed vector matches; integration review remains. |
 | Durability/recovery | Partial | File/directory durability, immutable row-ID high-water, manifest integrity, and crash/reopen evidence exist within named local bounds; full branch verification remains. |
 | Schema/migrations | Partial | Dataset-owned schema and strict validation are implemented; schema evolution and migration remain deferred. |
-| Lifecycle diagnostics, planning, pruning, and compaction | Partial | `Dataset::lifecycle_report()` inventories one captured snapshot, retention APIs delete eligible historical manifests, and `Dataset::compact()` writes zero row files for an empty live set or one per maximal contiguous live physical-row-ID run for a nonempty set, with at most one vector segment, while protecting active snapshots. `Dataset::vacuum()` removes recognized unprotected objects, and `Dataset::maintain()` returns `storage_bound_met` from its final inventory rather than enforcing an atomic or continuing bound. Unknown object types and universal cross-process bounds remain outside scope. See the lifecycle design documents, [Phase 3 verification report](phase-3-verification-report.md), and focused tests. |
+| Lifecycle diagnostics, planning, pruning, and compaction | Implemented within named bounds | `Dataset::lifecycle_report()` inventories one captured snapshot, retention APIs delete eligible historical manifests, and `Dataset::compact()` writes zero row files for an empty live set or one per maximal contiguous live physical-row-ID run for a nonempty set, with at most one vector segment, while protecting active snapshots. `Dataset::vacuum()` removes recognized unprotected objects, and `Dataset::maintain()` returns `storage_bound_met` from its final inventory rather than enforcing an atomic or continuing bound. Unknown object types and universal cross-process bounds remain outside scope. See the lifecycle design documents, [Phase 3 closeout audit](audit/phase-3/audit.md), [Phase 3 verification report](phase-3-verification-report.md), and focused tests. |
 | Loom/chaos/fuzz/bench evidence | Implemented within named bounds | Exact-head CI run [31644869407](https://github.com/negexx/strataDB/actions/runs/31644869407) passed the named functional gates; benchmark run [31647664161](https://github.com/negexx/strataDB/actions/runs/31647664161) passed the synthetic and full pinned-fixture matrices with retained provenance. Universal bounds and final limitations remain explicit non-claims. |
-| Compaction/GC | Partial | Explicit snapshot-preserving compaction writes zero row files for an empty live set or one per maximal contiguous live physical-row-ID run for a nonempty set, plus at most one vector segment. Post-publication reclamation, age-based manifest retention, recognized-object vacuum, and a maintenance operation whose final inventory may report `storage_bound_met` are implemented. It is not an atomic or continuing bound; active snapshots, protected history, and unsupported object types can keep physical growth above a requested limit. |
+| Compaction/GC | Implemented within named bounds | Explicit snapshot-preserving compaction writes zero row files for an empty live set or one per maximal contiguous live physical-row-ID run for a nonempty set, plus at most one vector segment. Post-publication reclamation, age-based manifest retention, recognized-object vacuum, and a maintenance operation whose final inventory may report `storage_bound_met` are implemented. It is not an atomic or continuing bound; active snapshots, protected history, and unsupported object types can keep physical growth above a requested limit. |
 | Cross-process coordination | Proposed | Independent openers do not share transaction state or durable conditional publication. The reserved future seam includes versioned capability negotiation, expected-manifest-version preconditions, request IDs with idempotent retries, typed conflicts, and explicit visibility/durability acknowledgements; Phase 4 entry gates are recorded in the [roadmap](roadmap.md#phase-4-reservation-and-entry-gates) and [decision 0010](decisions.md#0010---deferred-cross-process-coordination-seam). |
 | Branching/object storage | Proposed | No branch/merge or object-store backend is implemented. |
 

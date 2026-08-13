@@ -3,7 +3,10 @@
 **Run date:** 2026-08-13
 **Execution branch:** historical `codex/phase-3-vacuum`
 **Verification head:** `7be77d5` (final pre-merge PR head)
-**Merged branch:** `main` at `65449a9` (PR #68)
+**Merged implementation branch:** `main` at `65449a9` (PR #68)
+**Documentation baseline:** Evidence was reviewed against baseline `main` `66408bd` before this
+uncommitted documentation closeout. Final exact-head provenance must be the commit containing these
+docs.
 
 ## Fresh cloud provenance
 
@@ -40,20 +43,29 @@ The still earlier exact-head GitHub Actions run
 for remediation head `0141355d1261ee20d8128cbc11c38b23e83045c9`, with the same controller job set
 listed above. It remains retained provenance for the earlier Task 1–4 remediation aggregate.
 
-## Local limitation
+## Fresh local Windows verification
 
-The local Windows host now has the x64 MSVC compiler and linker binaries, but the installed Build
-Tools do not include the x64 MSVC library directory or `msvcrt.lib`. The Task 1–6 native `cargo test`
-attempts, including the strengthened unpadded vacuum/vector regression, therefore still stop at
-linking before test assertions run. Their targeted compile-only checks passed where recorded in the
-task ledgers. This remains an environment limitation, not a local test-pass claim; the exact-head
-cloud run above supplies the completed functional evidence.
+The 2026-08-13 native x64 MSVC environment was verified by explicit `PATH` setup and
+`where.exe cl`/`where.exe link`. The seven targeted lifecycle test binaries passed:
+
+| Command | Result |
+|---|---|
+| `cargo test -p strata-txn --no-default-features --test lifecycle_inventory --test retention_plan --test retention_age --test manifest_retention_executor --test compaction --test vacuum --test maintenance` | Exit 0; all seven targeted lifecycle test binaries passed. |
+| `cargo test --workspace --no-default-features` | Exit 0. |
+| `cargo clippy --workspace --all-targets -- -D warnings` | Exit 0. |
+| `cargo fmt --check` | Exit 0. |
+| `git diff --check` | Exit 0. |
+
+These native Windows results include the workspace test suite, lint, format, and diff checks, but
+make no local loom claim. The canonical exact-head cloud run above remains authoritative for the
+loom and broader CI gates.
 
 ## Claim boundary
 
-Phase 3 remains Partial. Its implemented lifecycle operations apply only to one process using one
-shared `Dataset` handle. Compaction preserves active snapshots, age retention protects legacy zero
-timestamps, vacuum deletes only recognized unprotected objects, and `storage_bound_met` is one
-maintenance run's final inventory observation. This evidence does not establish serializability,
-cross-process coordination, universal power-loss durability, or atomic/continuing storage-bound
-enforcement.
+**Phase 3 is implemented within named bounds.** Its lifecycle operations apply only to one process
+using one shared `Dataset` handle. Compaction preserves active snapshots, age retention protects
+legacy zero timestamps, vacuum deletes only recognized unprotected objects, and
+`storage_bound_met` is one completed maintenance run's final inventory observation. Active snapshots,
+protected history, or unknown objects can prevent that observation from meeting a requested bound.
+This evidence does not establish serializability, cross-process coordination, universal power-loss
+durability, or atomic/continuing storage-bound enforcement.

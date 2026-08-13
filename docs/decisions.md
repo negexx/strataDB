@@ -52,10 +52,10 @@ decision does not create a stable Python or administration API.
 
 **Status:** Accepted as a future-design reservation; Phase 4 implementation is not approved.
 
-Strata preserves the embedded, one-process/shared-`Dataset` boundary while Phase 1 correctness and
-durability remain Partial and Phase 3 lifecycle growth is not yet bounded. The storage core must not
-add native cross-process locks, independent multi-writer publication, distributed transactions, or a
-second commit protocol at this stage.
+Strata preserves the embedded, one-process/shared-`Dataset` boundary after the bounded Phase 1
+correctness/durability and Phase 3 lifecycle slices. Those completed slices do not provide durable
+process-boundary coordination. The storage core must not add native cross-process locks, independent
+multi-writer publication, distributed transactions, or a second commit protocol at this stage.
 
 The future coordination boundary must be versioned and typed. Its reserved contract includes:
 

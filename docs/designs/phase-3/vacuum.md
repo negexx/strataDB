@@ -1,6 +1,6 @@
 # Phase 3 Vacuum Design
 
-**Status:** Implemented and accepted for the bounded Phase 3 lifecycle scope; Phase 3 remains Partial.
+**Status:** Implemented within named bounds for the bounded Phase 3 lifecycle scope.
 
 ## Goal
 

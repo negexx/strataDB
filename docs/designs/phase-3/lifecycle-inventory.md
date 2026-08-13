@@ -1,6 +1,6 @@
 # Phase 3 Lifecycle Inventory and Diagnostics Design
 
-Status: approved design; implementation plan written and being executed.
+Status: implemented within named bounds; approved design record for the read-only inventory slice.
 
 This document governs the read-only inventory slice only. Its deletion exclusions apply to
 `Dataset::lifecycle_report()` and do not prohibit the separately approved
@@ -40,7 +40,7 @@ the report was being collected.
 The report is observational and must not acquire the commit lock, mutate the manifest, or read a
 second snapshot. Current-manifest reachability is the only classification in this slice. An object
 not referenced by the captured manifest is an `orphan_candidate`, not a reclaimable object, because
-an older in-memory snapshot may still reference it and because cleanup safety is a later design.
+an older in-memory snapshot may still reference it and this report never grants cleanup authority.
 
 ## Report contract
 
@@ -79,7 +79,7 @@ object counts and sizes are a best-effort point-in-time observation of the backe
 
 ## Verification
 
-Tests will prove:
+Regression coverage proves:
 
 1. a fresh dataset reports version zero and zero data/segment/tombstone usage;
 2. committed row files and vector segments are counted and matched to manifest byte lengths;
@@ -88,13 +88,15 @@ Tests will prove:
 5. missing reachable objects and invalid names fail closed; and
 6. concurrent commits do not mutate an already captured report or its observed version.
 
-The implementation will run targeted storage/transaction tests, the workspace test suite, check,
-clippy, format, and diff checks. No benchmark or lifecycle reclamation claim is made by this slice.
+Focused lifecycle storage/transaction tests and recorded Phase 3 verification evidence cover this
+implemented slice. No benchmark or lifecycle reclamation claim is made by this slice.
 
 ## Boundary preservation
 
 The design remains embedded, single-node, and one-process/shared-`Dataset` handle. It preserves
 immutable snapshot reads plus write-write OCC, and adds no universal
 durability, latency, memory, recovery, recall, or segment-count guarantee.
-coordination, compaction, vacuum, row/segment retention, and orphan cleanup remain later work; see
-the separate manifest-only executor design for its narrower historical-manifest slice.
+Cross-process coordination remains Phase 4 work. Compaction, vacuum, row/segment retention, and
+orphan cleanup are implemented only by their separate bounded designs; this read-only report grants
+no cleanup authority. See the separate manifest-only executor design for its narrower
+historical-manifest slice.

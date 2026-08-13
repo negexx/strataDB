@@ -12,7 +12,7 @@ columns and vector embeddings. Its supported concurrency scope is one process us
 detection, durable manifest publication, and row/index consistency without silent buffering; the
 2026-08-01 Phase 1 audit records counterexamples and an implemented-with-named-limits verdict.
 That verdict is limited to the documented local, single-process/shared-`Dataset` boundary; Phase 3
-lifecycle work remains Partial.
+lifecycle work is implemented within named bounds.
 
 Non-negotiable target invariants:
 

@@ -1,6 +1,6 @@
 # Phase 3 Compaction and Reclamation Design
 
-**Status:** Implemented and accepted for the bounded Phase 3 lifecycle scope; Phase 3 remains Partial.
+**Status:** Implemented and accepted for the bounded Phase 3 lifecycle scope; Phase 3 is implemented within named bounds.
 **Branch:** `codex/phase-3-lifecycle`
 
 ## Goal
