@@ -40,7 +40,7 @@ Before changing behavior, read the narrowest current sources needed:
 1. `docs/architecture.md`, `docs/status.md`, and `docs/roadmap.md` for current system shape,
    implementation boundaries, and planned work.
 2. `docs/design.md` before `crates/txn` or `crates/storage` work.
-3. `docs/decisions.md` and `docs/phase-1-audit.md` for governing decisions and current blockers.
+3. `docs/decisions.md` and `docs/audit/phase-1/audit.md` for governing decisions and current blockers.
 4. Current source, tests, Cargo manifests, and `.github/workflows/ci.yml`.
 5. Relevant historical material under `docs/history/` when the current documents need rationale.
 

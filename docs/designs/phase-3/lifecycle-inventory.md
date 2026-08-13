@@ -4,7 +4,7 @@ Status: approved design; implementation plan written and being executed.
 
 This document governs the read-only inventory slice only. Its deletion exclusions apply to
 `Dataset::lifecycle_report()` and do not prohibit the separately approved
-[manifest retention executor](phase-3-manifest-retention-executor-design.md).
+[manifest retention executor](manifest-retention-executor.md).
 
 ## Goal
 

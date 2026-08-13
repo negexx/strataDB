@@ -2,7 +2,7 @@
 
 The old analysis tree contained useful findings but repeated the same conclusions in unstable,
 line-number-heavy prose. Their themes are retained here; the active seven-lane review is
-[phase-1-audit.md](../phase-1-audit.md).
+[phase-1-audit.md](../audit/phase-1/audit.md).
 
 ## July 2026 audit chronology
 

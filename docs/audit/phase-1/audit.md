@@ -1,11 +1,8 @@
 # Phase 1 Sol audit
 
 > **2026-08-12 audit refresh:** The requested lane reports, evidence matrix, implementation
-> disposition plan, and fresh verification report are in `phase-1-correctness-audit.md`,
-> `phase-1-performance-audit.md`, `phase-1-memory-audit.md`, `phase-1-concurrency-audit.md`,
-> `phase-1-test-coverage-audit.md`, `phase-1-documentation-audit.md`,
-> `phase-1-refactoring-audit.md`, `phase-1-evidence-matrix.md`,
-> `phase-1-audit-implementation-plan.md`, and `phase-1-verification-report.md`. The fresh local run
+> disposition plan, and fresh verification report are in the historical records under
+> `../../history/phase-1/`, `evidence-matrix.md`, and `../../phase-1-verification-report.md`. The fresh local run
 > found no new confirmed runtime defect. Exact-head GitHub Actions run 31644869407 passed the
 > functional gates, and benchmark run 31647664161 passed the full pinned-fixture matrix. The
 > implementation is closed within named bounds; no universal durability/performance claim is made.
@@ -26,7 +23,7 @@ The original remediation closeout was synchronized through merged PR #50,
 gap-closure branch is based on merged PR #58, `21811031d0fbe3ed3f55532941c056c0c9e091b0`, which
 includes the subsequent evidence-finalization changes.
 The
-[Phase 1 closeout ledger](phase-1-closeout-ledger.md) is the mechanically scannable, row-per-finding
+[Phase 1 closeout ledger](../../phase-1-closeout-ledger.md) is the mechanically scannable, row-per-finding
 record of current state, dependencies, acceptance assertions, and the future evidence required before
 this audit's verdict can change. It does not close Phase 1 or replace this audit as the controlling
 finding register.
@@ -176,7 +173,7 @@ consolidated register above; IDs marked "merged" retain the same evidence under 
 | PERF-01 | Bounded cloud synthetic and validated full pinned 100K-row segmented/lifecycle matrices plus native Ubuntu/Windows provenance are recorded in `docs/phase-1-performance.md`; universal operating bounds remain open. |
 | PERF-02 | Five-repetition manifest-growth measurements cover versions 1/10/20/40/80/160; they are evidence, not a universal bound. Incremental manifests/GC remain Phase 3. |
 | PERF-03 | Typed recovery-byte accounting and deterministic row-ID/load-boundary regressions are implemented; validated bounded synthetic and full-fixture lifecycle/recovery evidence now exists. No universal recovery-time/byte bound is claimed. |
-| PERF-04 | Validated cloud Dataset/Snapshot fan-out matrices cover K=1…64 synthetic and full pinned-fixture segments in filtered/unfiltered modes; they do not establish a supported maximum. Compaction remains Phase 3. |
+| PERF-04 | Validated cloud Dataset/Snapshot fan-out matrices cover K=1â€¦64 synthetic and full pinned-fixture segments in filtered/unfiltered modes; they do not establish a supported maximum. Compaction remains Phase 3. |
 | PERF-05 | Repeated bounded synthetic evidence covers 0/1/4/16/64 retained handles and full-fixture one-pin lifecycle residency with exact logical-versus-unique manifest/data/segment accounting plus labeled approximate cache/allocator observations; RSS and universal residency bounds remain open. |
 | PERF-06 | Preserved as later Phase 2/3 query/layout work: public scans lack projection pushdown and sub-file pruning; establish an honest baseline. |
 | PERF-07 | Preserved as documentation/query work: projection avoids some array construction but not dominant file-body reads; benchmark and correct the claim. |

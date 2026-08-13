@@ -59,7 +59,7 @@ stronger isolation nor process-boundary conditional publication.
 
 ## Relationship to lifecycle inventory
 
-The [lifecycle inventory design](phase-3-lifecycle-inventory-design.md) governs a separate,
+The [lifecycle inventory design](lifecycle-inventory.md) governs a separate,
 read-only report. Its orphan candidates remain diagnostic and are not executor authority. This
 design authorizes only listed historical manifest deletion; row and segment reclamation requires a
 later crash-safe design such as a journal or equivalent durable protocol.

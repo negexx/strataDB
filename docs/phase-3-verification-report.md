@@ -1,14 +1,15 @@
 # Phase 3 verification report
 
 **Run date:** 2026-08-13
-**Branch:** `codex/phase-3-vacuum`
-**Remediation head:** `5a08bab096416b02b64fcb492b7d0114b1e192f4`
+**Execution branch:** historical `codex/phase-3-vacuum`
+**Verification head:** `7be77d5` (final pre-merge PR head)
+**Merged branch:** `main` at `65449a9` (PR #68)
 
 ## Fresh cloud provenance
 
 Canonical final exact-head GitHub Actions run
-[31711298549](https://github.com/negexx/strataDB/actions/runs/31711298549) completed successfully
-for final remediation head `5a08bab096416b02b64fcb492b7d0114b1e192f4`. The controller reported all
+[31714285971](https://github.com/negexx/strataDB/actions/runs/31714285971) completed successfully
+for final verification head `7be77d5`. The controller reported all
 workflow jobs successful:
 
 - `ci`;
@@ -41,11 +42,12 @@ listed above. It remains retained provenance for the earlier Task 1–4 remediat
 
 ## Local limitation
 
-The local Windows host has no MSVC `link.exe`; the Task 1–6 native `cargo test` attempts, including
-the strengthened unpadded vacuum/vector regression, stopped at linking before test assertions ran.
-Their targeted compile-only checks passed where recorded in the task ledgers. This is an environment
-limitation, not a local test-pass claim; the exact-head cloud run above supplies the completed
-functional evidence.
+The local Windows host now has the x64 MSVC compiler and linker binaries, but the installed Build
+Tools do not include the x64 MSVC library directory or `msvcrt.lib`. The Task 1–6 native `cargo test`
+attempts, including the strengthened unpadded vacuum/vector regression, therefore still stop at
+linking before test assertions run. Their targeted compile-only checks passed where recorded in the
+task ledgers. This remains an environment limitation, not a local test-pass claim; the exact-head
+cloud run above supplies the completed functional evidence.
 
 ## Claim boundary
 

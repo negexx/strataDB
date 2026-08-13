@@ -7,7 +7,7 @@ historical and may describe mechanisms that were later removed.
 
 The Phase 0 specification established Arrow IPC files, JSON manifests, physical row IDs, tombstones,
 write-write OCC, commit locking, and immutable snapshots. It remains useful as rationale, but current
-implementation limits and Phase 1 blockers are recorded in [design](../design.md) and the [audit](../phase-1-audit.md).
+implementation limits and Phase 1 blockers are recorded in [design](../design.md) and the [audit](../audit/phase-1/audit.md).
 
 ## Phase 2 and 3 query plans
 

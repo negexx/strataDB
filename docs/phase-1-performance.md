@@ -83,7 +83,7 @@ performance fix. The corrected run validated 370 records and 185 before/after de
 | Lifecycle, 0 pins: ingest+commit wall | 284.99 ms | 248.57 ms | -12.78% |
 | Lifecycle, 64 pins: ingest+commit wall | 243.15 ms | 293.10 ms | +20.54% |
 
-These are small, synthetic, VM-local observations—not proof of a broad performance win or
+These are small, synthetic, VM-local observationsâ€”not proof of a broad performance win or
 regression. The matrix does not isolate the statistics path, full real-fixture before/after
 behavior, portable native filesystems, RSS/process-memory bounds, projection/pruning, or a
 supported segment/history maximum. The performance-related Phase 1 rows therefore remain
@@ -104,16 +104,16 @@ The directly comparable pair is merged PR #56,
 above; the workflow recorded and verified size `363758493` and SHA-256
 `5ea400d91cba9b27fa55fc659e48f7bda8cba68443f087a15ddbc0e42acd049d` before running either
 revision. The segment benchmark uses a bounded 256-row prefix of that 100K-row fixture, 16 fixed
-queries, K=1…64, one excluded warmup, and five measured repetitions per K/mode. Both revisions
+queries, K=1â€¦64, one excluded warmup, and five measured repetitions per K/mode. Both revisions
 emitted the same fixture input hash `7a911b4e03268d44`; `summarize.py --validate` accepted 542
 records and 269 before/after deltas.
 
 | Workload | Before | After | Relative change |
 |---|---:|---:|---:|
-| Fixture K=1 unfiltered: median µs/query | 45.4 | 46.1 | +1.54% |
-| Fixture K=1 filtered: median µs/query | 47.9 | 46.8 | -2.30% |
-| Fixture K=64 unfiltered: median µs/query | 80.4 | 84.2 | +4.73% |
-| Fixture K=64 filtered: median µs/query | 57.8 | 59.5 | +2.94% |
+| Fixture K=1 unfiltered: median Âµs/query | 45.4 | 46.1 | +1.54% |
+| Fixture K=1 filtered: median Âµs/query | 47.9 | 46.8 | -2.30% |
+| Fixture K=64 unfiltered: median Âµs/query | 80.4 | 84.2 | +4.73% |
+| Fixture K=64 filtered: median Âµs/query | 57.8 | 59.5 | +2.94% |
 | Fixture recall, all reported K/modes | 1.0000 | 1.0000 | 0.00% |
 
 This is the complete before/after K/mode matrix on the bounded fixture prefix, not a full 100K-row
@@ -400,7 +400,7 @@ filesystem/query path. The lifecycle benchmark reports allocation and peak-live 
 |---|---|---|
 | 40 sequential id-only commits | Superseded for manifest-growth evidence by the fresh Task 5 1/10/20/40/80/160 matrix above; this earlier one-run sample is retained only as historical context. | Use the fresh five-repetition values above for current bounded manifest-growth evidence. |
 | 64 synthetic 512-dim rows, 8-row commits | reopen 21.66 ms; 24 concurrent commits 792.68 ms; 4 historical/current pinned handles 600 ns (423,598 live allocator bytes); end-of-run manifest 24,544 bytes after concurrent commits | Shows the current reopen, serialized-fsync, and historical-snapshot retention paths on this host; it is not an operating limit. |
-| 256 synthetic 512-dim rows, 16 queries, K=1…64 manifest-listed segments | K=1 recall@10 0.9938 at 98.2 us/query; K=64 recall@10 1.0000 at 157.2 us/query (1.6x) | This sample shows a bounded fan-out result without a recall drop; it does not prove behavior for production-scale data or all distributions. |
+| 256 synthetic 512-dim rows, 16 queries, K=1â€¦64 manifest-listed segments | K=1 recall@10 0.9938 at 98.2 us/query; K=64 recall@10 1.0000 at 157.2 us/query (1.6x) | This sample shows a bounded fan-out result without a recall drop; it does not prove behavior for production-scale data or all distributions. |
 
 Input hashes: lifecycle `97f1b4d1524e42f1`; earlier segment recall
 `6263e3d344dba5e7`; Task 7 segment recall `97f1b4d1524e42f1`.
@@ -430,11 +430,11 @@ them.
 
 | Area | Evidence state and workload / fixture | Metric | Acceptance criterion or decision gate | Provenance |
 |---|---|---|---|---|
-| Manifest/history growth | **Existing:** Task 5 deterministic id-only 1/10/20/40/80/160-commit matrix. **Future gate:** a named retained-history workload at the intended operating scale. | Manifest bytes, retained-history bytes, and publication wall time. | Choose a retained-history budget and whether a format/migration or lifecycle policy is required before setting a supported bound. | [Task 5 evidence](#task-5-manifest-growth-evidence-fresh-bounded); [Phase 1 audit](phase-1-audit.md); [closeout ledger](phase-1-closeout-ledger.md). |
+| Manifest/history growth | **Existing:** Task 5 deterministic id-only 1/10/20/40/80/160-commit matrix. **Future gate:** a named retained-history workload at the intended operating scale. | Manifest bytes, retained-history bytes, and publication wall time. | Choose a retained-history budget and whether a format/migration or lifecycle policy is required before setting a supported bound. | [Task 5 evidence](#task-5-manifest-growth-evidence-fresh-bounded); [Phase 1 audit](audit/phase-1/audit.md); [closeout ledger](phase-1-closeout-ledger.md). |
 | Segment fan-out | **Existing:** Task 7 synthetic K=1...64 matrix and the bounded full-fixture K/mode matrix. **Future gate:** pinned real fixtures across intended commit/segment distributions. | Filtered and unfiltered recall, latency, throughput, and segment count. | Decide a supported segment-count envelope or approve the compaction/layout work needed to enforce one; retain recall and latency evidence for that envelope. | [Task 7 evidence](#task-7-immutable-segment-fan-out-evidence-fresh-bounded); [full-fixture comparison](#cloud-beforeafter-comparison-fresh-full-pinned-100k-row-fixture). |
 | Cold filtered I/O | **Existing:** none; Task 7 explicitly measures warmed filtered searches. **Future gate:** cold-cache selective-filter runs on a pinned fixture with a documented cache-reset policy. | Cold p50/p95 latency and bytes/files read for matching and non-matching predicates. | Select the cold-query objective and tracing method; approve any layout, pruning, or ownership change needed when the current full-file path cannot meet it. | [Task 7 evidence](#task-7-immutable-segment-fan-out-evidence-fresh-bounded); [architecture](architecture.md#reads-updates-and-index-behavior). |
 | Recovery | **Existing:** Task 6 payload accounting and bounded synthetic/full-fixture reopen observations. **Future gate:** cold reopen across named data, segment, and retained-history scales. | Reopen p50/p95 latency, loaded/validated bytes, and process memory. | Establish the recovery objective and decide whether it requires lazy recovery, a format/migration change, or an operational retention policy. | [Task 6 evidence](#task-6-recovery-byte-accounting-evidence-fresh-bounded); [full-fixture comparison](#cloud-beforeafter-comparison-fresh-full-pinned-100k-row-fixture). |
-| Lifecycle cleanup/fairness | **Existing:** manifest-only pruning is a bounded executor slice; no cleanup or fairness result is claimed. **Future gate:** sustained commits plus retained snapshots while lifecycle preparation/execution is contended. | Eligible/reclaimed objects and bytes, lifecycle wait time, commit wait time, and starvation/completion observations. | Name the lifecycle owner and deletion authority, then decide reclamation scope and fairness policy before claiming cleanup or starvation bounds. | [status](status.md#overall-state); [roadmap](roadmap.md#deferred-and-refused-scope); [Phase 1 audit](phase-1-audit.md). |
+| Lifecycle cleanup/fairness | **Existing:** manifest-only pruning is a bounded executor slice; no cleanup or fairness result is claimed. **Future gate:** sustained commits plus retained snapshots while lifecycle preparation/execution is contended. | Eligible/reclaimed objects and bytes, lifecycle wait time, commit wait time, and starvation/completion observations. | Name the lifecycle owner and deletion authority, then decide reclamation scope and fairness policy before claiming cleanup or starvation bounds. | [status](status.md#overall-state); [roadmap](roadmap.md#deferred-and-refused-scope); [Phase 1 audit](audit/phase-1/audit.md). |
 | Memory/RSS | **Existing:** Task 8 reports logical/unique retained payload and cache-charge accounting, not RSS. **Future gate:** cold and steady-state process measurements at named fixture, segment, and retained-snapshot counts. | RSS/peak RSS, allocator/live-set accounting, and retained logical/unique payload. | Choose the memory budget and measurement platform; do not promote accounting values to an RSS limit without the corresponding process evidence. | [Task 8 evidence](#task-8-retained-snapshotcache-footprint-evidence-fresh-bounded); [full-fixture comparison](#cloud-beforeafter-comparison-fresh-full-pinned-100k-row-fixture). |
 | Concurrency | **Existing:** bounded shared-handle lifecycle observations include concurrent commits. **Future gate:** named shared-`Dataset` read/write and lifecycle-contention mixes. | Commit/read p50/p95/p99 latency, conflict rate, queue/wait time, and completion under contention. | Set the shared-handle workload objective and fairness policy. | [Task 6 evidence](#task-6-recovery-byte-accounting-evidence-fresh-bounded); [status concurrency scope](status.md#concurrency-scope). |
 | Portability | **Existing:** native Ubuntu/Windows foundation checks and Ubuntu cloud evidence; neither is a portable performance bound. **Future gate:** a declared supported local-filesystem/OS matrix using the same pinned workload and cache policy. | Per-platform correctness outcome, latency/memory variation, filesystem/cache-policy provenance. | Name the supported platform/filesystem matrix and operating owner before setting portable criteria; remote backends remain out of scope. | [Task 5 evidence](#task-5-manifest-growth-evidence-fresh-bounded); [status](status.md#capability-ledger); [roadmap](roadmap.md#deferred-and-refused-scope). |
