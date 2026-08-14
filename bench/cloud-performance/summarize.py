@@ -580,9 +580,9 @@ def validate_records(records: list[dict[str, Any]], artifact: Path) -> None:
         expected_commits = (lifecycle_rows_config + batch_rows - 1) // batch_rows
         if not commit_counts or any(count != expected_commits for count in commit_counts):
             errors.append(f"{label}: lifecycle commit count does not match configured batch size")
-        distinct_counts = [int(value) for _, value in LIFECYCLE_DISTINCT.findall(lifecycle_text)]
-        if sorted(set(distinct_counts)) != list(lifecycle_pins):
-            errors.append(f"{label}: lifecycle distinct-snapshot counts do not match configured pins")
+        retained_handle_counts = [int(value) for value, _ in LIFECYCLE_DISTINCT.findall(lifecycle_text)]
+        if sorted(set(retained_handle_counts)) != list(lifecycle_pins):
+            errors.append(f"{label}: lifecycle retained-handle counts do not match configured pins")
         for pins in lifecycle_pins:
             metric = f"lifecycle_pins{pins}_ingest_commit_wall_ms"
             lifecycle_rows = [

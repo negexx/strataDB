@@ -102,6 +102,7 @@ command_lifecycle=lifecycle
             )
             lifecycle = [*raw_headers]
             for pins in (0, 1, 4, 16, 64):
+                distinct_snapshots = 0 if pins == 0 else 1
                 lifecycle.extend(
                     [
                         "================ StrataDB lifecycle Ã¢â‚¬â€ 64 rows x 512-dim ================",
@@ -110,7 +111,7 @@ command_lifecycle=lifecycle
                         "8 threads x 3 = 24 commits, 24/s",
                         "input hash=abc123",
                         "measurement             : excluded warmup 1/1; pins=" + str(pins),
-                        f"{pins} retained handles ({pins} distinct snapshots; operational current snapshot excluded);",
+                        f"{pins} retained handles ({distinct_snapshots} distinct snapshots; operational current snapshot excluded);",
                         "loading 64 rows (512-dim) from synthetic seed=20260801; input hash=abc123",
                         "newest manifest bytes  : 200",
                     ]
@@ -124,7 +125,7 @@ command_lifecycle=lifecycle
                             "8 threads x 3 = 24 commits, 24/s",
                             "input hash=abc123",
                             f"measurement             : measured repetition {repetition}/5; pins={pins}",
-                            f"{pins} retained handles ({pins} distinct snapshots; operational current snapshot excluded);",
+                            f"{pins} retained handles ({distinct_snapshots} distinct snapshots; operational current snapshot excluded);",
                             "loading 64 rows (512-dim) from synthetic seed=20260801; input hash=abc123",
                             "newest manifest bytes  : 200",
                         ]
