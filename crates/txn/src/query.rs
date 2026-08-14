@@ -824,6 +824,8 @@ impl VectorSearchResult {
 /// An execution failure described by this contract.
 #[derive(Debug, Error)]
 pub enum QueryExecutionError {
+    #[error("transaction read operation '{operation}' cannot merge staged writes safely")]
+    UnsupportedTransactionRead { operation: &'static str },
     #[error("engine query execution failed: {0}")]
     Engine(#[source] Box<crate::TxnError>),
     #[error("checked Int64 sum overflowed for aggregate '{alias}'")]

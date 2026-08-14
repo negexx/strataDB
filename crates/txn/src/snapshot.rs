@@ -456,6 +456,42 @@ impl Snapshot {
         Ok(ScanResult { projection, rows })
     }
 
+    pub(crate) fn visible_logical_batches_excluding(
+        &self,
+        excluded_row_ids: &[u64],
+    ) -> Result<Vec<RecordBatch>> {
+        self.read_surviving_physical_batches()?
+            .into_iter()
+            .map(|batch| {
+                let batch = filter_row_ids(batch, excluded_row_ids)?;
+                cast_batch_to_schema(&batch, &self.schema)
+            })
+            .collect()
+    }
+
+    pub(crate) fn scan_query_overlay(
+        &self,
+        request: &ScanRequest,
+        batches: &[RecordBatch],
+    ) -> QueryResult<ScanResult> {
+        let projection = self.query_schema()?.validate_scan(request)?;
+        let rows = batches
+            .iter()
+            .map(|batch| {
+                let filtered = match &request.filter {
+                    Some(filter) => filter_record_batch(batch, &filter_mask(batch, filter)?)
+                        .map_err(TxnError::from)?,
+                    None => batch.clone(),
+                };
+                projected_rows(&filtered, &projection)
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect();
+        Ok(ScanResult { projection, rows })
+    }
+
     /// Executes a grouped aggregate query against this immutable snapshot.
     ///
     /// Files are processed in manifest order. Tombstones are removed before
@@ -567,6 +603,80 @@ impl Snapshot {
         GroupByResult::new(request.group_by.clone(), outputs, rows)
     }
 
+    pub(crate) fn group_by_query_overlay(
+        &self,
+        request: &GroupByRequest,
+        batches: &[RecordBatch],
+    ) -> QueryResult<GroupByResult> {
+        let outputs = self.query_schema()?.validate_group_by(request)?;
+        let aggregate_templates = request
+            .aggregates
+            .iter()
+            .zip(&outputs)
+            .map(|(aggregate, output)| AggregateState::new(aggregate, output))
+            .collect::<QueryResult<Vec<_>>>()?;
+        let mut group_indices = HashMap::new();
+        let mut groups = Vec::new();
+
+        for batch in batches {
+            let batch = match &request.filter {
+                Some(filter) => filter_record_batch(batch, &filter_mask(batch, filter)?)
+                    .map_err(TxnError::from)?,
+                None => batch.clone(),
+            };
+            for row in 0..batch.num_rows() {
+                let keys = request
+                    .group_by
+                    .iter()
+                    .map(|column| {
+                        let index = batch
+                            .schema_ref()
+                            .index_of(column)
+                            .map_err(TxnError::Arrow)?;
+                        result_value(batch.column(index), row)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let key = GroupKey::new(&keys)?;
+                let group_index = if let Some(index) = group_indices.get(&key) {
+                    *index
+                } else {
+                    let index = groups.len();
+                    group_indices.insert(key, index);
+                    groups.push(GroupState {
+                        keys,
+                        aggregates: aggregate_templates.clone(),
+                    });
+                    index
+                };
+
+                for (aggregate, state) in request
+                    .aggregates
+                    .iter()
+                    .zip(&mut groups[group_index].aggregates)
+                {
+                    let index = batch
+                        .schema_ref()
+                        .index_of(&aggregate.column)
+                        .map_err(TxnError::Arrow)?;
+                    state.update(&result_value(batch.column(index), row)?, &aggregate.alias)?;
+                }
+            }
+        }
+
+        let rows = groups
+            .into_iter()
+            .map(|group| GroupedRow {
+                keys: group.keys,
+                aggregates: group
+                    .aggregates
+                    .into_iter()
+                    .map(AggregateState::finish)
+                    .collect(),
+            })
+            .collect();
+        GroupByResult::new(request.group_by.clone(), outputs, rows)
+    }
+
     /// Looks up one physical row as of this immutable snapshot.
     ///
     /// The result distinguishes a row tombstoned in this snapshot from an
@@ -632,6 +742,17 @@ impl Snapshot {
             projection,
             outcome: RowLookupOutcome::NotFound,
         })
+    }
+
+    pub(crate) fn lookup_projection(&self, request: &RowLookupRequest) -> QueryResult<Vec<String>> {
+        self.query_schema()?.validate_row_lookup(request)
+    }
+
+    pub(crate) fn project_logical_row(
+        batch: &RecordBatch,
+        projection: &[String],
+    ) -> Result<ProjectedRow> {
+        projected_row(batch, 0, projection)
     }
 
     fn query_schema(&self) -> QueryResult<DatasetSchema> {
@@ -932,6 +1053,24 @@ impl Snapshot {
             })?;
         Ok(per_file_ids.into_iter().flatten().collect())
     }
+}
+
+fn filter_row_ids(batch: RecordBatch, excluded_row_ids: &[u64]) -> Result<RecordBatch> {
+    if excluded_row_ids.is_empty() {
+        return Ok(batch);
+    }
+    let row_id_idx = batch.schema_ref().index_of(ROW_ID_COLUMN)?;
+    let row_ids = batch
+        .column(row_id_idx)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .ok_or_else(|| query_cast_error(ROW_ID_COLUMN, "UInt64"))?;
+    let keep: BooleanArray = row_ids
+        .values()
+        .iter()
+        .map(|row_id| !excluded_row_ids.contains(row_id))
+        .collect();
+    Ok(filter_record_batch(&batch, &keep)?)
 }
 
 fn logical_type(data_type: &DataType) -> Result<LogicalType> {

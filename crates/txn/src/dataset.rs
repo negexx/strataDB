@@ -51,6 +51,11 @@ use crate::retention::{
 };
 use crate::row_id::{RowIdAllocator, RowIdRange};
 use crate::snapshot::Snapshot;
+use crate::{
+    GroupByRequest, GroupByResult, QueryError, QueryExecutionError, QueryResult, RowLookupOutcome,
+    RowLookupRequest, RowLookupResult, ScanRequest, ScanResult, VectorSearchRequest,
+    VectorSearchResult,
+};
 
 /// The hidden internal row-id column every committed batch carries
 /// alongside its logical columns. Callers can retrieve it through the
@@ -1172,6 +1177,7 @@ impl Dataset {
             base_snapshot: Arc::clone(&snapshot),
             schema: snapshot.schema(),
             pending: Vec::new(),
+            pending_replacements: HashMap::new(),
             pending_tombstones: Vec::new(),
             write_set: Vec::new(),
             current: Arc::clone(&self.current),
@@ -1266,6 +1272,9 @@ pub struct Transaction {
     /// Dataset-owned logical schema captured from `base_snapshot`.
     schema: SchemaRef,
     pending: Vec<RecordBatch>,
+    /// Replacement batches keyed by the committed physical row they replace.
+    /// Their physical row IDs are still allocated only by commit.
+    pending_replacements: HashMap<u64, RecordBatch>,
     /// Row-ids queued for tombstoning by [`Transaction::delete`]/
     /// [`Transaction::update`], applied at commit time (see
     /// [`Transaction::commit`]) — mirrors how `pending` buffers inserts.
@@ -1540,8 +1549,84 @@ impl Transaction {
         self.validate_target(row_id)?;
         self.pending_tombstones.push(row_id);
         self.write_set.push(row_id);
+        self.pending_replacements.insert(row_id, batch.clone());
         self.pending.push(batch);
         Ok(())
+    }
+
+    /// Scans the immutable base snapshot merged with this transaction's staged writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed validation or execution error from the query contract.
+    pub fn scan_query(&self, request: &ScanRequest) -> QueryResult<ScanResult> {
+        self.base_snapshot
+            .scan_query_overlay(request, &self.overlay_batches()?)
+    }
+
+    /// Groups the immutable base snapshot merged with this transaction's staged writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed validation or execution error from the query contract.
+    pub fn group_by_query(&self, request: &GroupByRequest) -> QueryResult<GroupByResult> {
+        self.base_snapshot
+            .group_by_query_overlay(request, &self.overlay_batches()?)
+    }
+
+    /// Looks up an existing committed physical row through this transaction's overlay.
+    ///
+    /// Staged inserts have no physical row ID until commit and are therefore
+    /// intentionally not addressable through this API.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed validation or execution error from the query contract.
+    pub fn lookup_row(&self, request: &RowLookupRequest) -> QueryResult<RowLookupResult> {
+        let projection = self.base_snapshot.lookup_projection(request)?;
+        let row_id = request.row_id.0;
+        if !self.pending_tombstones.contains(&row_id) {
+            return self.base_snapshot.lookup_row(request);
+        }
+        let outcome = match self.pending_replacements.get(&row_id) {
+            Some(batch) => {
+                RowLookupOutcome::Live(Snapshot::project_logical_row(batch, &projection)?)
+            }
+            None => RowLookupOutcome::Tombstoned,
+        };
+        Ok(RowLookupResult {
+            row_id: request.row_id,
+            projection,
+            outcome,
+        })
+    }
+
+    /// Executes vector search only when the base snapshot is the complete view.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed unsupported-operation error when staged writes would
+    /// make base-only vector results stale.
+    pub fn vector_search_query(
+        &self,
+        request: &VectorSearchRequest,
+    ) -> QueryResult<VectorSearchResult> {
+        if !self.pending.is_empty() || !self.pending_tombstones.is_empty() {
+            return Err(QueryError::Execution(
+                QueryExecutionError::UnsupportedTransactionRead {
+                    operation: "vector search",
+                },
+            ));
+        }
+        self.base_snapshot.vector_search_query(request)
+    }
+
+    fn overlay_batches(&self) -> Result<Vec<RecordBatch>> {
+        let mut batches = self
+            .base_snapshot
+            .visible_logical_batches_excluding(&self.pending_tombstones)?;
+        batches.extend(self.pending.iter().cloned());
+        Ok(batches)
     }
 
     fn validate_batch(&self, batch: &RecordBatch) -> Result<()> {
@@ -9372,6 +9457,23 @@ mod loom_tests {
         .expect("loom dataset creation and seed thread panicked")
     }
 
+    fn create_seeded_scalar_dataset(dir: std::path::PathBuf) -> crate::Dataset {
+        spawn_committer(move || {
+            let ds = crate::Dataset::create(dir, test_schema()).unwrap();
+            let batch = arrow::array::RecordBatch::try_new(
+                test_schema(),
+                vec![StdArc::new(arrow::array::Int64Array::from(vec![0, 1, 2]))],
+            )
+            .unwrap();
+            let mut seed = ds.begin();
+            seed.insert(batch).unwrap();
+            seed.commit().unwrap();
+            ds
+        })
+        .join()
+        .expect("loom dataset creation and seed thread panicked")
+    }
+
     #[test]
     fn one_writer_store_races_safely_with_many_readers_load() {
         loom::model(|| {
@@ -9459,6 +9561,97 @@ mod loom_tests {
                 .count();
             assert_eq!(successes, 1, "exactly one commit must succeed");
             assert_eq!(conflicts, 1, "exactly one commit must report a conflict");
+
+            std::fs::remove_dir_all(&dir).ok();
+        });
+    }
+
+    #[test]
+    fn transaction_read_overlay_stays_private_while_disjoint_and_contested_writes_commit() {
+        // Full transaction commits perform filesystem and Arrow work in each
+        // schedule. A bound of two reaches the reader-before/after-publish
+        // and contested-write orderings this model exercises without the
+        // unbounded state space exhausting Windows process resources.
+        let mut model = loom::model::Builder::new();
+        model.preemption_bound = Some(2);
+        model.check(|| {
+            let dir = tempfile::Builder::new()
+                .prefix(&format!(
+                    "strata-loom-transaction-read-overlay-{}-{:?}-",
+                    std::process::id(),
+                    loom::thread::current().id()
+                ))
+                .tempdir()
+                .unwrap()
+                .keep();
+            let ds = create_seeded_scalar_dataset(dir.clone());
+            let request = crate::ScanRequest {
+                projection: crate::Projection::Columns(vec!["id".into()]),
+                filter: None,
+            };
+
+            let mut read_view = ds.begin();
+            read_view
+                .insert(
+                    arrow::array::RecordBatch::try_new(
+                        test_schema(),
+                        vec![StdArc::new(arrow::array::Int64Array::from(vec![99]))],
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+
+            let mut disjoint = ds.begin();
+            disjoint.delete(0).unwrap();
+            let mut contender_a = ds.begin();
+            contender_a.delete(2).unwrap();
+            let mut contender_b = ds.begin();
+            contender_b.delete(2).unwrap();
+
+            let ds_reader = ds.clone();
+            let reader = spawn_committer(move || {
+                let own_rows = read_view.scan_query(&request).unwrap().rows.len();
+                let published_contains_staged = ds_reader
+                    .snapshot()
+                    .scan_query(&request)
+                    .unwrap()
+                    .rows
+                    .iter()
+                    .flat_map(|row| &row.fields)
+                    .any(|field| field.value == crate::ResultValue::Int64(99));
+                (own_rows, published_contains_staged)
+            });
+            let writer_a = spawn_committer(move || (disjoint.commit(), contender_a.commit()));
+            let contender_b_commit = spawn_committer(move || contender_b.commit());
+
+            let (disjoint_result, contender_a_result) = writer_a.join().unwrap();
+            let results = [
+                disjoint_result,
+                contender_a_result,
+                contender_b_commit.join().unwrap(),
+            ];
+            assert_eq!(
+                results.iter().filter(|result| result.is_ok()).count(),
+                2,
+                "the disjoint write and exactly one contested write must commit"
+            );
+            let conflicts = results
+                .iter()
+                .filter_map(|result| match result {
+                    Err(crate::TxnError::Conflict { contested_row_ids }) => Some(contested_row_ids),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(conflicts, vec![&vec![2]]);
+            let (own_rows, published_contains_staged) = reader.join().unwrap();
+            assert_eq!(
+                own_rows, 4,
+                "a transaction must see its staged insert alongside its immutable base"
+            );
+            assert!(
+                !published_contains_staged,
+                "the dataset snapshot must never expose another transaction's staged insert"
+            );
 
             std::fs::remove_dir_all(&dir).ok();
         });
