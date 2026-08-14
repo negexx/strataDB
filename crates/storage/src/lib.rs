@@ -12,6 +12,7 @@ pub mod error;
 pub mod manifest;
 pub mod row_group;
 pub mod row_id_high_water;
+pub mod schema;
 pub mod stats;
 
 pub use arrow;
@@ -38,5 +39,9 @@ pub use row_id_high_water::{
     persist_row_id_high_water_at_least, persist_row_id_high_water_at_least_with,
     read_row_id_high_water, read_row_id_high_water_with, read_row_id_high_water_with_byte_count,
     read_row_id_high_water_with_byte_count_with,
+};
+pub use schema::{
+    ADD_NULLABLE_COLUMN_SCHEMA_VERSION, INITIAL_SCHEMA_VERSION, SchemaMigration,
+    SchemaMigrationResult, validate_schema_version,
 };
 pub use stats::{ColumnStats, Value, compute_stats};

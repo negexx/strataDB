@@ -27,6 +27,7 @@ use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator, IpcWriteOptions};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, StorageError};
+use crate::schema::{INITIAL_SCHEMA_VERSION, validate_schema_version};
 use crate::stats::ColumnStats;
 
 /// The version of the manifest envelope, deliberately distinct from a
@@ -123,6 +124,11 @@ pub struct SegmentEntry {
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub version: u64,
+    /// Version of the durable logical schema catalog used by these row and
+    /// vector object references. Older supported manifests predate this
+    /// field and therefore default unambiguously to the initial catalog.
+    #[serde(default = "initial_schema_version")]
+    pub schema_version: u32,
     /// Raw Arrow IPC schema-message bytes for the dataset's owned logical
     /// schema. The physical `_row_id` and `_timestamp` columns are not part
     /// of this schema.
@@ -194,6 +200,7 @@ impl Manifest {
     pub fn empty_with_schema(schema: &Schema) -> Self {
         Self {
             version: 0,
+            schema_version: INITIAL_SCHEMA_VERSION,
             schema_ipc: encode_schema(schema),
             data_files: Vec::new(),
             next_row_id: 0,
@@ -214,6 +221,7 @@ impl Manifest {
     ///
     /// Returns an error when the persisted IPC schema bytes are malformed.
     pub fn schema(&self, manifest_path: &Path) -> Result<SchemaRef> {
+        validate_schema_version(self.schema_version, Some(manifest_path))?;
         if self.schema_ipc.is_empty() {
             return Err(StorageError::LegacyFormatNeedsMigration(
                 manifest_path.to_path_buf(),
@@ -227,6 +235,15 @@ impl Manifest {
         })?;
         Ok(std::sync::Arc::new(schema))
     }
+
+    /// Replaces the logical schema bytes after a validated catalog migration.
+    pub fn set_schema(&mut self, schema: &Schema) {
+        self.schema_ipc = encode_schema(schema);
+    }
+}
+
+const fn initial_schema_version() -> u32 {
+    INITIAL_SCHEMA_VERSION
 }
 
 /// The exact durable representation of a manifest file.
@@ -282,6 +299,7 @@ impl ManifestEnvelope {
                 ),
             ));
         }
+        validate_schema_version(self.manifest.schema_version, Some(path))?;
         Ok(())
     }
 }
@@ -1012,6 +1030,46 @@ mod tests {
     #[test]
     fn empty_manifest_has_no_segments() {
         assert!(Manifest::empty().segments.is_empty());
+    }
+
+    #[test]
+    fn schema_catalog_version_round_trips_and_legacy_manifests_default_to_v1() {
+        // Break caught: a manifest that silently drops its catalog version
+        // cannot distinguish v1 data from a future incompatible schema.
+        let mut manifest = Manifest::empty();
+        manifest.schema_version = 2;
+        let json = serde_json::to_vec(&manifest).unwrap();
+        let round_tripped: Manifest = serde_json::from_slice(&json).unwrap();
+        assert_eq!(round_tripped.schema_version, 2);
+
+        let legacy_json = serde_json::json!({
+            "version": 0,
+            "schema_ipc": Manifest::empty().schema_ipc,
+            "data_files": [],
+            "next_row_id": 0,
+        });
+        let legacy: Manifest = serde_json::from_value(legacy_json).unwrap();
+        assert_eq!(legacy.schema_version, 1);
+    }
+
+    #[test]
+    fn recovery_rejects_an_unknown_schema_catalog_version() {
+        // Break caught: treating a newer catalog version as a known schema
+        // could reinterpret rows and vector segments without a migration.
+        let dir = temp_dataset_dir("unknown-schema-version");
+        let mut manifest = Manifest::empty();
+        manifest.schema_version = 99;
+        commit_manifest(&dir, &manifest).unwrap();
+
+        let result = read_current(&dir);
+        assert!(
+            matches!(
+                result,
+                Err(StorageError::UnknownSchemaVersion { version: 99, .. })
+            ),
+            "unknown catalog versions must fail closed: {result:?}"
+        );
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

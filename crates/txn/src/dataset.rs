@@ -25,18 +25,20 @@ use std::sync::Mutex;
 // to avoid an unused-import warning in the loom build.
 #[cfg(not(loom))]
 use arc_swap::ArcSwap;
-use arrow::array::{Array, ArrayRef, Int64Array, RecordBatch, RecordBatchOptions, UInt64Array};
+use arrow::array::{
+    Array, ArrayRef, Int64Array, RecordBatch, RecordBatchOptions, UInt64Array, new_null_array,
+};
 use arrow::compute::{cast, concat_batches};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use strata_index::{EfConstruction, HnswIndex, MaxConnections, MaxElements, MaxLayers};
 #[cfg(test)]
 use strata_storage::commit_manifest;
 use strata_storage::{
-    ColumnStats, DataFileEntry, Manifest, SegmentEntry, StorageOwner, Value, commit_manifest_with,
-    compute_stats, initialize_row_id_high_water_with, read_current_with,
-    read_current_with_byte_count_with, read_manifest_at_key_with_byte_count_with,
-    read_row_id_high_water_with, read_row_id_high_water_with_byte_count_with, sync_dir,
-    write_batch_with, write_bytes_with,
+    ColumnStats, DataFileEntry, Manifest, SchemaMigration, SchemaMigrationResult, SegmentEntry,
+    StorageOwner, Value, commit_manifest_with, compute_stats, initialize_row_id_high_water_with,
+    read_batch_with, read_current_with, read_current_with_byte_count_with,
+    read_manifest_at_key_with_byte_count_with, read_row_id_high_water_with,
+    read_row_id_high_water_with_byte_count_with, sync_dir, write_batch_with, write_bytes_with,
 };
 
 use crate::commit_log::{CommitLog, ConflictCheck};
@@ -1133,6 +1135,135 @@ impl Dataset {
         self.snapshot().schema()
     }
 
+    /// Returns the durable catalog version captured by the current snapshot.
+    #[must_use]
+    pub fn schema_version(&self) -> u32 {
+        self.snapshot().manifest.schema_version
+    }
+
+    /// Applies one explicitly requested deterministic schema migration.
+    ///
+    /// Migration writes replacement row files and copied immutable vector
+    /// segments before publishing one new manifest. Existing snapshots keep
+    /// their original manifest, schema, rows, and segments.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed storage, schema, corruption, or durability error and
+    /// leaves the current complete manifest unchanged when publication has
+    /// not succeeded.
+    pub fn migrate_schema(&self, migration: &SchemaMigration) -> Result<SchemaMigrationResult> {
+        let _lifecycle_guard = self.lifecycle_coordinator.acquire_exclusive();
+        let mut commit_log = self
+            .commit_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let source = self.current.load_full();
+        let source_schema_version = source.manifest.schema_version;
+        let target_schema = migration
+            .target_schema(source_schema_version, &source.schema)
+            .map_err(TxnError::Storage)?;
+        let added_column = migration.added_nullable_column().ok_or_else(|| {
+            TxnError::Storage(strata_storage::StorageError::MigrationUnsupported {
+                name: migration.name(),
+                from_version: migration.source_version(),
+                target: migration.target_version(),
+            })
+        })?;
+        let new_version = source
+            .version
+            .checked_add(1)
+            .ok_or_else(|| TxnError::ManifestOverflow(format!("version {} + 1", source.version)))?;
+
+        let mut data_files = Vec::with_capacity(source.manifest.data_files.len());
+        for (index, entry) in source.manifest.data_files.iter().enumerate() {
+            let source_key = self
+                .storage
+                .data_object_key(&entry.name)
+                .map_err(TxnError::Storage)?;
+            let batch = read_batch_with(&self.storage, &source_key)?;
+            let rewritten = append_migrated_nullable_column(&batch, added_column)?;
+            let name = format!("migration-{new_version:020}-{index:020}.arrow");
+            let target_key = self
+                .storage
+                .data_object_key(&name)
+                .map_err(TxnError::Storage)?;
+            let metadata = write_batch_with(&self.storage, &target_key, &rewritten)?;
+            data_files.push(DataFileEntry {
+                name,
+                byte_len: metadata.byte_len,
+                crc32c: metadata.crc32c,
+                row_count: entry.row_count,
+                row_id_range: entry.row_id_range,
+                stats: compute_stats(&rewritten),
+            });
+        }
+
+        let mut segments = Vec::with_capacity(source.manifest.segments.len());
+        for (index, entry) in source.manifest.segments.iter().enumerate() {
+            let source_key = self
+                .storage
+                .data_object_key(&entry.name)
+                .map_err(TxnError::Storage)?;
+            let bytes = self.storage.get(&source_key).map_err(TxnError::Storage)?;
+            let name = format!("migration-{new_version:020}-{index:020}.seg");
+            let target_key = self
+                .storage
+                .data_object_key(&name)
+                .map_err(TxnError::Storage)?;
+            let metadata = write_bytes_with(&self.storage, &target_key, &bytes)?;
+            if metadata.byte_len != entry.byte_len {
+                return Err(TxnError::CorruptSegment(format!(
+                    "migration copied segment {} as {} bytes but catalog records {}",
+                    entry.name, metadata.byte_len, entry.byte_len
+                )));
+            }
+            let mut copied = entry.clone();
+            copied.name = name;
+            segments.push(copied);
+        }
+
+        let mut manifest = source.manifest.as_ref().clone();
+        manifest.version = new_version;
+        manifest.schema_version = migration.target_version();
+        manifest.set_schema(target_schema.as_ref());
+        manifest.data_files = data_files;
+        manifest.segments = segments;
+        let timestamp = issue_timestamp(&self.last_issued_timestamp)?;
+        manifest.commit_time_high_water = manifest.commit_time_high_water.max(timestamp);
+        manifest.committed_at_us = timestamp;
+
+        // Validate every new object before the manifest becomes reachable.
+        let owned_rows = validate_data_files_with_owner(
+            &self.storage,
+            &self.dir,
+            &manifest,
+            &target_schema,
+            None,
+        )?;
+        validate_tombstones(&self.dir, &manifest, &owned_rows)?;
+        let index = load_segments_with_owner(&self.storage, &manifest, &owned_rows, None)?;
+        commit_manifest_with(&self.storage, &manifest)?;
+
+        // A migration is a version boundary but has no row-level write set.
+        // Transactions captured against the prior schema are rejected by the
+        // schema-version guard in `Transaction::commit` below.
+        commit_log.push(new_version, Vec::new());
+        let snapshot = Snapshot {
+            dir: self.dir.clone(),
+            storage: Arc::clone(&self.storage),
+            version: new_version,
+            lease: self.snapshot_leases.register(new_version),
+            schema: target_schema,
+            manifest: Arc::new(manifest),
+            index,
+            tombstones: Arc::clone(&source.tombstones),
+            live_set_cache: LiveSetCache::new(crate::snapshot::LIVE_SET_CACHE_BYTE_BUDGET),
+        };
+        self.current.store(Arc::new(snapshot));
+        Ok(migration.result(new_version))
+    }
+
     #[must_use]
     /// For datasets opened through [`Dataset::create_with_storage`] or
     /// [`Dataset::open_with_storage`] with a non-local owner, this is only a
@@ -1793,6 +1924,15 @@ impl Transaction {
 
         let latest_snapshot = self.current.load_full();
         let latest_version = latest_snapshot.version;
+
+        if latest_snapshot.manifest.schema_version != self.base_snapshot.manifest.schema_version {
+            return Err(TxnError::Storage(
+                strata_storage::StorageError::SchemaVersionChanged {
+                    expected: self.base_snapshot.manifest.schema_version,
+                    actual: latest_snapshot.manifest.schema_version,
+                },
+            ));
+        }
 
         // Conflict detection MUST run before the manifest is touched at all:
         // a transaction that turns out to conflict must leave the manifest,
@@ -3374,6 +3514,36 @@ fn append_timestamp_column(batch: &RecordBatch, ts: i64, num_rows: u64) -> Resul
     let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
     columns.push(timestamp_array);
 
+    let schema = Arc::new(Schema::new_with_metadata(
+        fields,
+        batch.schema_ref().metadata().clone(),
+    ));
+    Ok(RecordBatch::try_new(schema, columns)?)
+}
+
+/// Inserts one nullable logical field immediately before the two physical
+/// system columns while preserving every existing physical row value.
+fn append_migrated_nullable_column(batch: &RecordBatch, column: &Field) -> Result<RecordBatch> {
+    let logical_len = batch
+        .num_columns()
+        .checked_sub(HIDDEN_COLUMNS.len())
+        .ok_or_else(|| {
+            TxnError::Storage(strata_storage::StorageError::MigrationIncompatibleType {
+                detail: "stored row batch does not contain the physical system columns".to_owned(),
+            })
+        })?;
+    let mut fields: Vec<Field> = batch
+        .schema_ref()
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect();
+    fields.insert(logical_len, column.clone());
+    let mut columns = batch.columns().to_vec();
+    columns.insert(
+        logical_len,
+        new_null_array(column.data_type(), batch.num_rows()),
+    );
     let schema = Arc::new(Schema::new_with_metadata(
         fields,
         batch.schema_ref().metadata().clone(),
@@ -5185,6 +5355,7 @@ mod tests {
         let dir = temp_dir("unreasonable-capacity");
         let hostile = Manifest {
             version: 0,
+            schema_version: strata_storage::INITIAL_SCHEMA_VERSION,
             schema_ipc: Manifest::empty_with_schema(test_schema().as_ref()).schema_ipc,
             data_files: Vec::new(),
             next_row_id: u64::MAX,
@@ -5216,6 +5387,7 @@ mod tests {
         // practice) to simulate a hostile/corrupted manifest.
         let hostile = Manifest {
             version: u64::MAX,
+            schema_version: strata_storage::INITIAL_SCHEMA_VERSION,
             schema_ipc: Manifest::empty_with_schema(test_schema().as_ref()).schema_ipc,
             data_files: Vec::new(),
             next_row_id: 0,
@@ -8516,6 +8688,71 @@ mod tests {
             entries[0].row_id_range,
             Some((1, 1)),
             "the durable allocator high-water must keep row-id 0 permanently abandoned"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migration_after_a_failed_manifest_commit_uses_only_the_complete_manifest() {
+        // The existing transaction fault hook leaves its prepared row and
+        // segment objects unreachable. A later migration must read and copy
+        // only the complete manifest's objects, then recovery must select the
+        // resulting complete migrated manifest rather than either orphan.
+        let dir = temp_dir("migration-after-failed-manifest-commit");
+        let ds = Dataset::create(&dir, vector_test_schema()).unwrap();
+
+        let mut seed = ds.begin();
+        seed.insert(vector_batch(
+            vec![1_i64],
+            cluster_vectors(1, [0.0, 0.0, 0.0], 0.0),
+        ))
+        .unwrap();
+        seed.commit().unwrap();
+
+        let mut abandoned = ds.begin();
+        abandoned
+            .insert(vector_batch(
+                vec![2_i64],
+                cluster_vectors(1, [900.0, 900.0, 900.0], 0.0),
+            ))
+            .unwrap();
+        abandoned.inject_manifest_commit_failure();
+        assert!(abandoned.commit().is_err());
+        assert_eq!(ds.current_version(), 1);
+
+        ds.migrate_schema(&SchemaMigration::add_nullable_column(
+            1,
+            2,
+            Field::new("tag", DataType::Utf8, true),
+        ))
+        .unwrap();
+        assert_eq!(ds.current_version(), 2);
+        assert_eq!(ds.schema_version(), 2);
+        assert_eq!(
+            ds.snapshot().scan(&ds.schema()).unwrap().num_rows(),
+            1,
+            "the abandoned row must not become visible through the migration"
+        );
+
+        drop(ds);
+        let reopened = Dataset::open(&dir).unwrap();
+        assert_eq!(reopened.schema_version(), 2);
+        assert_eq!(
+            reopened
+                .snapshot()
+                .scan(&reopened.schema())
+                .unwrap()
+                .num_rows(),
+            1
+        );
+        let results = reopened
+            .snapshot()
+            .vector_search(&[900.0, 900.0, 900.0], 1, None)
+            .unwrap();
+        assert!(
+            results.is_empty() || results[0].squared_distance > 1000.0,
+            "the failed transaction's vector must remain unreachable: {results:?}"
         );
 
         std::fs::remove_dir_all(&dir).ok();

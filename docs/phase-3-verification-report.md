@@ -99,3 +99,33 @@ a repository change.
 The loom result is a targeted local model result, not a replacement for the broader cloud loom
 provenance above. This entry records verification evidence only and makes no whole-feature or
 broader Phase 3 completion claim.
+
+## Task 2 schema-migration verification (2026-08-14)
+
+Task 2 adds the versioned durable schema catalog and the single explicit
+`add_nullable_column` migration. The migration rewrites row objects, copies immutable vector
+segments to new locations, then publishes their references and the catalog version in one
+manifest. Existing snapshots remain bound to their captured manifest and schema; recovery rejects
+unknown catalog versions and selects only a fully published manifest.
+
+All Cargo commands below ran in a process-local MSVC environment with the requested linker
+directory first on `PATH`, plus the MSVC and Windows SDK x64 library directories on `LIB`. This is
+environment setup only, not a repository change.
+
+| Command | Result |
+|---|---|
+| `cargo test -p strata-txn --no-default-features --test schema_migrations` | Exit 0: 3 passed, 0 failed. |
+| `cargo test -p strata-storage schema_catalog_version_round_trips_and_legacy_manifests_default_to_v1` | Exit 0: 1 passed, 0 failed. |
+| `cargo test -p strata-storage recovery_rejects_an_unknown_schema_catalog_version` | Exit 0: 1 passed, 0 failed. |
+| `cargo test -p strata-txn --no-default-features migration_after_a_failed_manifest_commit_uses_only_the_complete_manifest` | Exit 0: 1 passed, 0 failed. |
+| `cargo test -p strata-txn --no-default-features --features parallel-insert --lib --tests` | Exit 0: 296 passed, 0 failed. |
+| `cargo clippy -p strata-storage --all-targets -- -D warnings` | Exit 0; no warnings. |
+| `cargo clippy -p strata-txn --all-targets --features parallel-insert -- -D warnings` | Exit 0; no warnings. |
+| `cargo fmt --check` after `cargo fmt` | Exit 0. |
+
+The first two broader test-launch attempts exited 1 before a Rust test ran: first `LNK1104`
+(`msvcrt.lib`), then `LNK1181` (`kernel32.lib`). Supplying the explicit Windows SDK x64 `LIB`
+entries fixed the machine-local linker configuration; the successful commands above are the fresh
+verification evidence. This Task 2 entry is scoped to the documented single-process/shared-handle
+and local-filesystem boundary. It does not claim distributed coordination, serializability, or
+universal power-loss durability.
