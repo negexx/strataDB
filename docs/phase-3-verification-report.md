@@ -69,3 +69,33 @@ legacy zero timestamps, vacuum deletes only recognized unprotected objects, and
 protected history, or unknown objects can prevent that observation from meeting a requested bound.
 This evidence does not establish serializability, cross-process coordination, universal power-loss
 durability, or atomic/continuing storage-bound enforcement.
+
+## Task 1 fix round 2 verification (2026-08-14)
+
+This round re-established the Task 1 transaction-read-view red/green evidence without changing
+current-branch source, Git history, dependencies, or the transaction contract. Every command put
+the requested linker directory first on `PATH`:
+
+```text
+C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\MSVC\14.52.36615\bin\Hostx64\x64
+```
+
+The invoking Windows shell had no `LIB` or `INCLUDE` environment variables. `link.exe` was found
+through the required prefix, but a prefix-only preliminary invocation stopped at `LNK1181` for
+`kernel32.lib`, before Rust could compile the test. For each recorded Cargo invocation, the existing
+`VsDevCmd.bat -arch=x64 -host_arch=x64` environment was initialized and the installed MSVC x64
+library directory (`...\VC\Tools\MSVC\14.52.36615\lib\x64`) was prepended to `LIB`; the required
+linker directory was then prepended again to `PATH`. This was process-local environment setup, not
+a repository change.
+
+| Command | Result |
+|---|---|
+| In a detached temporary worktree at `acb5f99`, after copying the current `crates/txn/tests/transaction_read_view.rs`: `cargo test -p strata-txn --no-default-features --test transaction_read_view` | Exit 101, as expected for the red phase. Compilation reached the copied test and reported 11 E0599 errors: missing `Transaction::{scan_query, group_by_query, lookup_row, vector_search_query}` methods and missing `QueryExecutionError::UnsupportedTransactionRead`. The temporary worktree was then removed. |
+| `cargo test -p strata-txn --no-default-features --test transaction_read_view` | Exit 0: 6 passed, 0 failed. |
+| `cargo test -p strata-txn --no-default-features --features parallel-insert --lib --tests` | Exit 0: 292 unit/integration tests passed, 0 failed; doctests were excluded. |
+| `cargo clippy -p strata-txn --all-targets --features parallel-insert -- -D warnings` | Exit 0; no warnings. |
+| `cargo rustc -p strata-txn --lib --profile test --message-format=json -- --cfg loom`, followed by the produced test binary with `--exact dataset::loom_tests::transaction_read_overlay_stays_private_while_disjoint_and_contested_writes_commit --test-threads=1` | Build exit 0; model exit 0: 1 passed, 0 failed, 230 filtered out. |
+
+The loom result is a targeted local model result, not a replacement for the broader cloud loom
+provenance above. This entry records verification evidence only and makes no whole-feature or
+broader Phase 3 completion claim.
