@@ -125,6 +125,8 @@ pub fn read_row_id_high_water_with_byte_count_with(
         };
         let key = crate::backend::DatasetKey::new(&meta.key)?;
         let bytes = owner.get(&key)?;
+        #[cfg(feature = "test-fault-injection")]
+        test_support::run_after_row_id_read_hook(&bytes);
         bytes_read += u128::from(bytes.len() as u64);
         let path = owner.root().join(&meta.key);
         let recorded_end = decode_record(&path, &bytes)?;
@@ -278,6 +280,12 @@ pub fn persist_row_id_high_water_at_least_with(
     if let Some(end) = observed.filter(|end| *end >= requested_end) {
         return Ok(end);
     }
+
+    #[cfg(any(test, feature = "test-fault-injection"))]
+    if let Some(source) = test_support::before_publish_error() {
+        return Err(HighWaterPersistenceError::Definite(source.into()));
+    }
+
     let end = requested_end;
     let key = crate::backend::DatasetKey::new(record_key(end))
         .map_err(HighWaterPersistenceError::Definite)?;
