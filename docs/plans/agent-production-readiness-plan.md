@@ -48,9 +48,9 @@
 
 **Interfaces:**
 - Consumes: current `Dataset::begin`, immutable `Snapshot`, staged write structures, conflict history, and `Transaction::commit`.
-- Produces: a public transaction read view with read-your-writes for lookup/scan/predicate/group operations that can be merged correctly; typed unsupported behavior for operations whose overlay cannot be represented; unchanged write-write OCC semantics.
+- Produces: a public transaction read view with read-your-writes for scan/predicate/group operations over staged writes, plus lookup of existing committed physical row IDs reflecting staged replacement/delete state; typed unsupported behavior for operations whose overlay cannot be represented; unchanged write-write OCC semantics. This slice does not add a pre-commit physical-row-ID return value or a transaction-local identity type.
 
-- [ ] **Step 1: Write failing tests for the contract.** Cover transaction lookup of an inserted row, replacement visibility, delete invisibility, scan/predicate results, grouped results, abort/drop non-publication, isolation from another transaction, and typed unsupported vector-overlay behavior if vector reads cannot yet merge staged values.
+- [ ] **Step 1: Write failing tests for the contract.** Cover lookup of an existing row after staged replacement/delete, scan/predicate/group visibility of staged inserts and replacements, abort/drop non-publication, isolation from another transaction, and typed unsupported vector-overlay behavior if vector reads cannot yet merge staged values.
 - [ ] **Step 2: Run the focused tests and confirm failure.** Run `cargo test -p strata-txn --no-default-features <focused-filter>`; expected failures must identify missing transaction read methods or stale snapshot results.
 - [ ] **Step 3: Implement the minimal overlay.** Capture the base snapshot at begin, represent staged insert/replace/delete states by physical row ID, and make each supported read resolve overlay state before applying projection/filter/group logic. Preserve the base snapshot for untouched rows and never expose staged state through `Dataset::snapshot`.
 - [ ] **Step 4: Preserve OCC and publication behavior.** Route commit through the existing typed conflict validation and manifest publication path. Do not broaden conflict detection to read sets, predicates, or serializability.
