@@ -4,7 +4,7 @@
 //! objects. Row files, vector segments, temporary objects, and arbitrary
 //! orphans remain outside its authority.
 
-use strata_storage::{Backend, LocalFs};
+use strata_storage::DatasetKey;
 
 use crate::dataset::Dataset;
 use crate::error::Result;
@@ -31,10 +31,11 @@ pub struct ManifestPruneReport {
 
 pub(crate) fn prune(dataset: &Dataset, policy: RetentionPolicy) -> Result<ManifestPruneReport> {
     let authority = build_manifest_prune_authority(dataset, policy)?;
-    let backend = LocalFs::new(dataset.retention_dir());
+    let storage = dataset.storage();
     let (deleted_manifest_versions, deleted_manifest_bytes) =
         delete_authorized_manifests(&authority.candidates, |candidate| {
-            Ok(backend.delete(&candidate.key)?)
+            let key = DatasetKey::new(&candidate.key).map_err(crate::error::TxnError::Storage)?;
+            Ok(storage.delete(&key)?)
         })?;
 
     Ok(ManifestPruneReport {
@@ -49,10 +50,11 @@ pub(crate) fn prune_by_age(
     policy: AgeRetentionPolicy,
 ) -> Result<ManifestPruneReport> {
     let authority = build_age_manifest_prune_authority(dataset, policy)?;
-    let backend = LocalFs::new(dataset.retention_dir());
+    let storage = dataset.storage();
     let (deleted_manifest_versions, deleted_manifest_bytes) =
         delete_authorized_manifests(&authority.candidates, |candidate| {
-            Ok(backend.delete(&candidate.key)?)
+            let key = DatasetKey::new(&candidate.key).map_err(crate::error::TxnError::Storage)?;
+            Ok(storage.delete(&key)?)
         })?;
     Ok(ManifestPruneReport {
         observed_version: authority.observed_version,

@@ -29,16 +29,20 @@ use arrow::array::{Array, ArrayRef, Int64Array, RecordBatch, RecordBatchOptions,
 use arrow::compute::{cast, concat_batches};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use strata_index::{EfConstruction, HnswIndex, MaxConnections, MaxElements, MaxLayers};
+#[cfg(test)]
+use strata_storage::commit_manifest;
 use strata_storage::{
-    Backend, ColumnStats, DataFileEntry, LocalFs, Manifest, SegmentEntry, Value, commit_manifest,
-    compute_stats, initialize_row_id_high_water, read_current, read_current_with_byte_count,
-    read_manifest_at_key_with_byte_count, read_row_id_high_water,
-    read_row_id_high_water_with_byte_count, sync_dir, write_batch, write_bytes,
+    ColumnStats, DataFileEntry, Manifest, SegmentEntry, StorageOwner, Value, commit_manifest_with,
+    compute_stats, initialize_row_id_high_water_with, read_current_with,
+    read_current_with_byte_count_with, read_manifest_at_key_with_byte_count_with,
+    read_row_id_high_water_with, read_row_id_high_water_with_byte_count_with, sync_dir,
+    write_batch_with, write_bytes_with,
 };
 
 use crate::commit_log::{CommitLog, ConflictCheck};
 use crate::compaction::{CompactionPolicy, CompactionReport};
 use crate::error::{Result, TxnError};
+use crate::facade::{DataFileInfo, SegmentInfo};
 use crate::lifecycle_coordination::LifecycleCoordinator;
 use crate::live_set_cache::LiveSetCache;
 use crate::retention::{
@@ -182,6 +186,8 @@ impl SnapshotCell {
 #[derive(Clone)]
 pub struct Dataset {
     dir: PathBuf,
+    /// Backend capability and key layout owned by this dataset.
+    storage: Arc<StorageOwner>,
     current: Arc<SnapshotCell>,
     snapshot_leases: Arc<SnapshotLeaseRegistry>,
     /// Hands out contiguous row-id ranges from a single global counter.
@@ -427,7 +433,9 @@ impl Dataset {
             .write_attempt_counter
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let data_dir = data_subdir(&self.dir);
-        std::fs::create_dir_all(&data_dir)?;
+        if self.storage.is_local() {
+            std::fs::create_dir_all(&data_dir)?;
+        }
 
         let mut new_data_files = Vec::new();
         let mut vector_inserts = Vec::new();
@@ -498,7 +506,11 @@ impl Dataset {
                 let run_len = run_end - run_start;
                 let run_batch = batch.slice(run_start, run_len);
                 let file_name = format!("{attempt_id:020}-{run_index}.arrow");
-                let metadata = write_batch(&data_dir.join(&file_name), &run_batch)?;
+                let key = self
+                    .storage
+                    .data_object_key(&file_name)
+                    .map_err(TxnError::Storage)?;
+                let metadata = write_batch_with(&self.storage, &key, &run_batch)?;
                 new_data_files.push(DataFileEntry {
                     name: file_name,
                     byte_len: metadata.byte_len,
@@ -512,8 +524,12 @@ impl Dataset {
             }
             vector_inserts = build_vector_inserts_with_physical_row_ids(&batch)?;
         }
-        let new_segment =
-            Transaction::build_and_write_segment(&data_dir, attempt_id, vector_inserts, zone_map)?;
+        let new_segment = Transaction::build_and_write_segment(
+            &self.storage,
+            attempt_id,
+            vector_inserts,
+            zone_map,
+        )?;
         let index = match &new_segment {
             Some(segment) => {
                 let zone_map: Arc<dyn std::any::Any + Send + Sync> =
@@ -544,8 +560,10 @@ impl Dataset {
         // The manifest must not become durable before the directory entry
         // for every replacement object is durable. This is the same
         // publication precondition used by the normal commit path.
-        sync_dir(&data_dir)?;
-        commit_manifest(&self.dir, &manifest)?;
+        if self.storage.is_local() {
+            sync_dir(&data_dir)?;
+        }
+        commit_manifest_with(&self.storage, &manifest)?;
         #[cfg(feature = "test-fault-injection")]
         if test_support::consume_after_compaction_manifest_publication() {
             return Err(TxnError::Io(std::io::Error::other(
@@ -567,6 +585,7 @@ impl Dataset {
         commit_log.push(published_version, Vec::new());
         let snapshot = Snapshot {
             dir: self.dir.clone(),
+            storage: Arc::clone(&self.storage),
             version: published_version,
             lease: self.snapshot_leases.register(published_version),
             schema: Arc::clone(&source.schema),
@@ -578,8 +597,7 @@ impl Dataset {
         self.current.store(Arc::new(snapshot));
         drop(source);
 
-        let backend = LocalFs::new(&self.dir);
-        let manifest_keys = index_manifest_objects(&backend.list("_versions/")?)?;
+        let manifest_keys = index_manifest_objects(&self.storage.list("_versions")?)?;
         let mut protected_data = HashSet::new();
         let mut protected_segments = HashSet::new();
         for version in self.live_snapshot_versions() {
@@ -589,22 +607,29 @@ impl Dataset {
                     "protected manifest is missing from inventory".to_owned(),
                 ))
             })?;
-            let (manifest, _) = read_manifest_at_key_with_byte_count(&self.dir, &key.key, version)?;
-            let owned_rows = validate_data_files(&self.dir, &manifest, &logical_schema, None)?;
+            let (manifest, _) =
+                read_manifest_at_key_with_byte_count_with(&self.storage, &key.key, version)?;
+            let owned_rows = validate_data_files_with_owner(
+                &self.storage,
+                &self.dir,
+                &manifest,
+                &logical_schema,
+                None,
+            )?;
             validate_tombstones(&self.dir, &manifest, &owned_rows)?;
-            let _ = load_segments(&self.dir, &manifest, &owned_rows, None)?;
+            let _ = load_segments_with_owner(&self.storage, &manifest, &owned_rows, None)?;
             protected_data.extend(manifest.data_files.into_iter().map(|entry| entry.name));
             protected_segments.extend(manifest.segments.into_iter().map(|entry| entry.name));
         }
         let mut manifest_listed_objects = HashSet::new();
         for (version, key) in manifest_keys {
             let (historical, _) =
-                read_manifest_at_key_with_byte_count(&self.dir, &key.key, version)?;
+                read_manifest_at_key_with_byte_count_with(&self.storage, &key.key, version)?;
             let reachable = crate::lifecycle::reachable_keys(&historical)?;
             manifest_listed_objects.extend(reachable.data_files);
             manifest_listed_objects.extend(reachable.segments);
         }
-        let data_objects = backend.list("data/")?;
+        let data_objects = self.storage.list("data")?;
         let mut listed_data_objects = HashMap::with_capacity(data_objects.len());
         for object in data_objects {
             if listed_data_objects
@@ -641,7 +666,9 @@ impl Dataset {
                 continue;
             };
             if !protected_data.contains(name) && !protected_segments.contains(name) {
-                backend.delete(&key)?;
+                let object_key =
+                    strata_storage::DatasetKey::new(&key).map_err(TxnError::Storage)?;
+                self.storage.delete(&object_key)?;
                 objects_deleted = objects_deleted
                     .checked_add(1)
                     .ok_or_else(|| TxnError::ManifestOverflow("objects_deleted".to_owned()))?;
@@ -705,6 +732,30 @@ impl Dataset {
         Self::create_with_commit_log_capacity(dir, schema, COMMIT_LOG_CAPACITY)
     }
 
+    /// Creates a dataset through an explicitly supplied storage owner.
+    ///
+    /// `dir` remains the diagnostic identity used in typed errors and local
+    /// compatibility APIs; all durable objects are addressed through
+    /// `storage`. For a non-local backend, callers must provide a meaningful
+    /// diagnostic path but no local directories are created or synchronized.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed storage or transaction error when the owner cannot
+    /// publish the initial manifest or the schema is invalid.
+    pub fn create_with_storage(
+        dir: impl Into<PathBuf>,
+        storage: StorageOwner,
+        schema: SchemaRef,
+    ) -> Result<Self> {
+        Self::create_with_commit_log_capacity_and_storage(
+            dir.into(),
+            Arc::new(storage),
+            schema,
+            COMMIT_LOG_CAPACITY,
+        )
+    }
+
     /// Same as [`Dataset::create`], but with an explicit `CommitLog`
     /// capacity instead of the production [`COMMIT_LOG_CAPACITY`] default.
     /// Private to this module (no `pub`/`pub(crate)` — even more
@@ -723,20 +774,36 @@ impl Dataset {
         schema: SchemaRef,
         commit_log_capacity: usize,
     ) -> Result<Self> {
-        validate_dataset_schema(&schema)?;
         let dir = dir.into();
-        if read_current(&dir)?.is_some() {
+        Self::create_with_commit_log_capacity_and_storage(
+            dir.clone(),
+            Arc::new(StorageOwner::local(&dir)),
+            schema,
+            commit_log_capacity,
+        )
+    }
+
+    fn create_with_commit_log_capacity_and_storage(
+        dir: PathBuf,
+        storage: Arc<StorageOwner>,
+        schema: SchemaRef,
+        commit_log_capacity: usize,
+    ) -> Result<Self> {
+        validate_dataset_schema(&schema)?;
+        if read_current_with(&storage)?.is_some() {
             return Err(TxnError::AlreadyExists(dir));
         }
-        sync_dataset_directory_anchor(&dir)?;
+        if storage.is_local() {
+            sync_dataset_directory_anchor(&dir)?;
+        }
         let mut manifest = Manifest::empty_with_schema(schema.as_ref());
         let last_issued_timestamp = Arc::new(AtomicI64::new(manifest.commit_time_high_water));
         manifest.committed_at_us = issue_timestamp(&last_issued_timestamp)?;
-        initialize_row_id_high_water(&dir)?;
-        commit_manifest(&dir, &manifest)?;
-        let durable_high_water = read_row_id_high_water(&dir)?.unwrap_or(0);
-        let row_ids = Arc::new(RowIdAllocator::new(
-            dir.clone(),
+        initialize_row_id_high_water_with(&storage)?;
+        commit_manifest_with(&storage, &manifest)?;
+        let durable_high_water = read_row_id_high_water_with(&storage)?.unwrap_or(0);
+        let row_ids = Arc::new(RowIdAllocator::new_with_storage(
+            Arc::clone(&storage),
             manifest.next_row_id.max(durable_high_water),
         ));
         let write_attempt_counter = Arc::new(AtomicU64::new(manifest.next_attempt_id));
@@ -744,6 +811,7 @@ impl Dataset {
         let lease = snapshot_leases.register(manifest.version);
         let snapshot = Snapshot {
             dir: dir.clone(),
+            storage: Arc::clone(&storage),
             version: manifest.version,
             lease,
             schema,
@@ -757,6 +825,7 @@ impl Dataset {
         };
         Ok(Self {
             dir,
+            storage,
             current: Arc::new(SnapshotCell::new(Arc::new(snapshot))),
             snapshot_leases,
             row_ids,
@@ -803,7 +872,19 @@ impl Dataset {
     /// Returns [`TxnError::NotFound`] if no dataset exists at `dir`, or a
     /// storage error if the current manifest exists but fails to read.
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self> {
-        Self::open_inner(dir.into(), None)
+        let dir = dir.into();
+        Self::open_inner(&dir, None)
+    }
+
+    /// Opens an existing dataset through an explicitly supplied storage
+    /// owner. This is the backend-neutral counterpart to [`Dataset::open`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed storage or transaction error when the current manifest
+    /// or any owned data object cannot be read and validated.
+    pub fn open_with_storage(dir: impl Into<PathBuf>, storage: StorageOwner) -> Result<Self> {
+        Self::open_inner_with_storage(dir.into(), Arc::new(storage), None)
     }
 
     /// Opens a dataset and returns exact recovery validation payload bytes.
@@ -820,22 +901,29 @@ impl Dataset {
         dir: impl Into<PathBuf>,
     ) -> Result<(Self, RecoveryByteAccounting)> {
         let mut accounting = RecoveryByteAccounting::default();
-        let dataset = Self::open_inner(dir.into(), Some(&mut accounting))?;
+        let dir = dir.into();
+        let dataset = Self::open_inner(&dir, Some(&mut accounting))?;
         Ok((dataset, accounting))
     }
 
-    fn open_inner(
-        dir: PathBuf,
+    fn open_inner(dir: &PathBuf, accounting: Option<&mut RecoveryByteAccounting>) -> Result<Self> {
+        Self::open_inner_with_storage(dir, Arc::new(StorageOwner::local(dir)), accounting)
+    }
+
+    fn open_inner_with_storage(
+        dir: impl Into<PathBuf>,
+        storage: Arc<StorageOwner>,
         mut accounting: Option<&mut RecoveryByteAccounting>,
     ) -> Result<Self> {
+        let dir = dir.into();
         let manifest = match accounting.as_deref_mut() {
             Some(accounting) => {
-                let (manifest, bytes) = read_current_with_byte_count(&dir)?
+                let (manifest, bytes) = read_current_with_byte_count_with(&storage)?
                     .ok_or_else(|| TxnError::NotFound(dir.clone()))?;
                 accounting.manifest_bytes = u128::from(bytes);
                 manifest
             }
-            None => read_current(&dir)?.ok_or_else(|| TxnError::NotFound(dir.clone()))?,
+            None => read_current_with(&storage)?.ok_or_else(|| TxnError::NotFound(dir.clone()))?,
         };
         let manifest_path = dir
             .join("_versions")
@@ -848,11 +936,11 @@ impl Dataset {
         // panic-safety bound on what row-ids may reach `NodeTable` — see
         // `MAX_REASONABLE_ROW_ID_CAPACITY`.
         let durable_high_water = if let Some(accounting) = accounting.as_deref_mut() {
-            let loaded = read_row_id_high_water_with_byte_count(&dir)?;
+            let loaded = read_row_id_high_water_with_byte_count_with(&storage)?;
             accounting.row_id_catalog_bytes = loaded.bytes_read;
             loaded.high_water
         } else {
-            read_row_id_high_water(&dir)?
+            read_row_id_high_water_with(&storage)?
         }
         .ok_or_else(|| {
             strata_storage::StorageError::MissingRowIdHighWater(
@@ -866,14 +954,23 @@ impl Dataset {
                 MAX_REASONABLE_ROW_ID_CAPACITY,
             ));
         }
-        let owned_rows = validate_data_files(&dir, &manifest, &schema, accounting.as_deref_mut())?;
+        let owned_rows = validate_data_files_with_owner(
+            &storage,
+            &dir,
+            &manifest,
+            &schema,
+            accounting.as_deref_mut(),
+        )?;
         validate_tombstones(&dir, &manifest, &owned_rows)?;
-        let index = load_segments(&dir, &manifest, &owned_rows, accounting)?;
+        let index = load_segments_with_owner(&storage, &manifest, &owned_rows, accounting)?;
         // The manifest's tombstone list is now the only source: index-level
         // tombstone entries went away with the delta log, and never had a
         // producer on the commit path anyway.
         let tombstones: imbl::HashSet<u64> = manifest.tombstones.iter().copied().collect();
-        let row_ids = Arc::new(RowIdAllocator::new(dir.clone(), allocation_floor));
+        let row_ids = Arc::new(RowIdAllocator::new_with_storage(
+            Arc::clone(&storage),
+            allocation_floor,
+        ));
         // The real fix for the cross-session filename-collision bug: seed
         // from the persisted `manifest.next_attempt_id`, not 0. Without
         // this, a reopened dataset would regenerate the same
@@ -901,6 +998,7 @@ impl Dataset {
         let lease = snapshot_leases.register(manifest.version);
         let snapshot = Snapshot {
             dir: dir.clone(),
+            storage: Arc::clone(&storage),
             version: manifest.version,
             lease,
             schema,
@@ -911,6 +1009,7 @@ impl Dataset {
         };
         Ok(Self {
             dir,
+            storage,
             current: Arc::new(SnapshotCell::new(Arc::new(snapshot))),
             snapshot_leases,
             row_ids,
@@ -944,9 +1043,8 @@ impl Dataset {
     /// duplicate, missing, or overflowing lifecycle metadata.
     pub fn lifecycle_report(&self) -> Result<crate::LifecycleReport> {
         let snapshot = self.snapshot();
-        let backend = LocalFs::new(&self.dir);
-        let manifest_objects = backend.list("_versions/")?;
-        let data_objects = backend.list("data/")?;
+        let manifest_objects = self.storage.list("_versions")?;
+        let data_objects = self.storage.list("data")?;
 
         crate::lifecycle::collect(&manifest_objects, &data_objects, &snapshot.manifest)
     }
@@ -1031,8 +1129,18 @@ impl Dataset {
     }
 
     #[must_use]
+    /// For datasets opened through [`Dataset::create_with_storage`] or
+    /// [`Dataset::open_with_storage`] with a non-local owner, this is only a
+    /// diagnostic compatibility path; durable objects are addressed through
+    /// [`Dataset::storage`] and no directory is created here.
     pub fn data_dir(&self) -> PathBuf {
         data_subdir(&self.dir)
+    }
+
+    /// Returns the dataset's backend owner for backend-aware integrations.
+    #[must_use]
+    pub fn storage(&self) -> Arc<StorageOwner> {
+        Arc::clone(&self.storage)
     }
 
     /// Data file entries (name + per-column stats) belonging to the current
@@ -1041,6 +1149,18 @@ impl Dataset {
     #[must_use]
     pub fn data_files(&self) -> Vec<DataFileEntry> {
         self.snapshot().manifest.data_files.clone()
+    }
+
+    /// Returns facade-owned metadata without exposing storage manifest types.
+    #[must_use]
+    pub fn data_file_info(&self) -> Vec<DataFileInfo> {
+        self.snapshot().data_file_info()
+    }
+
+    /// Returns facade-owned metadata for the immutable vector segments.
+    #[must_use]
+    pub fn segment_info(&self) -> Vec<SegmentInfo> {
+        self.snapshot().segment_info()
     }
 
     #[must_use]
@@ -1770,7 +1890,8 @@ impl Transaction {
             "injected panic between segment fsync and manifest swap (test fault injection)"
         );
 
-        commit_manifest(&self.dir, &manifest)?;
+        let storage = Arc::clone(&self.current.load_full().storage);
+        commit_manifest_with(&storage, &manifest)?;
 
         // This is the durability point: `commit_manifest` has returned
         // successfully, so this commit's rows and segment are now on disk
@@ -1802,6 +1923,7 @@ impl Transaction {
         );
         let snapshot = Snapshot {
             dir: self.dir,
+            storage: Arc::clone(&self.base_snapshot.storage),
             version: new_version,
             lease: self.snapshot_leases.register(new_version),
             schema: Arc::clone(&self.schema),
@@ -1871,7 +1993,9 @@ impl Transaction {
                 }
             }
         }
-        std::fs::create_dir_all(data_dir)?;
+        if self.base_snapshot.storage.is_local() {
+            std::fs::create_dir_all(data_dir)?;
+        }
         // SeqCst ordering justification (this pre-lock fetch_add): the
         // only property it needs is per-atomic RMW uniqueness — no two
         // fetch_adds on the same AtomicU64 ever return the same value
@@ -1912,7 +2036,7 @@ impl Transaction {
         let mut new_data_files = Vec::new();
         let (inserts, zone_map) = Self::write_pending_batches(
             &self.pending,
-            data_dir,
+            &self.base_snapshot.storage,
             attempt_id,
             &claim,
             ts,
@@ -1926,14 +2050,21 @@ impl Transaction {
         let established_dimension = self.current.load().index.established_dimension();
         validate_vector_dimensions(&inserts, established_dimension)?;
 
-        let segment = Self::build_and_write_segment(data_dir, attempt_id, inserts, zone_map)?;
+        let segment = Self::build_and_write_segment(
+            &self.base_snapshot.storage,
+            attempt_id,
+            inserts,
+            zone_map,
+        )?;
 
         // Fsyncing each file's *content* (already done inside `write_batch`
         // and `write_bytes`) is not sufficient — the new directory entries
         // themselves must also be fsynced, or a real power-loss crash can
         // leave a file's bytes durable while the file itself is absent.
         // Must happen before the manifest commit.
-        strata_storage::sync_dir(data_dir)?;
+        if self.base_snapshot.storage.is_local() {
+            strata_storage::sync_dir(data_dir)?;
+        }
         Ok((new_data_files, segment))
     }
 
@@ -1971,7 +2102,7 @@ impl Transaction {
     /// file can't be written or fsynced, or [`TxnError::TryFromInt`] if a
     /// count doesn't fit its manifest field.
     fn build_and_write_segment(
-        data_dir: &Path,
+        storage: &StorageOwner,
         attempt_id: u64,
         inserts: Vec<VectorInsert>,
         zone_map: std::collections::HashMap<String, ColumnStats>,
@@ -2013,8 +2144,8 @@ impl Transaction {
         let bytes = index.to_segment_bytes(&row_ids)?;
 
         let name = format!("{attempt_id:020}.seg");
-        let path = data_dir.join(&name);
-        write_bytes(&path, &bytes)?;
+        let key = storage.data_object_key(&name).map_err(TxnError::Storage)?;
+        write_bytes_with(storage, &key, &bytes)?;
 
         // Built from the same buffer that was just fsynced — no read-back
         // on the commit path (base design doc §4).
@@ -2026,8 +2157,9 @@ impl Transaction {
         // per commit would multiply an already-expensive model's I/O.
         #[cfg(all(debug_assertions, not(loom)))]
         {
-            match std::fs::read(&path)
-                .map_err(TxnError::from)
+            match storage
+                .get(&key)
+                .map_err(TxnError::Storage)
                 .and_then(|on_disk| {
                     strata_index::SegmentReader::from_bytes(&on_disk).map_err(TxnError::from)
                 }) {
@@ -2115,7 +2247,7 @@ impl Transaction {
     /// when it was claimed.
     fn write_pending_batches(
         pending: &[RecordBatch],
-        data_dir: &Path,
+        storage: &StorageOwner,
         attempt_id: u64,
         claim: &RowIdRange,
         ts: i64,
@@ -2165,7 +2297,10 @@ impl Transaction {
             let with_timestamp = append_timestamp_column(&with_row_id, ts, num_rows)?;
 
             let file_name = format!("{attempt_id:020}-{i}.arrow");
-            let metadata = write_batch(&data_dir.join(&file_name), &with_timestamp)?;
+            let key = storage
+                .data_object_key(&file_name)
+                .map_err(TxnError::Storage)?;
+            let metadata = write_batch_with(storage, &key, &with_timestamp)?;
             let row_id_range = match num_rows {
                 0 => None,
                 _ => Some((row_id_base, row_id_base + num_rows - 1)),
@@ -2569,7 +2704,24 @@ fn catalog_row_id_range(
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn validate_data_files(
+    dir: &Path,
+    manifest: &Manifest,
+    logical_schema: &SchemaRef,
+    accounting: Option<&mut RecoveryByteAccounting>,
+) -> Result<HashSet<u64>> {
+    validate_data_files_with_owner(
+        &StorageOwner::local(dir),
+        dir,
+        manifest,
+        logical_schema,
+        accounting,
+    )
+}
+
+pub(crate) fn validate_data_files_with_owner(
+    owner: &StorageOwner,
     dir: &Path,
     manifest: &Manifest,
     logical_schema: &SchemaRef,
@@ -2590,7 +2742,10 @@ pub(crate) fn validate_data_files(
             ));
         }
         let path = safe_join(&data_dir, &entry.name)?;
-        let bytes = std::fs::read(&path)?;
+        let key = owner
+            .data_object_key(&entry.name)
+            .map_err(TxnError::Storage)?;
+        let bytes = owner.get(&key).map_err(TxnError::Storage)?;
         if let Some(accounting) = accounting.as_deref_mut() {
             accounting.row_data_bytes += u128::from(bytes.len() as u64);
         }
@@ -2695,13 +2850,22 @@ pub(crate) fn validate_tombstones(
 /// the corruption the original race could produce — would pass every one
 /// of them; only this cross-segment check catches it), or
 /// [`TxnError::Index`] if a segment fails its own header/body validation.
+#[allow(dead_code)]
 pub(crate) fn load_segments(
     dir: &Path,
     manifest: &Manifest,
     owned_rows: &HashSet<u64>,
+    accounting: Option<&mut RecoveryByteAccounting>,
+) -> Result<strata_index::SegmentSet> {
+    load_segments_with_owner(&StorageOwner::local(dir), manifest, owned_rows, accounting)
+}
+
+pub(crate) fn load_segments_with_owner(
+    owner: &StorageOwner,
+    manifest: &Manifest,
+    owned_rows: &HashSet<u64>,
     mut accounting: Option<&mut RecoveryByteAccounting>,
 ) -> Result<strata_index::SegmentSet> {
-    let data_dir = data_subdir(dir);
     let mut parts = Vec::with_capacity(manifest.segments.len());
     let mut established_dimension: Option<u32> = None;
     let mut segment_names = HashSet::with_capacity(manifest.segments.len());
@@ -2713,8 +2877,14 @@ pub(crate) fn load_segments(
                 entry.name
             )));
         }
-        let path = safe_join(&data_dir, &entry.name)?;
-        let bytes = std::fs::read(&path)?;
+        // Validate the manifest name before the backend key wrapper so
+        // corrupt traversal names retain the public path-safety error even
+        // when recovery is using a non-local owner.
+        let _ = safe_join(Path::new("data"), &entry.name)?;
+        let key = owner
+            .data_object_key(&entry.name)
+            .map_err(TxnError::Storage)?;
+        let bytes = owner.get(&key).map_err(TxnError::Storage)?;
         if let Some(accounting) = accounting.as_deref_mut() {
             accounting.segment_bytes += u128::from(bytes.len() as u64);
         }
@@ -3150,6 +3320,64 @@ mod tests {
     const TEST_COMMIT_LOG_CAPACITY: usize = 8;
 
     #[test]
+    fn backend_owned_dataset_round_trips_without_local_dataset_directories() {
+        let backend_root = temp_dir("backend-owner-root");
+        let diagnostic_dir = backend_root.join("diagnostic-only");
+        let backend = Arc::new(LocalFs::new(&backend_root));
+        let owner = StorageOwner::from_backend(
+            backend,
+            strata_storage::DatasetPrefix::new("tenant-a").unwrap(),
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let dataset =
+            Dataset::create_with_storage(&diagnostic_dir, owner, Arc::clone(&schema)).unwrap();
+        let mut txn = dataset.begin();
+        let schema = dataset.schema();
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![7, 11]))]).unwrap();
+        txn.insert(batch).unwrap();
+        txn.commit().unwrap();
+
+        assert_eq!(dataset.data_file_info().len(), 1);
+        assert_eq!(
+            Path::new(&dataset.data_file_info()[0].name)
+                .extension()
+                .and_then(|extension| extension.to_str()),
+            Some("arrow")
+        );
+        assert_eq!(
+            dataset
+                .snapshot()
+                .scan(&dataset.schema())
+                .unwrap()
+                .num_rows(),
+            2
+        );
+        assert!(!diagnostic_dir.exists());
+        let reopened = Dataset::open_with_storage(
+            &diagnostic_dir,
+            StorageOwner::from_backend(
+                Arc::new(LocalFs::new(&backend_root)),
+                strata_storage::DatasetPrefix::new("tenant-a").unwrap(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            reopened
+                .snapshot()
+                .scan(&reopened.schema())
+                .unwrap()
+                .num_rows(),
+            2
+        );
+        std::fs::remove_dir_all(backend_root).ok();
+    }
+
+    #[test]
     fn lifecycle_report_inventories_a_fresh_dataset() {
         // Break caught: bypassing the captured version or backend inventory
         // would make a new dataset's diagnostic report misstate its durable
@@ -3563,7 +3791,7 @@ mod tests {
 
         let result = Transaction::write_pending_batches(
             std::slice::from_ref(&batch),
-            &dir,
+            &StorageOwner::local(&dir),
             0,
             &claim,
             0,

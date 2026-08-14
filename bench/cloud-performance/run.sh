@@ -32,6 +32,11 @@ fixture_lifecycle_pins=1
 fixture_lifecycle_warmups=1
 fixture_lifecycle_repetitions=5
 fixture_lifecycle_protocol="fixture-100000-rows-batch-5000-pins-1-warmups-1-repetitions-5"
+fixture_lifecycle_max_regression_pct="${STRATA_FIXTURE_LIFECYCLE_MAX_REGRESSION_PCT:-}"
+if [[ -n "$fixture_lifecycle_max_regression_pct" && ! "$fixture_lifecycle_max_regression_pct" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  printf 'STRATA_FIXTURE_LIFECYCLE_MAX_REGRESSION_PCT must be a non-negative decimal percentage\n' >&2
+  exit 2
+fi
 fixture_repo="Qdrant/dbpedia-entities-openai3-text-embedding-3-small-512-100K"
 fixture_revision="56e6849a3d0f7913e56b475bf92c0064c93b576d"
 fixture_file="data/train-00000-of-00001.parquet"
@@ -128,6 +133,7 @@ fixture_lifecycle_pins=$fixture_lifecycle_pins
 fixture_lifecycle_warmup_runs=$fixture_lifecycle_warmups
 fixture_lifecycle_repetitions=$fixture_lifecycle_repetitions
 fixture_lifecycle_protocol=$fixture_lifecycle_protocol
+fixture_lifecycle_max_regression_pct=$fixture_lifecycle_max_regression_pct
 command_manifest=CARGO_TARGET_DIR=<revision-target> STRATA_GROWTH_COMMITS=<point> STRATA_GROWTH_WARMUP_RUNS=$growth_warmups STRATA_GROWTH_REPETITIONS=$growth_repetitions cargo bench --locked -p strata-bench --bench manifest_growth_bench -- --noplot
 command_segment=CARGO_TARGET_DIR=<revision-target> STRATA_BENCH_SOURCE=synthetic STRATA_BENCH_SEED=$bench_seed STRATA_SEG_ROWS=$segment_rows STRATA_SEG_QUERIES=$segment_queries STRATA_SEG_WARMUP_RUNS=$segment_warmups STRATA_SEG_REPETITIONS=$segment_repetitions cargo bench --locked -p strata-bench --bench segment_recall_bench -- --noplot
 command_lifecycle=CARGO_TARGET_DIR=<revision-target> STRATA_BENCH_SOURCE=synthetic STRATA_BENCH_SEED=$bench_seed STRATA_LIFECYCLE_ROWS=$lifecycle_rows STRATA_LIFECYCLE_BATCH_ROWS=$lifecycle_batch_rows STRATA_PINNED_SNAPSHOTS=<pin-count> STRATA_LIFECYCLE_WARMUP_RUNS=$lifecycle_warmups STRATA_LIFECYCLE_REPETITIONS=$lifecycle_repetitions STRATA_LIFECYCLE_MEASUREMENT=cloud cargo bench --locked -p strata-bench --bench lifecycle_bench -- --noplot
@@ -213,6 +219,7 @@ lifecycle_pins=$fixture_lifecycle_pins
 lifecycle_warmup_runs=$fixture_lifecycle_warmups
 lifecycle_repetitions=$fixture_lifecycle_repetitions
 fixture_lifecycle_protocol=$fixture_lifecycle_protocol
+fixture_lifecycle_max_regression_pct=$fixture_lifecycle_max_regression_pct
 command=CARGO_TARGET_DIR=<revision-target> STRATA_BENCH_SOURCE=fixture STRATA_BENCH_FIXTURE=$destination STRATA_LIFECYCLE_ROWS=$fixture_lifecycle_rows STRATA_LIFECYCLE_BATCH_ROWS=$fixture_lifecycle_batch_rows STRATA_PINNED_SNAPSHOTS=$fixture_lifecycle_pins STRATA_LIFECYCLE_WARMUP_RUNS=$fixture_lifecycle_warmups STRATA_LIFECYCLE_REPETITIONS=$fixture_lifecycle_repetitions STRATA_LIFECYCLE_MEASUREMENT=fixture-cloud cargo bench --locked -p strata-bench --bench lifecycle_bench -- --noplot
 EOF
   printf 'fixture_status=complete\n' > "$artifact_dir/$label/fixture_lifecycle.status"

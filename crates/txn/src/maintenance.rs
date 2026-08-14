@@ -17,15 +17,25 @@ pub struct LifecycleMaintenancePolicy {
     pub max_segments: u64,
 }
 
-/// Evidence from one coordinated lifecycle maintenance run.
+/// Evidence from one explicit lifecycle maintenance run.
+///
+/// The report describes the final inventory observed by this invocation. It is
+/// not an atomic or continuously enforced storage bound. Active snapshots,
+/// protected history, unknown objects, and noncontiguous physical row IDs can
+/// keep the final inventory above a requested bound. This API does not provide
+/// cross-process quota or SLO semantics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LifecycleMaintenanceReport {
     pub retention: ManifestPruneReport,
     pub compaction: CompactionReport,
     pub vacuum: VacuumReport,
     pub inventory: crate::LifecycleReport,
-    /// False when active snapshots or other protected durable history prevent
-    /// the requested physical bounds from being met.
+    /// Whether this run's final inventory was within the requested bounds.
+    ///
+    /// This is an observation, not atomic or continuous enforcement. It is
+    /// false when active snapshots, protected history, unknown objects, or
+    /// noncontiguous physical row IDs keep the final inventory above a bound.
+    /// It does not provide cross-process quota or SLO semantics.
     pub storage_bound_met: bool,
 }
 
@@ -34,11 +44,13 @@ impl Dataset {
     /// recognized unprotected objects, then reports whether the requested
     /// physical bounds were met.
     ///
-    /// The bound is conditional on the shared handle's active snapshots and
-    /// the policy's retention window. The report is authoritative for the
-    /// inventory captured at the end of this run; callers must treat a false
-    /// bound as an operational signal rather than silently deleting protected
-    /// history.
+    /// `storage_bound_met` is the final inventory observation from this one
+    /// explicit run, not atomic or continuously enforced storage-bound
+    /// enforcement. Active snapshots, protected history, unknown objects, and
+    /// noncontiguous physical row IDs can prevent the bound. This shared-handle
+    /// API does not provide cross-process quota or SLO semantics; callers must
+    /// treat a false result as an operational signal rather than silently
+    /// deleting protected history.
     ///
     /// # Errors
     ///

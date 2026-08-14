@@ -63,3 +63,7 @@ harness = false
 [[bench]]
 name = "query_concurrency_bench"
 harness = false
+
+[[bench]]
+name = "row_group_bench"
+harness = false

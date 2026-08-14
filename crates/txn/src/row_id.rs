@@ -67,12 +67,13 @@
 #[cfg(loom)]
 use loom::sync::Mutex;
 use std::path::PathBuf;
+use std::sync::Arc;
 #[cfg(not(loom))]
 use std::sync::Mutex;
 
 use crate::error::{Result, TxnError};
 #[cfg(not(loom))]
-use strata_storage::persist_row_id_high_water_at_least;
+use strata_storage::{StorageOwner, persist_row_id_high_water_at_least_with};
 
 /// A half-open range of row-ids, `[base, base + len)`, claimed for one
 /// transaction. There is nothing to release: once granted, a range is
@@ -104,12 +105,13 @@ struct AllocatorState {
 pub(crate) struct RowIdAllocator {
     state: Mutex<AllocatorState>,
     #[cfg(not(loom))]
-    dataset_dir: PathBuf,
+    storage: Arc<StorageOwner>,
 }
 
 impl RowIdAllocator {
     /// Starts allocating at `next_row_id` — `Manifest::next_row_id` on
     /// `Dataset::create`/`open`, so ids are never reused across sessions.
+    #[allow(dead_code)]
     pub(crate) fn new(dataset_dir: impl Into<PathBuf>, next_row_id: u64) -> Self {
         #[cfg(not(loom))]
         let dataset_dir = dataset_dir.into();
@@ -118,7 +120,30 @@ impl RowIdAllocator {
         Self {
             state: Mutex::new(AllocatorState { next_row_id }),
             #[cfg(not(loom))]
-            dataset_dir,
+            storage: Arc::new(StorageOwner::local(dataset_dir)),
+        }
+    }
+
+    /// Starts an allocator using an already-owned dataset storage capability.
+    #[cfg(not(loom))]
+    pub(crate) fn new_with_storage(storage: Arc<StorageOwner>, next_row_id: u64) -> Self {
+        Self {
+            state: Mutex::new(AllocatorState { next_row_id }),
+            storage,
+        }
+    }
+
+    /// Loom models keep publication disk-free, but dataset construction still
+    /// supplies the production storage capability. Accept it so the same
+    /// constructor call type-checks in the model build while intentionally
+    /// omitting the capability from the loom-only allocator state.
+    #[cfg(loom)]
+    pub(crate) fn new_with_storage(
+        _storage: Arc<strata_storage::StorageOwner>,
+        next_row_id: u64,
+    ) -> Self {
+        Self {
+            state: Mutex::new(AllocatorState { next_row_id }),
         }
     }
 
@@ -161,7 +186,7 @@ impl RowIdAllocator {
             let end = base.checked_add(count).ok_or_else(|| {
                 TxnError::ManifestOverflow(format!("next_row_id {base} + {count}"))
             })?;
-            match persist_row_id_high_water_at_least(&self.dataset_dir, end) {
+            match persist_row_id_high_water_at_least_with(&self.storage, end) {
                 Ok(persisted_end) if persisted_end == end => {
                     state.next_row_id = end;
                     return Ok(RowIdRange { base, len: count });

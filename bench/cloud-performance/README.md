@@ -17,7 +17,9 @@ The comparison runs:
 When `STRATA_REAL_FIXTURE=1`, the runner additionally executes lifecycle/recovery accounting against
 the pinned 100,000-row fixture. This is a distinct bounded fixture protocol: 5,000 rows per commit
 (20 commits per lifecycle process), one retained snapshot, one excluded warmup, and five measured
-repetitions. It is intentionally separate from, and does not alter, the synthetic lifecycle matrix.
+repetitions. Every measured lifecycle process includes recovery/reopen, compaction/reclamation, and
+bounded lifecycle maintenance, in addition to the normal read/query phases. It is intentionally
+separate from, and does not alter, the synthetic lifecycle matrix.
 
 Each run records the revision, lockfile hash, runner OS/architecture, toolchain, raw benchmark
 output, exact command/configuration provenance, fixture revision/size/SHA-256, seed, cache policy,
@@ -25,7 +27,19 @@ repetitions, and a GNU time report. `summarize.py` emits machine-readable JSONL 
 after verifying the complete like-for-like matrix. Fixture segment and lifecycle records are rejected
 unless they match the pinned Qdrant revision and SHA-256 exactly; lifecycle evidence additionally
 requires the exact 100,000-row/5,000-row-batch protocol, complete input metadata, one GNU time RSS
-value, and equal input hashes before and after.
+value, five measured samples for the wall/allocation/peak-live metrics of recovery, compaction, and
+maintenance, and equal input hashes before and after.
+
+Measurement completeness and provenance are the mandatory acceptance threshold. An optional,
+comparison-local regression budget can be enabled with
+`STRATA_FIXTURE_LIFECYCLE_MAX_REGRESSION_PCT=<non-negative percent>`. When configured, the validator
+rejects an `after` median whose recovery, compaction, or maintenance wall time or peak-live allocation
+exceeds the matching `before` median by more than that percentage. The budget is recorded in both
+fixture sidecars and must agree across revisions. It compares only this paired run on its recorded
+machine/cache conditions; it is not a product SLO, portable hardware limit, or universal latency or
+memory claim. The GitHub Actions workflow exposes this as
+`fixture_lifecycle_max_regression_pct` and defaults it to `20`; local runs may leave it unset to
+preserve evidence completeness/provenance validation without making a numerical regression claim.
 
 The fixture identity is `Qdrant/dbpedia-entities-openai3-text-embedding-3-small-512-100K`, revision
 `56e6849a3d0f7913e56b475bf92c0064c93b576d`, file `data/train-00000-of-00001.parquet`, exactly
@@ -47,6 +61,11 @@ caller's branch and working tree are not detached or rewritten. It uses a separa
 directory for each revision so compiled artifacts are not mixed across the comparison. The
 benchmark filesystem and OS caches are not forcibly flushed; that policy is recorded in the
 provenance log.
+
+The pinned fixture is not present in this checkout, so this task produced no fixture measurements.
+Do not substitute synthetic results or fabricate fixture artifacts: run the protocol on a host that
+already has the verified fixture, retain the raw before/after artifacts, and keep Phase 3 lifecycle
+performance as an evidence gap until those artifacts validate.
 
 Set `STRATA_REAL_FIXTURE=1` and `STRATA_BENCH_FIXTURE=/path/to/train-00000-of-00001.parquet` to
 add a real-fixture segmented `Dataset`/`Snapshot` run. Its row/query selection defaults to the

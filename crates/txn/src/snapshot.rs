@@ -21,9 +21,15 @@ use arrow::compute::{concat_batches, filter_record_batch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use strata_index::LiveSet;
 use strata_query::{Predicate, PredicateKey, filter, mask, should_scan_file};
-use strata_storage::{DataFileEntry, Manifest, read_batch, read_batch_columns};
+#[cfg(test)]
+use strata_storage::read_batch;
+use strata_storage::{
+    DataFileEntry, Manifest, StorageOwner, read_batch_columns_with, read_batch_with,
+};
 
-use crate::dataset::{ROW_ID_COLUMN, cast_batch_to_schema, data_subdir, safe_join};
+use crate::facade::{DataFileInfo, SegmentInfo};
+
+use crate::dataset::{ROW_ID_COLUMN, cast_batch_to_schema};
 use crate::error::{Result, TxnError};
 use crate::query::{
     Aggregate, AggregateFunction, AggregateOutput, Comparison, ComparisonOperator, DatasetSchema,
@@ -62,7 +68,9 @@ fn zone_map_permits_scan(
 }
 
 pub struct Snapshot {
+    #[allow(dead_code)]
     pub(crate) dir: PathBuf,
+    pub(crate) storage: Arc<StorageOwner>,
     pub(crate) version: u64,
     pub(crate) lease: Arc<SnapshotLease>,
     pub(crate) schema: SchemaRef,
@@ -138,6 +146,12 @@ fn widen_ef(base_ef: usize, snapshot: &Snapshot, predicate: &Predicate) -> usize
 }
 
 impl Snapshot {
+    /// The immutable manifest version this snapshot represents.
+    #[must_use]
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
     /// Returns the current per-snapshot live-set-cache observation.
     ///
     /// This is a read-only diagnostic for retained-footprint measurement.
@@ -235,6 +249,26 @@ impl Snapshot {
         &self.manifest.data_files
     }
 
+    /// Returns facade-owned metadata without exposing storage manifest types.
+    #[must_use]
+    pub fn data_file_info(&self) -> Vec<DataFileInfo> {
+        self.manifest
+            .data_files
+            .iter()
+            .map(DataFileInfo::from_entry)
+            .collect()
+    }
+
+    /// Returns facade-owned metadata for the immutable vector segments.
+    #[must_use]
+    pub fn segment_info(&self) -> Vec<SegmentInfo> {
+        self.manifest
+            .segments
+            .iter()
+            .map(SegmentInfo::from_entry)
+            .collect()
+    }
+
     /// Iterates `self.manifest.data_files`, keeping only entries
     /// `should_scan_file` says could match `predicate` (or every entry, if
     /// `predicate` is `None`), reads and joins each surviving file's path
@@ -260,16 +294,18 @@ impl Snapshot {
         columns: Option<&[&str]>,
         mut process: impl FnMut(RecordBatch) -> Result<T>,
     ) -> Result<Vec<T>> {
-        let data_dir = data_subdir(&self.dir);
         self.manifest
             .data_files
             .iter()
             .filter(|entry| predicate.is_none_or(|p| should_scan_file(&entry.stats, p)))
             .map(|entry| {
-                let path = safe_join(&data_dir, &entry.name)?;
+                let key = self
+                    .storage
+                    .data_object_key(&entry.name)
+                    .map_err(TxnError::Storage)?;
                 let batch = match columns {
-                    Some(cols) => read_batch_columns(&path, cols)?,
-                    None => read_batch(&path)?,
+                    Some(cols) => read_batch_columns_with(&self.storage, &key, cols)?,
+                    None => read_batch_with(&self.storage, &key)?,
                 };
                 let batch = self.filter_tombstoned_rows(batch)?;
                 process(batch)
@@ -556,14 +592,17 @@ impl Snapshot {
         let mut columns = projection.iter().map(String::as_str).collect::<Vec<_>>();
         push_unique_column(&mut columns, ROW_ID_COLUMN);
         let query_schema = self.query_schema_for_columns(&columns)?;
-        let data_dir = data_subdir(&self.dir);
         for entry in self.manifest.data_files.iter().filter(|entry| {
             entry
                 .row_id_range
                 .is_some_and(|(first, last)| first <= row_id && row_id <= last)
         }) {
-            let path = safe_join(&data_dir, &entry.name)?;
-            let raw_batch = read_batch_columns(&path, &columns).map_err(TxnError::Storage)?;
+            let key = self
+                .storage
+                .data_object_key(&entry.name)
+                .map_err(TxnError::Storage)?;
+            let raw_batch = read_batch_columns_with(&self.storage, &key, &columns)
+                .map_err(TxnError::Storage)?;
             let batch = cast_batch_to_schema(&raw_batch, &query_schema)?;
             let row_ids = batch
                 .column(
@@ -1411,6 +1450,19 @@ mod tests {
         (temp, dataset)
     }
 
+    #[test]
+    fn snapshot_version_accessor_remains_bound_to_captured_snapshot() {
+        let (_temp, dataset) = query_test_dataset(&[("before", Some(1), true, 1)]);
+        let snapshot = dataset.snapshot();
+
+        let mut transaction = dataset.begin();
+        transaction.delete(0).unwrap();
+        transaction.commit().unwrap();
+
+        assert_eq!(snapshot.version(), 1);
+        assert_eq!(dataset.current_version(), 2);
+    }
+
     fn group_by_test_dataset() -> (tempfile::TempDir, crate::Dataset, SchemaRef) {
         use crate::Dataset;
         use arrow::datatypes::{DataType, Field, Schema};
@@ -1459,6 +1511,7 @@ mod tests {
     fn test_snapshot(tombstoned: &[u64]) -> Snapshot {
         Snapshot {
             dir: PathBuf::from("unused-in-these-tests"),
+            storage: Arc::new(StorageOwner::local("unused-in-these-tests")),
             version: 1,
             lease: SnapshotLease::unregistered(1),
             schema: Arc::new(arrow::datatypes::Schema::empty()),
@@ -2383,6 +2436,50 @@ mod tests {
         assert_eq!(result.projection, vec!["title"]);
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0].fields.len(), 1);
+        assert_eq!(result.rows[0].fields[0].name, "title");
+        assert_eq!(
+            result.rows[0].fields[0].value,
+            ResultValue::Utf8("high".into())
+        );
+    }
+
+    #[cfg(feature = "test-fault-injection")]
+    #[test]
+    fn scan_query_accounts_for_only_projection_filter_and_row_id_columns() {
+        use crate::{
+            Comparison, ComparisonOperator, FilterExpression, FilterLiteral, Projection,
+            ResultValue, ScanRequest,
+        };
+        use strata_storage::datafile::test_support::{
+            ProjectedRead, record_directory_syncs, record_projected_reads,
+        };
+
+        // Break caught: widening scan-query's Arrow projection to every physical
+        // column would silently decode unrelated data (for example vectors).
+        let (_temp, dataset) =
+            query_test_dataset(&[("low", Some(3), true, 1), ("high", Some(11), false, 2)]);
+        let accounting = record_projected_reads();
+        let _directory_syncs = record_directory_syncs();
+
+        let result = dataset
+            .snapshot()
+            .scan_query(&ScanRequest {
+                projection: Projection::Columns(vec!["title".into()]),
+                filter: Some(FilterExpression::Compare(Comparison {
+                    column: "score".into(),
+                    operator: ComparisonOperator::GreaterThan,
+                    value: FilterLiteral::Int64(10),
+                })),
+            })
+            .unwrap();
+
+        assert_eq!(
+            accounting.projected_reads(),
+            vec![ProjectedRead::new(["title", "score", "_row_id"])],
+            "the storage projection must include only result, predicate, and tombstone columns"
+        );
+        assert_eq!(result.projection, vec!["title"]);
+        assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0].fields[0].name, "title");
         assert_eq!(
             result.rows[0].fields[0].value,
@@ -3467,6 +3564,7 @@ mod tests {
         let indexed_snapshot = dataset.snapshot();
         let snapshot = Snapshot {
             dir: indexed_snapshot.dir.clone(),
+            storage: Arc::clone(&indexed_snapshot.storage),
             version: indexed_snapshot.version,
             lease: SnapshotLease::unregistered(indexed_snapshot.version),
             schema: Arc::clone(&indexed_snapshot.schema),

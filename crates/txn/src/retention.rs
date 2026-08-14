@@ -13,9 +13,7 @@ use loom::sync::Mutex;
 #[cfg(not(loom))]
 use std::sync::Mutex;
 
-use strata_storage::{
-    Backend, LocalFs, ObjectMeta, StorageError, read_manifest_at_key_with_byte_count,
-};
+use strata_storage::{ObjectMeta, StorageError, read_manifest_at_key_with_byte_count_with};
 
 use crate::dataset::Dataset;
 use crate::error::{Result, TxnError};
@@ -149,9 +147,9 @@ pub(crate) fn build_plan(dataset: &Dataset, policy: RetentionPolicy) -> Result<R
     active_snapshot_versions.sort_unstable();
     active_snapshot_versions.dedup();
 
-    let backend = LocalFs::new(dataset.retention_dir());
-    let manifest_objects = backend.list("_versions/")?;
-    let data_objects = backend.list("data/")?;
+    let storage = dataset.storage();
+    let manifest_objects = storage.list("_versions")?;
+    let data_objects = storage.list("data")?;
     let manifest_keys = index_manifest_objects(&manifest_objects)?;
 
     let mut retained_manifest_versions =
@@ -168,15 +166,14 @@ pub(crate) fn build_plan(dataset: &Dataset, policy: RetentionPolicy) -> Result<R
                 "retained manifest is missing from inventory".to_string(),
             ))
         })?;
-        let (manifest, _) =
-            read_manifest_at_key_with_byte_count(dataset.retention_dir(), &key.key, version)?;
+        let (manifest, _) = read_manifest_at_key_with_byte_count_with(&storage, &key.key, version)?;
         let reachable = reachable_keys(&manifest)?;
         retained_data_keys.extend(reachable.data_files);
         retained_data_keys.extend(reachable.segments);
     }
 
     let (eligible_manifest_versions, older_data_keys) = older_manifest_data_keys(
-        dataset.retention_dir(),
+        &storage,
         &manifest_keys,
         &retained_manifest_versions,
         observed_version,
@@ -203,8 +200,8 @@ pub(crate) fn build_manifest_prune_authority(
     policy: RetentionPolicy,
 ) -> Result<ManifestPruneAuthority> {
     let plan = build_plan(dataset, policy)?;
-    let backend = LocalFs::new(dataset.retention_dir());
-    let manifest_keys = index_manifest_objects(&backend.list("_versions/")?)?;
+    let storage = dataset.storage();
+    let manifest_keys = index_manifest_objects(&storage.list("_versions")?)?;
     let mut candidates = Vec::with_capacity(plan.eligible_manifest_versions.len());
 
     for version in plan.eligible_manifest_versions {
@@ -239,7 +236,7 @@ pub(crate) fn build_age_manifest_prune_authority(
     let mut protected_versions = dataset.live_snapshot_versions();
     protected_versions.push(observed_version);
     protected_versions.extend(latest_versions(
-        index_manifest_objects(&LocalFs::new(dataset.retention_dir()).list("_versions/")?)?
+        index_manifest_objects(&dataset.storage().list("_versions")?)?
             .keys()
             .copied(),
         policy.keep_latest_versions,
@@ -247,8 +244,8 @@ pub(crate) fn build_age_manifest_prune_authority(
     protected_versions.sort_unstable();
     protected_versions.dedup();
     let protected: BTreeSet<_> = protected_versions.into_iter().collect();
-    let backend = LocalFs::new(dataset.retention_dir());
-    let manifest_keys = index_manifest_objects(&backend.list("_versions/")?)?;
+    let storage = dataset.storage();
+    let manifest_keys = index_manifest_objects(&storage.list("_versions")?)?;
     let now_us = i64::try_from(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -260,8 +257,7 @@ pub(crate) fn build_age_manifest_prune_authority(
         if version >= observed_version || protected.contains(&version) {
             continue;
         }
-        let (manifest, _) =
-            read_manifest_at_key_with_byte_count(dataset.retention_dir(), &key.key, version)?;
+        let (manifest, _) = read_manifest_at_key_with_byte_count_with(&storage, &key.key, version)?;
         if manifest.committed_at_us == 0
             || now_us.saturating_sub(manifest.committed_at_us) < i64::try_from(policy.max_age_us)?
         {
@@ -371,7 +367,7 @@ fn ensure_reachable_objects_are_listed(
 }
 
 fn older_manifest_data_keys(
-    dataset_dir: &std::path::Path,
+    storage: &strata_storage::StorageOwner,
     manifest_keys: &BTreeMap<u64, ListedManifest>,
     retained_versions: &[u64],
     observed_version: u64,
@@ -383,7 +379,7 @@ fn older_manifest_data_keys(
         .iter()
         .filter(|(version, _)| **version < observed_version && !retained.contains(version))
     {
-        let (manifest, _) = read_manifest_at_key_with_byte_count(dataset_dir, &key.key, version)?;
+        let (manifest, _) = read_manifest_at_key_with_byte_count_with(storage, &key.key, version)?;
         let reachable = reachable_keys(&manifest)?;
         older_data_keys.extend(reachable.data_files);
         older_data_keys.extend(reachable.segments);
