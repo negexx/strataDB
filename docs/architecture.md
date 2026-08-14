@@ -80,14 +80,17 @@ IPC batch at a time, reads its base snapshot plus its own overlay through `scan`
 `committed` or `aborted`; abort/drop never publishes staged writes. Open, reads, commit, and migration
 release the GIL around engine work. The API is limited to one Python process sharing a `Dataset`
 handle: it does not provide cross-process coordination, serializability, or a merged vector-search
-overlay. Conflict, validation/schema/migration, insufficient-history, and execution/storage failures
-remain distinct Python exception categories.
+overlay. `ConflictError` exposes `contested_row_ids`; `SchemaMigrationError`, `InvalidQueryError`,
+`UnsupportedTransactionReadError`, `StorageDurabilityError`, and `CorruptionError` are stable
+categories (and retain the existing `ValidationError`/`ExecutionError` base classes). Insufficient
+history remains a distinct category.
 
 ## Commit lifecycle
 
-1. `Dataset::begin` captures the current immutable snapshot version and returns a write-only
-   `Transaction`. It buffers Arrow batches and tombstones; it has no transactional scan/search or
-   read-your-own-writes.
+1. `Dataset::begin` captures one immutable base snapshot and returns a `Transaction` bound to that
+   snapshot's schema/version. It buffers Arrow batches and tombstones. Transaction `scan`, lookup,
+   and group reads merge that base with its private overlay; vector search uses the base index only
+   and rejects staged overlays with a typed unsupported-read error.
 2. Commit preparation allocates row IDs, writes/fsyncs Arrow files, and builds/fsyncs an immutable HNSW
    segment when vectors are present. Failed preparation may leave unreachable files; cleanup is absent.
 3. Under the shared handle's commit lock, the transaction reloads the latest snapshot and checks its
@@ -138,8 +141,9 @@ observation from one completed run, not atomic or continuing storage-bound enfor
 ## Reads, updates, and index behavior
 
 `Dataset::snapshot` returns a fixed manifest/segment/tombstone view. Later commits cannot alter that
-captured view. `Transaction` writes and `Snapshot` reads are separate APIs; the current engine does not
-provide a full read/write snapshot-transaction interface.
+captured view. `Transaction` supplies bounded read-your-writes over that same base snapshot (scan,
+lookup, and grouped reads); it is not a general read/write query interface, and vector reads with a
+staged overlay are explicitly unsupported.
 
 Rows are append-only physical records. `delete` and `update` must target one live physical row in the
 transaction's base snapshot and are revalidated under the commit lock. `update` tombstones that old

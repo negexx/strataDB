@@ -1,8 +1,11 @@
 //! A thin Python facade over Strata's immutable snapshot query API.
 //!
 //! The extension remains embedded and supports one process sharing one
-//! [`strata_txn::Dataset`] handle. It does not provide a read/write transaction
-//! API, cross-process coordination, or stronger isolation.
+//! [`strata_txn::Dataset`] handle. It provides bounded read/write transactions:
+//! scans read the immutable base snapshot plus the transaction's own overlay,
+//! while vector search is rejected when staged writes would make base-index
+//! results stale. It does not provide cross-process coordination, general
+//! transactional reads, or stronger isolation.
 
 use std::io::Cursor;
 use std::path::PathBuf;
@@ -36,6 +39,11 @@ create_exception!(strata_ext, ValidationError, StrataError);
 create_exception!(strata_ext, ExecutionError, StrataError);
 create_exception!(strata_ext, ConflictError, StrataError);
 create_exception!(strata_ext, InsufficientHistoryError, StrataError);
+create_exception!(strata_ext, SchemaMigrationError, ValidationError);
+create_exception!(strata_ext, InvalidQueryError, ValidationError);
+create_exception!(strata_ext, UnsupportedTransactionReadError, ExecutionError);
+create_exception!(strata_ext, StorageDurabilityError, ExecutionError);
+create_exception!(strata_ext, CorruptionError, ExecutionError);
 
 /// A Python handle to one embedded Strata dataset.
 #[pyclass(name = "Dataset", module = "strata_ext")]
@@ -117,9 +125,10 @@ impl PyDataset {
 
     /// Begins a transaction with a private read-your-writes overlay.
     fn begin(&self) -> PyTransaction {
+        let transaction = self.inner.begin();
         PyTransaction {
-            inner: Some(self.inner.begin()),
-            schema: self.inner.snapshot().schema(),
+            schema: transaction.schema(),
+            inner: Some(transaction),
             state: TransactionState::Active,
         }
     }
@@ -406,6 +415,41 @@ impl PyTransaction {
         self.inner = Some(transaction);
         let bytes = result.map_err(map_binding_failure)?;
         Ok(PyBytes::new(py, &bytes))
+    }
+
+    /// Returns nearest-neighbor hits from the transaction base snapshot.
+    ///
+    /// When this transaction has staged inserts, replacements, or deletes,
+    /// the immutable vector index cannot represent the overlay and this
+    /// raises `UnsupportedTransactionReadError` instead of returning stale
+    /// base-snapshot hits.
+    #[pyo3(signature = (vector_column, query, k, filter=None, projection=None))]
+    fn vector_search(
+        &mut self,
+        py: Python<'_>,
+        vector_column: String,
+        query: Vec<f32>,
+        k: usize,
+        filter: Option<(String, String, Py<PyAny>)>,
+        projection: Option<Vec<String>>,
+    ) -> PyResult<Vec<Py<PyDict>>> {
+        let request = VectorSearchRequest {
+            vector_column,
+            query,
+            k,
+            filter: filter_from_python(py, &self.schema, filter)?,
+            hydration: projection
+                .map(Projection::Columns)
+                .map_or(VectorHydration::NotRequested, VectorHydration::Projection),
+        };
+        let transaction = self.take_active()?;
+        let (transaction, result) = py.detach(move || {
+            let result = transaction.vector_search_query(&request);
+            (transaction, result)
+        });
+        self.inner = Some(transaction);
+        let result = result.map_err(map_query_error)?;
+        vector_result_to_python(py, &result)
     }
 }
 
@@ -935,7 +979,12 @@ fn map_binding_failure(error: BindingFailure) -> PyErr {
 
 fn map_query_error(error: QueryError) -> PyErr {
     match error {
-        QueryError::Validation(error) => ValidationError::new_err(error.to_string()),
+        QueryError::Validation(error) => InvalidQueryError::new_err(error.to_string()),
+        QueryError::Execution(QueryExecutionError::UnsupportedTransactionRead { operation }) => {
+            UnsupportedTransactionReadError::new_err(format!(
+                "transaction read operation '{operation}' cannot merge staged writes safely"
+            ))
+        }
         QueryError::Execution(QueryExecutionError::Engine(error)) => map_txn_error(error.as_ref()),
         QueryError::Execution(error) => ExecutionError::new_err(error.to_string()),
     }
@@ -943,41 +992,80 @@ fn map_query_error(error: QueryError) -> PyErr {
 
 fn map_txn_error(error: &TxnError) -> PyErr {
     match error {
-        TxnError::Conflict { .. } => ConflictError::new_err(error.to_string()),
+        TxnError::Conflict { contested_row_ids } => conflict_error(contested_row_ids),
         TxnError::InsufficientHistory { .. } => {
             InsufficientHistoryError::new_err(error.to_string())
         }
         TxnError::BatchSchemaMismatch { .. }
         | TxnError::SchemaMismatch { .. }
         | TxnError::ReservedColumnName(_)
-        | TxnError::InvalidUpdateShape { .. } => ValidationError::new_err(error.to_string()),
+        | TxnError::InvalidUpdateShape { .. } => SchemaMigrationError::new_err(error.to_string()),
         TxnError::Storage(error) => match error {
             StorageError::UnknownSchemaVersion { .. }
             | StorageError::MigrationSourceVersion { .. }
             | StorageError::MigrationUnsupportedDirection { .. }
             | StorageError::MigrationUnsupported { .. }
             | StorageError::MigrationIncompatibleType { .. }
-            | StorageError::MigrationLossyConversion { .. } => {
-                ValidationError::new_err(error.to_string())
+            | StorageError::MigrationLossyConversion { .. }
+            | StorageError::SchemaVersionChanged { .. }
+            | StorageError::LegacyFormatNeedsMigration(_) => {
+                SchemaMigrationError::new_err(error.to_string())
             }
-            _ => ExecutionError::new_err(error.to_string()),
+            StorageError::CorruptManifest(_, _)
+            | StorageError::CorruptDataFile(_, _)
+            | StorageError::EmptyDataFile(_)
+            | StorageError::MissingRowIdHighWater(_) => CorruptionError::new_err(error.to_string()),
+            StorageError::Io(_)
+            | StorageError::Arrow(_)
+            | StorageError::Serde(_)
+            | StorageError::DurabilityUnsupported(_)
+            | StorageError::AlreadyExists(_) => StorageDurabilityError::new_err(error.to_string()),
         },
+        TxnError::Io(_)
+        | TxnError::Arrow(_)
+        | TxnError::Index(_)
+        | TxnError::AlreadyExists(_)
+        | TxnError::NotFound(_)
+        | TxnError::ManifestOverflow(_)
+        | TxnError::RowIdReservationDurability { .. }
+        | TxnError::Clock(_) => StorageDurabilityError::new_err(error.to_string()),
+        TxnError::CorruptSegment(_)
+        | TxnError::UnsafeManifestPath(_)
+        | TxnError::UnreasonableCapacity(_, _)
+        | TxnError::RowIdRangeMismatch { .. } => CorruptionError::new_err(error.to_string()),
         _ => ExecutionError::new_err(error.to_string()),
     }
+}
+
+fn conflict_error(contested_row_ids: &[u64]) -> PyErr {
+    Python::attach(|py| {
+        let error = ConflictError::new_err(format!(
+            "conflict: {contested_row_ids:?} were modified by another transaction"
+        ));
+        if let Err(attribute_error) = error
+            .value(py)
+            .setattr("contested_row_ids", contested_row_ids)
+        {
+            return attribute_error;
+        }
+        error
+    })
 }
 
 #[pymodule]
 mod strata_ext {
     #[pymodule_export]
     use super::{
-        ConflictError, ExecutionError, InsufficientHistoryError, PyDataset, PySnapshot,
-        PyTransaction, StrataError, ValidationError,
+        ConflictError, CorruptionError, ExecutionError, InsufficientHistoryError,
+        InvalidQueryError, PyDataset, PySnapshot, PyTransaction, SchemaMigrationError,
+        StorageDurabilityError, StrataError, UnsupportedTransactionReadError, ValidationError,
     };
 }
 
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+    use std::path::PathBuf;
     use std::sync::Arc;
 
     use pyo3::prelude::*;
@@ -990,8 +1078,10 @@ mod tests {
     use strata_txn::arrow::record_batch::RecordBatch;
 
     use super::{
-        HydrationError, PyDataset, StrataError, TxnError, ValidationError,
-        hydration_error_to_python, record_batch_to_ipc,
+        CorruptionError, HydrationError, InvalidQueryError, PyDataset, SchemaMigrationError,
+        StorageDurabilityError, StrataError, TxnError, UnsupportedTransactionReadError,
+        ValidationError, hydration_error_to_python, map_query_error, map_txn_error,
+        record_batch_to_ipc,
     };
 
     #[test]
@@ -1053,6 +1143,96 @@ mod tests {
                 first_ipc_batch(dataset.snapshot(py).scan(py, None, None)?.as_bytes())?.num_rows(),
                 0
             );
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn transaction_schema_accessor_stays_bound_to_its_base_snapshot()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)]));
+        let dataset = strata_txn::Dataset::create(directory.path(), Arc::clone(&schema))?;
+        let transaction = dataset.begin();
+
+        dataset.migrate_schema(&strata_txn::SchemaMigration::add_nullable_column(
+            1,
+            2,
+            Field::new("note", DataType::Utf8, true),
+        ))?;
+
+        assert_eq!(transaction.schema(), schema);
+        assert_eq!(transaction.schema().fields().len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn transaction_vector_search_and_error_mapping_use_stable_categories()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = populated_dataset()?;
+
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let dataset = PyDataset::open(py, directory.path().to_path_buf())?;
+            let mut transaction = dataset.begin();
+            assert_eq!(
+                transaction
+                    .vector_search(py, "vector".to_owned(), vec![0.0, 0.0], 1, None, None)?
+                    .len(),
+                1
+            );
+            transaction
+                .active_mut()?
+                .delete(0)
+                .map_err(|error| map_txn_error(&error))?;
+            let Err(unsupported) =
+                transaction.vector_search(py, "vector".to_owned(), vec![0.0, 0.0], 1, None, None)
+            else {
+                return Err(ValidationError::new_err(
+                    "staged vector search was accepted",
+                ));
+            };
+            assert!(unsupported.is_instance_of::<UnsupportedTransactionReadError>(py));
+
+            let conflict = map_txn_error(&TxnError::Conflict {
+                contested_row_ids: vec![7, 9],
+            });
+            assert!(conflict.is_instance_of::<super::ConflictError>(py));
+            assert_eq!(
+                conflict
+                    .value(py)
+                    .getattr("contested_row_ids")?
+                    .extract::<Vec<u64>>()?,
+                vec![7, 9]
+            );
+
+            let schema = map_txn_error(&TxnError::Storage(
+                strata_txn::StorageError::MigrationSourceVersion {
+                    expected: 2,
+                    actual: 1,
+                },
+            ));
+            assert!(schema.is_instance_of::<SchemaMigrationError>(py));
+
+            let query = map_query_error(strata_txn::QueryError::Validation(
+                strata_txn::QueryValidationError::InvalidVectorK,
+            ));
+            assert!(query.is_instance_of::<InvalidQueryError>(py));
+
+            let durability = map_txn_error(&TxnError::RowIdReservationDurability {
+                end: 7,
+                source: strata_txn::StorageError::DurabilityUnsupported(PathBuf::from("dataset")),
+            });
+            assert!(durability.is_instance_of::<StorageDurabilityError>(py));
+
+            let corruption = map_txn_error(&TxnError::Storage(
+                strata_txn::StorageError::CorruptManifest(
+                    PathBuf::from("dataset/current"),
+                    "checksum mismatch".to_owned(),
+                ),
+            ));
+            assert!(corruption.is_instance_of::<CorruptionError>(py));
             Ok(())
         })?;
         Ok(())

@@ -54,7 +54,7 @@ pub enum TxnError {
     #[error("schema mismatch casting a data file: expected {expected} columns, found {actual}")]
     SchemaMismatch { expected: usize, actual: usize },
     #[error(
-        "batch schema does not match the dataset-owned schema: expected {expected:?}, found {actual:?}"
+        "batch schema does not match the dataset-owned schema: expected {expected}, found {actual}"
     )]
     BatchSchemaMismatch { expected: String, actual: String },
     #[error("row {row_id} is not owned by the transaction's base snapshot")]
@@ -136,6 +136,14 @@ mod tests {
             }
             .to_string(),
             "schema mismatch casting a data file: expected 3 columns, found 2"
+        );
+        assert_eq!(
+            TxnError::BatchSchemaMismatch {
+                expected: "dataset schema [name: Utf8 (required)]".to_owned(),
+                actual: "batch schema [name: Int64 (required)]".to_owned(),
+            }
+            .to_string(),
+            "batch schema does not match the dataset-owned schema: expected dataset schema [name: Utf8 (required)], found batch schema [name: Int64 (required)]"
         );
         assert_eq!(
             TxnError::Clock("second time provided was later than self".to_string()).to_string(),

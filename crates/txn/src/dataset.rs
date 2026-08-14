@@ -1394,6 +1394,23 @@ fn validate_dataset_schema(schema: &SchemaRef) -> Result<()> {
     Ok(())
 }
 
+fn schema_description(schema: &Schema) -> String {
+    let fields = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let nullability = if field.is_nullable() {
+                "nullable"
+            } else {
+                "required"
+            };
+            format!("{}: {} ({nullability})", field.name(), field.data_type())
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("schema [{fields}]")
+}
+
 /// Creates `dir/data` after checking that `dir`'s immediate parent already
 /// exists, then durably publishes only the dataset-owned directory boundary.
 ///
@@ -1591,6 +1608,13 @@ struct PublishedSegment {
 }
 
 impl Transaction {
+    /// Returns the logical schema captured with this transaction's immutable
+    /// base snapshot.
+    #[must_use]
+    pub fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
     /// # Examples
     ///
     /// Buffered rows are invisible to every reader — including this same
@@ -1795,8 +1819,8 @@ impl Transaction {
     fn validate_batch(&self, batch: &RecordBatch) -> Result<()> {
         if batch.schema_ref().as_ref() != self.schema.as_ref() {
             return Err(TxnError::BatchSchemaMismatch {
-                expected: format!("{:?}", self.schema),
-                actual: format!("{:?}", batch.schema_ref()),
+                expected: format!("dataset {}", schema_description(&self.schema)),
+                actual: format!("batch {}", schema_description(batch.schema_ref().as_ref())),
             });
         }
         Ok(())
@@ -4261,10 +4285,13 @@ mod tests {
         let batch =
             RecordBatch::try_new(renamed, vec![Arc::new(Int64Array::from(vec![1]))]).unwrap();
         let mut txn = ds.begin();
-        assert!(matches!(
-            txn.insert(batch),
-            Err(TxnError::BatchSchemaMismatch { .. })
-        ));
+        let error = txn
+            .insert(batch)
+            .expect_err("renamed schema must be rejected");
+        assert_eq!(
+            error.to_string(),
+            "batch schema does not match the dataset-owned schema: expected dataset schema [id: Int64 (required)], found batch schema [renamed: Int64 (required)]"
+        );
         assert!(
             txn.pending.is_empty(),
             "schema validation must precede buffering or I/O"

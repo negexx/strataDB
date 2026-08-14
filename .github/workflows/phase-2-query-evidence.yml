@@ -90,11 +90,18 @@ jobs:
           import strata_ext
 
           required = [
-              "Dataset",
-              "Snapshot",
-              "StrataError",
-              "ValidationError",
-              "ExecutionError",
+            "Dataset",
+            "Snapshot",
+            "Transaction",
+            "StrataError",
+            "ValidationError",
+            "ExecutionError",
+            "ConflictError",
+            "SchemaMigrationError",
+            "InvalidQueryError",
+            "UnsupportedTransactionReadError",
+            "StorageDurabilityError",
+            "CorruptionError",
           ]
           missing = [name for name in required if not hasattr(strata_ext, name)]
           if missing:

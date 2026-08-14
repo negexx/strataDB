@@ -279,6 +279,30 @@ search with staged data remains a typed unsupported operation.
 All native bindings commands used the process-local MSVC x64 linker and SDK library directories;
 no repository configuration changed for that environment.
 
+## Task 4 fix round 1 verification (2026-08-15)
+
+The Python facade now exposes stable exception subclasses for conflict, schema/migration, invalid
+query, unsupported transaction reads, storage/durability, and corruption. `ConflictError` carries a
+`contested_row_ids` attribute. `PyDataset.begin()` takes the wrapper schema from the same transaction
+base snapshot, and `Transaction.vector_search` delegates to the bounded Rust contract: it searches an
+unchanged base snapshot and raises `UnsupportedTransactionReadError` when staged writes would make
+base-index results stale. Batch-schema mismatches now render stable human-readable schema context
+instead of Rust `Debug` output.
+
+| Command | Result |
+|---|---|
+| `cargo test -p strata-bindings --no-default-features tests::transaction_schema_accessor_stays_bound_to_its_base_snapshot -- --exact` before the fix | Exit 101, expected red: the five stable exception classes, `Transaction::schema`, and `PyTransaction::vector_search` were absent. |
+| `cargo test -p strata-txn --no-default-features error::tests::new_error_variants_format_with_their_context -- --exact` before the fix | Exit 101, expected red: `BatchSchemaMismatch` quoted the schema strings through Rust `Debug` formatting. |
+| `cargo test -p strata-bindings --no-default-features` | Exit 0: 17 passed, 0 failed. |
+| `cargo test -p strata-txn --no-default-features dataset::tests::dataset_schema_is_persisted_and_rejects_renamed_or_castable_batches -- --exact` | Exit 0: 1 passed, 0 failed. |
+| `cargo test -p strata-txn --no-default-features error::tests::new_error_variants_format_with_their_context -- --exact` | Exit 0: 1 passed, 0 failed. |
+| `cargo build --workspace` | Exit 0. The Windows linker emitted its existing import-library informational warning for `strata-bindings`; no Rust source warning was emitted. |
+| `cargo clippy --workspace --all-targets -- -D warnings` | Exit 0; no warnings. |
+| `maturin 1.9.4 build --release --locked`, then temporary-wheel installation/import | Exit 0. The CPython 3.14 wheel imported and asserted `Dataset`, `Snapshot`, `Transaction`, and every stable exception export. |
+
+The package-smoke workflow retains the same locked-wheel convention and now checks the new
+`Transaction` and exception exports.
+
 ## Task 3 fix round 1 evidence (2026-08-15)
 
 This evidence-and-documentation round did not change planner source, dependencies, or planner
