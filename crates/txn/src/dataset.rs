@@ -372,11 +372,13 @@ pub mod test_support {
 
     thread_local! {
         static FAIL_AFTER_COMPACTION_MANIFEST_PUBLICATION: Cell<bool> = const { Cell::new(false) };
+        static FAIL_BEFORE_MIGRATION_MANIFEST_PUBLICATION: Cell<bool> = const { Cell::new(false) };
     }
 
     /// Restores the calling test thread's prior compaction fault state.
     pub struct PostPublicationFaultGuard {
         previous: bool,
+        previous_migration: bool,
         // The state is thread-local, so the guard must be dropped on the
         // thread that installed it. Rc makes this guard !Send and !Sync.
         _thread_affine: PhantomData<Rc<()>>,
@@ -385,6 +387,8 @@ pub mod test_support {
     impl Drop for PostPublicationFaultGuard {
         fn drop(&mut self) {
             FAIL_AFTER_COMPACTION_MANIFEST_PUBLICATION.with(|fault| fault.set(self.previous));
+            FAIL_BEFORE_MIGRATION_MANIFEST_PUBLICATION
+                .with(|fault| fault.set(self.previous_migration));
         }
     }
 
@@ -394,14 +398,35 @@ pub mod test_support {
     #[must_use]
     pub fn fail_after_compaction_manifest_publication() -> PostPublicationFaultGuard {
         let previous = FAIL_AFTER_COMPACTION_MANIFEST_PUBLICATION.with(|fault| fault.replace(true));
+        let previous_migration = FAIL_BEFORE_MIGRATION_MANIFEST_PUBLICATION.with(Cell::get);
         PostPublicationFaultGuard {
             previous,
+            previous_migration,
+            _thread_affine: PhantomData,
+        }
+    }
+
+    /// Causes one migration on this test thread to return a typed I/O error
+    /// after its replacement objects have been validated but before its
+    /// manifest becomes reachable.
+    #[must_use]
+    pub fn fail_before_migration_manifest_publication() -> PostPublicationFaultGuard {
+        let previous = FAIL_AFTER_COMPACTION_MANIFEST_PUBLICATION.with(Cell::get);
+        let previous_migration =
+            FAIL_BEFORE_MIGRATION_MANIFEST_PUBLICATION.with(|fault| fault.replace(true));
+        PostPublicationFaultGuard {
+            previous,
+            previous_migration,
             _thread_affine: PhantomData,
         }
     }
 
     pub(super) fn consume_after_compaction_manifest_publication() -> bool {
         FAIL_AFTER_COMPACTION_MANIFEST_PUBLICATION.with(|fault| fault.replace(false))
+    }
+
+    pub(super) fn consume_before_migration_manifest_publication() -> bool {
+        FAIL_BEFORE_MIGRATION_MANIFEST_PUBLICATION.with(|fault| fault.replace(false))
     }
 }
 
@@ -1152,6 +1177,7 @@ impl Dataset {
     /// Returns a typed storage, schema, corruption, or durability error and
     /// leaves the current complete manifest unchanged when publication has
     /// not succeeded.
+    #[allow(clippy::too_many_lines)]
     pub fn migrate_schema(&self, migration: &SchemaMigration) -> Result<SchemaMigrationResult> {
         let _lifecycle_guard = self.lifecycle_coordinator.acquire_exclusive();
         let mut commit_log = self
@@ -1243,6 +1269,12 @@ impl Dataset {
         )?;
         validate_tombstones(&self.dir, &manifest, &owned_rows)?;
         let index = load_segments_with_owner(&self.storage, &manifest, &owned_rows, None)?;
+        #[cfg(feature = "test-fault-injection")]
+        if test_support::consume_before_migration_manifest_publication() {
+            return Err(TxnError::Io(std::io::Error::other(
+                "injected pre-publication migration failure (test fault injection)",
+            )));
+        }
         commit_manifest_with(&self.storage, &manifest)?;
 
         // A migration is a version boundary but has no row-level write set.
@@ -9891,6 +9923,78 @@ mod loom_tests {
             );
 
             std::fs::remove_dir_all(&dir).ok();
+        });
+    }
+
+    #[test]
+    fn migration_exclusivity_rejects_a_stale_schema_commit_or_migrates_its_published_rows() {
+        // This models the two synchronization boundaries in Dataset directly:
+        // migrate_schema holds lifecycle exclusivity while it changes the
+        // catalog, and Transaction::commit holds a preparation lease until it
+        // either publishes or rejects its captured schema version. Filesystem
+        // and Arrow work are intentionally outside this model; loom cannot run
+        // migration's full recursive decode/encode path within its coroutine
+        // stack, while these gate/version operations are the race under test.
+        loom::model(|| {
+            use loom::sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            };
+
+            let coordinator =
+                Arc::new(crate::lifecycle_coordination::LifecycleCoordinator::default());
+            let schema_version = Arc::new(AtomicUsize::new(1));
+            let active_preparations = Arc::new(AtomicUsize::new(0));
+            let stale_commit_published = Arc::new(AtomicUsize::new(0));
+            let stale_commit_observed_version = Arc::new(AtomicUsize::new(0));
+
+            let migration_coordinator = Arc::clone(&coordinator);
+            let migration_schema_version = Arc::clone(&schema_version);
+            let migration_preparations = Arc::clone(&active_preparations);
+            let migration = loom::thread::spawn(move || {
+                let _exclusive = migration_coordinator.acquire_exclusive();
+                assert_eq!(
+                    migration_preparations.load(Ordering::SeqCst),
+                    0,
+                    "migration must not overlap a transaction publication lease"
+                );
+                migration_schema_version.store(2, Ordering::SeqCst);
+            });
+
+            let commit_coordinator = Arc::clone(&coordinator);
+            let commit_schema_version = Arc::clone(&schema_version);
+            let commit_preparations = Arc::clone(&active_preparations);
+            let commit_published = Arc::clone(&stale_commit_published);
+            let commit_observed_version = Arc::clone(&stale_commit_observed_version);
+            let stale_commit = loom::thread::spawn(move || {
+                let _preparation = commit_coordinator.acquire_preparation();
+                commit_preparations.fetch_add(1, Ordering::SeqCst);
+                let observed = commit_schema_version.load(Ordering::SeqCst);
+                commit_observed_version.store(observed, Ordering::SeqCst);
+                if observed == 1 {
+                    commit_published.store(1, Ordering::SeqCst);
+                } else {
+                    assert_eq!(
+                        observed, 2,
+                        "a stale v1 commit must only observe the migrated catalog"
+                    );
+                }
+                commit_preparations.fetch_sub(1, Ordering::SeqCst);
+            });
+
+            migration.join().unwrap();
+            stale_commit.join().unwrap();
+            assert_eq!(schema_version.load(Ordering::SeqCst), 2);
+            assert!(
+                matches!(
+                    (
+                        stale_commit_published.load(Ordering::SeqCst),
+                        stale_commit_observed_version.load(Ordering::SeqCst),
+                    ),
+                    (1, 1) | (0, 2)
+                ),
+                "the stale transaction may publish only before migration, or observe v2 and reject"
+            );
         });
     }
 

@@ -194,3 +194,38 @@ fn transaction_captured_before_migration_cannot_publish_old_schema_rows() {
     ));
     assert_eq!(dataset.current_version(), 1);
 }
+
+#[cfg(feature = "test-fault-injection")]
+#[test]
+fn migration_failure_before_publication_reopens_the_prior_complete_manifest() {
+    // Break caught: a migration that returns an error after writing replacement
+    // objects but before manifest publication must not replace the prior
+    // complete manifest selected by recovery.
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().join("dataset");
+    let dataset = Dataset::create(&dir, vector_schema()).unwrap();
+    let mut transaction = dataset.begin();
+    transaction.insert(vector_batch()).unwrap();
+    transaction.commit().unwrap();
+    assert_eq!(dataset.current_version(), 1);
+
+    let _fault = strata_txn::dataset::test_support::fail_before_migration_manifest_publication();
+    let result = dataset.migrate_schema(&add_nullable_tag(1, 2));
+    assert!(matches!(result, Err(TxnError::Io(_))), "{result:?}");
+    assert_eq!(dataset.current_version(), 1);
+    assert_eq!(dataset.schema_version(), 1);
+    drop(dataset);
+
+    let reopened = Dataset::open(&dir).unwrap();
+    assert_eq!(reopened.current_version(), 1);
+    assert_eq!(reopened.schema_version(), 1);
+    assert_eq!(
+        reopened
+            .snapshot()
+            .scan(&vector_schema())
+            .unwrap()
+            .num_rows(),
+        3,
+        "recovery must select the prior complete manifest"
+    );
+}

@@ -129,3 +129,38 @@ entries fixed the machine-local linker configuration; the successful commands ab
 verification evidence. This Task 2 entry is scoped to the documented single-process/shared-handle
 and local-filesystem boundary. It does not claim distributed coordination, serializability, or
 universal power-loss durability.
+
+## Task 2 fix round 1 verification (2026-08-14)
+
+This review-fix round adds a migration-only, pre-publication fault seam. The
+fault runs only with `test-fault-injection`, after replacement row/immutable
+segment objects have been validated and immediately before `commit_manifest_with`.
+The new regression proves a returned typed I/O error leaves the v1 manifest as
+the complete manifest selected after reopen. It also adds a crate-scoped loom
+model of `migrate_schema` lifecycle exclusivity versus a stale v1 transaction
+publication lease: the stale transaction can publish only before migration, or
+otherwise observes v2 and is rejected by the existing typed schema-version
+guard. The model intentionally scopes loom to that coordinator/catalog state
+boundary; migration's Arrow/filesystem rewrite path is covered by the concrete
+reopen test rather than loom's bounded coroutine stack.
+
+Every Cargo command below put
+`C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\MSVC\14.52.36615\bin\Hostx64\x64`
+first on `PATH` and prepended the MSVC x64, Windows SDK UCRT x64, and Windows
+SDK UM x64 directories to `LIB`; this was process-local environment setup.
+
+| Command | Result |
+|---|---|
+| Detached temporary worktree at `e536430`, after materializing the current `crates/txn/tests/schema_migrations.rs`: `cargo test -p strata-txn --no-default-features --features test-fault-injection --test schema_migrations migration_failure_before_publication_reopens_the_prior_complete_manifest -- --exact` | Exit 1, expected red phase. Rust compiled the test and reported 19 missing Task 2 symbols, including `SchemaMigration`, `Dataset::migrate_schema`, `Dataset::schema_version`, migration error variants, and the new `fail_before_migration_manifest_publication` hook. A prefix-only preliminary launch exited 1 at `LNK1104` for `msvcrt.lib` before Rust compilation; the explicit `LIB` setup above produced the recorded red result. |
+| `cargo test -p strata-txn --no-default-features --features test-fault-injection --test schema_migrations migration_failure_before_publication_reopens_the_prior_complete_manifest -- --exact` | Exit 0: 1 passed, 0 failed. |
+| `cargo test -p strata-txn --no-default-features --features test-fault-injection --test schema_migrations` | Exit 0: 4 passed, 0 failed. |
+| `cargo test -p strata-txn --no-default-features --features parallel-insert --lib --tests` | Exit 0: all 296 unit/integration tests passed, 0 failed. |
+| `cargo rustc -p strata-txn --lib --profile test -- --cfg loom`, then the produced binary with `--exact dataset::loom_tests::migration_exclusivity_rejects_a_stale_schema_commit_or_migrates_its_published_rows --test-threads=1` | Build exit 0 (one localized `linker_messages` warning from `link.exe`); model exit 0: 1 passed, 0 failed, 232 filtered out. |
+| `cargo clippy -p strata-txn --all-targets --features test-fault-injection -- -D warnings` | Exit 0; no warnings. |
+| `cargo clippy -p strata-txn --all-targets --features parallel-insert -- -D warnings` | Exit 0; no warnings. |
+| `cargo fmt --check` | Exit 0. |
+
+The detached temporary worktree was used only for red evidence and was removed
+after the final diff checks. These results remain limited to the
+documented local, one-process/shared-`Dataset` boundary and do not claim
+serializability, distributed coordination, or universal power-loss durability.
