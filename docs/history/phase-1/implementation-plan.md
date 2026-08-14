@@ -1,6 +1,6 @@
 # Phase 1 Audit Remediation Implementation Plan
 
-> **For agentic workers:** Execute one task at a time with the approved Luna -> Sol -> Terra workflow. Production behavior changes require TDD: write the failing regression, run it and observe the expected failure, implement the smallest fix, then rerun targeted and workspace checks. Do not create or restore `docs/superpowers/`.
+> **For agentic workers:** Execute one task at a time with the approved Luna -> Sol -> Terra workflow. Production behavior changes require TDD: write the failing regression, run it and observe the expected failure, implement the smallest fix, then rerun targeted and workspace checks. Do not create or restore the deleted planning tree.
 
 **Goal:** Close the approved Phase 1 correctness, durability, schema, recovery, facade, verification, and current segmented-evidence blockers within Strata's one-process/shared-`Dataset` boundary.
 
@@ -202,7 +202,7 @@ Use `rg -l "Dataset::create|\\.insert\\(|\\.delete\\(|\\.update\\(|\\.scan\\(" c
 - Modify: `docs/architecture.md`, `docs/design.md`, `docs/status.md`, `docs/decisions.md`, `docs/roadmap.md`, and `docs/phase-1-audit.md`
 - Test: cargo metadata, rustdoc, stale-claim/link scans, and documentation checks
 
-- [x] **Step 1: Write documentation/config regression checks.** Add a scriptable scan or CI shell assertions that no supported guarantee is attached to direct low-level storage/index use, no deleted `docs/superpowers/` path is linked, and all internal packages report `publish = false`.
+- [x] **Step 1: Write documentation/config regression checks.** Add a scriptable scan or CI shell assertions that no supported guarantee is attached to direct low-level storage/index use, no deleted planning-tree path is linked, and all internal packages report `publish = false`.
 
 - [x] **Step 2: Implement the narrow facade statement.** Document Dataset/Snapshot/Transaction as the supported engine surface and low-level crates as internal implementation surfaces. Do not merge crates or attempt ARCH-06/07/08.
 
@@ -264,7 +264,7 @@ VER-04 local fuzz build/smoke evidence now passes: both declared targets built u
 
 - All intentional files changed by Tasks 1–8
 
-- [x] **Step 1: Inspect the complete diff.** Confirm no `docs/superpowers/` tree, credentials, build artifacts, benchmark datasets, or unrelated edits are present.
+- [x] **Step 1: Inspect the complete diff.** Confirm no deleted planning tree, credentials, build artifacts, benchmark datasets, or unrelated edits are present.
 
 - [ ] **Step 2: Run required verification.** Run, with fresh output:
 
