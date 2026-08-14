@@ -214,3 +214,48 @@ error: could not compile `strata-txn` (test "schema_migrations") due to 1 previo
 The temporary worktree was then removed. This result demonstrates the missing
 migration fault seam/recovery coverage specifically; it is not the earlier
 missing-migration-API failure and makes no broader completion claim.
+
+## Task 3 query-planning evidence (2026-08-15)
+
+Task 3 adds a small logical/physical planner for the existing immutable
+snapshot query primitives. Explain observations are captured snapshot facts,
+not cost or cardinality guarantees. Planned scan, group-by, and vector-search
+entry points validate and select a path, then use the same direct snapshot
+operators, preserving the existing snapshot, tombstone, null, projection-order,
+and typed-error contracts.
+
+All commands below used a process-local native x64 MSVC environment: first
+`VsDevCmd.bat -arch=x64 -host_arch=x64`, then the MSVC linker directory first on
+`PATH`, and the MSVC 14.52.36615 plus Windows SDK 10.0.26100.0 UCRT/UM x64
+directories on `LIB` and the corresponding MSVC/Windows SDK include directories
+on `INCLUDE`.
+
+| Command | Result |
+|---|---|
+| `cargo test -p strata-query planner_tests::planner_rejects_a_predicate_after_a_result_operator -- --exact` before the ordering guard | Exit 101, expected red phase: `LogicalPlan::new` accepted `Source -> Projection -> Predicate -> Materialize`. |
+| The same focused test after the ordering guard | Exit 0: 1 passed, 0 failed. |
+| `cargo test -p strata-query` | Exit 0: 63 passed, 0 failed; 0 doctests. |
+| `cargo test -p strata-txn --no-default-features --test query_planner --test phase_3_pruning` | Exit 0: 4 planner-equivalence tests and 3 Phase 3 pruning tests passed. |
+| `cargo bench -p strata-bench --bench query_planner_bench` | Exit 0. Criterion executed every case below. The initial two attempts exited 1 during benchmark compilation (the local `fixture` value shadowed Criterion's setup function, then `RecordBatch::try_new` was passed without unwrapping); both benchmark-only defects were corrected before this successful measurement. |
+
+Criterion used its default 3 s warmup, 100 samples, and approximately 5 s
+measurement target. The fixture was four committed 64-row batches (256 rows),
+with a 2-dimensional vector column; the predicate was `id >= 192`, pruning the
+first three row files. Direct denotes the established snapshot facade, and
+planned includes validation/explain selection before delegating to that same
+operator path.
+
+| Workload | Direct 95% interval | Planned 95% interval | Observed comparison |
+|---|---:|---:|---|
+| Projection scan (`id,category`) | 577.39–581.76 µs | 567.16–575.79 µs | Planned interval was lower on this local rerun. |
+| Selective predicate scan (`id,amount`, `id >= 192`) | 136.70–137.28 µs | 138.81–140.99 µs | Planned path was slightly slower on this fixture. |
+| Grouped aggregation (`sum(amount)` by `category`, same predicate) | 150.72–152.72 µs | 151.74–152.36 µs | Intervals overlap closely. |
+| Filtered vector search (top 10, hydrate `id`, same predicate) | 1.3549–1.3710 ms | 1.3599–1.3729 ms | Intervals overlap closely. |
+| Shared-handle transaction commit (two concurrent one-row commits) | 51.992–53.022 ms | n/a | Commit baseline only; it does not claim planner cost. |
+
+Criterion emitted its standard advisory that the default 5-second target could
+not fit 100 vector-search or shared-handle-commit samples; it still collected
+and analyzed all 100 samples for each case. These results are local workload
+evidence only and do not establish universal performance, a cost model,
+serializability, cross-process coordination, or a broader Phase 3 completion
+claim.

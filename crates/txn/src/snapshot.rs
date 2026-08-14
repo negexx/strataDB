@@ -20,11 +20,14 @@ use arrow::array::{
 use arrow::compute::{concat_batches, filter_record_batch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use strata_index::LiveSet;
-use strata_query::{Predicate, PredicateKey, filter, mask, should_scan_file};
+use strata_query::{
+    LogicalOperator, LogicalPlan, PhysicalPlan, PlanObservations, Planner, Predicate, PredicateKey,
+    filter, mask, should_scan_file,
+};
 #[cfg(test)]
 use strata_storage::read_batch;
 use strata_storage::{
-    DataFileEntry, Manifest, StorageOwner, read_batch_columns_with, read_batch_with,
+    DataFileEntry, Manifest, StorageOwner, Value, read_batch_columns_with, read_batch_with,
 };
 
 use crate::facade::{DataFileInfo, SegmentInfo};
@@ -64,6 +67,42 @@ fn zone_map_permits_scan(
     {
         Some(map) => should_scan_file(map, predicate),
         None => true,
+    }
+}
+
+fn filter_expression_pruning_predicate(filter: &FilterExpression) -> Option<Predicate> {
+    match filter {
+        FilterExpression::Compare(Comparison {
+            column,
+            operator,
+            value,
+        }) => {
+            let value = match value {
+                FilterLiteral::Int64(value) => Value::Int64(*value),
+                FilterLiteral::Float64(value) => Value::Float64(*value),
+                FilterLiteral::Utf8(value) => Value::Utf8(value.clone()),
+                FilterLiteral::Boolean(_) | FilterLiteral::UInt64(_) => return None,
+            };
+            match operator {
+                ComparisonOperator::Equal => Some(Predicate::Eq(column.clone(), value)),
+                ComparisonOperator::LessThan => Some(Predicate::Lt(column.clone(), value)),
+                ComparisonOperator::LessThanOrEqual => Some(Predicate::LtEq(column.clone(), value)),
+                ComparisonOperator::GreaterThan => Some(Predicate::Gt(column.clone(), value)),
+                ComparisonOperator::GreaterThanOrEqual => {
+                    Some(Predicate::GtEq(column.clone(), value))
+                }
+                ComparisonOperator::NotEqual => None,
+            }
+        }
+        FilterExpression::And(left, right) => Some(Predicate::And(
+            Box::new(filter_expression_pruning_predicate(left)?),
+            Box::new(filter_expression_pruning_predicate(right)?),
+        )),
+        FilterExpression::Or(left, right) => Some(Predicate::Or(
+            Box::new(filter_expression_pruning_predicate(left)?),
+            Box::new(filter_expression_pruning_predicate(right)?),
+        )),
+        FilterExpression::Not(_) => None,
     }
 }
 
@@ -403,6 +442,165 @@ impl Snapshot {
         }
     }
 
+    /// Builds the stable logical/physical explain DTO for a typed scan.
+    ///
+    /// The DTO reports only the immutable snapshot captured by this value;
+    /// it never incorporates staged transaction rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed validation error as [`Self::scan_query`] for an
+    /// invalid projection or filter.
+    pub fn explain_scan_query(&self, request: &ScanRequest) -> QueryResult<PhysicalPlan> {
+        let projection = self.query_schema()?.validate_scan(request)?;
+        let mut operators = vec![LogicalOperator::Source];
+        if let Some(filter) = request.filter.as_ref() {
+            operators.push(LogicalOperator::Predicate {
+                zone_map_eligible: filter_expression_pruning_predicate(filter).is_some(),
+            });
+        }
+        operators.push(LogicalOperator::Projection {
+            columns: projection,
+        });
+        operators.push(LogicalOperator::Materialize);
+        self.plan_query(operators, request.filter.as_ref())
+    }
+
+    /// Executes the physical path selected for a typed scan.
+    ///
+    /// The selected path delegates to [`Self::scan_query`], retaining its
+    /// projection ordering, null, tombstone, and snapshot semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns planner or typed scan-contract errors.
+    pub fn execute_planned_scan_query(&self, request: &ScanRequest) -> QueryResult<ScanResult> {
+        let _plan = self.explain_scan_query(request)?;
+        self.scan_query(request)
+    }
+
+    /// Builds the stable logical/physical explain DTO for grouped aggregation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed validation error as [`Self::group_by_query`].
+    pub fn explain_group_by_query(&self, request: &GroupByRequest) -> QueryResult<PhysicalPlan> {
+        let _outputs = self.query_schema()?.validate_group_by(request)?;
+        let mut operators = vec![LogicalOperator::Source];
+        if let Some(filter) = request.filter.as_ref() {
+            operators.push(LogicalOperator::Predicate {
+                zone_map_eligible: filter_expression_pruning_predicate(filter).is_some(),
+            });
+        }
+        operators.push(LogicalOperator::Grouping {
+            keys: request.group_by.clone(),
+            aggregate_count: request.aggregates.len(),
+        });
+        operators.push(LogicalOperator::Materialize);
+        self.plan_query(operators, request.filter.as_ref())
+    }
+
+    /// Executes the physical path selected for grouped aggregation.
+    ///
+    /// # Errors
+    ///
+    /// Returns planner or typed grouped-query errors.
+    pub fn execute_planned_group_by_query(
+        &self,
+        request: &GroupByRequest,
+    ) -> QueryResult<GroupByResult> {
+        let _plan = self.explain_group_by_query(request)?;
+        self.group_by_query(request)
+    }
+
+    /// Builds the stable logical/physical explain DTO for vector search.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed validation error as [`Self::vector_search_query`].
+    pub fn explain_vector_search_query(
+        &self,
+        request: &VectorSearchRequest,
+    ) -> QueryResult<PhysicalPlan> {
+        let hydration = self
+            .query_schema()?
+            .validate_vector_search(request)?
+            .is_some();
+        let has_filter = request.filter.is_some();
+        let mut operators = vec![LogicalOperator::Source];
+        if has_filter {
+            operators.push(LogicalOperator::Predicate {
+                zone_map_eligible: request
+                    .filter
+                    .as_ref()
+                    .and_then(filter_expression_pruning_predicate)
+                    .is_some(),
+            });
+        }
+        operators.push(LogicalOperator::VectorSearch {
+            vector_column: request.vector_column.clone(),
+            k: request.k,
+            has_filter,
+            hydration,
+        });
+        operators.push(LogicalOperator::Materialize);
+        self.plan_query(operators, request.filter.as_ref())
+    }
+
+    /// Executes the physical path selected for vector search.
+    ///
+    /// # Errors
+    ///
+    /// Returns planner or typed vector-search errors.
+    pub fn execute_planned_vector_search_query(
+        &self,
+        request: &VectorSearchRequest,
+    ) -> QueryResult<VectorSearchResult> {
+        let _plan = self.explain_vector_search_query(request)?;
+        self.vector_search_query(request)
+    }
+
+    fn plan_query(
+        &self,
+        operators: Vec<LogicalOperator>,
+        predicate: Option<&FilterExpression>,
+    ) -> QueryResult<PhysicalPlan> {
+        let logical = LogicalPlan::new(operators).map_err(QueryExecutionError::Planner)?;
+        let observations = self.plan_observations(predicate);
+        Planner::plan(logical, observations)
+            .map_err(|error| QueryExecutionError::Planner(error).into())
+    }
+
+    fn plan_observations(&self, predicate: Option<&FilterExpression>) -> PlanObservations {
+        match predicate {
+            Some(predicate) => {
+                let pruning_predicate = filter_expression_pruning_predicate(predicate);
+                let Some(pruning_predicate) = pruning_predicate else {
+                    return self.plan_observations(None);
+                };
+                let explain = self.explain(&pruning_predicate);
+                PlanObservations {
+                    data_files_total: explain.total_files,
+                    data_files_scanned: explain.scanned.len(),
+                    data_files_pruned: explain.skipped.len(),
+                    index_segments_total: explain.segments_total,
+                    index_segments_scanned: explain.segments_scanned.len(),
+                    index_segments_pruned: explain.segments_skipped.len(),
+                    transaction_overlay: false,
+                }
+            }
+            None => PlanObservations {
+                data_files_total: self.manifest.data_files.len(),
+                data_files_scanned: self.manifest.data_files.len(),
+                data_files_pruned: 0,
+                index_segments_total: self.manifest.segments.len(),
+                index_segments_scanned: self.manifest.segments.len(),
+                index_segments_pruned: 0,
+                transaction_overlay: false,
+            },
+        }
+    }
+
     /// Like [`Snapshot::scan`], but skips any file `predicate` provably
     /// can't match (per [`Snapshot::explain`]'s decision) and row-filters
     /// the rest.
@@ -441,8 +639,12 @@ impl Snapshot {
         let projection = self.query_schema()?.validate_scan(request)?;
         let columns = scan_columns(&projection, request.filter.as_ref());
         let query_schema = self.query_schema_for_columns(&columns)?;
+        let pruning_predicate = request
+            .filter
+            .as_ref()
+            .and_then(filter_expression_pruning_predicate);
         let rows = self
-            .read_surviving_files(None, Some(&columns), |batch| {
+            .read_surviving_files(pruning_predicate.as_ref(), Some(&columns), |batch| {
                 let batch = cast_batch_to_schema(&batch, &query_schema)?;
                 let filtered = match &request.filter {
                     Some(filter) => filter_record_batch(&batch, &filter_mask(&batch, filter)?)?,
@@ -507,13 +709,18 @@ impl Snapshot {
         let outputs = self.query_schema()?.validate_group_by(request)?;
         let columns = group_by_columns(request);
         let query_schema = self.query_schema_for_columns(&columns)?;
-        let batches = self.read_surviving_files(None, Some(&columns), |batch| {
-            let batch = cast_batch_to_schema(&batch, &query_schema)?;
-            match &request.filter {
-                Some(filter) => Ok(filter_record_batch(&batch, &filter_mask(&batch, filter)?)?),
-                None => Ok(batch),
-            }
-        })?;
+        let pruning_predicate = request
+            .filter
+            .as_ref()
+            .and_then(filter_expression_pruning_predicate);
+        let batches =
+            self.read_surviving_files(pruning_predicate.as_ref(), Some(&columns), |batch| {
+                let batch = cast_batch_to_schema(&batch, &query_schema)?;
+                match &request.filter {
+                    Some(filter) => Ok(filter_record_batch(&batch, &filter_mask(&batch, filter)?)?),
+                    None => Ok(batch),
+                }
+            })?;
 
         let aggregate_templates = request
             .aggregates
@@ -813,6 +1020,7 @@ impl Snapshot {
         let mut matches = match &request.filter {
             Some(filter) => {
                 let live_set = self.vector_filter_live_set(filter)?;
+                let pruning_predicate = filter_expression_pruning_predicate(filter);
                 self.index
                     .search_filtered_pruned_live(
                         &request.query,
@@ -820,7 +1028,11 @@ impl Snapshot {
                         EF_SEARCH_DEFAULT,
                         &live_set,
                         |id| self.is_visible(id),
-                        |_| true,
+                        |zone_map| {
+                            pruning_predicate
+                                .as_ref()
+                                .is_none_or(|predicate| zone_map_permits_scan(zone_map, predicate))
+                        },
                     )
                     .map_err(TxnError::from)?
             }
@@ -874,8 +1086,9 @@ impl Snapshot {
         filter_columns(filter, &mut columns);
         push_unique_column(&mut columns, ROW_ID_COLUMN);
         let query_schema = self.query_schema_for_columns(&columns)?;
+        let pruning_predicate = filter_expression_pruning_predicate(filter);
         let row_ids = self
-            .read_surviving_files(None, Some(&columns), |batch| {
+            .read_surviving_files(pruning_predicate.as_ref(), Some(&columns), |batch| {
                 let batch = cast_batch_to_schema(&batch, &query_schema)?;
                 let selection = filter_mask(&batch, filter)?;
                 let row_ids = batch
