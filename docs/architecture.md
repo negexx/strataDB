@@ -19,7 +19,7 @@ for the audit trail and named limits.
 | Index | `crates/index` | From-scratch HNSW construction/search, immutable segment encoding, validation, loading, and fan-out search. |
 | Query | `crates/query` | Predicates, pruning decisions, and group-by primitives. |
 | CLI | `crates/cli` | Typed query/inspection commands within the one-process boundary; mutating commands require explicit single-writer acknowledgement. |
-| Bindings | `crates/bindings` | Thin PyO3 Dataset/Snapshot facade; tabular results use Arrow IPC bytes and vector results expose typed squared-L2 matches. |
+| Bindings | `crates/bindings` | Thin PyO3 `1.0` Dataset/Snapshot/Transaction facade; tabular results use Arrow IPC bytes, vector matches and migration/explain results use stable named Python dictionaries, and engine failures retain typed categories. |
 
 ## Supported on-disk formats
 
@@ -63,11 +63,25 @@ group-by, and manifest-listed immutable-segment search operators; it does not ad
 optimizer, or a cost model. Local Criterion evidence for the fixed 256-row fixture is recorded in
 the [Phase 3 verification report](phase-3-verification-report.md#task-3-query-planning-evidence);
 it measures that fixture only, not a universal performance guarantee. There is no
-schema-evolution/migration workflow, stable Python API, arbitrary orphan cleanup, time
+arbitrary orphan cleanup, time
 travel, or cross-process protocol. The Phase 2 Python/CLI surfaces are partial and remain subject to
 their documented typed contracts and integration verification. “Partial” here describes client/API
 maturity, not a claim that completed Phase 2 slices are outside their documented embedded,
 single-process boundary.
+
+## Python API 1.0
+
+`strata_ext.Dataset` provides `create`, `open`, `api_version`, `version`,
+`schema_version`, `snapshot`, `begin`, and the explicit
+`migrate_add_nullable_column` operation. `Snapshot` retains the compatible Arrow IPC scan,
+lookup, and grouped-result methods and typed vector-match dictionaries; `explain_scan` returns
+named logical/physical operator lists plus captured observations. A `Transaction` stages one Arrow
+IPC batch at a time, reads its base snapshot plus its own overlay through `scan`, and is terminally
+`committed` or `aborted`; abort/drop never publishes staged writes. Open, reads, commit, and migration
+release the GIL around engine work. The API is limited to one Python process sharing a `Dataset`
+handle: it does not provide cross-process coordination, serializability, or a merged vector-search
+overlay. Conflict, validation/schema/migration, insufficient-history, and execution/storage failures
+remain distinct Python exception categories.
 
 ## Commit lifecycle
 

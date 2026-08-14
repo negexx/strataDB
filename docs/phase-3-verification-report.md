@@ -260,6 +260,25 @@ evidence only and do not establish universal performance, a cost model,
 serializability, cross-process coordination, or a broader Phase 3 completion
 claim.
 
+## Task 4 Python API verification (2026-08-15)
+
+The PyO3 facade now exposes the versioned Dataset/Snapshot/Transaction lifecycle, Arrow IPC
+transaction scan overlay, explicit nullable-column migration result, and stable explain dictionaries.
+All operations remain limited to a single process sharing one Dataset handle; transaction vector
+search with staged data remains a typed unsupported operation.
+
+| Command | Result |
+|---|---|
+| `cargo test -p strata-bindings --no-default-features transaction_wrapper_reads` before schema capture | Exit 101, expected red: `PyTransaction::scan` referenced an uncaptured `schema` and the PyO3 helper methods were incorrectly exported. |
+| `cargo test -p strata-bindings --no-default-features transaction_wrapper_reads` after capture/helper separation | Exit 0: 1 passed, 0 failed. |
+| `cargo test -p strata-bindings --no-default-features stable_python_contract_commits_migrates_and_explains_without_rust_layouts` before wrappers | Exit 101, expected red: missing commit, migration, explain, and schema-version façade methods. |
+| `cargo test -p strata-bindings --no-default-features` | Exit 0: 15 passed, 0 failed. |
+| `cargo clippy -p strata-bindings --no-default-features --all-targets -- -D warnings` | Exit 0; no warnings. |
+| `cargo fmt --check` | Exit 0. |
+
+All native bindings commands used the process-local MSVC x64 linker and SDK library directories;
+no repository configuration changed for that environment.
+
 ## Task 3 fix round 1 evidence (2026-08-15)
 
 This evidence-and-documentation round did not change planner source, dependencies, or planner
