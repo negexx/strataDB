@@ -37,8 +37,9 @@ rejects an `after` median whose recovery, compaction, or maintenance wall time o
 exceeds the matching `before` median by more than that percentage. The budget is recorded in both
 fixture sidecars and must agree across revisions. It compares only this paired run on its recorded
 machine/cache conditions; it is not a product SLO, portable hardware limit, or universal latency or
-memory claim. Leaving it unset preserves evidence completeness/provenance validation without making
-a numerical regression claim.
+memory claim. The GitHub Actions workflow exposes this as
+`fixture_lifecycle_max_regression_pct` and defaults it to `20`; local runs may leave it unset to
+preserve evidence completeness/provenance validation without making a numerical regression claim.
 
 The fixture identity is `Qdrant/dbpedia-entities-openai3-text-embedding-3-small-512-100K`, revision
 `56e6849a3d0f7913e56b475bf92c0064c93b576d`, file `data/train-00000-of-00001.parquet`, exactly

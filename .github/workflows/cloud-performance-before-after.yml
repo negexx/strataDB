@@ -26,6 +26,11 @@ on:
         required: false
         default: "16"
         type: string
+      fixture_lifecycle_max_regression_pct:
+        description: Maximum paired lifecycle wall/peak-live regression percentage (default 20)
+        required: false
+        default: "20"
+        type: string
 permissions:
   contents: read
 
@@ -51,6 +56,7 @@ jobs:
           REAL_FIXTURE_REQUESTED: ${{ inputs.real_fixture && 'true' || 'false' }}
           FIXTURE_ROWS: ${{ inputs.fixture_rows }}
           FIXTURE_QUERIES: ${{ inputs.fixture_queries }}
+          FIXTURE_LIFECYCLE_MAX_REGRESSION_PCT: ${{ inputs.fixture_lifecycle_max_regression_pct }}
         run: |
           set -euo pipefail
           mkdir -p artifacts
@@ -94,6 +100,7 @@ jobs:
             printf 'fixture_verification=passed\n' | tee -a "$fixture_log"
             STRATA_REAL_FIXTURE=1 STRATA_BENCH_FIXTURE="$(realpath "$fixture")" \
               STRATA_FIXTURE_SEG_ROWS="$FIXTURE_ROWS" STRATA_FIXTURE_SEG_QUERIES="$FIXTURE_QUERIES" \
+              STRATA_FIXTURE_LIFECYCLE_MAX_REGRESSION_PCT="$FIXTURE_LIFECYCLE_MAX_REGRESSION_PCT" \
               bash bench/cloud-performance/run.sh "$BEFORE_REVISION" "$after" artifacts
           else
             bash bench/cloud-performance/run.sh "$BEFORE_REVISION" "$after" artifacts
