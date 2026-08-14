@@ -259,3 +259,34 @@ and analyzed all 100 samples for each case. These results are local workload
 evidence only and do not establish universal performance, a cost model,
 serializability, cross-process coordination, or a broader Phase 3 completion
 claim.
+
+## Task 3 fix round 1 evidence (2026-08-15)
+
+This evidence-and-documentation round did not change planner source, dependencies, or planner
+semantics. It used a detached worktree at the pre-Task-3 base `6f4d2c0`, then materialized the final
+`crates/txn/tests/query_planner.rs` integration test and the final planner construction/invalid-plan
+test bodies from `crates/query/src/lib.rs`. The worktree contained only those test copies and was
+removed after its status/diff check.
+
+Each focused command initialized the full local x64 MSVC environment with
+`VsDevCmd.bat -arch=x64 -host_arch=x64`, then put
+`C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\MSVC\14.52.36615\bin\Hostx64\x64`
+first on `PATH`; it prepended MSVC `14.52.36615` x64 plus Windows SDK
+`10.0.26100.0` UCRT/UM x64 directories to `LIB`, and the corresponding
+MSVC/Windows SDK directories to `INCLUDE`. `where cl` and `where link` resolved to that MSVC
+x64 directory before the first Cargo run.
+
+| Discriminator and exact focused command | Result |
+|---|---|
+| Construction/invalid logical plan: `cargo test -p strata-query planner_red_tests::planner_rejects_a_predicate_after_a_result_operator -- --exact` | Exit 101, expected red. The materialized final test could not compile because `strata_query` at `6f4d2c0` exported no `LogicalOperator`, `LogicalPlan`, or `PlanError`; no test body ran. This is direct missing-planner-API evidence, not a claim about a later assertion result. |
+| Explain fields/operators: `cargo test -p strata-txn --no-default-features --test query_planner unfiltered_plans_do_not_claim_a_row_filter_or_zone_map_path -- --exact` | Exit 101, expected red. The materialized final integration crate could not compile: `strata_query::{LogicalOperator, PhysicalOperator}` and `Snapshot::explain_scan_query`/`explain_vector_search_query` were absent. Cargo compiles the full test crate before applying the filter, so zero test bodies ran. |
+| Explain fields plus direct/planned scan, group, and vector equivalence: `cargo test -p strata-txn --no-default-features --test query_planner planned_queries_match_direct_snapshot_operators_and_report_selection_evidence -- --exact` | Exit 101, expected red. The same missing planner exports, `explain_*`, and `execute_planned_{scan,group_by,vector_search}_query` APIs produced 12 compiler errors; no assertion result is claimed. |
+| Direct/planned equivalence with tombstones, nulls, projection ordering, and invalid requests: `cargo test -p strata-txn --no-default-features --test query_planner planned_paths_preserve_tombstones_nulls_projection_order_and_invalid_request_errors -- --exact` | Exit 101, expected red. The full materialized integration crate again stopped at the same 12 missing planner API errors before this filtered test could run. |
+
+The first integration compile reached `strata-txn` and reported exactly the absent public API expected
+at this pre-Task-3 base: two unresolved planner operator exports; three missing `explain_*` methods;
+and seven missing `execute_planned_*` method uses. This establishes a red precondition for each
+discriminator, but it does not manufacture a runtime failure where compilation prevented one. The
+current Task 3 green evidence and measured benchmark output remain the preceding section; neither
+set of results claims SQL support, a cost model, serializability, cross-process coordination, or
+universal performance.

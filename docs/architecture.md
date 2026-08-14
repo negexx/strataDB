@@ -54,8 +54,16 @@ work and must not be inferred from these checks.
   objects, and `Dataset::maintain()` for one coordinated maintenance run.
 - Real-process crash/reopen tests, targeted loom models, fuzz targets, and benchmarks.
 
-These are usable slices, not a finished database API. There is no schema-evolution/migration workflow, planner,
-stable Python API, arbitrary orphan cleanup, time
+These are usable slices, not a finished database API. The implemented planner is deliberately
+bounded: it builds logical source/predicate/projection, grouping, or vector-search pipelines and
+returns a stable physical-plan explain value with the logical operators, selected physical
+operators, and captured file/segment pruning and overlay observations. It validates the supported
+shape, then reuses the existing immutable-snapshot scan, zone-map pruning, tombstone filtering,
+group-by, and manifest-listed immutable-segment search operators; it does not add SQL, a general
+optimizer, or a cost model. Local Criterion evidence for the fixed 256-row fixture is recorded in
+the [Phase 3 verification report](phase-3-verification-report.md#task-3-query-planning-evidence);
+it measures that fixture only, not a universal performance guarantee. There is no
+schema-evolution/migration workflow, stable Python API, arbitrary orphan cleanup, time
 travel, or cross-process protocol. The Phase 2 Python/CLI surfaces are partial and remain subject to
 their documented typed contracts and integration verification. “Partial” here describes client/API
 maturity, not a claim that completed Phase 2 slices are outside their documented embedded,
@@ -131,8 +139,12 @@ until explicit compaction is requested; no universal supported segment-count or 
 is claimed.
 
 Predicates and statistics can prune files or segments that cannot match. Filtered ANN uses predicate
-pruning and a live-set constraint. These are query primitives, not a planner-integrated SQL engine or a
-guarantee that every selective query is cheap.
+pruning and a live-set constraint. The bounded planner exposes those selections through its logical/
+physical explain output, including captured row-file and index-segment totals, scanned/pruned counts,
+and whether a transaction overlay was supplied. Those observations are snapshot facts, not cardinality
+or latency estimates; the planner is not a SQL engine and does not guarantee that every selective
+query is cheap. Planned reads retain the existing immutable-snapshot behavior and do not broaden the
+write-write OCC isolation boundary.
 
 ## Deliberate boundaries
 
