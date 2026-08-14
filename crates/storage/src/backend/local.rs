@@ -67,8 +67,17 @@ impl LocalFs {
             )
             .into());
         }
-        // Check the raw string for empty segments, `.`, `..`, and doubled/trailing
-        // separators that `Path::components()` would silently normalize away.
+        // Check the raw string for backslashes, empty segments, `.`, `..`, and
+        // doubled/trailing separators that `Path::components()` would silently
+        // normalize away. Backslash is a Windows separator, so allowing it would
+        // alias the canonical `/`-delimited key spelling on that platform.
+        if key.contains('\\') {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("key {key:?} must use '/' separators"),
+            )
+            .into());
+        }
         if key
             .split('/')
             .any(|segment| segment.is_empty() || segment == "." || segment == "..")
@@ -887,6 +896,43 @@ mod tests {
 
         assert!(backend.get("a.bin").is_err());
         assert!(backend.delete("a.bin").is_err());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn delete_rejects_an_invalid_key_without_removing_valid_content() {
+        // Break caught: accepting alternate path spellings would let delete
+        // escape the backend root or alias a valid canonical key.
+        let root = temp_root("delete-key-validation");
+        let backend = LocalFs::new(&root);
+        let outside = root.with_file_name(format!(
+            "{}-outside.bin",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        fs::write(&outside, b"outside sentinel").unwrap();
+        backend.put("nested/kept.bin", b"content").unwrap();
+
+        let traversal = format!("../{}", outside.file_name().unwrap().to_string_lossy());
+        for result in [
+            backend.delete(&traversal),
+            backend.delete("nested\\kept.bin"),
+        ] {
+            assert!(
+                matches!(result, Err(StorageError::Io(ref error)) if error.kind() == std::io::ErrorKind::InvalidInput),
+                "an invalid delete key must return InvalidInput, got {result:?}"
+            );
+        }
+
+        assert!(
+            outside.exists(),
+            "a rejected traversal delete must not remove the outside-root sentinel"
+        );
+        assert_eq!(
+            backend.get("nested/kept.bin").unwrap(),
+            b"content",
+            "a rejected backslash alias must not remove a valid canonical key"
+        );
+        fs::remove_file(&outside).ok();
         fs::remove_dir_all(&root).ok();
     }
 

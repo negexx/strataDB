@@ -88,9 +88,14 @@ promoted as generic schema APIs or broader supported guarantees.
 
 ### P2 â€” Narrow-read and layering claims need evidence
 
-Narrow-read I/O and pruning claims are not yet isolated by counters and measured on the current
-manifest-listed segment path. Public layers also expose subordinate storage/query/index types and
-reserved names that should be hidden behind the supported facade.
+Projection I/O is now isolated by an opt-in, thread-local accounting seam: the current scan path
+records exactly the requested projection, filter-only columns, and `_row_id`, with focused native
+evidence. Sub-file/row-group pruning remains deferred because each current Arrow data file contains
+one record batch and only whole-file statistics. An additive indexed row-group container now
+supports explicit selected-group projection reads; automatic predicate-to-group pruning is not
+claimed. Public layers still expose subordinate
+storage/query/index types; removing that leakage requires an additive facade DTO design and a
+separate compatibility/deprecation decision.
 
 ### P3 â€” Remove stale source references
 

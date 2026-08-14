@@ -421,6 +421,23 @@ smoke, and a validated full 100K-row real-fixture before/after matrix are now ca
 operating bounds remain open evidence work; PERF-01 through PERF-05 are bounded-evidence rows rather
 than universal performance guarantees.
 
+## PERF-06 projected-read evidence (fresh native Windows run)
+
+The existing `projected_read_bench` was run on the current head with the pinned 100,000-row
+fixture (`file_bytes=3,638,554`, one projected column). Criterion reported:
+
+| Case | Median time |
+|---|---:|
+| Full-file decode | 1.058 ms |
+| One-column projected decode | 1.324 ms |
+
+This confirms the projected reader path is exercised, but it is not a runtime speed win on this
+fixture: one-column decode is slower because the current Arrow IPC file still reads a contiguous
+record-batch body. The result is evidence for column-selection behavior, not a latency or byte-read
+SLO. Automatic predicate-to-row-group pruning remains deferred; an additive indexed row-group
+format now provides explicit selected-group projection reads without changing legacy files.
+or column chunks is approved.
+
 ## Remaining evidence gates
 
 The rows marked **existing** point only to already measured, bounded evidence. The rows marked

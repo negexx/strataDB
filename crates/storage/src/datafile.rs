@@ -16,6 +16,41 @@ use arrow::ipc::writer::FileWriter;
 
 use crate::error::{Result, StorageError};
 
+/// Writes an Arrow IPC batch through a dataset-owned backend key.
+#[allow(clippy::missing_errors_doc)]
+pub fn write_batch_with(
+    owner: &crate::backend::StorageOwner,
+    key: &crate::backend::DatasetKey,
+    batch: &RecordBatch,
+) -> Result<WriteMetadata> {
+    let mut writer = FileWriter::try_new(Cursor::new(Vec::new()), &batch.schema())?;
+    writer.write(batch)?;
+    writer.finish()?;
+    let bytes = writer.into_inner()?.into_inner();
+    let metadata = WriteMetadata {
+        byte_len: u64::try_from(bytes.len())
+            .map_err(|error| StorageError::Io(std::io::Error::other(error.to_string())))?,
+        crc32c: crc32c_checksum(&bytes),
+    };
+    owner.put(key, &bytes)?;
+    Ok(metadata)
+}
+
+/// Writes raw immutable-format bytes through a dataset-owned backend key.
+#[allow(clippy::missing_errors_doc)]
+pub fn write_bytes_with(
+    owner: &crate::backend::StorageOwner,
+    key: &crate::backend::DatasetKey,
+    bytes: &[u8],
+) -> Result<WriteMetadata> {
+    owner.put(key, bytes)?;
+    Ok(WriteMetadata {
+        byte_len: u64::try_from(bytes.len())
+            .map_err(|error| StorageError::Io(std::io::Error::other(error.to_string())))?,
+        crc32c: crc32c_checksum(bytes),
+    })
+}
+
 /// Integrity metadata for bytes durably written by [`write_batch`] or
 /// [`write_bytes`].
 ///
@@ -71,8 +106,33 @@ pub mod test_support {
         calls: Vec<PathBuf>,
     }
 
+    /// One successful Arrow IPC projected decode observed on the calling
+    /// test thread. This records decoded columns, not physical bytes read:
+    /// Arrow IPC's contiguous record-batch body still requires a body read.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct ProjectedRead {
+        columns: Vec<String>,
+    }
+
+    impl ProjectedRead {
+        #[must_use]
+        pub fn new<I, S>(columns: I) -> Self
+        where
+            I: IntoIterator<Item = S>,
+            S: AsRef<str>,
+        {
+            Self {
+                columns: columns
+                    .into_iter()
+                    .map(|column| column.as_ref().to_owned())
+                    .collect(),
+            }
+        }
+    }
+
     thread_local! {
         static DIRECTORY_SYNC_STATE: RefCell<DirectorySyncState> = RefCell::new(DirectorySyncState::default());
+        static PROJECTED_READS: RefCell<Option<Vec<ProjectedRead>>> = const { RefCell::new(None) };
     }
 
     /// Restores the calling test thread's previous directory-sync state.
@@ -83,10 +143,34 @@ pub mod test_support {
         _thread_affine: PhantomData<Rc<()>>,
     }
 
+    /// Restores the calling test thread's prior projected-read accounting.
+    pub struct ProjectedReadGuard {
+        previous: Option<Vec<ProjectedRead>>,
+        _thread_affine: PhantomData<Rc<()>>,
+    }
+
     impl Drop for DirectorySyncGuard {
         fn drop(&mut self) {
             DIRECTORY_SYNC_STATE.with(|state| *state.borrow_mut() = self.previous.clone());
         }
+    }
+
+    impl Drop for ProjectedReadGuard {
+        fn drop(&mut self) {
+            PROJECTED_READS.with(|reads| *reads.borrow_mut() = self.previous.take());
+        }
+    }
+
+    /// Records projected Arrow reads on the calling test thread.
+    #[must_use]
+    pub fn record_projected_reads() -> ProjectedReadGuard {
+        PROJECTED_READS.with(|reads| {
+            let previous = reads.borrow_mut().replace(Vec::new());
+            ProjectedReadGuard {
+                previous,
+                _thread_affine: PhantomData,
+            }
+        })
     }
 
     /// Causes the selected directory-sync invocation to fail on this test
@@ -155,6 +239,21 @@ pub mod test_support {
         }
     }
 
+    impl ProjectedReadGuard {
+        #[must_use]
+        pub fn projected_reads(&self) -> Vec<ProjectedRead> {
+            PROJECTED_READS.with(|reads| reads.borrow().as_ref().cloned().unwrap_or_default())
+        }
+    }
+
+    pub(crate) fn record_projected_read(columns: &[&str]) {
+        PROJECTED_READS.with(|reads| {
+            if let Some(reads) = reads.borrow_mut().as_mut() {
+                reads.push(ProjectedRead::new(columns));
+            }
+        });
+    }
+
     #[allow(dead_code)]
     pub(crate) fn outcome(path: &Path) -> Option<io::Result<()>> {
         DIRECTORY_SYNC_STATE.with(|state| {
@@ -171,6 +270,23 @@ pub mod test_support {
             }
             state.force_success.then_some(Ok(()))
         })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn projected_reads_are_ignored_without_an_accounting_guard() {
+            record_projected_read(&["uncollected"]);
+
+            PROJECTED_READS.with(|reads| {
+                assert!(
+                    reads.borrow().is_none(),
+                    "a projected read must not install accounting without its guard"
+                );
+            });
+        }
     }
 }
 
@@ -332,6 +448,17 @@ pub fn read_batch(path: &Path) -> Result<RecordBatch> {
     read_batch_from_reader(file, path)
 }
 
+/// Reads an Arrow IPC batch through a dataset-owned backend key.
+#[allow(clippy::missing_errors_doc)]
+pub fn read_batch_with(
+    owner: &crate::backend::StorageOwner,
+    key: &crate::backend::DatasetKey,
+) -> Result<RecordBatch> {
+    let bytes = owner.get(key)?;
+    let path = owner.root().join(key.as_str());
+    read_batch_from_bytes(&path, &bytes)
+}
+
 /// Decodes the first record batch from already-loaded Arrow IPC bytes.
 ///
 /// Recovery uses this after inspecting a row file's complete bytes for its
@@ -415,11 +542,44 @@ pub fn read_batch_columns(path: &Path, columns: &[&str]) -> Result<RecordBatch> 
         let batch = reader
             .next()
             .ok_or_else(|| StorageError::EmptyDataFile(path.to_path_buf()))??;
+        #[cfg(any(test, feature = "test-fault-injection"))]
+        test_support::record_projected_read(columns);
         Ok(batch)
     }))
     .unwrap_or_else(|payload| {
         Err(StorageError::CorruptDataFile(
             path.to_path_buf(),
+            panic_message(&*payload),
+        ))
+    })
+}
+
+/// Reads projected columns through a dataset-owned backend key.
+#[allow(clippy::missing_errors_doc)]
+pub fn read_batch_columns_with(
+    owner: &crate::backend::StorageOwner,
+    key: &crate::backend::DatasetKey,
+    columns: &[&str],
+) -> Result<RecordBatch> {
+    let bytes = owner.get(key)?;
+    let path = owner.root().join(key.as_str());
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let schema = FileReader::try_new(Cursor::new(bytes.as_slice()), None)?.schema();
+        let projection = columns
+            .iter()
+            .map(|name| schema.index_of(name))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut reader = FileReader::try_new(Cursor::new(bytes), Some(projection))?;
+        let batch = reader
+            .next()
+            .ok_or_else(|| StorageError::EmptyDataFile(path.clone()))??;
+        #[cfg(any(test, feature = "test-fault-injection"))]
+        test_support::record_projected_read(columns);
+        Ok(batch)
+    }))
+    .unwrap_or_else(|payload| {
+        Err(StorageError::CorruptDataFile(
+            path,
             panic_message(&*payload),
         ))
     })

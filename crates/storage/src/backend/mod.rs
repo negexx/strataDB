@@ -5,6 +5,7 @@
 //! `docs/roadmap.md`.
 
 pub mod local;
+pub mod owner;
 
 #[cfg(test)]
 mod conformance;
@@ -79,15 +80,28 @@ pub trait Backend: Send + Sync {
     /// Returns an error if the underlying storage can't be listed.
     fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>>;
 
-    /// Removes `key`.
+    /// Removes a `key` that satisfies the [key contract](Backend#key-contract).
     ///
     /// # Errors
+    ///
+    /// Returns an error when `key` violates the key contract. `LocalFs`
+    /// reports that case as [`crate::error::StorageError::Io`] with
+    /// [`std::io::ErrorKind::InvalidInput`].
     ///
     /// Whether deleting an already-missing key errors is
     /// implementation-defined: `LocalFs` errors (POSIX `unlink` semantics),
     /// but an S3-compatible backend's `DeleteObject` is idempotent and
     /// would return success. Callers must not depend on either behavior.
+    ///
+    /// `LocalFs` returns only after unlinking the validated key and
+    /// synchronizing its owned containing-directory chain through the
+    /// configured backend root. A directory-sync error after unlink remains
+    /// an error: the key may already be absent, but deletion durability is
+    /// uncertain, so callers must not treat it as either acknowledged durable
+    /// completion or a failed unlink. This is a bounded local-filesystem
+    /// contract, not a cross-process or universal power-loss guarantee.
     fn delete(&self, key: &str) -> Result<()>;
 }
 
 pub use local::LocalFs;
+pub use owner::{DatasetKey, DatasetPrefix, StorageOwner};

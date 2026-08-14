@@ -9,6 +9,7 @@ pub mod commit_log;
 pub mod compaction;
 pub mod dataset;
 pub mod error;
+pub mod facade;
 mod lifecycle;
 mod lifecycle_coordination;
 pub(crate) mod live_set_cache;
@@ -28,6 +29,7 @@ pub use compaction::{CompactionPolicy, CompactionReport};
 pub use dataset::test_support;
 pub use dataset::{Dataset, ROW_ID_COLUMN, TIMESTAMP_COLUMN, Transaction};
 pub use error::{Result, TxnError};
+pub use facade::{DataFileInfo, SegmentInfo};
 pub use lifecycle::LifecycleReport;
 pub use maintenance::{LifecycleMaintenancePolicy, LifecycleMaintenanceReport};
 pub use query::{

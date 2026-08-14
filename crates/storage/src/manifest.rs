@@ -26,7 +26,6 @@ use arrow::ipc::convert::try_schema_from_flatbuffer_bytes;
 use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator, IpcWriteOptions};
 use serde::{Deserialize, Serialize};
 
-use crate::backend::{Backend, LocalFs};
 use crate::error::{Result, StorageError};
 use crate::stats::ColumnStats;
 
@@ -342,8 +341,16 @@ fn manifest_path(dataset_dir: &Path, version: u64) -> PathBuf {
 /// Returns an error if the `_versions/` directory can't be created, if the
 /// manifest can't be serialized or written, or if the atomic rename fails.
 pub fn commit_manifest(dataset_dir: &Path, manifest: &Manifest) -> Result<()> {
-    let backend = LocalFs::new(dataset_dir);
-    let key = format!("_versions/{:020}.manifest", manifest.version);
+    commit_manifest_with(&crate::backend::StorageOwner::local(dataset_dir), manifest)
+}
+
+/// Publishes a manifest through a dataset-owned backend capability.
+#[allow(clippy::missing_errors_doc)]
+pub fn commit_manifest_with(
+    owner: &crate::backend::StorageOwner,
+    manifest: &Manifest,
+) -> Result<()> {
+    let key = owner.manifest_object_key(manifest.version);
     let json = serde_json::to_vec(&ManifestEnvelope::new(manifest.clone())?)?;
     // `LocalFs::put` fsyncs the containing directory internally (see Task
     // 1), so there is no separate `sync_dir` call here the way the
@@ -354,7 +361,7 @@ pub fn commit_manifest(dataset_dir: &Path, manifest: &Manifest) -> Result<()> {
     // exactly the directory `put` already fsyncs for this key, so a second
     // call would double a chaos checkpoint and break the "checkpoint count
     // unchanged" global constraint below.
-    backend.put(&key, &json)?;
+    owner.put(&key, &json)?;
     Ok(())
 }
 
@@ -370,6 +377,12 @@ pub fn commit_manifest(dataset_dir: &Path, manifest: &Manifest) -> Result<()> {
 /// doc comment for why those are distinguishable).
 pub fn read_current(dataset_dir: &Path) -> Result<Option<Manifest>> {
     Ok(read_current_with_byte_count(dataset_dir)?.map(|(manifest, _)| manifest))
+}
+
+/// Reads the newest manifest through a dataset-owned backend capability.
+#[allow(clippy::missing_errors_doc)]
+pub fn read_current_with(owner: &crate::backend::StorageOwner) -> Result<Option<Manifest>> {
+    Ok(read_current_with_byte_count_with(owner)?.map(|(manifest, _)| manifest))
 }
 
 /// Reads and validates one durable manifest version, returning its payload
@@ -401,9 +414,23 @@ pub fn read_manifest_at_key_with_byte_count(
     key: &str,
     version: u64,
 ) -> Result<(Manifest, u64)> {
-    let backend = LocalFs::new(dataset_dir);
-    let bytes = backend.get(key)?;
-    decode_manifest_with_byte_count(dataset_dir, key, version, &bytes)
+    read_manifest_at_key_with_byte_count_with(
+        &crate::backend::StorageOwner::local(dataset_dir),
+        key,
+        version,
+    )
+}
+
+/// Reads one exact manifest key through a dataset-owned backend capability.
+#[allow(clippy::missing_errors_doc)]
+pub fn read_manifest_at_key_with_byte_count_with(
+    owner: &crate::backend::StorageOwner,
+    key: &str,
+    version: u64,
+) -> Result<(Manifest, u64)> {
+    let key = crate::backend::DatasetKey::new(key)?;
+    let bytes = owner.get(&key)?;
+    decode_manifest_with_byte_count(owner.root(), key.as_str(), version, &bytes)
 }
 
 fn decode_manifest_with_byte_count(
@@ -446,10 +473,16 @@ fn decode_manifest_with_byte_count(
 /// As [`read_current`], if recovery cannot list, load, parse, or validate the
 /// selected manifest.
 pub fn read_current_with_byte_count(dataset_dir: &Path) -> Result<Option<(Manifest, u64)>> {
-    let backend = LocalFs::new(dataset_dir);
+    read_current_with_byte_count_with(&crate::backend::StorageOwner::local(dataset_dir))
+}
 
+/// Returns the newest manifest and loaded-byte count through an owner.
+#[allow(clippy::missing_errors_doc)]
+pub fn read_current_with_byte_count_with(
+    owner: &crate::backend::StorageOwner,
+) -> Result<Option<(Manifest, u64)>> {
     let mut best: Option<(u64, String)> = None;
-    for meta in backend.list("_versions/")? {
+    for meta in owner.list("_versions")? {
         let Some(stem) = meta
             .key
             .strip_prefix("_versions/")
@@ -469,8 +502,9 @@ pub fn read_current_with_byte_count(dataset_dir: &Path) -> Result<Option<(Manife
     let Some((filename_version, key)) = best else {
         return Ok(None);
     };
-    let bytes = backend.get(&key)?;
-    decode_manifest_with_byte_count(dataset_dir, &key, filename_version, &bytes).map(Some)
+    let manifest_key = crate::backend::DatasetKey::new(&key)?;
+    let bytes = owner.get(&manifest_key)?;
+    decode_manifest_with_byte_count(owner.root(), &key, filename_version, &bytes).map(Some)
 }
 
 #[cfg(test)]

@@ -93,14 +93,9 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         }
         "scan" => {
             let ds = strata_txn::Dataset::open(dir)?;
-            let batch = ds
-                .snapshot()
-                .scan(&strata_txn::mvp_fixtures::mvp_schema())?;
-            println!(
-                "{} rows at version {}",
-                batch.num_rows(),
-                ds.current_version()
-            );
+            let snapshot = ds.snapshot();
+            let (batch, header) = scan_summary(&snapshot, &strata_txn::mvp_fixtures::mvp_schema())?;
+            println!("{header}");
             print_batch(&batch)?;
         }
         "filter" => {
@@ -116,13 +111,10 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         "search" => handle_search(args, dir)?,
         "inspect" => {
             let ds = strata_txn::Dataset::open(dir)?;
-            let batch = ds
-                .snapshot()
-                .scan(&strata_txn::mvp_fixtures::mvp_schema())?;
+            let snapshot = ds.snapshot();
             println!(
-                "version={} row_count={}",
-                ds.current_version(),
-                batch.num_rows()
+                "{}",
+                inspect_summary(&snapshot, &strata_txn::mvp_fixtures::mvp_schema())?
             );
         }
         "explain" => {
@@ -152,6 +144,31 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
     }
 
     Ok(())
+}
+
+fn scan_summary(
+    snapshot: &strata_txn::Snapshot,
+    schema: &arrow::datatypes::SchemaRef,
+) -> Result<(RecordBatch, String), Box<dyn Error>> {
+    let batch = snapshot.scan(schema)?;
+    let header = format_scan_header(batch.num_rows(), snapshot.version());
+    Ok((batch, header))
+}
+
+fn inspect_summary(
+    snapshot: &strata_txn::Snapshot,
+    schema: &arrow::datatypes::SchemaRef,
+) -> Result<String, Box<dyn Error>> {
+    let batch = snapshot.scan(schema)?;
+    Ok(format_inspect_line(snapshot.version(), batch.num_rows()))
+}
+
+fn format_scan_header(row_count: usize, snapshot_version: u64) -> String {
+    format!("{row_count} rows at version {snapshot_version}")
+}
+
+fn format_inspect_line(snapshot_version: u64, row_count: usize) -> String {
+    format!("version={snapshot_version} row_count={row_count}")
 }
 
 fn usage_error(message: impl Into<String>) -> Box<dyn Error> {
@@ -915,6 +932,41 @@ mod tests {
         ];
         let result = handle_explain(&dir_str, &args);
         assert!(result.is_ok(), "handle_explain failed: {result:?}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn snapshot_label_uses_captured_snapshot_version_and_rows() {
+        let dir = tempfile::Builder::new()
+            .prefix("strata-cli-snapshot-label-test-")
+            .tempdir()
+            .unwrap()
+            .keep();
+        let dir_str = dir.to_str().unwrap().to_string();
+        let schema = strata_txn::mvp_fixtures::mvp_schema();
+        strata_txn::Dataset::create(&dir_str, schema.clone()).unwrap();
+        let ds = strata_txn::Dataset::open(&dir_str).unwrap();
+
+        let mut txn = ds.begin();
+        txn.insert(strata_txn::mvp_fixtures::mvp_row(1, "alice", [1.0, 2.0, 3.0]).unwrap())
+            .unwrap();
+        txn.commit().unwrap();
+
+        let snapshot = ds.snapshot();
+
+        let mut txn = ds.begin();
+        txn.insert(strata_txn::mvp_fixtures::mvp_row(2, "bob", [4.0, 5.0, 6.0]).unwrap())
+            .unwrap();
+        txn.commit().unwrap();
+
+        let (batch, header) = scan_summary(&snapshot, &schema).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(header, "1 rows at version 1");
+        assert_eq!(
+            inspect_summary(&snapshot, &schema).unwrap(),
+            "version=1 row_count=1"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -76,6 +76,15 @@ pub fn initialize_row_id_high_water(dataset_dir: &Path) -> Result<()> {
     }
 }
 
+/// Initializes the row-id reservation catalog through an owner.
+#[allow(clippy::missing_errors_doc)]
+pub fn initialize_row_id_high_water_with(owner: &crate::backend::StorageOwner) -> Result<()> {
+    match persist_row_id_high_water_at_least_with(owner, 0) {
+        Ok(_) => Ok(()),
+        Err(error) => Err(error.into_storage_error()),
+    }
+}
+
 /// Returns the greatest valid durable reservation record, if the collection
 /// has not yet been initialized for this dataset.
 ///
@@ -89,6 +98,50 @@ pub fn initialize_row_id_high_water(dataset_dir: &Path) -> Result<()> {
 /// record is malformed or fails its checksum validation.
 pub fn read_row_id_high_water(dataset_dir: &Path) -> Result<Option<u64>> {
     Ok(read_row_id_high_water_with_byte_count(dataset_dir)?.high_water)
+}
+
+/// Reads row-id reservations through a dataset-owned backend capability.
+#[allow(clippy::missing_errors_doc)]
+pub fn read_row_id_high_water_with(owner: &crate::backend::StorageOwner) -> Result<Option<u64>> {
+    Ok(read_row_id_high_water_with_byte_count_with(owner)?.high_water)
+}
+
+/// Reads row-id reservations and byte accounting through an owner.
+#[allow(clippy::missing_errors_doc)]
+pub fn read_row_id_high_water_with_byte_count_with(
+    owner: &crate::backend::StorageOwner,
+) -> Result<RowIdHighWaterRead> {
+    let mut greatest = None;
+    let mut bytes_read = 0_u128;
+    for meta in owner.list(ROW_ID_HIGH_WATER_PREFIX.trim_end_matches('/'))? {
+        let Some(end) = end_from_key(&meta.key) else {
+            if temporary_key(&meta.key) {
+                continue;
+            }
+            return Err(corrupt_record(
+                &owner.root().join(&meta.key),
+                "record name does not encode an immutable row-id high-water end",
+            ));
+        };
+        let key = crate::backend::DatasetKey::new(&meta.key)?;
+        let bytes = owner.get(&key)?;
+        bytes_read += u128::from(bytes.len() as u64);
+        let path = owner.root().join(&meta.key);
+        let recorded_end = decode_record(&path, &bytes)?;
+        if recorded_end != end {
+            return Err(corrupt_record(
+                &path,
+                format!(
+                    "record filename end {end} does not match checksummed payload end {recorded_end}"
+                ),
+            ));
+        }
+        greatest = Some(greatest.map_or(end, |current: u64| current.max(end)));
+    }
+    Ok(RowIdHighWaterRead {
+        high_water: greatest,
+        bytes_read,
+    })
 }
 
 /// Returns the greatest valid durable reservation record and the exact bytes
@@ -200,6 +253,49 @@ pub fn persist_row_id_high_water_at_least(
             Ok(observed_end)
         }
         Err(source) => match read_row_id_high_water(dataset_dir) {
+            Ok(Some(observed_end)) if observed_end >= end => {
+                Err(HighWaterPersistenceError::PossiblyPublished {
+                    end: observed_end,
+                    source,
+                })
+            }
+            Ok(_) => Err(HighWaterPersistenceError::Definite(source)),
+            Err(observation_error) => Err(HighWaterPersistenceError::Definite(observation_error)),
+        },
+    }
+}
+
+/// Persists a row-id reservation through an owner. Backend publication is
+/// already the durability boundary, so this path does not require local
+/// directory handles and makes no cross-process allocation claim.
+#[allow(clippy::missing_errors_doc)]
+pub fn persist_row_id_high_water_at_least_with(
+    owner: &crate::backend::StorageOwner,
+    requested_end: u64,
+) -> std::result::Result<u64, HighWaterPersistenceError> {
+    let observed =
+        read_row_id_high_water_with(owner).map_err(HighWaterPersistenceError::Definite)?;
+    if let Some(end) = observed.filter(|end| *end >= requested_end) {
+        return Ok(end);
+    }
+    let end = requested_end;
+    let key = crate::backend::DatasetKey::new(record_key(end))
+        .map_err(HighWaterPersistenceError::Definite)?;
+    let bytes = encode_record(end);
+    match owner.put_if_absent(&key, &bytes) {
+        Ok(()) => Ok(end),
+        Err(StorageError::AlreadyExists(_)) => {
+            let observed =
+                read_row_id_high_water_with(owner).map_err(HighWaterPersistenceError::Definite)?;
+            match observed.filter(|observed_end| *observed_end >= end) {
+                Some(observed_end) => Ok(observed_end),
+                None => Err(HighWaterPersistenceError::Definite(corrupt_record(
+                    &owner.root().join(key.as_str()),
+                    "immutable row-id high-water target existed without a valid matching record",
+                ))),
+            }
+        }
+        Err(source) => match read_row_id_high_water_with(owner) {
             Ok(Some(observed_end)) if observed_end >= end => {
                 Err(HighWaterPersistenceError::PossiblyPublished {
                     end: observed_end,

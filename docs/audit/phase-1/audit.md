@@ -142,7 +142,7 @@ for process-boundary publication.
 | PERF-01..05 | P1 | Bounds/evidence | Capture current segmented measurements and define supported history, segment, recovery, and memory bounds. Compaction remains Phase 3. |
 | IDX-04 / ARCH-04 / VER-07 | P1 | Claim accuracy | Correct decision and status language that treats limited recall experiments or broad snapshot/durability evidence as universal proof. |
 | PERF-02..05 / DUR-06 | Later | Lifecycle | Compaction, vacuum, orphan cleanup, bounded history, and index lifecycle belong to Phase 3; document current growth meanwhile. |
-| ARCH-06..08 | Later | Client/backend surfaces | Decide subordinate-crate leakage, backend plumbing, and CLI version semantics during later API stabilization. |
+| ARCH-06..07 | Later | Client/backend surfaces | Decide subordinate-crate leakage and backend plumbing during later API stabilization; broader client/API stabilization remains deferred. |
 
 ## Complete legacy-ID mapping
 
@@ -165,7 +165,7 @@ consolidated register above; IDs marked "merged" retain the same evidence under 
 | DUR-04 | Historical verification gap; checkpoint/fast/thorough chaos now pass the manual Ubuntu CI gate, but they do not prove power-loss durability or native-platform coverage. |
 | DUR-05 | Historical claim overstatement; merged with ARCH-04/VER-07 and bounded in current docs. Final canonical review remains. |
 | DUR-06 | Preserved as later Phase 3 lifecycle work: failed commits/crashes can leave unreachable files; current growth obligation remains documented. |
-| DUR-07 | Preserved as later Phase 3/4/6 boundary work: LocalFs platform/key and durable-delete constraints need an explicit contract. |
+| DUR-07 | Implemented within named local bounds: LocalFs rejects platform-dependent backslash aliases, validates keys before filesystem resolution, synchronizes owned parent directories after unlink, and reports post-unlink sync errors without claiming universal power-loss durability. |
 | IDX-01 | Historical counterexample; remediated with row/vector identity validation and base-snapshot targeting under COR-01/CONC-01. Final branch verification remains. |
 | IDX-02 | Historical recovery-integrity counterexample; remediated with manifest-listed row/vector identity validation and regression coverage. Final branch verification remains. |
 | IDX-03 | Preserved explicitly: fixed `ef_search` can underfill `k`, including an unbounded API request above 32. Phase 1 contract decision and Phase 2 API work. |
@@ -175,16 +175,16 @@ consolidated register above; IDs marked "merged" retain the same evidence under 
 | PERF-03 | Typed recovery-byte accounting and deterministic row-ID/load-boundary regressions are implemented; validated bounded synthetic and full-fixture lifecycle/recovery evidence now exists. No universal recovery-time/byte bound is claimed. |
 | PERF-04 | Validated cloud Dataset/Snapshot fan-out matrices cover K=1â€¦64 synthetic and full pinned-fixture segments in filtered/unfiltered modes; they do not establish a supported maximum. Compaction remains Phase 3. |
 | PERF-05 | Repeated bounded synthetic evidence covers 0/1/4/16/64 retained handles and full-fixture one-pin lifecycle residency with exact logical-versus-unique manifest/data/segment accounting plus labeled approximate cache/allocator observations; RSS and universal residency bounds remain open. |
-| PERF-06 | Preserved as later Phase 2/3 query/layout work: public scans lack projection pushdown and sub-file pruning; establish an honest baseline. |
-| PERF-07 | Preserved as documentation/query work: projection avoids some array construction but not dominant file-body reads; benchmark and correct the claim. |
+| PERF-06 | Implemented evidence path within named bounds: the real scan path records requested projection, predicate-only, and `_row_id` columns under the opt-in test accounting seam; focused native evidence passed. |
+| PERF-07 | Implemented as an additive indexed row-group format with explicit selected-group projection reads; legacy one-batch-per-file Arrow IPC remains compatible and automatic predicate-to-group pruning is not claimed. |
 | ARCH-01 | Dataset-owned schema validation is implemented and regression-covered; schema evolution and final branch verification remain. |
 | ARCH-02 | Merged with COR-05: target validation and singular update semantics are implemented and regression-covered; final branch verification remains. |
 | ARCH-03 | Typed insufficient-history/error semantics are implemented and regression-covered; final branch verification remains. |
 | ARCH-04 | Merged with IDX-04 and VER-07: accepted decision/active docs overclaimed transaction or recall guarantees. Corrected and bounded in current docs. |
 | ARCH-05 | Supported public facade and invariant-boundary cleanup are implemented; final branch verification remains. |
-| ARCH-06 | Preserved as later Phase 2 API work: subordinate-crate types leak through the transaction facade. |
-| ARCH-07 | Preserved as later Phase 2/6 work: backend abstraction is not threaded through all I/O. |
-| ARCH-08 | Preserved as later Phase 2 client work: CLI snapshot labels can disagree with displayed rows. |
+| ARCH-06 | Implemented additively: facade-owned `DataFileInfo`/`SegmentInfo` views exist while legacy raw accessors remain source-compatible; removal/deprecation of subordinate-crate types still requires a separate compatibility decision. |
+| ARCH-07 | Implemented within the local/backend capability boundary: `Dataset` owns a validated `StorageOwner`, and manifest/datafile/segment/reservation/lifecycle/retention/vacuum/compaction I/O routes through it. No universal remote-backend guarantee is claimed. |
+| ARCH-08 | Implemented within named bounds: [the Phase 2 CLI audit](../phase-2/audit.md#p1--python-and-cli-surfaces) records the compatibility-command boundary, and read-only labels now source both version and displayed row/count data from one captured immutable snapshot. Broader client/API stabilization remains deferred. |
 | VER-01 | Known counterexamples have targeted regression gates; exact-head CI run 31644869407 passed the required functional verification. |
 | VER-02 | Merged with CONC-02: exact-head GitHub Actions execution passed the named transaction/cache/index loom models and semantic guard. |
 | VER-03 | Merged with DUR-04: exact-head GitHub Actions thorough chaos reached `2000/2000` seeds with zero violations. |

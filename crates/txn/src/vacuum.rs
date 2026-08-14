@@ -2,9 +2,11 @@
 
 use std::collections::HashSet;
 
-use strata_storage::{Backend, LocalFs, read_manifest_at_key_with_byte_count};
+use strata_storage::read_manifest_at_key_with_byte_count_with;
 
-use crate::dataset::{Dataset, load_segments, validate_data_files, validate_tombstones};
+use crate::dataset::{
+    Dataset, load_segments_with_owner, validate_data_files_with_owner, validate_tombstones,
+};
 use crate::error::{Result, TxnError};
 use crate::retention::index_manifest_objects;
 
@@ -38,8 +40,8 @@ impl Dataset {
         protected_versions.push(observed_version);
         protected_versions.sort_unstable();
         protected_versions.dedup();
-        let backend = LocalFs::new(self.retention_dir());
-        let manifest_keys = index_manifest_objects(&backend.list("_versions/")?)?;
+        let storage = self.storage();
+        let manifest_keys = index_manifest_objects(&storage.list("_versions")?)?;
 
         for version in protected_versions {
             let key = manifest_keys.get(&version).ok_or_else(|| {
@@ -50,11 +52,20 @@ impl Dataset {
                 ))
             })?;
             let (manifest, _) =
-                read_manifest_at_key_with_byte_count(self.retention_dir(), &key.key, version)?;
-            let owned_rows =
-                validate_data_files(self.retention_dir(), &manifest, &current.schema, None)?;
+                read_manifest_at_key_with_byte_count_with(&storage, &key.key, version)?;
+            let owned_rows = validate_data_files_with_owner(
+                &storage,
+                self.retention_dir(),
+                &manifest,
+                &current.schema,
+                None,
+            )
+            .map_err(|error| match error {
+                TxnError::Storage(strata_storage::StorageError::Io(source)) => TxnError::Io(source),
+                other => other,
+            })?;
             validate_tombstones(self.retention_dir(), &manifest, &owned_rows)?;
-            let _ = load_segments(self.retention_dir(), &manifest, &owned_rows, None)?;
+            let _ = load_segments_with_owner(&storage, &manifest, &owned_rows, None)?;
             protected.extend(
                 manifest
                     .data_files
@@ -71,13 +82,13 @@ impl Dataset {
 
         for (version, key) in manifest_keys {
             let (manifest, _) =
-                read_manifest_at_key_with_byte_count(self.retention_dir(), &key.key, version)?;
+                read_manifest_at_key_with_byte_count_with(&storage, &key.key, version)?;
             let reachable = crate::lifecycle::reachable_keys(&manifest)?;
             protected.extend(reachable.data_files.into_iter().chain(reachable.segments));
         }
         let mut objects_deleted = 0_u64;
         let mut bytes_deleted = 0_u64;
-        for object in backend.list("data/")? {
+        for object in storage.list("data")? {
             let Some(name) = object.key.strip_prefix("data/") else {
                 continue;
             };
@@ -91,7 +102,8 @@ impl Dataset {
             if !recognized_orphan || protected.contains(&object.key) {
                 continue;
             }
-            backend.delete(&object.key)?;
+            let key = strata_storage::DatasetKey::new(&object.key).map_err(TxnError::Storage)?;
+            storage.delete(&key)?;
             objects_deleted = objects_deleted
                 .checked_add(1)
                 .ok_or_else(|| TxnError::ManifestOverflow("objects_deleted".to_owned()))?;
