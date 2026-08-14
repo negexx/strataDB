@@ -21,14 +21,20 @@ corruption proof.
 
 ## Transactions and snapshots
 
-`Dataset::begin` creates a write-only transaction against the current immutable snapshot. Preparation
-allocates physical row IDs, writes data, and builds vector segments before the commit lock is taken.
-Under the shared handle's lock, write-write conflicts are checked against recent committed history.
-A clean commit publishes a new manifest and installs a replacement immutable snapshot.
+`Dataset::begin` captures an immutable base snapshot for a transaction. The stable, bounded
+transaction read API merges that base with the transaction's private staged writes: row lookup,
+scan (including predicate reads), and group reads provide read-your-writes for staged inserts,
+replacements, and deletes. `vector_search` can use the base index only while the transaction has no
+staged writes; after staged writes it returns a typed unsupported-transaction-read error rather than
+silently returning stale base-snapshot results. Preparation allocates physical row IDs, writes data,
+and builds vector segments before the commit lock is taken. Under the shared handle's lock,
+write-write conflicts are checked against recent committed history. A clean commit publishes a new
+manifest and installs a replacement immutable snapshot.
 
-The API does not provide transactional scan/search or read-your-own-writes. The supported concurrency
-boundary is one process sharing one `Dataset` handle. Independent openers do not share the lock,
-allocator, history, or in-memory snapshot, and cross-process conditional publication is Phase 4.
+The supported concurrency boundary is one process sharing one `Dataset` handle. This bounded read
+API and write-write OCC have snapshot isolation as their ceiling, not full serializability; it is not
+a general read/write query interface. Independent openers do not share the lock, allocator, history,
+or in-memory snapshot, and cross-process conditional publication is Phase 4.
 
 Rows are append-only physical records. Delete adds a tombstone. Update tombstones the old physical row
 and inserts replacement data with a new physical row ID. Future tombstones, target validation,
