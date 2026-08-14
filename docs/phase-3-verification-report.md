@@ -164,3 +164,53 @@ The detached temporary worktree was used only for red evidence and was removed
 after the final diff checks. These results remain limited to the
 documented local, one-process/shared-`Dataset` boundary and do not claim
 serializability, distributed coordination, or universal power-loss durability.
+
+## Task 2 fix round 2 evidence (2026-08-15)
+
+This is evidence-only. A detached temporary worktree at `80b4fe8` (the initial
+Task 2 implementation) received the final
+`crates/txn/tests/schema_migrations.rs` test from `2f81581`; no current source
+or history was modified. Unlike the earlier base used for the first red run,
+this base already supplies `SchemaMigration`, `Dataset::migrate_schema`, and
+the schema-version API. The test therefore isolates the migration-specific
+pre-publication seam introduced by `2f81581`.
+
+The process-local MSVC environment set the following explicit directories:
+
+```powershell
+$env:PATH = 'C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\MSVC\14.52.36615\bin\Hostx64\x64;' + $env:PATH
+$env:LIB = 'C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\MSVC\14.52.36615\lib\x64;C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\ucrt\x64;C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\um\x64;' + $env:LIB
+$env:INCLUDE = 'C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\MSVC\14.52.36615\include;C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\ucrt;C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared;C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um;C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\winrt;' + $env:INCLUDE
+Set-Location 'C:\Users\dagda\Downloads\nex\strataDB\.worktrees\task-2-fix-round-2-red'
+cargo test -p strata-txn --no-default-features --features test-fault-injection --test schema_migrations migration_failure_before_publication_reopens_the_prior_complete_manifest -- --exact
+```
+
+| Command | Result |
+|---|---|
+| The command above, in the detached `80b4fe8` worktree after materializing the final test | Exit 101, expected red phase. The test crate compiled against the initial Task 2 migration API and failed only because the migration-specific recovery seam was absent; no Rust test executed. |
+
+Relevant final Cargo output was:
+
+```text
+   Compiling strata-storage v0.1.0 (C:\Users\dagda\Downloads\nex\strataDB\.worktrees\task-2-fix-round-2-red\crates\storage)
+   Compiling strata-index v0.1.0 (C:\Users\dagda\Downloads\nex\strataDB\.worktrees\task-2-fix-round-2-red\crates\index)
+   Compiling strata-query v0.1.0 (C:\Users\dagda\Downloads\nex\strataDB\.worktrees\task-2-fix-round-2-red\crates\query)
+   Compiling strata-txn v0.1.0 (C:\Users\dagda\Downloads\nex\strataDB\.worktrees\task-2-fix-round-2-red\crates\txn)
+error[E0425]: cannot find function `fail_before_migration_manifest_publication` in module `strata_txn::dataset::test_support`
+   --> crates\txn\tests\schema_migrations.rs:212:53
+    |
+212 |     let _fault = strata_txn::dataset::test_support::fail_before_migration_manifest_publication();
+    |                                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+   ::: crates\txn\src\dataset.rs:395:5
+    |
+395 |     pub fn fail_after_compaction_manifest_publication() -> PostPublicationFaultGuard {
+    |     -------------------------------------------------------------------------------- similarly named function `fail_after_compaction_manifest_publication` defined here
+
+For more information about this error, try `rustc --explain E0425`.
+error: could not compile `strata-txn` (test "schema_migrations") due to 1 previous error
+```
+
+The temporary worktree was then removed. This result demonstrates the missing
+migration fault seam/recovery coverage specifically; it is not the earlier
+missing-migration-API failure and makes no broader completion claim.
