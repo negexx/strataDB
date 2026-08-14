@@ -133,6 +133,20 @@ impl RowIdAllocator {
         }
     }
 
+    /// Loom models keep publication disk-free, but dataset construction still
+    /// supplies the production storage capability. Accept it so the same
+    /// constructor call type-checks in the model build while intentionally
+    /// omitting the capability from the loom-only allocator state.
+    #[cfg(loom)]
+    pub(crate) fn new_with_storage(
+        _storage: Arc<strata_storage::StorageOwner>,
+        next_row_id: u64,
+    ) -> Self {
+        Self {
+            state: Mutex::new(AllocatorState { next_row_id }),
+        }
+    }
+
     /// A poisoned allocator lock is recovered rather than propagated, for
     /// the same reason `Dataset.commit_lock` does: the guarded state is
     /// only ever mutated by a single whole-integer assignment, so a
