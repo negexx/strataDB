@@ -185,6 +185,8 @@ command_lifecycle=lifecycle
                     "================ StrataDB lifecycle â€” 100000 rows x 512-dim ================",
                     "ingest+commit                    20.00ms       2.0MB       3.0MB      -1.0MB  fsync",
                     "recovery (reopen)                10.00ms       1.0MB       2.0MB      -0.5MB  I/O + validation",
+                    "compaction+reclaim               12.00ms       3.0MB       4.0MB      -0.5MB  rewrite + reclamation",
+                    "bounded lifecycle maintenance     6.00ms       1.5MB       2.5MB      -0.5MB  maintenance",
                     "pinned snapshot/cache residency   1.00ms       0.1MB       0.2MB      -0.1MB  direct retained payloads",
                     "full scan                          5.00ms       1.0MB       1.5MB      -0.2MB  I/O",
                     "filtered scan                      2.00ms       0.2MB       0.3MB      -0.1MB  I/O + CPU",
@@ -601,6 +603,50 @@ command_lifecycle=lifecycle
             self.assertTrue(
                 any(row["benchmark"] == "fixture_segment_recall" for row in records)
             )
+
+    def test_validation_rejects_fixture_lifecycle_without_compaction_and_maintenance(self):
+        with tempfile.TemporaryDirectory() as root:
+            artifact = Path(root)
+            self._write_complete_configured_matrix(artifact, "requested")
+            for label in ("before", "after"):
+                self._write_fixture_evidence(artifact, label)
+            path = artifact / "before" / "fixture_lifecycle.log"
+            path.write_text(
+                "\n".join(
+                    line
+                    for line in path.read_text(encoding="utf-8").splitlines()
+                    if not line.startswith(("compaction+reclaim", "bounded lifecycle maintenance"))
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "exact emitted set"):
+                summarize.validate_records(summarize.summarize_directory(artifact), artifact)
+
+    def test_validation_applies_configured_fixture_lifecycle_regression_budget(self):
+        with tempfile.TemporaryDirectory() as root:
+            artifact = Path(root)
+            self._write_complete_configured_matrix(artifact, "requested")
+            for label in ("before", "after"):
+                self._write_fixture_evidence(artifact, label)
+                for filename in ("config.env", "fixture_lifecycle.env"):
+                    path = artifact / label / filename
+                    path.write_text(
+                        path.read_text(encoding="utf-8")
+                        + "fixture_lifecycle_max_regression_pct=10\n",
+                        encoding="utf-8",
+                    )
+            after_log = artifact / "after" / "fixture_lifecycle.log"
+            after_log.write_text(
+                after_log.read_text(encoding="utf-8").replace(
+                    "compaction+reclaim               12.00ms",
+                    "compaction+reclaim               14.00ms",
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "regression budget"):
+                summarize.validate_records(summarize.summarize_directory(artifact), artifact)
 
     def test_validation_rejects_requested_fixture_without_lifecycle_artifacts(self):
         with tempfile.TemporaryDirectory() as root:

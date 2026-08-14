@@ -8,7 +8,7 @@ in [documentation history](history/README.md). Current implementation claims liv
 | 0 — Foundation | Implemented within named local bounds | Local format, manifests, row allocation, and bounded transaction primitives. See the [Phase 0 foundation audit](audit/phase-0/audit.md). | Restart-safe row-ID non-reuse and retained foundation evidence pass within the named local-filesystem boundary. |
 | 1 — Correctness and durability baseline | Implemented within named bounds | Shared-handle commits, immutable snapshots, typed conflicts, recovery/integrity, schema/error semantics, supported facade, and boundedness evidence. | All asserted guarantees have scope, implementation evidence, regression coverage, and current bounded performance evidence. |
 | 2 — Query and usability | Implemented within named bounds | Stable schema/query APIs, scan/projection/filter/group-by integration, point lookup, CLI, and Python surface. See the [Phase 2 audit](audit/phase-2/audit.md). | Supported query/client behavior is documented and integration-tested within the embedded single-process boundary. |
-| 3 — Operational lifecycle | Implemented within named bounds | Lifecycle diagnostics, explicit snapshot-preserving compaction, manifest retention including age policy, recognized orphan vacuum, and `Dataset::maintain(LifecycleMaintenancePolicy)` are implemented for one shared handle. Maintenance reports whether requested data-object and segment bounds were met; active snapshots and unknown object types remain explicit limitations. See the [Phase 3 closeout audit](audit/phase-3/audit.md), [inventory design](designs/phase-3/lifecycle-inventory.md), [executor design](designs/phase-3/manifest-retention-executor.md), [vacuum design](designs/phase-3/vacuum.md), and focused lifecycle tests. | One completed maintenance run safely applies the supported retention/reclamation policy and reports its final storage observation; it does not guarantee a continuing bound. |
+| 3 — Operational lifecycle | Implemented within named bounds | Lifecycle diagnostics, explicit snapshot-preserving compaction, manifest retention including age policy, recognized orphan vacuum, and `Dataset::maintain(LifecycleMaintenancePolicy)` are implemented for one shared handle. Maintenance reports one run's final data-object and segment observation; active snapshots, protected history, unknown objects, and noncontiguous physical row IDs remain explicit limitations. See the [Phase 3 closeout audit](audit/phase-3/audit.md), [inventory design](designs/phase-3/lifecycle-inventory.md), [executor design](designs/phase-3/manifest-retention-executor.md), [vacuum design](designs/phase-3/vacuum.md), and focused lifecycle tests. | One explicit maintenance run safely applies the supported retention/reclamation policy and reports its final storage observation; it is neither atomic nor continuous enforcement and does not provide cross-process quota or SLO semantics. |
 | 4 — Cross-process coordination | Proposed | Durable conditional publication, independent opener semantics, shared allocation, and process-boundary guarantees. | Separate processes coordinate without violating visibility, conflict, or durability invariants. |
 | 5 — Branching and merge | Proposed | Fork, abort, merge, conflict reporting, and branch-aware manifests. | Branch behavior is correct under concurrency and recovery tests. |
 | 6 — Object storage and deployment | Proposed | Object-store conditional writes, S3-compatible backends, remote recovery, and durability testing. | The supported correctness suite passes against supported remote backends. |
@@ -22,10 +22,11 @@ Phase 3 lifecycle now also includes explicit snapshot-preserving compaction and 
 inventory evidence. Universal growth enforcement across independent processes or unknown object
 types remains outside the embedded single-process product boundary.
 
-The Phase 3 exit signal above denotes evidence from one completed maintenance run. In particular,
-`storage_bound_met` is the final inventory observation, not atomic or continuing storage-bound
-enforcement; active snapshots, protected history, and unknown object types can keep physical growth
-above a requested limit.
+The Phase 3 exit signal above denotes evidence from one explicit maintenance run. In particular,
+`storage_bound_met` is that run's final inventory observation, not atomic or continuous
+storage-bound enforcement. Active snapshots, protected history, unknown objects, and noncontiguous
+physical row IDs can keep physical growth above a requested limit. Cross-process quota and SLO
+semantics remain outside the embedded shared-handle boundary and require separately authorized work.
 
 ## Phase 4 reservation and entry gates
 
@@ -78,7 +79,7 @@ These are not requests for compaction in Phase 1.
 
 | Capability | Placement | Current boundary |
 |---|---|---|
-| Compaction, vacuum, orphan cleanup, bounded history | Phase 3 | Explicit compaction rewrites the current live snapshot, age retention removes eligible historical manifests, vacuum removes recognized unprotected `.arrow`/`.seg` and temporary objects, and `Dataset::maintain()` reports a final inventory observation of requested storage bounds; it is neither atomic nor continuing enforcement. Unknown object types and cross-process universal bounds remain out of scope. |
+| Compaction, vacuum, orphan cleanup, bounded history | Phase 3 | Explicit compaction rewrites the current live snapshot, age retention removes eligible historical manifests, vacuum removes recognized unprotected `.arrow`/`.seg` and temporary objects, and `Dataset::maintain()` reports one explicit run's final inventory observation of requested storage bounds; it is neither atomic nor continuous enforcement. Active snapshots, protected history, unknown objects, and noncontiguous physical row IDs can prevent a requested bound. Cross-process quota/SLO semantics and universal bounds remain out of scope. |
 | Schema catalog, migrations, point lookup, time travel, stable query API | Phase 2–3 | Current Arrow batches/manifests are not a complete catalog or migration layer. |
 | Independent-open and cross-process coordination | Phase 4 | Shared-handle locking is not durable conditional publication. |
 | Fork, abort, branch reads, and merge | Phase 5 | Immutable segments are a prerequisite, not a delivered feature. |

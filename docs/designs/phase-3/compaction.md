@@ -111,6 +111,47 @@ Implemented regression coverage includes:
    next row-ID/timestamp/attempt high-water state.
 8. The report's deleted counts and bytes equal successful deletions only.
 
+## Loom applicability (T3-02)
+
+A dedicated `Dataset::compact()` loom model is not a faithful or useful additional
+gate for this implementation. The operation's admission protocol is in-memory, but
+the operation itself also reads and writes Arrow files, builds and loads HNSW
+segments, publishes manifests, lists backend keys, deletes objects, and synchronizes
+directories. Loom does not model those filesystem and durability operations or their
+listing/unlink failure modes. Running the real operation under loom would therefore
+leave its storage effects outside the scheduler; replacing them with test doubles
+would reimplement the manifest/reclamation protocol instead of exercising
+`Dataset::compact()`.
+
+The existing crate-scoped models cover the interleavings that are both shared by
+compaction and controllable by loom:
+
+- `lifecycle_coordination::loom_tests::preparation_and_exclusive_execution_never_overlap`
+  exhaustively exercises the coordinator's preparation/exclusive state machine. A
+  transaction holds its preparation lease for the whole commit path, while
+  compaction takes exclusivity before `commit_lock`; the model covers waiting for
+  an in-flight preparation, preventing a later preparation from passing a queued
+  executor, and preventing overlapping exclusive execution.
+- `retention::loom_tests::concurrent_registration_and_final_drop_prune_after_quiescence`
+  exercises the lease registry's concurrent registration, weak-lease expiry, and
+  live-version scan. `Dataset::snapshot()` only clones the immutable current
+  `Arc<Snapshot>`; a snapshot lease is registered when that immutable snapshot is
+  created or published. During compaction, a concurrent snapshot can therefore
+  hold either the source or the published snapshot, and `live_snapshot_versions()`
+  observes any still-live source lease before reclamation. A concurrent final drop
+  can only leave an object protected longer or establish that no snapshot still
+  owns it; it cannot create an unregistered historical snapshot.
+
+The normal compaction regressions exercise the filesystem-backed consequences that
+loom cannot: `compaction_reads_an_unpadded_active_snapshot_manifest_key_and_preserves_its_objects`
+keeps a historical snapshot readable through publication, and
+`compaction_reclaims_superseded_objects_after_old_snapshot_drops` verifies that
+reclamation occurs only after that snapshot is released. The fault-injection
+compaction tests cover pre- and post-publication error paths. Together these tests
+and the generic loom models are evidence only for the documented one-process,
+shared-`Dataset` contract; they do not model filesystem durability, cross-process
+interleavings, or universal power-loss behavior.
+
 ## Non-claims
 
 This design does not establish universal power-loss durability, cross-process safety, serializable

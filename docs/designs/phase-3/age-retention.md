@@ -11,9 +11,11 @@ holding lifecycle exclusivity and the publication lock.
 
 `Dataset::maintain(LifecycleMaintenancePolicy)` composes compaction, age
 retention, recognized-object vacuum, and a final inventory. It reports
-`storage_bound_met` rather than claiming a universal bound: active snapshots,
-retained history, or unsupported object types can keep physical growth above a
-requested limit and remain visible in the report.
+`storage_bound_met` as the final observation of one explicit maintenance run,
+not as atomic or continuous enforcement. Active snapshots, protected history,
+unknown objects, or noncontiguous physical row IDs can keep physical growth
+above a requested limit and remain visible in the report. The shared-handle API
+does not provide cross-process quota or SLO semantics.
 
 Independent openers and cross-process retention are intentionally excluded;
 that boundary remains reserved for Phase 4.

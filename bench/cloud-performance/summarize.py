@@ -7,6 +7,7 @@ import argparse
 from collections import Counter
 import csv
 import json
+import math
 import re
 import statistics
 from pathlib import Path
@@ -90,6 +91,8 @@ EXPECTED_FIXTURE_LIFECYCLE_MEASUREMENTS = (
 EXPECTED_LIFECYCLE_PHASES = {
     "ingest_commit",
     "recovery_reopen",
+    "compaction_reclaim",
+    "bounded_lifecycle_maintenance",
     "pinned_snapshot_cache_residency",
     "full_scan",
     "filtered_scan",
@@ -99,6 +102,12 @@ EXPECTED_LIFECYCLE_PHASES = {
     "vector_search_filtered_varying_predicate",
     "concurrent_commits",
 }
+FIXTURE_LIFECYCLE_REGRESSION_PHASES = (
+    "recovery_reopen",
+    "compaction_reclaim",
+    "bounded_lifecycle_maintenance",
+)
+FIXTURE_LIFECYCLE_REGRESSION_METRICS = ("wall_ms", "peak_live_mb")
 
 
 def _read(path: Path) -> str:
@@ -419,6 +428,63 @@ def compute_deltas(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return deltas
 
 
+def _fixture_lifecycle_regression_budget(
+    config: dict[str, str], label: str, errors: list[str]
+) -> float | None:
+    raw_budget = config.get("fixture_lifecycle_max_regression_pct", "")
+    if not raw_budget:
+        return None
+    try:
+        budget = float(raw_budget)
+    except ValueError:
+        errors.append(f"{label}: fixture lifecycle regression budget must be a percentage")
+        return None
+    if not math.isfinite(budget) or budget < 0:
+        errors.append(f"{label}: fixture lifecycle regression budget must be finite and non-negative")
+        return None
+    return budget
+
+
+def _validate_fixture_lifecycle_regression_budget(
+    by_label: dict[str, list[dict[str, Any]]],
+    configs: dict[str, dict[str, str]],
+    errors: list[str],
+) -> None:
+    budgets = {
+        label: _fixture_lifecycle_regression_budget(config, label, errors)
+        for label, config in configs.items()
+    }
+    before_budget = budgets["before"]
+    after_budget = budgets["after"]
+    if before_budget != after_budget:
+        errors.append("fixture lifecycle regression budgets differ between before and after")
+        return
+    if before_budget is None:
+        return
+    for phase in FIXTURE_LIFECYCLE_REGRESSION_PHASES:
+        for metric in FIXTURE_LIFECYCLE_REGRESSION_METRICS:
+            name = f"lifecycle_pins1_{phase}_{metric}"
+            values = {
+                label: [
+                    row["value"]
+                    for row in by_label[label]
+                    if row["benchmark"] == "fixture_lifecycle" and row["metric"] == name
+                ]
+                for label in ("before", "after")
+            }
+            if len(values["before"]) != 1 or len(values["after"]) != 1:
+                errors.append(f"fixture lifecycle regression budget is missing comparable {name}")
+                continue
+            before = float(values["before"][0])
+            after = float(values["after"][0])
+            allowed = before * (1 + before_budget / 100)
+            if after > allowed:
+                errors.append(
+                    f"fixture lifecycle regression budget exceeded for {name}: "
+                    f"after={after} exceeds before={before} plus {before_budget}%"
+                )
+
+
 def validate_records(records: list[dict[str, Any]], artifact: Path) -> None:
     by_label = {label: [row for row in records if row["label"] == label] for label in ("before", "after")}
     errors: list[str] = []
@@ -687,6 +753,7 @@ def validate_records(records: list[dict[str, Any]], artifact: Path) -> None:
             ("lifecycle_warmup_runs", "fixture_lifecycle_warmup_runs"),
             ("lifecycle_repetitions", "fixture_lifecycle_repetitions"),
             ("fixture_lifecycle_protocol", "fixture_lifecycle_protocol"),
+            ("fixture_lifecycle_max_regression_pct", "fixture_lifecycle_max_regression_pct"),
         ):
             if config.get(sidecar_key) != configs[label].get(selected_key):
                 errors.append(
@@ -761,12 +828,20 @@ def validate_records(records: list[dict[str, Any]], artifact: Path) -> None:
                 lifecycle_blocks, expected_commits, fixture_pins[0], label, errors
             )
         fixture_lifecycle_rows = [row for row in by_label[label] if row["benchmark"] == "fixture_lifecycle"]
-        metric = "lifecycle_pins1_ingest_commit_wall_ms"
-        metric_rows = [row for row in fixture_lifecycle_rows if row["metric"] == metric]
-        if not metric_rows:
-            errors.append(f"{label}: missing fixture_lifecycle/{metric}")
-        elif any(row.get("samples") != int(config.get("lifecycle_repetitions", "0")) for row in metric_rows):
-            errors.append(f"{label}: fixture lifecycle ingest metrics do not contain measured repetitions")
+        required_phases = ("ingest_commit", *FIXTURE_LIFECYCLE_REGRESSION_PHASES)
+        for phase in required_phases:
+            for suffix in ("wall_ms", "allocated_mb", "peak_live_mb", "live_delta_mb"):
+                metric = f"lifecycle_pins1_{phase}_{suffix}"
+                metric_rows = [row for row in fixture_lifecycle_rows if row["metric"] == metric]
+                if not metric_rows:
+                    errors.append(f"{label}: missing fixture_lifecycle/{metric}")
+                elif any(
+                    row.get("samples") != int(config.get("lifecycle_repetitions", "0"))
+                    for row in metric_rows
+                ):
+                    errors.append(
+                        f"{label}: fixture lifecycle {phase} metrics do not contain measured repetitions"
+                    )
         hashes = {tuple(row.get("input_hashes", [])) for row in fixture_lifecycle_rows}
         if hashes != {(fixture_input_hash,)}:
             errors.append(f"{label}: fixture lifecycle must contain exactly its sidecar input hash")
@@ -786,6 +861,7 @@ def validate_records(records: list[dict[str, Any]], artifact: Path) -> None:
             and before_lifecycle_hash != after_lifecycle_hash
         ):
             errors.append("before/after fixture_lifecycle input hashes differ")
+        _validate_fixture_lifecycle_regression_budget(by_label, fixture_lifecycle_configs, errors)
     if errors:
         raise ValueError("incomplete before/after evidence:\n" + "\n".join(errors))
 
