@@ -121,7 +121,7 @@ pub enum PhysicalOperator {
     ImmutableSegmentVectorSearch,
     /// Hydrates vector hits through the same captured snapshot.
     HydrationLookup,
-    /// Merges staged transaction rows into a read view.
+    /// Merges staged transaction rows into the fully decoded base read view.
     TransactionOverlay,
     /// Produces the request's typed result value.
     Materialize,
@@ -132,15 +132,15 @@ pub enum PhysicalOperator {
 pub struct PlanObservations {
     /// Number of manifest-listed row data files.
     pub data_files_total: usize,
-    /// Number of row data files the current predicate could require scanning.
+    /// Number of row data files selected by the current physical path.
     pub data_files_scanned: usize,
-    /// Number of row data files the current predicate proved skippable.
+    /// Number of row data files the current physical path proved skippable.
     pub data_files_pruned: usize,
     /// Number of manifest-listed immutable vector segments.
     pub index_segments_total: usize,
-    /// Number of vector segments the current predicate could require scanning.
+    /// Number of vector segments selected by the current physical path.
     pub index_segments_scanned: usize,
-    /// Number of vector segments the current predicate proved skippable.
+    /// Number of vector segments the current physical path proved skippable.
     pub index_segments_pruned: usize,
     /// Whether the query's caller supplied a transaction-local overlay.
     pub transaction_overlay: bool,
@@ -194,6 +194,19 @@ impl Planner {
         logical: LogicalPlan,
         observations: PlanObservations,
     ) -> Result<PhysicalPlan, PlanError> {
+        let observations = if observations.transaction_overlay {
+            PlanObservations {
+                data_files_total: observations.data_files_total,
+                data_files_scanned: observations.data_files_total,
+                data_files_pruned: 0,
+                index_segments_total: observations.index_segments_total,
+                index_segments_scanned: observations.index_segments_total,
+                index_segments_pruned: 0,
+                transaction_overlay: true,
+            }
+        } else {
+            observations
+        };
         let has_predicate = logical
             .operators()
             .iter()
@@ -218,21 +231,33 @@ impl Planner {
         }) {
             Some(LogicalOperator::Projection { .. }) => {
                 physical_operators.push(PhysicalOperator::ManifestSnapshotSource);
-                if zone_map_eligible {
-                    physical_operators.push(PhysicalOperator::ZoneMapPruning);
+                if observations.transaction_overlay {
+                    physical_operators.push(PhysicalOperator::TombstoneFilter);
+                    physical_operators.push(PhysicalOperator::TransactionOverlay);
+                } else {
+                    if zone_map_eligible {
+                        physical_operators.push(PhysicalOperator::ZoneMapPruning);
+                    }
+                    physical_operators.push(PhysicalOperator::TombstoneFilter);
                 }
-                physical_operators.push(PhysicalOperator::TombstoneFilter);
                 if has_predicate {
                     physical_operators.push(PhysicalOperator::RowFilter);
                 }
-                physical_operators.push(PhysicalOperator::ColumnProjection);
+                if !observations.transaction_overlay {
+                    physical_operators.push(PhysicalOperator::ColumnProjection);
+                }
             }
             Some(LogicalOperator::Grouping { .. }) => {
                 physical_operators.push(PhysicalOperator::ManifestSnapshotSource);
-                if zone_map_eligible {
-                    physical_operators.push(PhysicalOperator::ZoneMapPruning);
+                if observations.transaction_overlay {
+                    physical_operators.push(PhysicalOperator::TombstoneFilter);
+                    physical_operators.push(PhysicalOperator::TransactionOverlay);
+                } else {
+                    if zone_map_eligible {
+                        physical_operators.push(PhysicalOperator::ZoneMapPruning);
+                    }
+                    physical_operators.push(PhysicalOperator::TombstoneFilter);
                 }
-                physical_operators.push(PhysicalOperator::TombstoneFilter);
                 if has_predicate {
                     physical_operators.push(PhysicalOperator::RowFilter);
                 }
@@ -263,9 +288,6 @@ impl Planner {
             | None => return Err(PlanError::InvalidLogicalShape),
         }
 
-        if observations.transaction_overlay {
-            physical_operators.push(PhysicalOperator::TransactionOverlay);
-        }
         physical_operators.push(PhysicalOperator::Materialize);
         Ok(PhysicalPlan {
             logical_operators: logical.operators,
