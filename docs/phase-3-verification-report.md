@@ -532,3 +532,25 @@ result is only a local fixed-fixture measurement of the `query_planner_bench`
 target, not a universal performance, cost-model, serializability,
 cross-process, durability, or whole-feature claim. Historical CI and status
 qualifications above continue to apply only to their recorded revisions.
+
+## Final-head CLI evidence (2026-08-15)
+
+This is fresh, focused local evidence for current code HEAD
+`87d131fcaa9d76bcb708ab3d2ebb2efb535de908`. That commit fixes the CLI `explain`
+syntax path by validating its complete grammar before opening the supplied dataset, so malformed
+requests retain the typed usage category instead of being masked by a missing-path operational
+error. The commands used the report's process-local native x64 MSVC/Windows SDK environment.
+
+| Command | Result |
+|---|---|
+| `cargo test -p strata-cli --no-default-features --test admin_cli` | Exit 0: 15 passed, 0 failed. |
+| `cargo test -p strata-cli --no-default-features` | Exit 0: 38 passed, 0 failed across the CLI package. |
+| `cargo clippy -p strata-cli --all-targets -- -D warnings` | Exit 0; no warnings. |
+| Direct `strata explain --json` invocation | Exit 2; JSON error category `usage`. |
+| Direct `strata explain <missing-path> id eq 1 --json` invocation | Exit 1; JSON error category `operational`. |
+| `cargo fmt --check` and `git diff --check` | Exit 0. |
+
+The broad workspace gates recorded above apply to code head `29c70e3` (or earlier recorded
+heads). They were not rerun at `87d131f`, and this section does not extend those results to the
+final head. The previously aborted/unrun transaction loom models, unavailable `maturin`
+wheel/import smoke, and remaining fuzz, chaos, and package gates are not claimed green.
