@@ -585,3 +585,39 @@ This section supplies fresh local fuzz and chaos evidence only for the named
 completed gates at `756ab70`. It does not convert the interrupted 8,000-trial
 run, other unrun gates, or historical results at different revisions into a
 pass claim.
+
+## Verification and rustdoc closure (2026-08-15, `191337e`)
+
+This additive record applies to `191337e4e75bf96d6db2939ab84d7cd524750375`, a
+report-only descendant of `756ab70`. The unrelated
+`.superpowers/sdd/agent-production-readiness-plan/reports/task-2-report.md`
+worktree edit was preserved throughout. The only source change is the
+rustdoc-only replacement of the unresolved
+`crate::backend::LocalFs::put` intra-doc link in
+`crates/storage/src/manifest.rs` with inline code; it does not change the
+manifest commit protocol or backend interface.
+
+All native commands used the documented process-local x64 MSVC `14.52.36615`
+and Windows SDK `10.0.26100.0` `PATH`, `LIB`, and `INCLUDE` directories. The
+wheel retry additionally set Cargo's temporary target-linker environment
+variable to that already-documented `link.exe` because the first maturin
+subprocess did not inherit a discoverable linker despite the configured
+`PATH`. No repository dependency, lockfile, packaging configuration, or
+workflow was changed.
+
+| Gate | Fresh result |
+|---|---|
+| 8,000-trial real-thread HNSW gate | The user-supplied short `--exact` filter selected 0 tests (exit 0; 0.33 s), so it is not evidence. The corrected exact registered name, `graph::tests::concurrent_inserts_into_a_genuinely_empty_graph_never_strand_a_node`, exited 0: 1 passed, 158 filtered; 28.67 s test time / 29.10 s wall time. |
+| Declared fuzz discovery and lockfile | Exit 0; exactly `datafile_parse`, `manifest_current_parse`, `manifest_parse`, and `segment_parse`; `fuzz/Cargo.lock` remained `ECDAB8CA45B67F1B522E4FE2D435171B9B9DCF716C82EBFDE2838C82F3DBACD5`. |
+| Declared fuzz builds | All exit 0 with `CARGO_BUILD_JOBS=1`: `manifest_parse` 17.23 s, `datafile_parse` 2.04 s, `manifest_current_parse` 1.99 s, and `segment_parse` 1.43 s. MSVC import-library messages were emitted as existing `linker_messages` warnings. |
+| Deterministic parser smokes | Five `-runs=1 -seed=24740` runs exited 0: both checked-in `datafile_parse` corpus inputs plus temporary `manifest_parse`, `manifest_current_parse`, and `segment_parse` inputs (0.68â€“0.77 s each). |
+| Fast chaos | Exit 0: 1 passed, 5 filtered; 36.49 s. |
+| Thorough chaos | Exit 0: 1 passed, 5 filtered; 829.15 s. Output reached `2000/2000` seeds checked with zero violations. |
+| Pinned wheel workflow | `maturin==1.9.4` was installed into a temporary Python 3.14 virtual environment. The first `maturin build --release --locked` attempt exited 101 with `linker link.exe not found`; the retry with only a temporary explicit Cargo linker path exited 0 and built `strata_bindings-0.1.0-cp314-cp314-win_amd64.whl` in 2m24s. The wheel installed and imported successfully; all 13 current module exports (`Dataset`, `Snapshot`, `Transaction`, and 10 typed exceptions, including `InsufficientHistoryError`) were asserted. Existing pinned maturin remains the correct project workflow; no alternative packager was needed. |
+| Rustdoc closure | `cargo doc --workspace --no-deps` exited 0 and generated documentation with no warning output, including no unresolved `LocalFs::put` link. |
+| Focused regression | `cargo test -p strata-storage manifest -- --nocapture` exited 0: 31 passed, 78 filtered; 0.04 s test time. |
+| Final focused static checks | `cargo fmt --check`, `cargo clippy -p strata-storage --all-targets -- -D warnings`, and `git diff --check` each exited 0; clippy completed in 9.70 s. |
+
+This is focused local evidence only. It does not claim that unrun workspace-wide
+clippy, transaction loom, benchmark, portability, or historical exact-head
+gates passed at `191337e`.

@@ -3,8 +3,8 @@
 //!
 //! A manifest is one immutable file per version, named so lexicographic
 //! order equals numeric order (`{version:020}.manifest`, following Lance's
-//! own convention). Commit is: write to a temp name (via
-//! [`crate::backend::LocalFs::put`]), fsync, atomically rename into place.
+//! own convention). Commit is: write to a temp name (via `LocalFs::put`),
+//! fsync, atomically rename into place.
 //! A crash mid-write leaves only a `.tmp-*` file behind. Its stem (the
 //! part before `.manifest`) always starts with a `.` from the temp-name
 //! prefix, so it can never parse as a `u64` version — `read_current`
