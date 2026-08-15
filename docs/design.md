@@ -15,20 +15,32 @@ The manifest is intended to be the single publication boundary for row and index
 The current design provides explicit snapshot-preserving compaction, age-based manifest retention,
 and vacuum of recognized unprotected objects. It does not provide arbitrary orphan cleanup,
 guaranteed bounded segment growth, or time-travel retention. Dataset-owned schema, manifest identity, row/file integrity, and durable
-row-ID high-water checks are implemented within the named local bounds; schema evolution and
-universal power-loss claims remain deferred. See the audit rather than treating the format as
-corruption proof.
+row-ID high-water checks are implemented within the named local bounds. The versioned schema
+catalog supports one explicit, bounded evolution: version 1 to version 2 may add one nullable
+logical column, rewriting row objects and copying listed immutable segments before one new manifest
+is published. Target schemas must pass the same dataset preflight used by create and recovery; in
+particular `_row_id` and `_timestamp` remain reserved physical names. General schema evolution,
+arbitrary type changes, reverse migrations, and universal power-loss claims remain deferred. See
+the audit rather than treating the format as corruption proof.
 
 ## Transactions and snapshots
 
-`Dataset::begin` creates a write-only transaction against the current immutable snapshot. Preparation
-allocates physical row IDs, writes data, and builds vector segments before the commit lock is taken.
-Under the shared handle's lock, write-write conflicts are checked against recent committed history.
-A clean commit publishes a new manifest and installs a replacement immutable snapshot.
+`Dataset::begin` captures an immutable base snapshot for a transaction. The stable, bounded
+transaction read API merges that base with the transaction's private staged writes: scans (including
+predicate reads) and group reads expose staged inserts, replacements, and deletes. Lookup is only
+for physical row IDs already present in the base snapshot; it reflects a staged replacement or delete
+of such a row, while a staged insert has no physical row ID until commit and cannot be looked up
+pre-commit. `vector_search` can use the base index only while the transaction has no staged writes;
+after staged writes it returns a typed unsupported-transaction-read error rather than silently
+returning stale base-snapshot results. Preparation allocates physical row IDs, writes data,
+and builds vector segments before the commit lock is taken. Under the shared handle's lock,
+write-write conflicts are checked against recent committed history. A clean commit publishes a new
+manifest and installs a replacement immutable snapshot.
 
-The API does not provide transactional scan/search or read-your-own-writes. The supported concurrency
-boundary is one process sharing one `Dataset` handle. Independent openers do not share the lock,
-allocator, history, or in-memory snapshot, and cross-process conditional publication is Phase 4.
+The supported concurrency boundary is one process sharing one `Dataset` handle. This bounded read
+API and write-write OCC have snapshot isolation as their ceiling, not full serializability; it is not
+a general read/write query interface. Independent openers do not share the lock, allocator, history,
+or in-memory snapshot, and cross-process conditional publication is Phase 4.
 
 Rows are append-only physical records. Delete adds a tombstone. Update tombstones the old physical row
 and inserts replacement data with a new physical row ID. Future tombstones, target validation,
@@ -47,8 +59,11 @@ reclaims superseded listed objects only after publication and active-snapshot ch
 ## Query primitives
 
 The query crate provides predicates, statistics/zone-map pruning, filtered ANN constraints, explain
-information, and in-memory group-by primitives. It does not yet provide a complete planner, SQL
-parser, stable client contract, or guaranteed cost bound for selective queries.
+information, in-memory group-by primitives, and a bounded logical/physical planner. The planner
+accepts only the supported source/projection/predicate, grouping, and vector-search shapes; it
+records selected physical operators plus captured file/segment pruning and transaction-overlay
+observations, then reuses the immutable-snapshot operators. It is not SQL, a general optimizer, a
+cost model, or a guaranteed cost bound for selective queries.
 
 ## Verification boundary
 

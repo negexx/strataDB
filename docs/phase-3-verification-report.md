@@ -8,9 +8,9 @@
 uncommitted documentation closeout. Final exact-head provenance must be the commit containing these
 docs.
 
-## Fresh cloud provenance
+## Historical cloud provenance (2026-08-13)
 
-Canonical final exact-head GitHub Actions run
+Canonical final historical exact-head GitHub Actions run
 [31714285971](https://github.com/negexx/strataDB/actions/runs/31714285971) completed successfully
 for final verification head `7be77d5`. The controller reported all
 workflow jobs successful:
@@ -22,7 +22,7 @@ workflow jobs successful:
 - `thorough-chaos`; and
 - `windows-directory-durability`.
 
-This is the canonical final exact-head evidence for the Task 1–6 remediation aggregate, including
+This is the canonical final historical exact-head evidence for the Task 1–6 remediation aggregate, including
 manifest-publication timestamps; Task 6 exact-key protection for recovery-recognized numeric manifest
 keys, with duplicate padded/unpadded aliases rejected fail-closed; constrained vacuum cleanup; lifecycle
 inventory compatibility; and compaction crash/reopen coverage. It also covers the unpadded current-manifest
@@ -31,19 +31,19 @@ dataset the vector search returns physical row ID `0`. The active-snapshot compa
 correctly asserts that two unprotected superseded objects are reclaimed while the historical snapshot's
 row file and vector segment remain readable.
 
-## Prior cloud provenance
+## Earlier historical cloud provenance
 
-The earlier exact-head GitHub Actions run
+The earlier historical exact-head GitHub Actions run
 [31701969422](https://github.com/negexx/strataDB/actions/runs/31701969422) completed successfully
 for remediation head `105c24f74dc68d8c4c552bfa9d4b63b1a4c79a2c`, with the same controller job set
 listed above. It remains retained provenance for the earlier Task 1–4 remediation aggregate.
 
-The still earlier exact-head GitHub Actions run
+The still earlier historical exact-head GitHub Actions run
 [31698710652](https://github.com/negexx/strataDB/actions/runs/31698710652) completed successfully
 for remediation head `0141355d1261ee20d8128cbc11c38b23e83045c9`, with the same controller job set
 listed above. It remains retained provenance for the earlier Task 1–4 remediation aggregate.
 
-## Fresh local Windows verification
+## Historical local Windows verification
 
 The 2026-08-13 native x64 MSVC environment was verified by explicit `PATH` setup and
 `where.exe cl`/`where.exe link`. The seven targeted lifecycle test binaries passed:
@@ -57,8 +57,8 @@ The 2026-08-13 native x64 MSVC environment was verified by explicit `PATH` setup
 | `git diff --check` | Exit 0. |
 
 These native Windows results include the workspace test suite, lint, format, and diff checks, but
-make no local loom claim. The canonical exact-head cloud run above remains authoritative for the
-loom and broader CI gates.
+make no local loom claim. The canonical historical exact-head cloud run above remains authoritative
+only for its recorded head and does not establish a CI result for later code or evidence commits.
 
 ## Claim boundary
 
@@ -69,3 +69,589 @@ legacy zero timestamps, vacuum deletes only recognized unprotected objects, and
 protected history, or unknown objects can prevent that observation from meeting a requested bound.
 This evidence does not establish serializability, cross-process coordination, universal power-loss
 durability, or atomic/continuing storage-bound enforcement.
+
+## Task 1 fix round 2 verification (2026-08-14)
+
+This round re-established the Task 1 transaction-read-view red/green evidence without changing
+current-branch source, Git history, dependencies, or the transaction contract. Every command put
+the requested linker directory first on `PATH`:
+
+```text
+C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\MSVC\14.52.36615\bin\Hostx64\x64
+```
+
+The invoking Windows shell had no `LIB` or `INCLUDE` environment variables. `link.exe` was found
+through the required prefix, but a prefix-only preliminary invocation stopped at `LNK1181` for
+`kernel32.lib`, before Rust could compile the test. For each recorded Cargo invocation, the existing
+`VsDevCmd.bat -arch=x64 -host_arch=x64` environment was initialized and the installed MSVC x64
+library directory (`...\VC\Tools\MSVC\14.52.36615\lib\x64`) was prepended to `LIB`; the required
+linker directory was then prepended again to `PATH`. This was process-local environment setup, not
+a repository change.
+
+| Command | Result |
+|---|---|
+| In a detached temporary worktree at `acb5f99`, after copying the current `crates/txn/tests/transaction_read_view.rs`: `cargo test -p strata-txn --no-default-features --test transaction_read_view` | Exit 101, as expected for the red phase. Compilation reached the copied test and reported 11 E0599 errors: missing `Transaction::{scan_query, group_by_query, lookup_row, vector_search_query}` methods and missing `QueryExecutionError::UnsupportedTransactionRead`. The temporary worktree was then removed. |
+| `cargo test -p strata-txn --no-default-features --test transaction_read_view` | Exit 0: 6 passed, 0 failed. |
+| `cargo test -p strata-txn --no-default-features --features parallel-insert --lib --tests` | Exit 0: 292 unit/integration tests passed, 0 failed; doctests were excluded. |
+| `cargo clippy -p strata-txn --all-targets --features parallel-insert -- -D warnings` | Exit 0; no warnings. |
+| `cargo rustc -p strata-txn --lib --profile test --message-format=json -- --cfg loom`, followed by the produced test binary with `--exact dataset::loom_tests::transaction_read_overlay_stays_private_while_disjoint_and_contested_writes_commit --test-threads=1` | Build exit 0; model exit 0: 1 passed, 0 failed, 230 filtered out. |
+
+The loom result is a targeted local model result, not a replacement for the broader cloud loom
+provenance above. This entry records verification evidence only and makes no whole-feature or
+broader Phase 3 completion claim.
+
+## Task 2 schema-migration verification (2026-08-14)
+
+Task 2 adds the versioned durable schema catalog and the single explicit
+`add_nullable_column` migration. The migration rewrites row objects, copies immutable vector
+segments to new locations, then publishes their references and the catalog version in one
+manifest. Existing snapshots remain bound to their captured manifest and schema; recovery rejects
+unknown catalog versions and selects only a fully published manifest.
+
+All Cargo commands below ran in a process-local MSVC environment with the requested linker
+directory first on `PATH`, plus the MSVC and Windows SDK x64 library directories on `LIB`. This is
+environment setup only, not a repository change.
+
+| Command | Result |
+|---|---|
+| `cargo test -p strata-txn --no-default-features --test schema_migrations` | Exit 0: 3 passed, 0 failed. |
+| `cargo test -p strata-storage schema_catalog_version_round_trips_and_legacy_manifests_default_to_v1` | Exit 0: 1 passed, 0 failed. |
+| `cargo test -p strata-storage recovery_rejects_an_unknown_schema_catalog_version` | Exit 0: 1 passed, 0 failed. |
+| `cargo test -p strata-txn --no-default-features migration_after_a_failed_manifest_commit_uses_only_the_complete_manifest` | Exit 0: 1 passed, 0 failed. |
+| `cargo test -p strata-txn --no-default-features --features parallel-insert --lib --tests` | Exit 0: 296 passed, 0 failed. |
+| `cargo clippy -p strata-storage --all-targets -- -D warnings` | Exit 0; no warnings. |
+| `cargo clippy -p strata-txn --all-targets --features parallel-insert -- -D warnings` | Exit 0; no warnings. |
+| `cargo fmt --check` after `cargo fmt` | Exit 0. |
+
+The first two broader test-launch attempts exited 1 before a Rust test ran: first `LNK1104`
+(`msvcrt.lib`), then `LNK1181` (`kernel32.lib`). Supplying the explicit Windows SDK x64 `LIB`
+entries fixed the machine-local linker configuration; the successful commands above are the fresh
+verification evidence. This Task 2 entry is scoped to the documented single-process/shared-handle
+and local-filesystem boundary. It does not claim distributed coordination, serializability, or
+universal power-loss durability.
+
+## Task 2 fix round 1 verification (2026-08-14)
+
+This review-fix round adds a migration-only, pre-publication fault seam. The
+fault runs only with `test-fault-injection`, after replacement row/immutable
+segment objects have been validated and immediately before `commit_manifest_with`.
+The new regression proves a returned typed I/O error leaves the v1 manifest as
+the complete manifest selected after reopen. It also adds a crate-scoped loom
+model of `migrate_schema` lifecycle exclusivity versus a stale v1 transaction
+publication lease: the stale transaction can publish only before migration, or
+otherwise observes v2 and is rejected by the existing typed schema-version
+guard. The model intentionally scopes loom to that coordinator/catalog state
+boundary; migration's Arrow/filesystem rewrite path is covered by the concrete
+reopen test rather than loom's bounded coroutine stack.
+
+Every Cargo command below put
+`C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\MSVC\14.52.36615\bin\Hostx64\x64`
+first on `PATH` and prepended the MSVC x64, Windows SDK UCRT x64, and Windows
+SDK UM x64 directories to `LIB`; this was process-local environment setup.
+
+| Command | Result |
+|---|---|
+| Detached temporary worktree at `e536430`, after materializing the current `crates/txn/tests/schema_migrations.rs`: `cargo test -p strata-txn --no-default-features --features test-fault-injection --test schema_migrations migration_failure_before_publication_reopens_the_prior_complete_manifest -- --exact` | Exit 1, expected red phase. Rust compiled the test and reported 19 missing Task 2 symbols, including `SchemaMigration`, `Dataset::migrate_schema`, `Dataset::schema_version`, migration error variants, and the new `fail_before_migration_manifest_publication` hook. A prefix-only preliminary launch exited 1 at `LNK1104` for `msvcrt.lib` before Rust compilation; the explicit `LIB` setup above produced the recorded red result. |
+| `cargo test -p strata-txn --no-default-features --features test-fault-injection --test schema_migrations migration_failure_before_publication_reopens_the_prior_complete_manifest -- --exact` | Exit 0: 1 passed, 0 failed. |
+| `cargo test -p strata-txn --no-default-features --features test-fault-injection --test schema_migrations` | Exit 0: 4 passed, 0 failed. |
+| `cargo test -p strata-txn --no-default-features --features parallel-insert --lib --tests` | Exit 0: all 296 unit/integration tests passed, 0 failed. |
+| `cargo rustc -p strata-txn --lib --profile test -- --cfg loom`, then the produced binary with `--exact dataset::loom_tests::migration_exclusivity_rejects_a_stale_schema_commit_or_migrates_its_published_rows --test-threads=1` | Build exit 0 (one localized `linker_messages` warning from `link.exe`); model exit 0: 1 passed, 0 failed, 232 filtered out. |
+| `cargo clippy -p strata-txn --all-targets --features test-fault-injection -- -D warnings` | Exit 0; no warnings. |
+| `cargo clippy -p strata-txn --all-targets --features parallel-insert -- -D warnings` | Exit 0; no warnings. |
+| `cargo fmt --check` | Exit 0. |
+
+The detached temporary worktree was used only for red evidence and was removed
+after the final diff checks. These results remain limited to the
+documented local, one-process/shared-`Dataset` boundary and do not claim
+serializability, distributed coordination, or universal power-loss durability.
+
+## Task 2 fix round 2 evidence (2026-08-15)
+
+This is evidence-only. A detached temporary worktree at `80b4fe8` (the initial
+Task 2 implementation) received the final
+`crates/txn/tests/schema_migrations.rs` test from `2f81581`; no current source
+or history was modified. Unlike the earlier base used for the first red run,
+this base already supplies `SchemaMigration`, `Dataset::migrate_schema`, and
+the schema-version API. The test therefore isolates the migration-specific
+pre-publication seam introduced by `2f81581`.
+
+The process-local MSVC environment set the following explicit directories:
+
+```powershell
+$env:PATH = 'C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\MSVC\14.52.36615\bin\Hostx64\x64;' + $env:PATH
+$env:LIB = 'C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\MSVC\14.52.36615\lib\x64;C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\ucrt\x64;C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\um\x64;' + $env:LIB
+$env:INCLUDE = 'C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\MSVC\14.52.36615\include;C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\ucrt;C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared;C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um;C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\winrt;' + $env:INCLUDE
+Set-Location 'C:\Users\dagda\Downloads\nex\strataDB\.worktrees\task-2-fix-round-2-red'
+cargo test -p strata-txn --no-default-features --features test-fault-injection --test schema_migrations migration_failure_before_publication_reopens_the_prior_complete_manifest -- --exact
+```
+
+| Command | Result |
+|---|---|
+| The command above, in the detached `80b4fe8` worktree after materializing the final test | Exit 101, expected red phase. The test crate compiled against the initial Task 2 migration API and failed only because the migration-specific recovery seam was absent; no Rust test executed. |
+
+Relevant final Cargo output was:
+
+```text
+   Compiling strata-storage v0.1.0 (C:\Users\dagda\Downloads\nex\strataDB\.worktrees\task-2-fix-round-2-red\crates\storage)
+   Compiling strata-index v0.1.0 (C:\Users\dagda\Downloads\nex\strataDB\.worktrees\task-2-fix-round-2-red\crates\index)
+   Compiling strata-query v0.1.0 (C:\Users\dagda\Downloads\nex\strataDB\.worktrees\task-2-fix-round-2-red\crates\query)
+   Compiling strata-txn v0.1.0 (C:\Users\dagda\Downloads\nex\strataDB\.worktrees\task-2-fix-round-2-red\crates\txn)
+error[E0425]: cannot find function `fail_before_migration_manifest_publication` in module `strata_txn::dataset::test_support`
+   --> crates\txn\tests\schema_migrations.rs:212:53
+    |
+212 |     let _fault = strata_txn::dataset::test_support::fail_before_migration_manifest_publication();
+    |                                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+   ::: crates\txn\src\dataset.rs:395:5
+    |
+395 |     pub fn fail_after_compaction_manifest_publication() -> PostPublicationFaultGuard {
+    |     -------------------------------------------------------------------------------- similarly named function `fail_after_compaction_manifest_publication` defined here
+
+For more information about this error, try `rustc --explain E0425`.
+error: could not compile `strata-txn` (test "schema_migrations") due to 1 previous error
+```
+
+The temporary worktree was then removed. This result demonstrates the missing
+migration fault seam/recovery coverage specifically; it is not the earlier
+missing-migration-API failure and makes no broader completion claim.
+
+## Task 3 query-planning evidence (2026-08-15)
+
+Task 3 adds a small logical/physical planner for the existing immutable
+snapshot query primitives. Explain observations are captured snapshot facts,
+not cost or cardinality guarantees. Planned scan, group-by, and vector-search
+entry points validate and select a path, then use the same direct snapshot
+operators, preserving the existing snapshot, tombstone, null, projection-order,
+and typed-error contracts.
+
+All commands below used a process-local native x64 MSVC environment: first
+`VsDevCmd.bat -arch=x64 -host_arch=x64`, then the MSVC linker directory first on
+`PATH`, and the MSVC 14.52.36615 plus Windows SDK 10.0.26100.0 UCRT/UM x64
+directories on `LIB` and the corresponding MSVC/Windows SDK include directories
+on `INCLUDE`.
+
+| Command | Result |
+|---|---|
+| `cargo test -p strata-query planner_tests::planner_rejects_a_predicate_after_a_result_operator -- --exact` before the ordering guard | Exit 101, expected red phase: `LogicalPlan::new` accepted `Source -> Projection -> Predicate -> Materialize`. |
+| The same focused test after the ordering guard | Exit 0: 1 passed, 0 failed. |
+| `cargo test -p strata-query` | Exit 0: 63 passed, 0 failed; 0 doctests. |
+| `cargo test -p strata-txn --no-default-features --test query_planner --test phase_3_pruning` | Exit 0: 4 planner-equivalence tests and 3 Phase 3 pruning tests passed. |
+| `cargo bench -p strata-bench --bench query_planner_bench` | Exit 0. Criterion executed every case below. The initial two attempts exited 1 during benchmark compilation (the local `fixture` value shadowed Criterion's setup function, then `RecordBatch::try_new` was passed without unwrapping); both benchmark-only defects were corrected before this successful measurement. |
+
+Criterion used its default 3 s warmup, 100 samples, and approximately 5 s
+measurement target. The fixture was four committed 64-row batches (256 rows),
+with a 2-dimensional vector column; the predicate was `id >= 192`, pruning the
+first three row files. Direct denotes the established snapshot facade, and
+planned includes validation/explain selection before delegating to that same
+operator path.
+
+| Workload | Direct 95% interval | Planned 95% interval | Observed comparison |
+|---|---:|---:|---|
+| Projection scan (`id,category`) | 577.39–581.76 µs | 567.16–575.79 µs | Planned interval was lower on this local rerun. |
+| Selective predicate scan (`id,amount`, `id >= 192`) | 136.70–137.28 µs | 138.81–140.99 µs | Planned path was slightly slower on this fixture. |
+| Grouped aggregation (`sum(amount)` by `category`, same predicate) | 150.72–152.72 µs | 151.74–152.36 µs | Intervals overlap closely. |
+| Filtered vector search (top 10, hydrate `id`, same predicate) | 1.3549–1.3710 ms | 1.3599–1.3729 ms | Intervals overlap closely. |
+| Shared-handle transaction commit (two concurrent one-row commits) | 51.992–53.022 ms | n/a | Commit baseline only; it does not claim planner cost. |
+
+Criterion emitted its standard advisory that the default 5-second target could
+not fit 100 vector-search or shared-handle-commit samples; it still collected
+and analyzed all 100 samples for each case. These results are local workload
+evidence only and do not establish universal performance, a cost model,
+serializability, cross-process coordination, or a broader Phase 3 completion
+claim.
+
+## Task 4 Python API verification (2026-08-15)
+
+The PyO3 facade now exposes the versioned Dataset/Snapshot/Transaction lifecycle, Arrow IPC
+transaction scan overlay, explicit nullable-column migration result, and stable explain dictionaries.
+All operations remain limited to a single process sharing one Dataset handle; transaction vector
+search with staged data remains a typed unsupported operation.
+
+| Command | Result |
+|---|---|
+| `cargo test -p strata-bindings --no-default-features transaction_wrapper_reads` before schema capture | Exit 101, expected red: `PyTransaction::scan` referenced an uncaptured `schema` and the PyO3 helper methods were incorrectly exported. |
+| `cargo test -p strata-bindings --no-default-features transaction_wrapper_reads` after capture/helper separation | Exit 0: 1 passed, 0 failed. |
+| `cargo test -p strata-bindings --no-default-features stable_python_contract_commits_migrates_and_explains_without_rust_layouts` before wrappers | Exit 101, expected red: missing commit, migration, explain, and schema-version façade methods. |
+| `cargo test -p strata-bindings --no-default-features` | Exit 0: 15 passed, 0 failed. |
+| `cargo clippy -p strata-bindings --no-default-features --all-targets -- -D warnings` | Exit 0; no warnings. |
+| `cargo fmt --check` | Exit 0. |
+
+All native bindings commands used the process-local MSVC x64 linker and SDK library directories;
+no repository configuration changed for that environment.
+
+## Task 4 fix round 1 verification (2026-08-15)
+
+The Python facade now exposes stable exception subclasses for conflict, schema/migration, invalid
+query, unsupported transaction reads, storage/durability, and corruption. `ConflictError` carries a
+`contested_row_ids` attribute. `PyDataset.begin()` takes the wrapper schema from the same transaction
+base snapshot, and `Transaction.vector_search` delegates to the bounded Rust contract: it searches an
+unchanged base snapshot and raises `UnsupportedTransactionReadError` when staged writes would make
+base-index results stale. Batch-schema mismatches now render stable human-readable schema context
+instead of Rust `Debug` output.
+
+| Command | Result |
+|---|---|
+| `cargo test -p strata-bindings --no-default-features tests::transaction_schema_accessor_stays_bound_to_its_base_snapshot -- --exact` before the fix | Exit 101, expected red: the five stable exception classes, `Transaction::schema`, and `PyTransaction::vector_search` were absent. |
+| `cargo test -p strata-txn --no-default-features error::tests::new_error_variants_format_with_their_context -- --exact` before the fix | Exit 101, expected red: `BatchSchemaMismatch` quoted the schema strings through Rust `Debug` formatting. |
+| `cargo test -p strata-bindings --no-default-features` | Exit 0: 17 passed, 0 failed. |
+| `cargo test -p strata-txn --no-default-features dataset::tests::dataset_schema_is_persisted_and_rejects_renamed_or_castable_batches -- --exact` | Exit 0: 1 passed, 0 failed. |
+| `cargo test -p strata-txn --no-default-features error::tests::new_error_variants_format_with_their_context -- --exact` | Exit 0: 1 passed, 0 failed. |
+| `cargo build --workspace` | Exit 0. The Windows linker emitted its existing import-library informational warning for `strata-bindings`; no Rust source warning was emitted. |
+| `cargo clippy --workspace --all-targets -- -D warnings` | Exit 0; no warnings. |
+| `maturin 1.9.4 build --release --locked`, then temporary-wheel installation/import | Exit 0. The CPython 3.14 wheel imported and asserted `Dataset`, `Snapshot`, `Transaction`, and every stable exception export. |
+
+The package-smoke workflow retains the same locked-wheel convention and now checks the new
+`Transaction` and exception exports.
+
+## Task 3 fix round 1 evidence (2026-08-15)
+
+This evidence-and-documentation round did not change planner source, dependencies, or planner
+semantics. It used a detached worktree at the pre-Task-3 base `6f4d2c0`, then materialized the final
+`crates/txn/tests/query_planner.rs` integration test and the final planner construction/invalid-plan
+test bodies from `crates/query/src/lib.rs`. The worktree contained only those test copies and was
+removed after its status/diff check.
+
+Each focused command initialized the full local x64 MSVC environment with
+`VsDevCmd.bat -arch=x64 -host_arch=x64`, then put
+`C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\MSVC\14.52.36615\bin\Hostx64\x64`
+first on `PATH`; it prepended MSVC `14.52.36615` x64 plus Windows SDK
+`10.0.26100.0` UCRT/UM x64 directories to `LIB`, and the corresponding
+MSVC/Windows SDK directories to `INCLUDE`. `where cl` and `where link` resolved to that MSVC
+x64 directory before the first Cargo run.
+
+| Discriminator and exact focused command | Result |
+|---|---|
+| Construction/invalid logical plan: `cargo test -p strata-query planner_red_tests::planner_rejects_a_predicate_after_a_result_operator -- --exact` | Exit 101, expected red. The materialized final test could not compile because `strata_query` at `6f4d2c0` exported no `LogicalOperator`, `LogicalPlan`, or `PlanError`; no test body ran. This is direct missing-planner-API evidence, not a claim about a later assertion result. |
+| Explain fields/operators: `cargo test -p strata-txn --no-default-features --test query_planner unfiltered_plans_do_not_claim_a_row_filter_or_zone_map_path -- --exact` | Exit 101, expected red. The materialized final integration crate could not compile: `strata_query::{LogicalOperator, PhysicalOperator}` and `Snapshot::explain_scan_query`/`explain_vector_search_query` were absent. Cargo compiles the full test crate before applying the filter, so zero test bodies ran. |
+| Explain fields plus direct/planned scan, group, and vector equivalence: `cargo test -p strata-txn --no-default-features --test query_planner planned_queries_match_direct_snapshot_operators_and_report_selection_evidence -- --exact` | Exit 101, expected red. The same missing planner exports, `explain_*`, and `execute_planned_{scan,group_by,vector_search}_query` APIs produced 12 compiler errors; no assertion result is claimed. |
+| Direct/planned equivalence with tombstones, nulls, projection ordering, and invalid requests: `cargo test -p strata-txn --no-default-features --test query_planner planned_paths_preserve_tombstones_nulls_projection_order_and_invalid_request_errors -- --exact` | Exit 101, expected red. The full materialized integration crate again stopped at the same 12 missing planner API errors before this filtered test could run. |
+
+The first integration compile reached `strata-txn` and reported exactly the absent public API expected
+at this pre-Task-3 base: two unresolved planner operator exports; three missing `explain_*` methods;
+and seven missing `execute_planned_*` method uses. This establishes a red precondition for each
+discriminator, but it does not manufacture a runtime failure where compilation prevented one. The
+current Task 3 green evidence and measured benchmark output remain the preceding section; neither
+set of results claims SQL support, a cost model, serializability, cross-process coordination, or
+universal performance.
+
+## Task 6 final branch verification (2026-08-15)
+
+This is a bounded, local Windows record for `codex/agent-production-readiness` at
+`HEAD` `36a3faa` (merge-base with `origin/main` `f362e54`). It preserves the historical
+evidence above and records only the commands actually run against that head; it is not a
+claim that every complete-branch gate passed.
+
+Each Cargo command used a process-local native x64 MSVC/Windows SDK environment. `PATH`
+began with `C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\MSVC\14.52.36615\bin\Hostx64\x64`;
+`LIB` began with the corresponding MSVC x64 directory and Windows SDK `10.0.26100.0`
+UCRT/UM x64 directories; and `INCLUDE` began with the corresponding MSVC and Windows SDK
+UCRT/shared/UM/winrt directories. `where.exe cl` and `where.exe link` both resolved to that
+MSVC x64 directory.
+
+| Command | Result |
+|---|---|
+| `cargo fmt --check` | Exit 0. |
+| `cargo metadata --no-deps --format-version 1` | Exit 0. |
+| `cargo check --workspace` | Exit 0. |
+| `cargo build --workspace` | Exit 0. The existing `strata-bindings` `linker_messages` warning remained: MSVC reported creation of `strata_ext.dll.lib` and `strata_ext.dll.exp`; no Rust-source warning is claimed. |
+| `cargo test --workspace --no-default-features` | Exit 0. The bindings unit binary passed 17/17; `admin_cli` and `phase_2_cli` each passed 12/12. |
+| `cargo test -p strata-txn --no-default-features --test schema_migrations --quiet` | Exit 0: 3 passed, 0 failed, 0 ignored. This separately records the migration-test count also included in the successful workspace run. |
+| `git diff --check` | Exit 0 after this evidence-only edit. |
+
+The normal workspace test selection retained its intentionally ignored real-thread HNSW stress
+test and thorough 2,000-seed chaos/recovery test. Neither ignored test was force-run here.
+
+### Unrun and not claimed
+
+The following Task 6 gates were not run in this local evidence pass and are not claimed: workspace
+clippy, `cargo doc --workspace --no-deps`, `cargo deny check bans sources advisories`, the
+`parallel-insert` test/clippy checks, crate-scoped loom builds and binaries, and the
+fault-injection recovery gates. The native workspace test command does not enable the
+fault-injection feature and is not evidence for those recovery gates. `maturin` was absent, so no
+packaging/wheel-import smoke ran. No Criterion benchmark command ran, so this section adds no
+performance measurement or comparison. These omissions, the intentionally ignored tests, and the
+existing linker informational warning mean this record must not be read as a full-branch-green or
+complete-feature claim.
+
+## Task 6 exact-HEAD partial Windows verification (2026-08-15)
+
+This later run is a partial exact-HEAD record for `29c70e3f2f6a7886cf108985fa323b2ffd4aafae`.
+It used a process-local x64 environment with MSVC `14.52.36615` and Windows SDK
+`10.0.26100.0`: `PATH` began with `...\\VC\\Tools\\MSVC\\14.52.36615\\bin\\Hostx64\\x64`,
+`LIB` began with the MSVC x64, SDK UCRT x64, and SDK UM x64 directories, and `INCLUDE`
+began with the matching MSVC and SDK UCRT/shared/UM/winrt directories. In that environment,
+`link.exe` resolved from the requested MSVC directory and the SDK x64 `kernel32.lib` existed.
+
+| Command | Result |
+|---|---|
+| `cargo fmt --check` | Exit 0. |
+| `cargo metadata --locked --no-deps` | Exit 0; Cargo emitted its compatibility warning requesting an explicit `--format-version`. |
+| `cargo check --workspace` | Exit 0. |
+| `cargo build --workspace` | Exit 0; existing `strata-bindings` `linker_messages` warning reported MSVC creation of `strata_ext.dll.lib` and `strata_ext.dll.exp`. |
+| `cargo test --workspace --no-default-features` | Exit 0; all executed unit, integration, and doctest binaries passed. The normal ignored HNSW real-thread stress test and thorough 2,000-seed chaos test remained ignored. |
+| `cargo clippy --workspace --all-targets -- -D warnings` | Exit 0. |
+| `cargo doc --workspace --no-deps` | Exit 0; existing rustdoc warning: unresolved intra-doc link `crate::backend::LocalFs::put` in `crates/storage/src/manifest.rs`. |
+| `cargo deny check bans sources advisories` | Initial sandbox attempt exited 1 because the advisory DB lock path was read-only. The required rerun with advisory-cache write access exited 0: advisories, bans, and sources were OK; cargo-deny warned about duplicate lock entries for `getrandom`, `hashbrown`, `r-efi`, `thiserror`, and `thiserror-impl`. |
+| `cargo test -p strata-txn --features parallel-insert` | Exit 0; all executed tests and doctests passed, with 0 failures. |
+| `cargo clippy -p strata-txn --all-targets --features parallel-insert -- -D warnings` | Exit 0. |
+| `cargo test -p strata-txn --features test-fault-injection` | Exit 0; all executed tests and doctests passed, with 0 failures. |
+| `cargo test -p strata-txn --no-default-features --features test-fault-injection --test schema_migrations migration_failure_before_publication_reopens_the_prior_complete_manifest -- --exact` | Exit 0: 1 passed, 0 failed, 5 filtered out. |
+| `cargo test -p strata-txn --features chaos-injection --test manifest_retention_executor -- --exact manifest_prune_abort_before_directory_sync_preserves_latest_recovery --nocapture` | Exit 0: 1 passed, 0 failed, 5 filtered out. |
+
+The txn loom gate was started with the CI-style crate-scoped recipe
+`cargo rustc -p strata-txn --lib --profile test --message-format=json -- --cfg loom`, then the
+produced binary was invoked with `--exact <model> --test-threads=1`. The build exited 0 and
+emitted the existing localized MSVC `linker_messages` import-library warning. These two models
+passed: `one_writer_store_races_safely_with_many_readers_load` and
+`two_threads_deleting_the_same_row_exactly_one_conflicts`. The next exact model,
+`dataset::loom_tests::a_failed_commits_segment_is_never_searchable_under_concurrent_commits`,
+did not complete or emit a failure line within the practical run window. At user direction it was
+terminated together with its owning PowerShell process; it is **aborted**, not passed.
+
+### Unrun and not claimed
+
+Because the run stopped at that aborted txn loom model, the remaining txn loom models, all
+live-set-cache loom models, and all `strata-index` loom models were unrun. Criterion benchmark
+compile/run was unrun. `maturin` was unavailable on PATH, so the bindings wheel/import smoke was
+unrun. No additional standalone CLI integration invocation, fault-injection clippy invocation,
+thorough-chaos run, independent Terra review, or Sol final review was run in this partial pass.
+The only pre-existing worktree change was
+`.superpowers/sdd/agent-production-readiness-plan/reports/task-2-report.md`; it was preserved.
+This section records partial local evidence only and makes no whole-feature, complete-branch, or
+unrun-gate-green claim.
+
+## Task 6 verification-only closure attempt (2026-08-15)
+
+This entry is the current local record for code commit
+`29c70e3f2f6a7886cf108985fa323b2ffd4aafae`; the evidence baseline before this documentation
+edit was `95ca832f9c865e6a6bae54e9fa6f0b35d6af19bb`. `git diff --name-status
+29c70e3..95ca832` named only this report, so the compiled source tree was the stated code head.
+The historical cloud runs above are retained provenance for their own recorded revisions, not
+exact-head CI provenance for `29c70e3` or this evidence commit.
+
+The process-local environment called `VsDevCmd.bat -arch=x64 -host_arch=x64`, then placed MSVC
+`14.52.36615` x64 and Windows SDK `10.0.26100.0` UCRT/UM x64 directories first on `PATH`/`LIB`
+with matching `INCLUDE` directories. `where.exe cl` and `where.exe link` resolved to the requested
+MSVC x64 tools. The CI-style command
+`cargo rustc -p strata-txn --lib --profile test --message-format=json -- --cfg loom` exited 0 and
+produced `strata_txn-5c2704560b55f96c.exe`; its `--list --format terse` output included every
+current CI-named txn and live-set-cache model.
+
+| Gate | Current result |
+|---|---|
+| Txn loom: `one_writer_store_races_safely_with_many_readers_load` | Exit 0: 1 passed, 232 filtered, 0.00 s. |
+| Txn loom: `two_threads_deleting_the_same_row_exactly_one_conflicts` | Exit 0: 1 passed, 232 filtered, 8.40 s. |
+| Txn loom: `two_threads_deleting_disjoint_rows_both_succeed` | Exit 0: 1 passed, 232 filtered, 60.64 s. |
+| Txn loom: `concurrent_first_vector_commits_at_different_dimensions_are_not_both_accepted` | Exit 0: 1 passed, 232 filtered, 3.83 s. |
+| Txn loom: `a_failed_commits_segment_is_never_visible_to_a_concurrent_reader` | Exit 0: 1 passed, 232 filtered, 2.46 s. |
+| Txn loom: `a_commits_row_and_its_segment_become_visible_as_one_atomic_step` | Exit 0: 1 passed, 232 filtered, 3.88 s. |
+| Txn loom: `a_reader_never_sees_one_in_flight_commits_row_while_observing_an_unrelated_commits_row_id_counter` | No result. Two active invocations (PIDs 18128 started 06:46:41 and 18164 started 06:50:37) had emitted no failure or completion line; at the user's stop instruction their CPU times were 117.281 s and 58.062 s. Both exact-model processes were terminated and a subsequent process check found no active txn loom binary. This is **aborted**, not passed. |
+| Historically nonterminating txn loom: `a_failed_commits_segment_is_never_searchable_under_concurrent_commits` | Unrun in this closure attempt. Inspection of the locked `loom 0.7.2` source found bounded controls (`LOOM_MAX_PREEMPTIONS`, `LOOM_MAX_PERMUTATIONS`, and `LOOM_MAX_DURATION`), but no bounded invocation was started after the stop instruction; no bounded result is claimed. |
+| Remaining txn semantic/lifecycle/row-ID models, all live-set-cache models, and all index models | Unrun after the aborted reader/row-ID model; not claimed. |
+| Criterion `cargo bench -p strata-bench --bench query_planner_bench` | Unrun after the stop instruction. The intervals in the earlier Task 3 section are historical local measurements, not a rerun after final planner fixes at `29c70e3`. |
+| Locked wheel/import smoke | Unavailable: `Get-Command maturin` found no command, and `py -3.14 -m maturin --version` exited 1 with `No module named maturin`; no wheel was built or installed. |
+| Status provenance scan | Completed with `rg`: the status ledger's former unqualified `Exact-head CI run` reference was historical provenance and is qualified below. |
+| Rustdoc warning check | No fresh invocation after the stop instruction. The immediately preceding exact-head partial record remains the only recorded result: `cargo doc --workspace --no-deps` exited 0 with the unresolved `crate::backend::LocalFs::put` intra-doc link in `crates/storage/src/manifest.rs`. This source-doc fix is outside this verification-only, no-code edit. |
+
+This is a partial closure record only. It supplies no complete CI, loom, benchmark, package, or
+rustdoc-green claim for `29c70e3` or the evidence commit.
+
+## Task 6 exact-HEAD remaining-gates verification (2026-08-15)
+
+This evidence-only run started at code commit
+`29c70e3f2f6a7886cf108985fa323b2ffd4aafae` and documentation commit
+`a3624d4eb8966148e57b316b083b3f2b29f34287`. The diff from the code commit
+to that documentation baseline contained only `docs/phase-3-verification-report.md`
+and `docs/status.md`; the Cargo commands therefore exercised the stated code
+head. Before this report edit, the only worktree change was the unrelated
+`.superpowers/sdd/agent-production-readiness-plan/reports/task-2-report.md`,
+which was preserved.
+
+Every Cargo invocation used a process-local native x64 MSVC environment with
+MSVC `14.52.36615`'s `Hostx64\\x64` directory first on `PATH`, and its x64
+library plus Windows SDK `10.0.26100.0` UCRT/UM x64 libraries on `LIB`, with
+matching MSVC/SDK include directories on `INCLUDE`. `where.exe cl` and
+`where.exe link` both resolved to that MSVC directory. No repository source,
+dependency, lockfile, or configuration was changed.
+
+The following are the exact CI crate-scoped loom recipes: first
+`cargo rustc -p <crate> --lib --profile test --message-format=json -- --cfg loom`,
+then the produced test binary's CI-listed exact models with
+`--test-threads=1`. This is not a workspace-wide `RUSTFLAGS` invocation.
+
+| Gate | Current result |
+|---|---|
+| Live-set-cache loom build (`strata-txn`) | Exit 0; produced `strata_txn-5c2704560b55f96c.exe`. |
+| `live_set_cache::loom_tests::two_concurrent_misses_on_the_same_key_compute_exactly_once` | Exit 0: 1 passed, 0 failed, 232 filtered; 0.01 s. |
+| `live_set_cache::loom_tests::concurrent_different_key_payloads_do_not_exceed_the_budget` | Exit 0: 1 passed, 0 failed, 232 filtered; 0.02 s. |
+| `live_set_cache::loom_tests::concurrent_different_key_entry_charges_do_not_exceed_the_budget` | Exit 0: 1 passed, 0 failed, 232 filtered; 0.01 s. |
+| Index loom build (`strata-index`) | Exit 0; produced `strata_index-acebb1a09b16ff24.exe`. |
+| `node::loom_tests::full_node_publish_is_completely_visible_to_a_reader` | Exit 0: 1 passed, 0 failed, 25 filtered; 0.01 s. |
+| `node_table::loom_tests::concurrent_chunk_allocation_publishes_exactly_one_chunk` | Exit 0: 1 passed, 0 failed, 25 filtered; 0.04 s. |
+| `slot_array::loom_tests::concurrent_claim_and_shrink_never_corrupts_a_slot` | Exit 0: 1 passed, 0 failed, 25 filtered; 8.43 s. |
+| `graph::loom_tests::concurrent_advances_always_settle_on_the_highest_level` | Exit 0: 1 passed, 0 failed, 25 filtered; 0.01 s. |
+| `graph::loom_tests::concurrent_inserts_of_distinct_rows_are_all_findable_and_uncorrupted` | Exit 0: 1 passed, 0 failed, 25 filtered; 1.69 s. |
+| `graph::loom_tests::concurrent_inserts_racing_on_one_shared_neighbor_always_keep_the_nearest` | Exit 0: 1 passed, 0 failed, 25 filtered; 134.81 s. |
+| `graph::loom_tests::concurrent_inserts_into_a_genuinely_empty_graph_never_strand_a_node_loom` | Exit 0: 1 passed, 0 failed, 25 filtered; 7.17 s. |
+| `graph::loom_tests::concurrent_insert_never_uses_an_unpublished_node_as_a_descent_entry_loom` | Exit 0: 1 passed, 0 failed, 25 filtered; 4.87 s. |
+
+The complete `query_planner_bench` Criterion target was then run with
+`cargo bench -p strata-bench --bench query_planner_bench`. Compilation and
+execution exited 0; compilation took 1m45s. Criterion used the plotters
+backend because Gnuplot was unavailable. It completed all 100 samples for all
+nine registered workloads; it gave its standard target-time advisory for both
+vector-search cases and the shared-handle commit case, not a failure.
+
+| Workload | Current 95% interval |
+|---|---:|
+| Projection scan, direct | 564.54–566.96 µs |
+| Projection scan, planned | 563.75–566.58 µs |
+| Selective predicate scan, direct | 136.34–136.64 µs |
+| Selective predicate scan, planned | 138.38–139.34 µs |
+| Grouped aggregation, direct | 147.08–147.65 µs |
+| Grouped aggregation, planned | 149.10–149.54 µs |
+| Vector search, direct | 1.3567–1.3723 ms |
+| Vector search, planned | 1.3335–1.3393 ms |
+| Shared-handle transaction commit | 49.646–50.436 ms |
+
+For the locked wheel/import smoke, `Get-Command maturin` found no executable
+and `py -3.14 -m maturin --version` exited 1 with `No module named maturin`.
+Maturin is therefore **unavailable**; no wheel was built, installed, or
+imported.
+
+### Remaining limitations and unrun gates
+
+The earlier transaction loom model
+`a_reader_never_sees_one_in_flight_commits_row_while_observing_an_unrelated_commits_row_id_counter`
+remains **aborted**, not passed; it was deliberately not rerun. The earlier
+historically nonterminating transaction model and the remaining transaction
+semantic/lifecycle/row-ID models remain unrun. The cache and index rows above
+are now fresh exact-model results, but no other CI, fuzz, chaos, rustdoc,
+binding-package, or complete-branch gate is newly claimed. The Criterion
+result is only a local fixed-fixture measurement of the `query_planner_bench`
+target, not a universal performance, cost-model, serializability,
+cross-process, durability, or whole-feature claim. Historical CI and status
+qualifications above continue to apply only to their recorded revisions.
+
+## Final-head CLI evidence (2026-08-15)
+
+This is fresh, focused local evidence for current code HEAD
+`87d131fcaa9d76bcb708ab3d2ebb2efb535de908`. That commit fixes the CLI `explain`
+syntax path by validating its complete grammar before opening the supplied dataset, so malformed
+requests retain the typed usage category instead of being masked by a missing-path operational
+error. The commands used the report's process-local native x64 MSVC/Windows SDK environment.
+
+| Command | Result |
+|---|---|
+| `cargo test -p strata-cli --no-default-features --test admin_cli` | Exit 0: 15 passed, 0 failed. |
+| `cargo test -p strata-cli --no-default-features` | Exit 0: 38 passed, 0 failed across the CLI package. |
+| `cargo clippy -p strata-cli --all-targets -- -D warnings` | Exit 0; no warnings. |
+| Direct `strata explain --json` invocation | Exit 2; JSON error category `usage`. |
+| Direct `strata explain <missing-path> id eq 1 --json` invocation | Exit 1; JSON error category `operational`. |
+| `cargo fmt --check` and `git diff --check` | Exit 0. |
+
+The broad workspace gates recorded above apply to code head `29c70e3` (or earlier recorded
+heads). They were not rerun at `87d131f`, and this section does not extend those results to the
+final head. The previously aborted/unrun transaction loom models, unavailable `maturin`
+wheel/import smoke, and remaining fuzz, chaos, and package gates are not claimed green.
+
+## Exact-head fuzz and chaos verification (2026-08-15)
+
+This verification-only record applies to code commit
+`756ab70c465491c3329d6d884e2b1c300d971aaf`. Before this report edit, the
+only worktree change was the unrelated
+`.superpowers/sdd/agent-production-readiness-plan/reports/task-2-report.md`,
+which was preserved. No source, dependency, configuration, or lockfile was
+changed; temporary parser inputs were created outside the repository.
+
+All successful fuzz and chaos commands used the documented process-local x64
+MSVC `14.52.36615` and Windows SDK `10.0.26100.0` environment, including the
+matching `INCLUDE` directories, with the pinned
+`nightly-2026-07-25` toolchain and `cargo-fuzz 0.13.2` already available. No
+toolchain or dependency installation was performed.
+
+| Gate | Command/result |
+|---|---|
+| Declared fuzz targets | `cargo +nightly-2026-07-25 fuzz list` exited 0 and listed exactly `datafile_parse`, `manifest_current_parse`, `manifest_parse`, and `segment_parse`. |
+| Initial manifest fuzz build | `CARGO_BUILD_JOBS=1 cargo +nightly-2026-07-25 fuzz build manifest_parse` exited 1 after 22.68 s because that first process-local setup omitted MSVC/SDK `INCLUDE`; `libfuzzer-sys` could not find C++ standard headers. This is an environment failure, not a target pass. |
+| Fuzz builds after documented MSVC setup | All four prescribed builds exited 0: `manifest_parse` 0.29 s, `datafile_parse` 1.51 s, `manifest_current_parse` 1.69 s, and `segment_parse` 1.32 s. |
+| Fuzz lockfile | `fuzz/Cargo.lock` SHA-256 was unchanged before and after: `ECDAB8CA45B67F1B522E4FE2D435171B9B9DCF716C82EBFDE2838C82F3DBACD5`. |
+| Parser smokes | All five `cargo +nightly-2026-07-25 fuzz run <target> <input> -- -runs=1 -seed=24740` smokes exited 0: two checked-in `datafile_parse` Arrow corpus inputs plus temporary manifest, current-manifest, and segment inputs. |
+| Fast chaos | `cargo test -p strata-sim fast_tier_random_seeds_survive_random_crash_points -- --exact --nocapture` exited 0: 1 passed in 33.62 s. |
+| Thorough chaos | `CARGO_BUILD_JOBS=1 STRATA_CHAOS_THOROUGH=1 cargo test -p strata-sim thorough_tier_satisfies_the_phase_7_exit_criterion -- --exact --ignored --nocapture` exited 0: 1 passed in 684.57 s; output reported `2000/2000` seeds checked with zero violations. |
+| 8,000-trial real-thread index tier | `cargo test -p strata-index concurrent_inserts_into_a_genuinely_empty_graph_never_strand_a_node -- --exact --ignored --nocapture` was launched, then interrupted before an exit code or result was collected. It is **aborted/unclaimed**, not passed. |
+
+This section supplies fresh local fuzz and chaos evidence only for the named
+completed gates at `756ab70`. It does not convert the interrupted 8,000-trial
+run, other unrun gates, or historical results at different revisions into a
+pass claim.
+
+## Verification and rustdoc closure (2026-08-15, `191337e`)
+
+This additive record applies to `191337e4e75bf96d6db2939ab84d7cd524750375`, a
+report-only descendant of `756ab70`. The unrelated
+`.superpowers/sdd/agent-production-readiness-plan/reports/task-2-report.md`
+worktree edit was preserved throughout. The only source change is the
+rustdoc-only replacement of the unresolved
+`crate::backend::LocalFs::put` intra-doc link in
+`crates/storage/src/manifest.rs` with inline code; it does not change the
+manifest commit protocol or backend interface.
+
+All native commands used the documented process-local x64 MSVC `14.52.36615`
+and Windows SDK `10.0.26100.0` `PATH`, `LIB`, and `INCLUDE` directories. The
+wheel retry additionally set Cargo's temporary target-linker environment
+variable to that already-documented `link.exe` because the first maturin
+subprocess did not inherit a discoverable linker despite the configured
+`PATH`. No repository dependency, lockfile, packaging configuration, or
+workflow was changed.
+
+| Gate | Fresh result |
+|---|---|
+| 8,000-trial real-thread HNSW gate | The user-supplied short `--exact` filter selected 0 tests (exit 0; 0.33 s), so it is not evidence. The corrected exact registered name, `graph::tests::concurrent_inserts_into_a_genuinely_empty_graph_never_strand_a_node`, exited 0: 1 passed, 158 filtered; 28.67 s test time / 29.10 s wall time. |
+| Declared fuzz discovery and lockfile | Exit 0; exactly `datafile_parse`, `manifest_current_parse`, `manifest_parse`, and `segment_parse`; `fuzz/Cargo.lock` remained `ECDAB8CA45B67F1B522E4FE2D435171B9B9DCF716C82EBFDE2838C82F3DBACD5`. |
+| Declared fuzz builds | All exit 0 with `CARGO_BUILD_JOBS=1`: `manifest_parse` 17.23 s, `datafile_parse` 2.04 s, `manifest_current_parse` 1.99 s, and `segment_parse` 1.43 s. MSVC import-library messages were emitted as existing `linker_messages` warnings. |
+| Deterministic parser smokes | Five `-runs=1 -seed=24740` runs exited 0: both checked-in `datafile_parse` corpus inputs plus temporary `manifest_parse`, `manifest_current_parse`, and `segment_parse` inputs (0.68â€“0.77 s each). |
+| Fast chaos | Exit 0: 1 passed, 5 filtered; 36.49 s. |
+| Thorough chaos | Exit 0: 1 passed, 5 filtered; 829.15 s. Output reached `2000/2000` seeds checked with zero violations. |
+| Pinned wheel workflow | `maturin==1.9.4` was installed into a temporary Python 3.14 virtual environment. The first `maturin build --release --locked` attempt exited 101 with `linker link.exe not found`; the retry with only a temporary explicit Cargo linker path exited 0 and built `strata_bindings-0.1.0-cp314-cp314-win_amd64.whl` in 2m24s. The wheel installed and imported successfully; all 13 current module exports (`Dataset`, `Snapshot`, `Transaction`, and 10 typed exceptions, including `InsufficientHistoryError`) were asserted. Existing pinned maturin remains the correct project workflow; no alternative packager was needed. |
+| Rustdoc closure | `cargo doc --workspace --no-deps` exited 0 and generated documentation with no warning output, including no unresolved `LocalFs::put` link. |
+| Focused regression | `cargo test -p strata-storage manifest -- --nocapture` exited 0: 31 passed, 78 filtered; 0.04 s test time. |
+| Final focused static checks | `cargo fmt --check`, `cargo clippy -p strata-storage --all-targets -- -D warnings`, and `git diff --check` each exited 0; clippy completed in 9.70 s. |
+
+This is focused local evidence only. It does not claim that unrun workspace-wide
+clippy, transaction loom, benchmark, portability, or historical exact-head
+gates passed at `191337e`.
+
+## Final-head verification closure (2026-08-15, `f872236`)
+
+This additive record supersedes the earlier partial-closure limitations where
+the same gates are listed as aborted or unavailable. The unrelated
+`.superpowers/sdd/agent-production-readiness-plan/reports/task-2-report.md`
+worktree edit remained preserved and was not part of this verification.
+
+The exact transaction loom binary was built with the documented crate-scoped
+recipe under a process-local x64 MSVC environment. The installed Visual Studio
+18 BuildTools environment selected MSVC `14.52.36615` with
+`VsDevCmd.bat -arch=x64 -host_arch=x64 -vcvars_ver=14.52`; `where cl` and
+`where link` resolved to its `Hostx64/x64` directory.
+
+| Gate | Fresh result |
+|---|---|
+| `dataset::loom_tests::a_failed_commits_segment_is_never_searchable_under_concurrent_commits` | Exit 0: 1 passed, 232 filtered; 1,802.46 s. |
+| `dataset::loom_tests::a_reader_never_sees_one_in_flight_commits_row_while_observing_an_unrelated_commits_row_id_counter` | Exit 0: 1 passed, 232 filtered; 1,343.48 s. |
+| `dataset::loom_tests::immutable_snapshot_membership_controls_visibility_despite_claimed_high_water` | Exit 0: 1 passed, 232 filtered; 0.07 s. |
+| `row_id::loom_tests::concurrent_claims_publish_monotonic_high_water` | Exit 0: 1 passed, 232 filtered; 0.02 s. |
+| `retention::loom_tests::concurrent_registration_and_final_drop_prune_after_quiescence` | Exit 0: 1 passed, 232 filtered; 0.01 s. |
+| `lifecycle_coordination::loom_tests::preparation_and_exclusive_execution_never_overlap` | Exit 0: 1 passed, 232 filtered; 3.32 s. |
+| Workspace check | `cargo check --workspace --no-default-features` exited 0 in 33.87 s. |
+
+The previously unavailable packaging gate is also closed: the pinned
+`maturin==1.9.4` temporary Python 3.14 wheel build, installation, and import
+smoke passed, including all 13 current module exports. The corrected 8,000-trial
+HNSW stress test passed, the declared fuzz builds and parser smokes passed,
+thorough chaos passed for 2,000/2,000 seeds with zero violations, and rustdoc
+completed without warnings, as recorded in the preceding exact-head evidence.
+
+The report now has fresh evidence for the previously outstanding transaction
+loom and local workspace-check gates. Hosted CI remains an external PR gate and
+must be observed on the pushed branch before merge.

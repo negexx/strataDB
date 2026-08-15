@@ -20,6 +20,7 @@ const SINGLE_WRITER_BOUNDARY: &str = "this acknowledges only one process using o
 #[derive(Debug)]
 enum CliError {
     Usage(String),
+    UnknownCommand(String),
     Query { kind: &'static str, message: String },
     VectorResolution(String),
 }
@@ -28,6 +29,7 @@ impl fmt::Display for CliError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Usage(message) => write!(formatter, "usage error: {message}"),
+            Self::UnknownCommand(command) => write!(formatter, "unknown command: {command}"),
             Self::Query { kind, message } => {
                 write!(formatter, "query error kind={kind} message={message}")
             }
@@ -38,14 +40,105 @@ impl fmt::Display for CliError {
 
 impl Error for CliError {}
 
+#[derive(Clone, Copy)]
+enum ExitCategory {
+    Operational,
+    Usage,
+    Conflict,
+    Unsupported,
+    Corruption,
+}
+
+impl ExitCategory {
+    const fn code(self) -> u8 {
+        match self {
+            Self::Operational => 1,
+            Self::Usage => 2,
+            Self::Conflict => 3,
+            Self::Unsupported => 4,
+            Self::Corruption => 5,
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Operational => "operational",
+            Self::Usage => "usage",
+            Self::Conflict => "conflict",
+            Self::Unsupported => "unsupported",
+            Self::Corruption => "corruption",
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
     match run(&args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("error: {e}");
-            ExitCode::FAILURE
+            let category = error_category(e.as_ref());
+            if args.iter().any(|argument| argument == "--json") {
+                eprintln!(
+                    "{{\"error\":{{\"category\":\"{}\",\"message\":{}}}}}",
+                    category.name(),
+                    json_string(&e.to_string()),
+                );
+            } else {
+                eprintln!("error: {e}");
+            }
+            ExitCode::from(category.code())
         }
+    }
+}
+
+fn error_category(error: &(dyn Error + 'static)) -> ExitCategory {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if matches!(
+            error.downcast_ref::<CliError>(),
+            Some(CliError::Usage(_) | CliError::UnknownCommand(_))
+        ) {
+            return ExitCategory::Usage;
+        }
+        if let Some(error) = error.downcast_ref::<strata_txn::TxnError>() {
+            match error {
+                strata_txn::TxnError::Conflict { .. } => return ExitCategory::Conflict,
+                strata_txn::TxnError::CorruptSegment(_)
+                | strata_txn::TxnError::UnsafeManifestPath(_) => {
+                    return ExitCategory::Corruption;
+                }
+                strata_txn::TxnError::ReservedColumnName(_) => return ExitCategory::Usage,
+                strata_txn::TxnError::Storage(error) => return storage_error_category(error),
+                _ => {}
+            }
+        }
+        if let Some(error) = error.downcast_ref::<strata_txn::StorageError>() {
+            return storage_error_category(error);
+        }
+        current = error.source();
+    }
+    ExitCategory::Operational
+}
+
+fn storage_error_category(error: &strata_txn::StorageError) -> ExitCategory {
+    match error {
+        strata_txn::StorageError::LegacyFormatNeedsMigration(_)
+        | strata_txn::StorageError::UnknownSchemaVersion { .. }
+        | strata_txn::StorageError::MigrationSourceVersion { .. }
+        | strata_txn::StorageError::MigrationUnsupportedDirection { .. }
+        | strata_txn::StorageError::MigrationUnsupported { .. }
+        | strata_txn::StorageError::MigrationIncompatibleType { .. }
+        | strata_txn::StorageError::MigrationLossyConversion { .. }
+        | strata_txn::StorageError::SchemaVersionChanged { .. }
+        | strata_txn::StorageError::DurabilityUnsupported(_) => ExitCategory::Unsupported,
+        strata_txn::StorageError::Serde(_)
+        | strata_txn::StorageError::EmptyDataFile(_)
+        | strata_txn::StorageError::CorruptManifest(_, _)
+        | strata_txn::StorageError::MissingRowIdHighWater(_)
+        | strata_txn::StorageError::CorruptDataFile(_, _) => ExitCategory::Corruption,
+        strata_txn::StorageError::Io(_)
+        | strata_txn::StorageError::Arrow(_)
+        | strata_txn::StorageError::AlreadyExists(_) => ExitCategory::Operational,
     }
 }
 
@@ -57,6 +150,10 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         "filter",
         "search",
         "inspect",
+        "schema",
+        "migration",
+        "manifest-status",
+        "recovery-status",
         "explain",
         "crash-loop",
         "lookup",
@@ -66,7 +163,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
 
     let Some(cmd) = args.get(1) else {
         eprintln!(
-            "usage: strata <create|insert|scan|filter|search|explain|inspect|crash-loop|lookup|group-by|query-scan> <dir> [...]"
+            "usage: strata <create|insert|scan|filter|search|explain|inspect|schema|migration|manifest-status|recovery-status|evidence|crash-loop|lookup|group-by|query-scan> <dir> [...]"
         );
         eprintln!(
             "  search <dir> --vector <comma-separated finite floats> [--k <usize>] [--filter <column> <op> <value>]"
@@ -78,13 +175,48 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         eprintln!("  query-scan <dir> --columns <column,...> [--filter <column> <op> <value>]");
         return Ok(());
     };
+    if let Some(result) = handle_command_without_dataset(args, cmd) {
+        return result;
+    }
     if !KNOWN_COMMANDS.contains(&cmd.as_str()) {
-        return Err(format!("unknown command: {cmd}").into());
+        return Err(Box::new(CliError::UnknownCommand(cmd.clone())));
+    }
+    if cmd == "explain" {
+        return handle_explain(args);
     }
 
-    let dir = args.get(2).ok_or("missing <dir> argument")?;
+    let dir = args
+        .get(2)
+        .ok_or_else(|| usage_error("missing <dir> argument"))?;
+    run_dataset_command(args, cmd, dir)
+}
 
-    match cmd.as_str() {
+fn handle_command_without_dataset(
+    args: &[String],
+    cmd: &str,
+) -> Option<Result<(), Box<dyn Error>>> {
+    if cmd == "help" {
+        if args.len() != 2 {
+            return Some(Err(usage_error(
+                "help does not accept additional arguments",
+            )));
+        }
+        println!(
+            "usage: strata <create|insert|scan|filter|search|explain|inspect|schema|migration|manifest-status|recovery-status|evidence|crash-loop|lookup|group-by|query-scan> <dir> [...]"
+        );
+        return Some(Ok(()));
+    }
+    if cmd == "evidence" {
+        return Some(handle_evidence(args));
+    }
+    if cmd == "migration" {
+        return Some(handle_migration(args));
+    }
+    None
+}
+
+fn run_dataset_command(args: &[String], cmd: &str, dir: &str) -> Result<(), Box<dyn Error>> {
+    match cmd {
         "create" => {
             handle_create(args, dir)?;
         }
@@ -112,14 +244,25 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         "inspect" => {
             let ds = strata_txn::Dataset::open(dir)?;
             let snapshot = ds.snapshot();
-            println!(
-                "{}",
-                inspect_summary(&snapshot, &strata_txn::mvp_fixtures::mvp_schema())?
-            );
+            let json = parse_json_flag(args, 3, "inspect")?;
+            if json {
+                let batch = snapshot.scan(&ds.schema())?;
+                println!(
+                    "{{\"kind\":\"inspect\",\"manifest_version\":{},\"schema_version\":{},\"row_count\":{}}}",
+                    snapshot.version(),
+                    ds.schema_version(),
+                    batch.num_rows(),
+                );
+            } else {
+                println!(
+                    "{}",
+                    inspect_summary(&snapshot, &strata_txn::mvp_fixtures::mvp_schema())?
+                );
+            }
         }
-        "explain" => {
-            handle_explain(dir, args)?;
-        }
+        "schema" => handle_schema(args, dir)?,
+        "manifest-status" => handle_manifest_status(args, dir)?,
+        "recovery-status" => handle_recovery_status(args, dir)?,
         "crash-loop" => {
             require_single_writer_ack(args, "crash-loop")?;
             let n: usize = args.get(3).ok_or("missing <num_commits>")?.parse()?;
@@ -140,7 +283,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         "lookup" => handle_lookup(args, dir)?,
         "group-by" => handle_group_by(args, dir)?,
         "query-scan" => handle_query_scan(args, dir)?,
-        other => return Err(format!("unknown command: {other}").into()),
+        other => return Err(Box::new(CliError::UnknownCommand(other.to_owned()))),
     }
 
     Ok(())
@@ -169,6 +312,341 @@ fn format_scan_header(row_count: usize, snapshot_version: u64) -> String {
 
 fn format_inspect_line(snapshot_version: u64, row_count: usize) -> String {
     format!("version={snapshot_version} row_count={row_count}")
+}
+
+fn handle_schema(args: &[String], dir: &str) -> Result<(), Box<dyn Error>> {
+    let json = parse_json_flag(args, 3, "schema")?;
+    let dataset = strata_txn::Dataset::open(dir)?;
+    let schema = dataset.schema();
+    if json {
+        let fields = schema
+            .fields()
+            .iter()
+            .map(|field| {
+                format!(
+                    "{{\"name\":{},\"type\":{},\"nullable\":{}}}",
+                    json_string(field.name()),
+                    json_string(&schema_type_name(field.data_type())),
+                    field.is_nullable(),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        println!(
+            "{{\"kind\":\"schema\",\"manifest_version\":{},\"schema_version\":{},\"fields\":[{fields}]}}",
+            dataset.current_version(),
+            dataset.schema_version(),
+        );
+    } else {
+        println!(
+            "schema manifest_version={} schema_version={}",
+            dataset.current_version(),
+            dataset.schema_version(),
+        );
+        for field in schema.fields() {
+            println!(
+                "field name={} type={} nullable={}",
+                field.name(),
+                schema_type_name(field.data_type()),
+                field.is_nullable(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn handle_evidence(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let json = parse_json_flag(args, 2, "evidence")?;
+    if json {
+        println!(
+            "{{\"kind\":\"evidence\",\"criterion_command\":\"cargo bench -p strata-bench --bench query_planner_bench\",\"report\":\"docs/phase-3-verification-report.md#task-3-query-planning-evidence\"}}"
+        );
+    } else {
+        println!("criterion_command=cargo bench -p strata-bench --bench query_planner_bench");
+        println!("report=docs/phase-3-verification-report.md#task-3-query-planning-evidence");
+    }
+    Ok(())
+}
+
+fn handle_migration(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let action = migration_action(args)?;
+    let dir = args
+        .get(3)
+        .ok_or_else(|| usage_error("migration requires <validate|run|status> <dir> [...]"))?;
+
+    if action == "status" {
+        return handle_migration_status(args, dir);
+    }
+
+    let (column, data_type, json) = migration_request(args, action)?;
+    if action == "run" {
+        require_single_writer_ack(args, "migration run")?;
+    }
+    let dataset = strata_txn::Dataset::open(dir)?;
+    let migration = strata_txn::SchemaMigration::add_nullable_column(
+        dataset.schema_version(),
+        strata_storage::ADD_NULLABLE_COLUMN_SCHEMA_VERSION,
+        arrow::datatypes::Field::new(column, data_type.clone(), true),
+    );
+
+    validate_migration_target_schema(&migration, &dataset)?;
+    if action == "validate" {
+        print_migration_validation(&migration, column, &data_type, json);
+        return Ok(());
+    }
+
+    let result = dataset.migrate_schema(&migration)?;
+    print_migration_result(&result, json);
+    Ok(())
+}
+
+fn migration_action(args: &[String]) -> Result<&str, Box<dyn Error>> {
+    let action = args
+        .get(2)
+        .ok_or_else(|| usage_error("migration requires <validate|run|status> <dir> [...]"))?;
+    if matches!(action.as_str(), "validate" | "run" | "status") {
+        Ok(action)
+    } else {
+        Err(usage_error(
+            "migration requires validate, run, or status as its first argument",
+        ))
+    }
+}
+
+fn handle_migration_status(args: &[String], dir: &str) -> Result<(), Box<dyn Error>> {
+    let json = parse_json_flag(args, 4, "migration status")?;
+    let dataset = strata_txn::Dataset::open(dir)?;
+    if json {
+        println!(
+            "{{\"kind\":\"migration_status\",\"manifest_version\":{},\"schema_version\":{}}}",
+            dataset.current_version(),
+            dataset.schema_version(),
+        );
+    } else {
+        println!(
+            "migration manifest_version={} schema_version={}",
+            dataset.current_version(),
+            dataset.schema_version(),
+        );
+    }
+    Ok(())
+}
+
+fn migration_request<'args>(
+    args: &'args [String],
+    action: &str,
+) -> Result<(&'args str, DataType, bool), Box<dyn Error>> {
+    let name = args.get(4).ok_or_else(|| {
+        usage_error("migration validate/run requires add-nullable-column <column> <type>")
+    })?;
+    if name != "add-nullable-column" {
+        return Err(usage_error(
+            "migration validate/run requires the explicit add-nullable-column migration name",
+        ));
+    }
+    let column = args.get(5).ok_or_else(|| {
+        usage_error("migration validate/run requires add-nullable-column <column> <type>")
+    })?;
+    let data_type = migration_column_type(args.get(6).ok_or_else(|| {
+        usage_error("migration validate/run requires add-nullable-column <column> <type>")
+    })?)?;
+    let json = if action == "run" {
+        let non_acknowledgement_options = args
+            .get(7..)
+            .unwrap_or_default()
+            .iter()
+            .filter(|argument| argument.as_str() != ACK_SINGLE_WRITER)
+            .cloned()
+            .collect::<Vec<_>>();
+        parse_json_flag(&non_acknowledgement_options, 0, "migration validate/run")?
+    } else {
+        parse_json_flag(args, 7, "migration validate/run")?
+    };
+    Ok((column, data_type, json))
+}
+
+fn print_migration_validation(
+    migration: &strata_txn::SchemaMigration,
+    column: &str,
+    data_type: &DataType,
+    json: bool,
+) {
+    if json {
+        println!(
+            "{{\"kind\":\"migration_validation\",\"name\":\"{}\",\"source_schema_version\":{},\"target_schema_version\":{},\"column\":{{\"name\":{},\"type\":{},\"nullable\":true}}}}",
+            migration.name(),
+            migration.source_version(),
+            migration.target_version(),
+            json_string(column),
+            json_string(&schema_type_name(data_type)),
+        );
+    } else {
+        println!(
+            "migration validation name={} source_schema_version={} target_schema_version={} column={} type={} nullable=true",
+            migration.name(),
+            migration.source_version(),
+            migration.target_version(),
+            column,
+            schema_type_name(data_type),
+        );
+    }
+}
+
+fn print_migration_result(result: &strata_txn::SchemaMigrationResult, json: bool) {
+    if json {
+        println!(
+            "{{\"kind\":\"migration_result\",\"name\":\"{}\",\"source_schema_version\":{},\"target_schema_version\":{},\"manifest_version\":{}}}",
+            result.name,
+            result.source_schema_version,
+            result.target_schema_version,
+            result.manifest_version,
+        );
+    } else {
+        println!(
+            "migration result name={} source_schema_version={} target_schema_version={} manifest_version={}",
+            result.name,
+            result.source_schema_version,
+            result.target_schema_version,
+            result.manifest_version,
+        );
+    }
+}
+
+fn validate_migration_target_schema(
+    migration: &strata_txn::SchemaMigration,
+    dataset: &strata_txn::Dataset,
+) -> Result<(), Box<dyn Error>> {
+    let target_schema = migration.target_schema(dataset.schema_version(), &dataset.schema())?;
+    strata_txn::Dataset::validate_schema(&target_schema).map_err(|error| match error {
+        strata_txn::TxnError::ReservedColumnName(_) => usage_error(error.to_string()),
+        other => Box::new(other) as Box<dyn Error>,
+    })
+}
+
+fn handle_manifest_status(args: &[String], dir: &str) -> Result<(), Box<dyn Error>> {
+    let json = parse_json_flag(args, 3, "manifest-status")?;
+    let dataset = strata_txn::Dataset::open(dir)?;
+    let report = dataset.lifecycle_report()?;
+    if json {
+        println!(
+            "{{\"kind\":\"manifest_status\",\"observed_version\":{},\"schema_version\":{},\"manifest_object_count\":{},\"current_manifest_present\":{},\"data_object_count\":{},\"reachable_data_file_count\":{},\"reachable_segment_count\":{},\"orphan_candidate_count\":{}}}",
+            report.observed_version(),
+            dataset.schema_version(),
+            report.manifest_object_count(),
+            report.current_manifest_bytes().is_some(),
+            report.data_object_count(),
+            report.reachable_data_file_count(),
+            report.reachable_segment_count(),
+            report.orphan_candidate_count(),
+        );
+    } else {
+        println!(
+            "manifest observed_version={} schema_version={} manifest_object_count={} current_manifest_present={} data_object_count={} reachable_data_file_count={} reachable_segment_count={} orphan_candidate_count={}",
+            report.observed_version(),
+            dataset.schema_version(),
+            report.manifest_object_count(),
+            report.current_manifest_bytes().is_some(),
+            report.data_object_count(),
+            report.reachable_data_file_count(),
+            report.reachable_segment_count(),
+            report.orphan_candidate_count(),
+        );
+    }
+    Ok(())
+}
+
+fn handle_recovery_status(args: &[String], dir: &str) -> Result<(), Box<dyn Error>> {
+    let json = parse_json_flag(args, 3, "recovery-status")?;
+    let dataset = strata_txn::Dataset::open(dir)?;
+    let report = dataset.lifecycle_report()?;
+    if json {
+        println!(
+            "{{\"kind\":\"recovery_status\",\"manifest_version\":{},\"schema_version\":{},\"physical_row_count\":{},\"tombstone_count\":{}}}",
+            dataset.current_version(),
+            dataset.schema_version(),
+            report.physical_row_count(),
+            report.tombstone_count(),
+        );
+    } else {
+        println!(
+            "recovery manifest_version={} schema_version={} physical_row_count={} tombstone_count={}",
+            dataset.current_version(),
+            dataset.schema_version(),
+            report.physical_row_count(),
+            report.tombstone_count(),
+        );
+    }
+    Ok(())
+}
+
+fn migration_column_type(value: &str) -> Result<DataType, Box<dyn Error>> {
+    match value {
+        "boolean" => Ok(DataType::Boolean),
+        "int64" => Ok(DataType::Int64),
+        "uint64" => Ok(DataType::UInt64),
+        "float64" => Ok(DataType::Float64),
+        "utf8" => Ok(DataType::Utf8),
+        _ => Err(usage_error(
+            "migration column type must be boolean|int64|uint64|float64|utf8",
+        )),
+    }
+}
+
+fn parse_json_flag(args: &[String], start: usize, command: &str) -> Result<bool, Box<dyn Error>> {
+    match args.get(start..) {
+        Some([]) => Ok(false),
+        Some([flag]) if flag == "--json" => Ok(true),
+        _ => Err(usage_error(format!(
+            "{command} accepts only an optional --json flag"
+        ))),
+    }
+}
+
+fn schema_type_name(data_type: &DataType) -> String {
+    match data_type {
+        DataType::Boolean => "boolean".to_owned(),
+        DataType::Int64 => "int64".to_owned(),
+        DataType::UInt64 => "uint64".to_owned(),
+        DataType::Float32 => "float32".to_owned(),
+        DataType::Float64 => "float64".to_owned(),
+        DataType::Utf8 => "utf8".to_owned(),
+        DataType::FixedSizeList(field, dimensions) if field.data_type() == &DataType::Float32 => {
+            format!("vector({dimensions})")
+        }
+        other => format!("unsupported({other:?})"),
+    }
+}
+
+fn json_string(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len() + 2);
+    escaped.push('\"');
+    for character in value.chars() {
+        match character {
+            '\"' => {
+                escaped.push('\\');
+                escaped.push('\"');
+            }
+            '\\' => {
+                escaped.push('\\');
+                escaped.push('\\');
+            }
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            character if character.is_control() => {
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                let value = u32::from(character);
+                escaped.push_str("\\u");
+                for shift in [12, 8, 4, 0] {
+                    let digit = ((value >> shift) & 0x0f) as usize;
+                    escaped.push(char::from(HEX[digit]));
+                }
+            }
+            character => escaped.push(character),
+        }
+    }
+    escaped.push('\"');
+    escaped
 }
 
 fn usage_error(message: impl Into<String>) -> Box<dyn Error> {
@@ -760,17 +1238,91 @@ fn parse_predicate(
         "lteq" => Ok(Predicate::LtEq(column.to_string(), Value::Int64(value))),
         "gt" => Ok(Predicate::Gt(column.to_string(), Value::Int64(value))),
         "gteq" => Ok(Predicate::GtEq(column.to_string(), Value::Int64(value))),
-        other => Err(format!("unknown op: {other} (expected eq|lt|lteq|gt|gteq)").into()),
+        _ => Err(usage_error("explain <op> must be eq|lt|lteq|gt|gteq")),
     }
 }
 
-fn handle_explain(dir: &str, args: &[String]) -> Result<(), Box<dyn Error>> {
-    let column = args.get(3).ok_or("missing <column>")?;
-    let op = args.get(4).ok_or("missing <op: eq|lt|lteq|gt|gteq>")?;
-    let value: i64 = args.get(5).ok_or("missing <value>")?.parse()?;
-    let predicate = parse_predicate(column, op, value)?;
+enum ExplainRequest<'args> {
+    Legacy(strata_query::Predicate),
+    Json {
+        column: &'args str,
+        operator: &'args str,
+        value: &'args str,
+    },
+}
 
-    let ds = strata_txn::Dataset::open(dir)?;
+struct ExplainCommand<'args> {
+    dir: &'args str,
+    request: ExplainRequest<'args>,
+}
+
+fn parse_explain_command(args: &[String]) -> Result<ExplainCommand<'_>, Box<dyn Error>> {
+    let dir = args
+        .get(2)
+        .filter(|argument| !argument.starts_with("--"))
+        .map(String::as_str)
+        .ok_or_else(|| usage_error("explain requires <dir> <column> <op> <value> [--json]"))?;
+    let (column, operator, value, json) = match args.get(3..) {
+        Some([column, operator, value]) => {
+            (column.as_str(), operator.as_str(), value.as_str(), false)
+        }
+        Some([column, operator, value, flag]) if flag == "--json" => {
+            (column.as_str(), operator.as_str(), value.as_str(), true)
+        }
+        _ => {
+            return Err(usage_error(
+                "explain requires <column> <op> <value> and accepts only an optional --json flag",
+            ));
+        }
+    };
+    if column.starts_with("--") || operator.starts_with("--") || value == "--json" {
+        return Err(usage_error(
+            "explain requires <column> <op> <value> and accepts only an optional --json flag",
+        ));
+    }
+
+    let request = if json {
+        parse_comparison_operator(operator)?;
+        ExplainRequest::Json {
+            column,
+            operator,
+            value,
+        }
+    } else {
+        let value = value
+            .parse()
+            .map_err(|_| usage_error("explain <value> must be an Int64"))?;
+        ExplainRequest::Legacy(parse_predicate(column, operator, value)?)
+    };
+    Ok(ExplainCommand { dir, request })
+}
+
+fn handle_explain(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let command = parse_explain_command(args)?;
+    let ds = strata_txn::Dataset::open(command.dir)?;
+    let predicate = match command.request {
+        ExplainRequest::Json {
+            column,
+            operator,
+            value,
+        } => {
+            let filter = strata_txn::FilterExpression::Compare(strata_txn::Comparison {
+                column: column.to_owned(),
+                operator: parse_comparison_operator(operator)?,
+                value: parse_filter_literal(column, value, ds.schema().as_ref())?,
+            });
+            let plan = ds
+                .snapshot()
+                .explain_scan_query(&strata_txn::ScanRequest {
+                    projection: strata_txn::Projection::All,
+                    filter: Some(filter),
+                })
+                .map_err(|error| query_error(&error))?;
+            println!("{}", explain_plan_json(&plan));
+            return Ok(());
+        }
+        ExplainRequest::Legacy(predicate) => predicate,
+    };
     let result = ds.snapshot().explain(&predicate);
     println!(
         "total_files={} scanned={} skipped={} predicate={predicate:?}",
@@ -785,6 +1337,62 @@ fn handle_explain(dir: &str, args: &[String]) -> Result<(), Box<dyn Error>> {
         println!("  skip:  {name}");
     }
     Ok(())
+}
+
+fn explain_plan_json(plan: &strata_txn::PhysicalPlan) -> String {
+    let logical = plan
+        .logical_operators
+        .iter()
+        .map(logical_operator_name)
+        .map(json_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let physical = plan
+        .physical_operators
+        .iter()
+        .map(physical_operator_name)
+        .map(json_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"kind\":\"explain\",\"logical_operators\":[{logical}],\"physical_operators\":[{physical}],\"observations\":{{\"data_files_total\":{},\"data_files_scanned\":{},\"data_files_pruned\":{},\"index_segments_total\":{},\"index_segments_scanned\":{},\"index_segments_pruned\":{},\"transaction_overlay\":{}}}}}",
+        plan.observations.data_files_total,
+        plan.observations.data_files_scanned,
+        plan.observations.data_files_pruned,
+        plan.observations.index_segments_total,
+        plan.observations.index_segments_scanned,
+        plan.observations.index_segments_pruned,
+        plan.observations.transaction_overlay,
+    )
+}
+
+fn logical_operator_name(operator: &strata_txn::LogicalOperator) -> &'static str {
+    match operator {
+        strata_txn::LogicalOperator::Source => "source",
+        strata_txn::LogicalOperator::Predicate { .. } => "predicate",
+        strata_txn::LogicalOperator::Projection { .. } => "projection",
+        strata_txn::LogicalOperator::Grouping { .. } => "grouping",
+        strata_txn::LogicalOperator::VectorSearch { .. } => "vector_search",
+        strata_txn::LogicalOperator::Materialize => "materialize",
+    }
+}
+
+fn physical_operator_name(operator: &strata_txn::PhysicalOperator) -> &'static str {
+    match operator {
+        strata_txn::PhysicalOperator::ManifestSnapshotSource => "manifest_snapshot_source",
+        strata_txn::PhysicalOperator::ZoneMapPruning => "zone_map_pruning",
+        strata_txn::PhysicalOperator::TombstoneFilter => "tombstone_filter",
+        strata_txn::PhysicalOperator::RowFilter => "row_filter",
+        strata_txn::PhysicalOperator::ColumnProjection => "column_projection",
+        strata_txn::PhysicalOperator::HashGroupBy => "hash_group_by",
+        strata_txn::PhysicalOperator::FilterLiveSet => "filter_live_set",
+        strata_txn::PhysicalOperator::ImmutableSegmentVectorSearch => {
+            "immutable_segment_vector_search"
+        }
+        strata_txn::PhysicalOperator::HydrationLookup => "hydration_lookup",
+        strata_txn::PhysicalOperator::TransactionOverlay => "transaction_overlay",
+        strata_txn::PhysicalOperator::Materialize => "materialize",
+    }
 }
 
 #[cfg(test)]
@@ -930,10 +1538,20 @@ mod tests {
             "eq".to_string(),
             "1".to_string(),
         ];
-        let result = handle_explain(&dir_str, &args);
+        let result = handle_explain(&args);
         assert!(result.is_ok(), "handle_explain failed: {result:?}");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn conflict_errors_use_the_conflict_exit_category() {
+        let error = strata_txn::TxnError::Conflict {
+            contested_row_ids: vec![7],
+        };
+
+        assert_eq!(error_category(&error).code(), 3);
+        assert_eq!(error_category(&error).name(), "conflict");
     }
 
     #[test]

@@ -5,6 +5,7 @@
 
 use std::collections::HashSet;
 
+use strata_query::PlanError;
 use thiserror::Error;
 
 /// A scalar literal accepted by a filter comparison.
@@ -824,8 +825,12 @@ impl VectorSearchResult {
 /// An execution failure described by this contract.
 #[derive(Debug, Error)]
 pub enum QueryExecutionError {
+    #[error("transaction read operation '{operation}' cannot merge staged writes safely")]
+    UnsupportedTransactionRead { operation: &'static str },
     #[error("engine query execution failed: {0}")]
     Engine(#[source] Box<crate::TxnError>),
+    #[error("query planner could not select a supported path: {0}")]
+    Planner(#[source] PlanError),
     #[error("checked Int64 sum overflowed for aggregate '{alias}'")]
     Int64SumOverflow { alias: String },
     #[error("vector result returned {actual} hits for requested k={requested_k}")]

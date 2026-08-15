@@ -43,4 +43,6 @@ pub use query::{
 pub use retention::{AgeRetentionPolicy, RetentionCandidate, RetentionPlan, RetentionPolicy};
 pub use retention_executor::ManifestPruneReport;
 pub use snapshot::Snapshot;
+pub use strata_query::{LogicalOperator, PhysicalOperator, PhysicalPlan};
+pub use strata_storage::{SchemaMigration, SchemaMigrationResult, StorageError};
 pub use vacuum::VacuumReport;

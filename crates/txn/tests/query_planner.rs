@@ -1,0 +1,547 @@
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
+use std::sync::Arc;
+
+use arrow::array::{FixedSizeListArray, Float32Array, Int64Array, RecordBatch, StringArray};
+use arrow::datatypes::{DataType, Field, Schema};
+use strata_query::{LogicalOperator, PhysicalOperator};
+use strata_txn::{
+    Aggregate, AggregateFunction, Comparison, ComparisonOperator, Dataset, FilterExpression,
+    FilterLiteral, GroupByRequest, Projection, QueryError, QueryValidationError, RowId,
+    ScanRequest, VectorHydration, VectorSearchRequest,
+};
+
+fn schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("category", DataType::Utf8, true),
+        Field::new("amount", DataType::Int64, true),
+        Field::new(
+            "vector",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 2),
+            false,
+        ),
+    ]))
+}
+
+fn batch(
+    categories: Vec<Option<&str>>,
+    amounts: Vec<Option<i64>>,
+    vectors: Vec<[f32; 2]>,
+) -> RecordBatch {
+    let flat = vectors.into_iter().flatten().collect::<Vec<_>>();
+    RecordBatch::try_new(
+        schema(),
+        vec![
+            Arc::new(StringArray::from(categories)),
+            Arc::new(Int64Array::from(amounts)),
+            Arc::new(FixedSizeListArray::new(
+                Arc::new(Field::new("item", DataType::Float32, false)),
+                2,
+                Arc::new(Float32Array::from(flat)),
+                None,
+            )),
+        ],
+    )
+    .unwrap()
+}
+
+fn dataset_with_selective_vector_segments() -> (tempfile::TempDir, Dataset) {
+    let temp = tempfile::tempdir().unwrap();
+    let dataset = Dataset::create(temp.path().join("dataset"), schema()).unwrap();
+    for (category, amount, vector) in [
+        ("low", 1, [1.0, 1.0]),
+        ("middle", 2, [2.0, 2.0]),
+        ("high", 100, [100.0, 100.0]),
+    ] {
+        let mut transaction = dataset.begin();
+        transaction
+            .insert(batch(
+                vec![Some(category)],
+                vec![Some(amount)],
+                vec![vector],
+            ))
+            .unwrap();
+        transaction.commit().unwrap();
+    }
+    (temp, dataset)
+}
+
+#[test]
+fn planned_queries_match_direct_snapshot_operators_and_report_selection_evidence() {
+    let temp = tempfile::tempdir().unwrap();
+    let dataset = Dataset::create(temp.path().join("dataset"), schema()).unwrap();
+    for rows in [
+        batch(
+            vec![Some("discard"), None],
+            vec![Some(1), None],
+            vec![[0.0, 0.0], [1.0, 1.0]],
+        ),
+        batch(
+            vec![Some("keep"), Some("keep")],
+            vec![Some(10), Some(20)],
+            vec![[2.0, 2.0], [3.0, 3.0]],
+        ),
+    ] {
+        let mut transaction = dataset.begin();
+        transaction.insert(rows).unwrap();
+        transaction.commit().unwrap();
+    }
+    let snapshot = dataset.snapshot();
+    let filter = FilterExpression::Compare(Comparison {
+        column: "amount".into(),
+        operator: ComparisonOperator::GreaterThan,
+        value: FilterLiteral::Int64(5),
+    });
+    let scan = ScanRequest {
+        projection: Projection::Columns(vec!["category".into()]),
+        filter: Some(filter.clone()),
+    };
+    let scan_plan = snapshot.explain_scan_query(&scan).unwrap();
+    assert_eq!(scan_plan.observations.data_files_total, 2);
+    assert_eq!(scan_plan.observations.data_files_pruned, 1);
+    assert_eq!(scan_plan.observations.index_segments_total, 2);
+    assert_eq!(scan_plan.observations.index_segments_scanned, 0);
+    assert_eq!(scan_plan.observations.index_segments_pruned, 0);
+    assert!(!scan_plan.observations.transaction_overlay);
+    assert!(
+        scan_plan
+            .physical_operators
+            .contains(&PhysicalOperator::ZoneMapPruning)
+    );
+    assert_eq!(
+        snapshot.execute_planned_scan_query(&scan).unwrap(),
+        snapshot.scan_query(&scan).unwrap()
+    );
+
+    let group = GroupByRequest {
+        group_by: vec!["category".into()],
+        aggregates: vec![Aggregate::new("amount", AggregateFunction::Sum, "sum")],
+        filter: Some(filter.clone()),
+    };
+    let group_plan = snapshot.explain_group_by_query(&group).unwrap();
+    assert_eq!(group_plan.observations.index_segments_total, 2);
+    assert_eq!(group_plan.observations.index_segments_scanned, 0);
+    assert_eq!(group_plan.observations.index_segments_pruned, 0);
+    assert_eq!(
+        snapshot.execute_planned_group_by_query(&group).unwrap(),
+        snapshot.group_by_query(&group).unwrap()
+    );
+
+    let vector = VectorSearchRequest {
+        vector_column: "vector".into(),
+        query: vec![2.0, 2.0],
+        k: 2,
+        filter: Some(filter),
+        hydration: VectorHydration::Projection(Projection::Columns(vec!["category".into()])),
+    };
+    let vector_plan = snapshot.explain_vector_search_query(&vector).unwrap();
+    assert!(
+        vector_plan
+            .physical_operators
+            .contains(&PhysicalOperator::ImmutableSegmentVectorSearch)
+    );
+    assert_eq!(
+        snapshot
+            .execute_planned_vector_search_query(&vector)
+            .unwrap(),
+        snapshot.vector_search_query(&vector).unwrap()
+    );
+}
+
+#[test]
+fn snapshot_vector_explain_does_not_claim_row_file_reads_without_a_row_operator() {
+    // Break caught: an unfiltered, non-hydrating vector plan inherits row-file
+    // scans from global snapshot accounting even though its physical path reads
+    // only immutable vector segments.
+    let (_temp, dataset) = dataset_with_selective_vector_segments();
+    let snapshot = dataset.snapshot();
+    let request = VectorSearchRequest {
+        vector_column: "vector".into(),
+        query: vec![2.0, 2.0],
+        k: 2,
+        filter: None,
+        hydration: VectorHydration::NotRequested,
+    };
+
+    let plan = snapshot.explain_vector_search_query(&request).unwrap();
+    assert_eq!(plan.observations.data_files_total, 3);
+    assert_eq!(plan.observations.data_files_scanned, 0);
+    assert_eq!(plan.observations.data_files_pruned, 0);
+    assert_eq!(plan.observations.index_segments_total, 3);
+    assert_eq!(plan.observations.index_segments_scanned, 3);
+    assert_eq!(plan.observations.index_segments_pruned, 0);
+    assert_eq!(
+        snapshot
+            .execute_planned_vector_search_query(&request)
+            .unwrap(),
+        snapshot.vector_search_query(&request).unwrap()
+    );
+}
+
+#[test]
+fn unfiltered_plans_do_not_claim_a_row_filter_or_zone_map_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let dataset = Dataset::create(temp.path().join("dataset"), schema()).unwrap();
+    let mut transaction = dataset.begin();
+    transaction
+        .insert(batch(vec![Some("keep")], vec![Some(10)], vec![[2.0, 2.0]]))
+        .unwrap();
+    transaction.commit().unwrap();
+
+    let plan = dataset
+        .snapshot()
+        .explain_scan_query(&ScanRequest {
+            projection: Projection::All,
+            filter: None,
+        })
+        .unwrap();
+
+    assert!(
+        !plan
+            .physical_operators
+            .contains(&PhysicalOperator::RowFilter)
+    );
+    assert!(
+        !plan
+            .physical_operators
+            .contains(&PhysicalOperator::ZoneMapPruning)
+    );
+    assert!(
+        plan.logical_operators
+            .iter()
+            .all(|operator| !matches!(operator, LogicalOperator::Predicate { .. }))
+    );
+}
+
+#[test]
+fn unprunable_filters_still_select_the_row_filter_without_claiming_zone_map_pruning() {
+    let temp = tempfile::tempdir().unwrap();
+    let dataset = Dataset::create(temp.path().join("dataset"), schema()).unwrap();
+    let mut transaction = dataset.begin();
+    transaction
+        .insert(batch(vec![Some("keep")], vec![Some(10)], vec![[2.0, 2.0]]))
+        .unwrap();
+    transaction.commit().unwrap();
+
+    let plan = dataset
+        .snapshot()
+        .explain_scan_query(&ScanRequest {
+            projection: Projection::All,
+            filter: Some(FilterExpression::Not(Box::new(FilterExpression::Compare(
+                Comparison {
+                    column: "amount".into(),
+                    operator: ComparisonOperator::GreaterThan,
+                    value: FilterLiteral::Int64(100),
+                },
+            )))),
+        })
+        .unwrap();
+
+    assert!(
+        plan.physical_operators
+            .contains(&PhysicalOperator::RowFilter)
+    );
+    assert!(
+        !plan
+            .physical_operators
+            .contains(&PhysicalOperator::ZoneMapPruning)
+    );
+}
+
+#[test]
+fn planned_transaction_scan_and_group_reads_merge_the_overlay_and_report_it() {
+    // Break caught: exposing the planner only on snapshots bypasses staged
+    // inserts/replacements and makes explain conceal transaction read state.
+    let temp = tempfile::tempdir().unwrap();
+    let dataset = Dataset::create(temp.path().join("dataset"), schema()).unwrap();
+    let mut seed = dataset.begin();
+    seed.insert(batch(vec![Some("base")], vec![Some(10)], vec![[1.0, 1.0]]))
+        .unwrap();
+    seed.commit().unwrap();
+
+    let mut transaction = dataset.begin();
+    transaction
+        .insert(batch(
+            vec![Some("staged")],
+            vec![Some(20)],
+            vec![[2.0, 2.0]],
+        ))
+        .unwrap();
+    let scan = ScanRequest {
+        projection: Projection::Columns(vec!["category".into(), "amount".into()]),
+        filter: None,
+    };
+    let scan_plan = transaction.explain_scan_query(&scan).unwrap();
+    assert!(scan_plan.observations.transaction_overlay);
+    assert!(
+        scan_plan
+            .physical_operators
+            .contains(&PhysicalOperator::TransactionOverlay)
+    );
+    assert_eq!(
+        transaction.execute_planned_scan_query(&scan).unwrap(),
+        transaction.scan_query(&scan).unwrap()
+    );
+
+    let group = GroupByRequest {
+        group_by: vec!["category".into()],
+        aggregates: vec![Aggregate::new("amount", AggregateFunction::Sum, "sum")],
+        filter: None,
+    };
+    let group_plan = transaction.explain_group_by_query(&group).unwrap();
+    assert!(group_plan.observations.transaction_overlay);
+    assert!(
+        group_plan
+            .physical_operators
+            .contains(&PhysicalOperator::TransactionOverlay)
+    );
+    assert_eq!(
+        transaction.execute_planned_group_by_query(&group).unwrap(),
+        transaction.group_by_query(&group).unwrap()
+    );
+}
+
+#[test]
+fn transaction_explain_reports_full_base_scan_before_overlay_filter_and_grouping() {
+    // Break caught: reporting snapshot pruning or column pushdown for a transaction
+    // whose overlay execution first reads every base file and merges staged rows.
+    let (_temp, dataset) = dataset_with_selective_vector_segments();
+
+    let mut transaction = dataset.begin();
+    transaction
+        .insert(batch(
+            vec![Some("staged")],
+            vec![Some(200)],
+            vec![[200.0, 200.0]],
+        ))
+        .unwrap();
+    let filter = FilterExpression::Compare(Comparison {
+        column: "amount".into(),
+        operator: ComparisonOperator::GreaterThan,
+        value: FilterLiteral::Int64(50),
+    });
+    let scan = ScanRequest {
+        projection: Projection::Columns(vec!["category".into()]),
+        filter: Some(filter.clone()),
+    };
+
+    let scan_plan = transaction.explain_scan_query(&scan).unwrap();
+    assert_eq!(scan_plan.observations.data_files_total, 3);
+    assert_eq!(scan_plan.observations.data_files_scanned, 3);
+    assert_eq!(scan_plan.observations.data_files_pruned, 0);
+    assert_eq!(
+        scan_plan.physical_operators,
+        vec![
+            PhysicalOperator::ManifestSnapshotSource,
+            PhysicalOperator::TombstoneFilter,
+            PhysicalOperator::TransactionOverlay,
+            PhysicalOperator::RowFilter,
+            PhysicalOperator::Materialize,
+        ]
+    );
+    assert_eq!(
+        transaction.execute_planned_scan_query(&scan).unwrap(),
+        transaction.scan_query(&scan).unwrap()
+    );
+
+    let group = GroupByRequest {
+        group_by: vec!["category".into()],
+        aggregates: vec![Aggregate::new("amount", AggregateFunction::Sum, "sum")],
+        filter: Some(filter),
+    };
+    let group_plan = transaction.explain_group_by_query(&group).unwrap();
+    assert_eq!(group_plan.observations.data_files_total, 3);
+    assert_eq!(group_plan.observations.data_files_scanned, 3);
+    assert_eq!(group_plan.observations.data_files_pruned, 0);
+    assert_eq!(
+        group_plan.physical_operators,
+        vec![
+            PhysicalOperator::ManifestSnapshotSource,
+            PhysicalOperator::TombstoneFilter,
+            PhysicalOperator::TransactionOverlay,
+            PhysicalOperator::RowFilter,
+            PhysicalOperator::HashGroupBy,
+            PhysicalOperator::Materialize,
+        ]
+    );
+    assert_eq!(
+        transaction.execute_planned_group_by_query(&group).unwrap(),
+        transaction.group_by_query(&group).unwrap()
+    );
+}
+
+#[test]
+fn read_only_transaction_explain_uses_the_full_overlay_path() {
+    // Break caught: treating a transaction with no staged writes as a snapshot
+    // plan even though execution still decodes all base batches into its overlay.
+    let (_temp, dataset) = dataset_with_selective_vector_segments();
+
+    let transaction = dataset.begin();
+    let filter = FilterExpression::Compare(Comparison {
+        column: "amount".into(),
+        operator: ComparisonOperator::GreaterThan,
+        value: FilterLiteral::Int64(50),
+    });
+    let scan = ScanRequest {
+        projection: Projection::Columns(vec!["category".into()]),
+        filter: Some(filter.clone()),
+    };
+
+    let scan_plan = transaction.explain_scan_query(&scan).unwrap();
+    assert!(scan_plan.observations.transaction_overlay);
+    assert_eq!(scan_plan.observations.data_files_scanned, 3);
+    assert_eq!(scan_plan.observations.data_files_pruned, 0);
+    assert_eq!(
+        scan_plan.physical_operators,
+        vec![
+            PhysicalOperator::ManifestSnapshotSource,
+            PhysicalOperator::TombstoneFilter,
+            PhysicalOperator::TransactionOverlay,
+            PhysicalOperator::RowFilter,
+            PhysicalOperator::Materialize,
+        ]
+    );
+    assert_eq!(
+        transaction.execute_planned_scan_query(&scan).unwrap(),
+        transaction.scan_query(&scan).unwrap()
+    );
+
+    let group = GroupByRequest {
+        group_by: vec!["category".into()],
+        aggregates: vec![Aggregate::new("amount", AggregateFunction::Sum, "sum")],
+        filter: Some(filter),
+    };
+    let group_plan = transaction.explain_group_by_query(&group).unwrap();
+    assert!(group_plan.observations.transaction_overlay);
+    assert_eq!(group_plan.observations.data_files_scanned, 3);
+    assert_eq!(group_plan.observations.data_files_pruned, 0);
+    assert_eq!(
+        group_plan.physical_operators,
+        vec![
+            PhysicalOperator::ManifestSnapshotSource,
+            PhysicalOperator::TombstoneFilter,
+            PhysicalOperator::TransactionOverlay,
+            PhysicalOperator::RowFilter,
+            PhysicalOperator::HashGroupBy,
+            PhysicalOperator::Materialize,
+        ]
+    );
+    assert_eq!(
+        transaction.execute_planned_group_by_query(&group).unwrap(),
+        transaction.group_by_query(&group).unwrap()
+    );
+}
+
+#[test]
+fn transaction_scalar_explain_reports_zero_vector_segment_scans() {
+    // Break caught: scalar transaction scan/group explain inheriting vector
+    // segment selections even though only vector search reads those segments.
+    let (_temp, dataset) = dataset_with_selective_vector_segments();
+
+    let mut transaction = dataset.begin();
+    transaction
+        .insert(batch(
+            vec![Some("staged")],
+            vec![Some(200)],
+            vec![[200.0, 200.0]],
+        ))
+        .unwrap();
+    let filter = FilterExpression::Compare(Comparison {
+        column: "amount".into(),
+        operator: ComparisonOperator::GreaterThan,
+        value: FilterLiteral::Int64(50),
+    });
+    let scan = ScanRequest {
+        projection: Projection::Columns(vec!["category".into()]),
+        filter: Some(filter.clone()),
+    };
+    let scan_plan = transaction.explain_scan_query(&scan).unwrap();
+    assert_eq!(scan_plan.observations.index_segments_total, 3);
+    assert_eq!(scan_plan.observations.index_segments_scanned, 0);
+    assert_eq!(scan_plan.observations.index_segments_pruned, 0);
+
+    let group = GroupByRequest {
+        group_by: vec!["category".into()],
+        aggregates: vec![Aggregate::new("amount", AggregateFunction::Sum, "sum")],
+        filter: Some(filter),
+    };
+    let group_plan = transaction.explain_group_by_query(&group).unwrap();
+    assert_eq!(group_plan.observations.index_segments_total, 3);
+    assert_eq!(group_plan.observations.index_segments_scanned, 0);
+    assert_eq!(group_plan.observations.index_segments_pruned, 0);
+}
+
+#[test]
+fn planned_paths_preserve_tombstones_nulls_projection_order_and_invalid_request_errors() {
+    let temp = tempfile::tempdir().unwrap();
+    let dataset = Dataset::create(temp.path().join("dataset"), schema()).unwrap();
+    let mut transaction = dataset.begin();
+    transaction
+        .insert(batch(
+            vec![None, Some("keep")],
+            vec![None, Some(20)],
+            vec![[0.0, 0.0], [2.0, 2.0]],
+        ))
+        .unwrap();
+    transaction.commit().unwrap();
+    let mut transaction = dataset.begin();
+    transaction.delete(RowId(1).0).unwrap();
+    transaction.commit().unwrap();
+
+    let snapshot = dataset.snapshot();
+    let scan = ScanRequest {
+        projection: Projection::Columns(vec!["amount".into(), "category".into()]),
+        filter: None,
+    };
+    let direct_scan = snapshot.scan_query(&scan).unwrap();
+    assert_eq!(
+        direct_scan
+            .rows
+            .iter()
+            .flat_map(|row| row.fields.iter().map(|field| field.name.as_str()))
+            .collect::<Vec<_>>(),
+        vec!["amount", "category"]
+    );
+    assert_eq!(
+        snapshot.execute_planned_scan_query(&scan).unwrap(),
+        direct_scan
+    );
+
+    let group = GroupByRequest {
+        group_by: vec!["category".into()],
+        aggregates: vec![Aggregate::new("amount", AggregateFunction::Count, "count")],
+        filter: None,
+    };
+    assert_eq!(
+        snapshot.execute_planned_group_by_query(&group).unwrap(),
+        snapshot.group_by_query(&group).unwrap()
+    );
+
+    let vector = VectorSearchRequest {
+        vector_column: "vector".into(),
+        query: vec![0.0, 0.0],
+        k: 2,
+        filter: None,
+        hydration: VectorHydration::Projection(Projection::Columns(vec!["category".into()])),
+    };
+    assert_eq!(
+        snapshot
+            .execute_planned_vector_search_query(&vector)
+            .unwrap(),
+        snapshot.vector_search_query(&vector).unwrap()
+    );
+
+    let invalid = ScanRequest {
+        projection: Projection::Columns(vec!["missing".into()]),
+        filter: None,
+    };
+    for result in [
+        snapshot.scan_query(&invalid),
+        snapshot.execute_planned_scan_query(&invalid),
+    ] {
+        assert!(matches!(
+            result,
+            Err(QueryError::Validation(QueryValidationError::UnknownColumn { name })) if name == "missing"
+        ));
+    }
+}

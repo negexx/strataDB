@@ -67,3 +67,7 @@ harness = false
 [[bench]]
 name = "row_group_bench"
 harness = false
+
+[[bench]]
+name = "query_planner_bench"
+harness = false

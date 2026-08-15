@@ -8,10 +8,14 @@ intent and constraints; current source and tests determine what is actually impl
 
 **Status:** Accepted as the design ceiling; the current API is narrower.
 
-Strata targets snapshot isolation rather than serializability. The implementation currently exposes
-immutable snapshot reads and write-write optimistic conflict detection, not a full read/write
-transaction snapshot API. Stronger isolation requires a new decision and evidence that the extra
-coordination is worth its complexity.
+Strata targets snapshot isolation rather than serializability. The implementation exposes immutable
+snapshot reads and bounded transaction-base reads: scans (including predicate reads) and group
+operations expose staged inserts, replacements, and deletes; lookup reflects staged replacements and
+deletes only for physical row IDs already in the base snapshot, because staged inserts receive no
+physical row ID until commit and cannot be looked up pre-commit. It also provides write-write
+optimistic conflict detection. `vector_search` after staged writes returns a typed
+unsupported-transaction-read error; this is not a full/general read/write query interface. Stronger
+isolation requires a new decision and evidence that the extra coordination is worth its complexity.
 
 ## 0005 - Rust over C++
 

@@ -1,9 +1,13 @@
 //! A thin Python facade over Strata's immutable snapshot query API.
 //!
 //! The extension remains embedded and supports one process sharing one
-//! [`strata_txn::Dataset`] handle. It does not provide a read/write transaction
-//! API, cross-process coordination, or stronger isolation.
+//! [`strata_txn::Dataset`] handle. It provides bounded read/write transactions:
+//! scans read the immutable base snapshot plus the transaction's own overlay,
+//! while vector search is rejected when staged writes would make base-index
+//! results stale. It does not provide cross-process coordination, general
+//! transactional reads, or stronger isolation.
 
+use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -16,21 +20,30 @@ use strata_txn::arrow::array::{
 };
 use strata_txn::arrow::buffer::NullBuffer;
 use strata_txn::arrow::datatypes::{DataType, Field, Schema};
+use strata_txn::arrow::ipc::reader::StreamReader;
 use strata_txn::arrow::ipc::writer::StreamWriter;
 use strata_txn::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use strata_txn::{
     Aggregate, AggregateFunction, Comparison, ComparisonOperator, FilterExpression, FilterLiteral,
-    GroupByRequest, GroupByResult, HydrationError, LogicalType, ProjectedRow, Projection,
-    QueryError, QueryExecutionError, ResultValue, RowId, RowLookupOutcome, RowLookupRequest,
-    ScanRequest, ScanResult, Snapshot, TxnError, VectorHydration, VectorHydrationState,
+    GroupByRequest, GroupByResult, HydrationError, LogicalOperator, LogicalType, PhysicalOperator,
+    PhysicalPlan, ProjectedRow, Projection, QueryError, QueryExecutionError, ResultValue, RowId,
+    RowLookupOutcome, RowLookupRequest, ScanRequest, ScanResult, SchemaMigration, Snapshot,
+    StorageError, Transaction, TxnError, VectorHydration, VectorHydrationState,
     VectorSearchRequest, VectorSearchResult,
 };
+
+const PYTHON_API_VERSION: &str = "1.0";
 
 create_exception!(strata_ext, StrataError, pyo3::exceptions::PyException);
 create_exception!(strata_ext, ValidationError, StrataError);
 create_exception!(strata_ext, ExecutionError, StrataError);
 create_exception!(strata_ext, ConflictError, StrataError);
 create_exception!(strata_ext, InsufficientHistoryError, StrataError);
+create_exception!(strata_ext, SchemaMigrationError, ValidationError);
+create_exception!(strata_ext, InvalidQueryError, ValidationError);
+create_exception!(strata_ext, UnsupportedTransactionReadError, ExecutionError);
+create_exception!(strata_ext, StorageDurabilityError, ExecutionError);
+create_exception!(strata_ext, CorruptionError, ExecutionError);
 
 /// A Python handle to one embedded Strata dataset.
 #[pyclass(name = "Dataset", module = "strata_ext")]
@@ -40,6 +53,57 @@ struct PyDataset {
 
 #[pymethods]
 impl PyDataset {
+    /// Creates a dataset with the supplied stable Python schema descriptor.
+    ///
+    /// Each field is `(name, type_name, nullable)`. Supported `type_name`
+    /// values are `bool`, `int64`, `uint64`, `float64`, `utf8`, and
+    /// `vector[N]` for a fixed-size Float32 vector.
+    #[staticmethod]
+    fn create(
+        py: Python<'_>,
+        path: PathBuf,
+        fields: Vec<(String, String, bool)>,
+    ) -> PyResult<Self> {
+        let schema = schema_from_python(fields)?;
+        py.detach(move || strata_txn::Dataset::create(path, schema))
+            .map(|inner| Self { inner })
+            .map_err(|error| map_txn_error(&error))
+    }
+
+    /// Returns the stable Python API major/minor marker for this handle.
+    #[allow(clippy::unused_self)]
+    fn api_version(&self) -> &'static str {
+        PYTHON_API_VERSION
+    }
+
+    /// Returns the current durable manifest version.
+    fn version(&self) -> u64 {
+        self.inner.snapshot().version()
+    }
+
+    fn schema_version(&self) -> u32 {
+        self.inner.schema_version()
+    }
+
+    /// Adds one nullable column through the only supported explicit migration.
+    fn migrate_add_nullable_column(
+        &self,
+        py: Python<'_>,
+        name: String,
+        type_name: &str,
+    ) -> PyResult<Py<PyDict>> {
+        let data_type = python_type_to_arrow(type_name)?;
+        let migration = SchemaMigration::add_nullable_column(
+            self.inner.schema_version(),
+            self.inner.schema_version().saturating_add(1),
+            Field::new(name, data_type, true),
+        );
+        let result = py
+            .detach(|| self.inner.migrate_schema(&migration))
+            .map_err(|error| map_txn_error(&error))?;
+        migration_result_to_python(py, &result)
+    }
+
     /// Opens an existing embedded dataset at `path`.
     ///
     /// The resulting handle is intended for sharing inside one Python process.
@@ -58,6 +122,59 @@ impl PyDataset {
         let inner = py.detach(move || dataset.snapshot());
         PySnapshot { inner }
     }
+
+    /// Begins a transaction with a private read-your-writes overlay.
+    fn begin(&self) -> PyTransaction {
+        let transaction = self.inner.begin();
+        PyTransaction {
+            schema: transaction.schema(),
+            inner: Some(transaction),
+            state: TransactionState::Active,
+        }
+    }
+}
+
+fn schema_from_python(fields: Vec<(String, String, bool)>) -> PyResult<Arc<Schema>> {
+    fields
+        .into_iter()
+        .map(|(name, type_name, nullable)| {
+            python_type_to_arrow(&type_name).map(|data_type| Field::new(name, data_type, nullable))
+        })
+        .collect::<PyResult<Vec<_>>>()
+        .map(Schema::new)
+        .map(Arc::new)
+}
+
+fn python_type_to_arrow(type_name: &str) -> PyResult<DataType> {
+    match type_name {
+        "bool" => Ok(DataType::Boolean),
+        "int64" => Ok(DataType::Int64),
+        "uint64" => Ok(DataType::UInt64),
+        "float64" => Ok(DataType::Float64),
+        "utf8" => Ok(DataType::Utf8),
+        _ => {
+            let Some(dimensions) = type_name
+                .strip_prefix("vector[")
+                .and_then(|value| value.strip_suffix(']'))
+            else {
+                return Err(ValidationError::new_err(
+                    "field type must be bool, int64, uint64, float64, utf8, or vector[N]",
+                ));
+            };
+            let dimensions = dimensions.parse::<i32>().map_err(|_| {
+                ValidationError::new_err("vector field type must be written as vector[N] for N > 0")
+            })?;
+            if dimensions <= 0 {
+                return Err(ValidationError::new_err(
+                    "vector field type must be written as vector[N] for N > 0",
+                ));
+            }
+            Ok(DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, false)),
+                dimensions,
+            ))
+        }
+    }
 }
 
 /// An immutable snapshot that executes typed read queries.
@@ -68,6 +185,27 @@ struct PySnapshot {
 
 #[pymethods]
 impl PySnapshot {
+    /// Returns the immutable manifest version captured by this snapshot.
+    fn version(&self) -> u64 {
+        self.inner.version()
+    }
+
+    #[pyo3(signature = (projection=None, filter=None))]
+    fn explain_scan(
+        &self,
+        py: Python<'_>,
+        projection: Option<Vec<String>>,
+        filter: Option<(String, String, Py<PyAny>)>,
+    ) -> PyResult<Py<PyDict>> {
+        let request = ScanRequest {
+            projection: projection_from_python(projection),
+            filter: filter_from_python(py, self.inner.schema().as_ref(), filter)?,
+        };
+        let plan = py
+            .detach(|| self.inner.explain_scan_query(&request))
+            .map_err(map_query_error)?;
+        plan_to_python(py, &plan)
+    }
     /// Returns an Arrow IPC stream containing the snapshot scan result.
     ///
     /// `projection` is `None` for all user columns or a list of user column
@@ -114,11 +252,13 @@ impl PySnapshot {
                 .lookup_row(&request)
                 .map_err(BindingFailure::Query)?;
             match result.outcome {
-                RowLookupOutcome::Live(row) => {
-                    projected_rows_to_ipc(&snapshot, &result.projection, std::slice::from_ref(&row))
-                        .map(Some)
-                        .map_err(BindingFailure::Execution)
-                }
+                RowLookupOutcome::Live(row) => projected_rows_to_ipc(
+                    snapshot.schema().as_ref(),
+                    &result.projection,
+                    std::slice::from_ref(&row),
+                )
+                .map(Some)
+                .map_err(BindingFailure::Execution),
                 RowLookupOutcome::Tombstoned | RowLookupOutcome::NotFound => Ok(None),
             }
         });
@@ -188,6 +328,170 @@ impl PySnapshot {
         let result = result.map_err(map_query_error)?;
         vector_result_to_python(py, &result)
     }
+}
+
+enum TransactionState {
+    Active,
+    Committed,
+    Aborted,
+}
+
+impl TransactionState {
+    const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Committed => "committed",
+            Self::Aborted => "aborted",
+        }
+    }
+}
+
+/// A private transaction overlay. Dropping an active handle aborts it.
+#[pyclass(name = "Transaction", module = "strata_ext", unsendable)]
+struct PyTransaction {
+    inner: Option<Transaction>,
+    schema: Arc<Schema>,
+    state: TransactionState,
+}
+
+#[pymethods]
+impl PyTransaction {
+    /// Returns `active`, `committed`, or `aborted`.
+    fn state(&self) -> &'static str {
+        self.state.as_str()
+    }
+
+    /// Discards staged writes. An aborted transaction cannot be reused.
+    fn abort(&mut self) {
+        self.inner = None;
+        if matches!(self.state, TransactionState::Active) {
+            self.state = TransactionState::Aborted;
+        }
+    }
+
+    /// Durably publishes staged writes or returns their typed failure.
+    fn commit(&mut self, py: Python<'_>) -> PyResult<()> {
+        let transaction = self.take_active()?;
+        let result = py.detach(move || transaction.commit());
+        self.state = TransactionState::Aborted;
+        result.map_err(|error| map_txn_error(&error))?;
+        self.state = TransactionState::Committed;
+        Ok(())
+    }
+
+    /// Stages exactly one Arrow IPC record batch for this transaction.
+    fn insert(&mut self, batch: &Bound<'_, PyBytes>) -> PyResult<()> {
+        let batch = record_batch_from_ipc(batch.as_bytes())?;
+        self.active_mut()?
+            .insert(batch)
+            .map_err(|error| map_txn_error(&error))
+    }
+
+    /// Returns Arrow IPC rows from the base snapshot plus this transaction's
+    /// private staged-write overlay.
+    #[pyo3(signature = (projection=None, filter=None))]
+    fn scan<'py>(
+        &mut self,
+        py: Python<'py>,
+        projection: Option<Vec<String>>,
+        filter: Option<(String, String, Py<PyAny>)>,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let request = ScanRequest {
+            projection: projection_from_python(projection),
+            filter: filter_from_python(py, &self.schema, filter)?,
+        };
+        let schema = Arc::clone(&self.schema);
+        let transaction = self.take_active()?;
+        let (transaction, result) = py.detach(move || {
+            let result = transaction
+                .scan_query(&request)
+                .map_err(BindingFailure::Query)
+                .and_then(|result| {
+                    scan_result_to_ipc_with_schema(&schema, &result)
+                        .map_err(BindingFailure::Execution)
+                });
+            (transaction, result)
+        });
+        self.inner = Some(transaction);
+        let bytes = result.map_err(map_binding_failure)?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+
+    /// Returns nearest-neighbor hits from the transaction base snapshot.
+    ///
+    /// When this transaction has staged inserts, replacements, or deletes,
+    /// the immutable vector index cannot represent the overlay and this
+    /// raises `UnsupportedTransactionReadError` instead of returning stale
+    /// base-snapshot hits.
+    #[pyo3(signature = (vector_column, query, k, filter=None, projection=None))]
+    fn vector_search(
+        &mut self,
+        py: Python<'_>,
+        vector_column: String,
+        query: Vec<f32>,
+        k: usize,
+        filter: Option<(String, String, Py<PyAny>)>,
+        projection: Option<Vec<String>>,
+    ) -> PyResult<Vec<Py<PyDict>>> {
+        let request = VectorSearchRequest {
+            vector_column,
+            query,
+            k,
+            filter: filter_from_python(py, &self.schema, filter)?,
+            hydration: projection
+                .map(Projection::Columns)
+                .map_or(VectorHydration::NotRequested, VectorHydration::Projection),
+        };
+        let transaction = self.take_active()?;
+        let (transaction, result) = py.detach(move || {
+            let result = transaction.vector_search_query(&request);
+            (transaction, result)
+        });
+        self.inner = Some(transaction);
+        let result = result.map_err(map_query_error)?;
+        vector_result_to_python(py, &result)
+    }
+}
+
+impl PyTransaction {
+    fn active_mut(&mut self) -> PyResult<&mut Transaction> {
+        self.inner.as_mut().ok_or_else(|| {
+            ExecutionError::new_err(format!(
+                "transaction is {}; only active transactions accept operations",
+                self.state.as_str()
+            ))
+        })
+    }
+
+    fn take_active(&mut self) -> PyResult<Transaction> {
+        self.inner.take().ok_or_else(|| {
+            ExecutionError::new_err(format!(
+                "transaction is {}; only active transactions accept operations",
+                self.state.as_str()
+            ))
+        })
+    }
+}
+
+fn record_batch_from_ipc(bytes: &[u8]) -> PyResult<RecordBatch> {
+    let mut reader = StreamReader::try_new(Cursor::new(bytes), None)
+        .map_err(|error| ValidationError::new_err(error.to_string()))?;
+    let batch = reader
+        .next()
+        .transpose()
+        .map_err(|error| ValidationError::new_err(error.to_string()))?
+        .ok_or_else(|| ValidationError::new_err("Arrow IPC input must contain one record batch"))?;
+    if reader
+        .next()
+        .transpose()
+        .map_err(|error| ValidationError::new_err(error.to_string()))?
+        .is_some()
+    {
+        return Err(ValidationError::new_err(
+            "Arrow IPC input must contain exactly one record batch",
+        ));
+    }
+    Ok(batch)
 }
 
 fn projection_from_python(projection: Option<Vec<String>>) -> Projection {
@@ -299,15 +603,18 @@ fn filter_literal(value: &Bound<'_, PyAny>) -> PyResult<FilterLiteral> {
 }
 
 fn scan_result_to_ipc(snapshot: &Snapshot, result: &ScanResult) -> Result<Vec<u8>, String> {
-    projected_rows_to_ipc(snapshot, &result.projection, &result.rows)
+    scan_result_to_ipc_with_schema(snapshot.schema().as_ref(), result)
+}
+
+fn scan_result_to_ipc_with_schema(schema: &Schema, result: &ScanResult) -> Result<Vec<u8>, String> {
+    projected_rows_to_ipc(schema, &result.projection, &result.rows)
 }
 
 fn projected_rows_to_ipc(
-    snapshot: &Snapshot,
+    schema: &Schema,
     projection: &[String],
     rows: &[ProjectedRow],
 ) -> Result<Vec<u8>, String> {
-    let schema = snapshot.schema();
     let fields = projection
         .iter()
         .map(|name| {
@@ -548,6 +855,82 @@ fn vector_result_to_python(
         .collect()
 }
 
+fn migration_result_to_python(
+    py: Python<'_>,
+    result: &strata_txn::SchemaMigrationResult,
+) -> PyResult<Py<PyDict>> {
+    let output = PyDict::new(py);
+    output.set_item("name", result.name)?;
+    output.set_item("source_schema_version", result.source_schema_version)?;
+    output.set_item("target_schema_version", result.target_schema_version)?;
+    output.set_item("manifest_version", result.manifest_version)?;
+    Ok(output.unbind())
+}
+
+fn plan_to_python(py: Python<'_>, plan: &PhysicalPlan) -> PyResult<Py<PyDict>> {
+    let output = PyDict::new(py);
+    output.set_item(
+        "logical_operators",
+        plan.logical_operators
+            .iter()
+            .map(logical_operator_name)
+            .collect::<Vec<_>>(),
+    )?;
+    output.set_item(
+        "physical_operators",
+        plan.physical_operators
+            .iter()
+            .map(physical_operator_name)
+            .collect::<Vec<_>>(),
+    )?;
+    let observations = PyDict::new(py);
+    observations.set_item("data_files_total", plan.observations.data_files_total)?;
+    observations.set_item("data_files_scanned", plan.observations.data_files_scanned)?;
+    observations.set_item("data_files_pruned", plan.observations.data_files_pruned)?;
+    observations.set_item(
+        "index_segments_total",
+        plan.observations.index_segments_total,
+    )?;
+    observations.set_item(
+        "index_segments_scanned",
+        plan.observations.index_segments_scanned,
+    )?;
+    observations.set_item(
+        "index_segments_pruned",
+        plan.observations.index_segments_pruned,
+    )?;
+    observations.set_item("transaction_overlay", plan.observations.transaction_overlay)?;
+    output.set_item("observations", observations)?;
+    Ok(output.unbind())
+}
+
+fn logical_operator_name(operator: &LogicalOperator) -> &'static str {
+    match operator {
+        LogicalOperator::Source => "source",
+        LogicalOperator::Predicate { .. } => "predicate",
+        LogicalOperator::Projection { .. } => "projection",
+        LogicalOperator::Grouping { .. } => "grouping",
+        LogicalOperator::VectorSearch { .. } => "vector_search",
+        LogicalOperator::Materialize => "materialize",
+    }
+}
+
+fn physical_operator_name(operator: &PhysicalOperator) -> &'static str {
+    match operator {
+        PhysicalOperator::ManifestSnapshotSource => "manifest_snapshot_source",
+        PhysicalOperator::ZoneMapPruning => "zone_map_pruning",
+        PhysicalOperator::TombstoneFilter => "tombstone_filter",
+        PhysicalOperator::RowFilter => "row_filter",
+        PhysicalOperator::ColumnProjection => "column_projection",
+        PhysicalOperator::HashGroupBy => "hash_group_by",
+        PhysicalOperator::FilterLiveSet => "filter_live_set",
+        PhysicalOperator::ImmutableSegmentVectorSearch => "immutable_segment_vector_search",
+        PhysicalOperator::HydrationLookup => "hydration_lookup",
+        PhysicalOperator::TransactionOverlay => "transaction_overlay",
+        PhysicalOperator::Materialize => "materialize",
+    }
+}
+
 fn hydration_error_to_python<'py>(
     py: Python<'py>,
     error: &HydrationError,
@@ -596,7 +979,12 @@ fn map_binding_failure(error: BindingFailure) -> PyErr {
 
 fn map_query_error(error: QueryError) -> PyErr {
     match error {
-        QueryError::Validation(error) => ValidationError::new_err(error.to_string()),
+        QueryError::Validation(error) => InvalidQueryError::new_err(error.to_string()),
+        QueryError::Execution(QueryExecutionError::UnsupportedTransactionRead { operation }) => {
+            UnsupportedTransactionReadError::new_err(format!(
+                "transaction read operation '{operation}' cannot merge staged writes safely"
+            ))
+        }
         QueryError::Execution(QueryExecutionError::Engine(error)) => map_txn_error(error.as_ref()),
         QueryError::Execution(error) => ExecutionError::new_err(error.to_string()),
     }
@@ -604,30 +992,84 @@ fn map_query_error(error: QueryError) -> PyErr {
 
 fn map_txn_error(error: &TxnError) -> PyErr {
     match error {
-        TxnError::Conflict { .. } => ConflictError::new_err(error.to_string()),
+        TxnError::Conflict { contested_row_ids } => conflict_error(contested_row_ids),
         TxnError::InsufficientHistory { .. } => {
             InsufficientHistoryError::new_err(error.to_string())
         }
+        TxnError::BatchSchemaMismatch { .. }
+        | TxnError::SchemaMismatch { .. }
+        | TxnError::ReservedColumnName(_)
+        | TxnError::InvalidUpdateShape { .. } => SchemaMigrationError::new_err(error.to_string()),
+        TxnError::Storage(error) => match error {
+            StorageError::UnknownSchemaVersion { .. }
+            | StorageError::MigrationSourceVersion { .. }
+            | StorageError::MigrationUnsupportedDirection { .. }
+            | StorageError::MigrationUnsupported { .. }
+            | StorageError::MigrationIncompatibleType { .. }
+            | StorageError::MigrationLossyConversion { .. }
+            | StorageError::SchemaVersionChanged { .. }
+            | StorageError::LegacyFormatNeedsMigration(_) => {
+                SchemaMigrationError::new_err(error.to_string())
+            }
+            StorageError::CorruptManifest(_, _)
+            | StorageError::CorruptDataFile(_, _)
+            | StorageError::EmptyDataFile(_)
+            | StorageError::MissingRowIdHighWater(_) => CorruptionError::new_err(error.to_string()),
+            StorageError::Io(_)
+            | StorageError::Arrow(_)
+            | StorageError::Serde(_)
+            | StorageError::DurabilityUnsupported(_)
+            | StorageError::AlreadyExists(_) => StorageDurabilityError::new_err(error.to_string()),
+        },
+        TxnError::Io(_)
+        | TxnError::Arrow(_)
+        | TxnError::Index(_)
+        | TxnError::AlreadyExists(_)
+        | TxnError::NotFound(_)
+        | TxnError::ManifestOverflow(_)
+        | TxnError::RowIdReservationDurability { .. }
+        | TxnError::Clock(_) => StorageDurabilityError::new_err(error.to_string()),
+        TxnError::CorruptSegment(_)
+        | TxnError::UnsafeManifestPath(_)
+        | TxnError::UnreasonableCapacity(_, _)
+        | TxnError::RowIdRangeMismatch { .. } => CorruptionError::new_err(error.to_string()),
         _ => ExecutionError::new_err(error.to_string()),
     }
+}
+
+fn conflict_error(contested_row_ids: &[u64]) -> PyErr {
+    Python::attach(|py| {
+        let error = ConflictError::new_err(format!(
+            "conflict: {contested_row_ids:?} were modified by another transaction"
+        ));
+        if let Err(attribute_error) = error
+            .value(py)
+            .setattr("contested_row_ids", contested_row_ids)
+        {
+            return attribute_error;
+        }
+        error
+    })
 }
 
 #[pymodule]
 mod strata_ext {
     #[pymodule_export]
     use super::{
-        ConflictError, ExecutionError, InsufficientHistoryError, PyDataset, PySnapshot,
-        StrataError, ValidationError,
+        ConflictError, CorruptionError, ExecutionError, InsufficientHistoryError,
+        InvalidQueryError, PyDataset, PySnapshot, PyTransaction, SchemaMigrationError,
+        StorageDurabilityError, StrataError, UnsupportedTransactionReadError, ValidationError,
     };
 }
 
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+    use std::path::PathBuf;
     use std::sync::Arc;
 
     use pyo3::prelude::*;
-    use pyo3::types::PyBytesMethods;
+    use pyo3::types::{PyBytes, PyBytesMethods, PyDict, PyList};
     use strata_txn::arrow::array::{
         FixedSizeListArray, Float32Array, Int64Array, StringArray, UInt64Array,
     };
@@ -636,9 +1078,285 @@ mod tests {
     use strata_txn::arrow::record_batch::RecordBatch;
 
     use super::{
-        HydrationError, PyDataset, StrataError, TxnError, ValidationError,
-        hydration_error_to_python,
+        CorruptionError, HydrationError, InvalidQueryError, PyDataset, SchemaMigrationError,
+        StorageDurabilityError, StrataError, TxnError, UnsupportedTransactionReadError,
+        ValidationError, hydration_error_to_python, map_query_error, map_txn_error,
+        record_batch_to_ipc,
     };
+
+    #[test]
+    fn stable_api_exposes_versioned_dataset_snapshot_and_transaction_lifecycle()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let dataset = PyDataset::create(
+                py,
+                directory.path().to_path_buf(),
+                vec![("name".to_owned(), "utf8".to_owned(), false)],
+            )?;
+            assert_eq!(dataset.api_version(), "1.0");
+            assert_eq!(dataset.version(), 0);
+            assert_eq!(dataset.snapshot(py).version(), 0);
+
+            let mut transaction = dataset.begin();
+            assert_eq!(transaction.state(), "active");
+            transaction.abort();
+            assert_eq!(transaction.state(), "aborted");
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn transaction_wrapper_reads_its_arrow_ipc_write_and_abort_keeps_it_private()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringArray::from(vec!["staged"]))],
+        )?;
+        let input = record_batch_to_ipc(&batch)?;
+
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let dataset = PyDataset::create(
+                py,
+                directory.path().to_path_buf(),
+                vec![("name".to_owned(), "utf8".to_owned(), false)],
+            )?;
+            let mut transaction = dataset.begin();
+            transaction.insert(&PyBytes::new(py, &input))?;
+
+            let staged = transaction.scan(py, Some(vec!["name".to_owned()]), None)?;
+            assert_eq!(first_ipc_batch(staged.as_bytes())?.num_rows(), 1);
+            assert_eq!(
+                first_ipc_batch(dataset.snapshot(py).scan(py, None, None)?.as_bytes())?.num_rows(),
+                0
+            );
+
+            transaction.abort();
+            assert_eq!(transaction.state(), "aborted");
+            assert_eq!(
+                first_ipc_batch(dataset.snapshot(py).scan(py, None, None)?.as_bytes())?.num_rows(),
+                0
+            );
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn transaction_schema_accessor_stays_bound_to_its_base_snapshot()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)]));
+        let dataset = strata_txn::Dataset::create(directory.path(), Arc::clone(&schema))?;
+        let transaction = dataset.begin();
+
+        dataset.migrate_schema(&strata_txn::SchemaMigration::add_nullable_column(
+            1,
+            2,
+            Field::new("note", DataType::Utf8, true),
+        ))?;
+
+        assert_eq!(transaction.schema(), schema);
+        assert_eq!(transaction.schema().fields().len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn transaction_vector_search_and_error_mapping_use_stable_categories()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = populated_dataset()?;
+
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let dataset = PyDataset::open(py, directory.path().to_path_buf())?;
+            let mut transaction = dataset.begin();
+            assert_eq!(
+                transaction
+                    .vector_search(py, "vector".to_owned(), vec![0.0, 0.0], 1, None, None)?
+                    .len(),
+                1
+            );
+            transaction
+                .active_mut()?
+                .delete(0)
+                .map_err(|error| map_txn_error(&error))?;
+            let Err(unsupported) =
+                transaction.vector_search(py, "vector".to_owned(), vec![0.0, 0.0], 1, None, None)
+            else {
+                return Err(ValidationError::new_err(
+                    "staged vector search was accepted",
+                ));
+            };
+            assert!(unsupported.is_instance_of::<UnsupportedTransactionReadError>(py));
+
+            let conflict = map_txn_error(&TxnError::Conflict {
+                contested_row_ids: vec![7, 9],
+            });
+            assert!(conflict.is_instance_of::<super::ConflictError>(py));
+            assert_eq!(
+                conflict
+                    .value(py)
+                    .getattr("contested_row_ids")?
+                    .extract::<Vec<u64>>()?,
+                vec![7, 9]
+            );
+
+            let schema = map_txn_error(&TxnError::Storage(
+                strata_txn::StorageError::MigrationSourceVersion {
+                    expected: 2,
+                    actual: 1,
+                },
+            ));
+            assert!(schema.is_instance_of::<SchemaMigrationError>(py));
+
+            let query = map_query_error(strata_txn::QueryError::Validation(
+                strata_txn::QueryValidationError::InvalidVectorK,
+            ));
+            assert!(query.is_instance_of::<InvalidQueryError>(py));
+
+            let durability = map_txn_error(&TxnError::RowIdReservationDurability {
+                end: 7,
+                source: strata_txn::StorageError::DurabilityUnsupported(PathBuf::from("dataset")),
+            });
+            assert!(durability.is_instance_of::<StorageDurabilityError>(py));
+
+            let corruption = map_txn_error(&TxnError::Storage(
+                strata_txn::StorageError::CorruptManifest(
+                    PathBuf::from("dataset/current"),
+                    "checksum mismatch".to_owned(),
+                ),
+            ));
+            assert!(corruption.is_instance_of::<CorruptionError>(py));
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn stable_python_contract_commits_migrates_and_explains_without_rust_layouts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringArray::from(vec!["durable"]))],
+        )?;
+        let input = record_batch_to_ipc(&batch)?;
+
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let dataset = PyDataset::create(
+                py,
+                directory.path().to_path_buf(),
+                vec![("name".to_owned(), "utf8".to_owned(), false)],
+            )?;
+            let mut transaction = dataset.begin();
+            transaction.insert(&PyBytes::new(py, &input))?;
+            transaction.commit(py)?;
+            assert_eq!(transaction.state(), "committed");
+            assert_eq!(dataset.version(), 1);
+
+            let migration = dataset.migrate_add_nullable_column(py, "note".to_owned(), "utf8")?;
+            let migration = migration.bind(py);
+            assert_eq!(
+                migration
+                    .get_item("name")?
+                    .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("missing name"))?
+                    .extract::<String>()?,
+                "add_nullable_column"
+            );
+            assert_eq!(
+                migration
+                    .get_item("target_schema_version")?
+                    .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(
+                        "missing target version"
+                    ))?
+                    .extract::<u32>()?,
+                2
+            );
+
+            let plan =
+                dataset
+                    .snapshot(py)
+                    .explain_scan(py, Some(vec!["name".to_owned()]), None)?;
+            let plan = plan.bind(py);
+            assert!(
+                plan.get_item("logical_operators")?
+                    .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(
+                        "missing logical operators"
+                    ))?
+                    .is_instance_of::<PyList>()
+            );
+            assert!(
+                plan.get_item("observations")?
+                    .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(
+                        "missing observations"
+                    ))?
+                    .is_instance_of::<PyDict>()
+            );
+            assert_eq!(
+                PyDataset::open(py, directory.path().to_path_buf())?.schema_version(),
+                2
+            );
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn python_explain_serializes_scalar_zero_segment_counts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Break caught: the Python explain DTO reports immutable-segment scans
+        // for a scalar snapshot plan that does not select a vector operator.
+        let directory = populated_dataset()?;
+
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let plan = PyDataset::open(py, directory.path().to_path_buf())?
+                .snapshot(py)
+                .explain_scan(py, Some(vec!["name".to_owned()]), None)?;
+            let plan = plan.bind(py);
+            let observations_value = plan
+                .get_item("observations")?
+                .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("missing observations"))?;
+            let observations = observations_value.cast::<PyDict>()?;
+            assert_eq!(
+                observations
+                    .get_item("index_segments_total")?
+                    .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(
+                        "missing segment total"
+                    ))?
+                    .extract::<usize>()?,
+                1
+            );
+            assert_eq!(
+                observations
+                    .get_item("index_segments_scanned")?
+                    .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(
+                        "missing scanned segments"
+                    ))?
+                    .extract::<usize>()?,
+                0
+            );
+            assert_eq!(
+                observations
+                    .get_item("index_segments_pruned")?
+                    .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(
+                        "missing pruned segments"
+                    ))?
+                    .extract::<usize>()?,
+                0
+            );
+            Ok(())
+        })?;
+        Ok(())
+    }
 
     #[test]
     fn scan_returns_arrow_ipc_and_invalid_projection_is_a_typed_validation_error()

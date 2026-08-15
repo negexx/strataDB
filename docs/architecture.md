@@ -19,7 +19,7 @@ for the audit trail and named limits.
 | Index | `crates/index` | From-scratch HNSW construction/search, immutable segment encoding, validation, loading, and fan-out search. |
 | Query | `crates/query` | Predicates, pruning decisions, and group-by primitives. |
 | CLI | `crates/cli` | Typed query/inspection commands within the one-process boundary; mutating commands require explicit single-writer acknowledgement. |
-| Bindings | `crates/bindings` | Thin PyO3 Dataset/Snapshot facade; tabular results use Arrow IPC bytes and vector results expose typed squared-L2 matches. |
+| Bindings | `crates/bindings` | Thin PyO3 `1.0` Dataset/Snapshot/Transaction facade; tabular results use Arrow IPC bytes, vector matches and migration/explain results use stable named Python dictionaries, and engine failures retain typed categories. |
 
 ## Supported on-disk formats
 
@@ -54,18 +54,54 @@ work and must not be inferred from these checks.
   objects, and `Dataset::maintain()` for one coordinated maintenance run.
 - Real-process crash/reopen tests, targeted loom models, fuzz targets, and benchmarks.
 
-These are usable slices, not a finished database API. There is no schema-evolution/migration workflow, planner,
-stable Python API, arbitrary orphan cleanup, time
-travel, or cross-process protocol. The Phase 2 Python/CLI surfaces are partial and remain subject to
-their documented typed contracts and integration verification. “Partial” here describes client/API
-maturity, not a claim that completed Phase 2 slices are outside their documented embedded,
-single-process boundary.
+These are usable slices, not a finished database API. The implemented planner is deliberately
+bounded: it builds logical source/predicate/projection, grouping, or vector-search pipelines and
+returns a stable physical-plan explain value with the logical operators, selected physical
+operators, and captured file/segment pruning and overlay observations. It validates the supported
+shape, then reuses the existing immutable-snapshot scan, zone-map pruning, tombstone filtering,
+group-by, and manifest-listed immutable-segment search operators; it does not add SQL, a general
+optimizer, or a cost model. Local Criterion evidence for the fixed 256-row fixture is recorded in
+the [Phase 3 verification report](phase-3-verification-report.md#task-3-query-planning-evidence);
+it measures that fixture only, not a universal performance guarantee. There is no
+arbitrary orphan cleanup, time
+travel, or cross-process protocol. The Phase 2 Python/CLI surfaces provide stable bounded contracts
+within the documented embedded, single-process boundary. Their remaining packaging/runtime limits
+are recorded in [status](status.md); they do not make the accepted interfaces "awaiting
+integration" or broaden the API to cross-process coordination, serializability, or a general
+read/write query interface.
+
+## Python API 1.0
+
+`strata_ext.Dataset` provides `create`, `open`, `api_version`, `version`,
+`schema_version`, `snapshot`, `begin`, and the explicit
+`migrate_add_nullable_column` operation. `Snapshot` retains the compatible Arrow IPC scan,
+lookup, and grouped-result methods and typed vector-match dictionaries; `explain_scan` returns
+named logical/physical operator lists plus captured observations. The engine `Transaction` supports
+bounded transaction-base snapshot reads: scans (including predicate reads) and groups expose staged
+inserts, replacements, and deletes; lookup reflects staged replacements and deletes only for physical
+row IDs already in the base snapshot, because staged inserts receive no physical row ID until commit
+and cannot be looked up before then. The current Python `Transaction` facade stages one Arrow IPC
+batch at a time and exposes overlay-aware `scan` reads (including its optional predicate), but does not expose
+transaction lookup or group methods. It is terminally `committed` or `aborted`, and abort/drop never
+publishes staged writes. Its `vector_search` returns the typed
+`UnsupportedTransactionReadError` after staged writes, rather than a merged overlay result. Open,
+reads, commit, and migration release the GIL around engine work. The API is limited to one Python
+process sharing a `Dataset` handle: it does not provide cross-process coordination, serializability,
+or a full/general read/write query interface. `ConflictError` exposes `contested_row_ids`;
+`SchemaMigrationError`, `InvalidQueryError`,
+`UnsupportedTransactionReadError`, `StorageDurabilityError`, and `CorruptionError` are stable
+categories (and retain the existing `ValidationError`/`ExecutionError` base classes). Insufficient
+history remains a distinct category.
 
 ## Commit lifecycle
 
-1. `Dataset::begin` captures the current immutable snapshot version and returns a write-only
-   `Transaction`. It buffers Arrow batches and tombstones; it has no transactional scan/search or
-   read-your-own-writes.
+1. `Dataset::begin` captures one immutable base snapshot and returns a `Transaction` bound to that
+   snapshot's schema/version. It buffers Arrow batches and tombstones. Transaction scans (including
+   predicate reads) and group reads merge that base with its private overlay, exposing staged inserts,
+   replacements, and deletes. Lookup reflects staged replacements/deletes for an existing
+   base-snapshot physical row ID; staged inserts have no physical row ID until commit and cannot be
+   looked up pre-commit. `vector_search` after staged writes uses no merged overlay and returns a typed
+   unsupported-transaction-read error.
 2. Commit preparation allocates row IDs, writes/fsyncs Arrow files, and builds/fsyncs an immutable HNSW
    segment when vectors are present. Failed preparation may leave unreachable files; cleanup is absent.
 3. Under the shared handle's commit lock, the transaction reloads the latest snapshot and checks its
@@ -116,8 +152,12 @@ observation from one completed run, not atomic or continuing storage-bound enfor
 ## Reads, updates, and index behavior
 
 `Dataset::snapshot` returns a fixed manifest/segment/tombstone view. Later commits cannot alter that
-captured view. `Transaction` writes and `Snapshot` reads are separate APIs; the current engine does not
-provide a full read/write snapshot-transaction interface.
+captured view. `Transaction` supplies bounded transaction-base snapshot reads: scans (including
+predicate reads) and group operations expose staged inserts, replacements, and deletes; lookup
+reflects staged replacements/deletes for an existing base-snapshot physical row ID, while staged
+inserts have no physical row ID until commit and cannot be looked up pre-commit. It is not a general
+read/write query interface, and `vector_search` after staged writes returns a typed
+unsupported-transaction-read error rather than reading a merged overlay.
 
 Rows are append-only physical records. `delete` and `update` must target one live physical row in the
 transaction's base snapshot and are revalidated under the commit lock. `update` tombstones that old
@@ -131,15 +171,22 @@ until explicit compaction is requested; no universal supported segment-count or 
 is claimed.
 
 Predicates and statistics can prune files or segments that cannot match. Filtered ANN uses predicate
-pruning and a live-set constraint. These are query primitives, not a planner-integrated SQL engine or a
-guarantee that every selective query is cheap.
+pruning and a live-set constraint. The bounded planner exposes those selections through its logical/
+physical explain output, including captured row-file and index-segment totals, scanned/pruned counts,
+and whether a transaction overlay was supplied. Those observations are snapshot facts, not cardinality
+or latency estimates; the planner is not a SQL engine and does not guarantee that every selective
+query is cheap. Planned reads retain the existing immutable-snapshot behavior and do not broaden the
+write-write OCC isolation boundary.
 
 ## Deliberate boundaries
 
 The design ceiling is snapshot isolation rather than serializability. The current API is narrower:
-immutable snapshot reads plus write-write OCC. Strata remains embedded and single-node; distributed
-transactions, full SQL, automatic conflict resolution, stronger isolation, extra ANN families, and an
-agent-memory/belief product are out of scope.
+immutable snapshot reads; bounded transaction-base scans/predicate and group operations that expose
+staged inserts, replacements, and deletes; lookup that reflects staged replacements/deletes only for
+an existing base-snapshot physical row ID (staged inserts receive no physical row ID until commit);
+and write-write OCC. It is not a full/general read/write query interface. Strata
+remains embedded and single-node; distributed transactions, full SQL, automatic conflict resolution,
+stronger isolation, extra ANN families, and an agent-memory/belief product are out of scope.
 
 Normal tests, loom models, chaos tests, fuzz targets, and benchmarks provide bounded evidence rather
 than a blanket proof. See [decisions](decisions.md), [current design](design.md), and the [roadmap](roadmap.md)

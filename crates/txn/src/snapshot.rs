@@ -20,11 +20,14 @@ use arrow::array::{
 use arrow::compute::{concat_batches, filter_record_batch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use strata_index::LiveSet;
-use strata_query::{Predicate, PredicateKey, filter, mask, should_scan_file};
+use strata_query::{
+    LogicalOperator, LogicalPlan, PhysicalPlan, PlanObservations, Planner, Predicate, PredicateKey,
+    filter, mask, should_scan_file,
+};
 #[cfg(test)]
 use strata_storage::read_batch;
 use strata_storage::{
-    DataFileEntry, Manifest, StorageOwner, read_batch_columns_with, read_batch_with,
+    DataFileEntry, Manifest, StorageOwner, Value, read_batch_columns_with, read_batch_with,
 };
 
 use crate::facade::{DataFileInfo, SegmentInfo};
@@ -64,6 +67,42 @@ fn zone_map_permits_scan(
     {
         Some(map) => should_scan_file(map, predicate),
         None => true,
+    }
+}
+
+fn filter_expression_pruning_predicate(filter: &FilterExpression) -> Option<Predicate> {
+    match filter {
+        FilterExpression::Compare(Comparison {
+            column,
+            operator,
+            value,
+        }) => {
+            let value = match value {
+                FilterLiteral::Int64(value) => Value::Int64(*value),
+                FilterLiteral::Float64(value) => Value::Float64(*value),
+                FilterLiteral::Utf8(value) => Value::Utf8(value.clone()),
+                FilterLiteral::Boolean(_) | FilterLiteral::UInt64(_) => return None,
+            };
+            match operator {
+                ComparisonOperator::Equal => Some(Predicate::Eq(column.clone(), value)),
+                ComparisonOperator::LessThan => Some(Predicate::Lt(column.clone(), value)),
+                ComparisonOperator::LessThanOrEqual => Some(Predicate::LtEq(column.clone(), value)),
+                ComparisonOperator::GreaterThan => Some(Predicate::Gt(column.clone(), value)),
+                ComparisonOperator::GreaterThanOrEqual => {
+                    Some(Predicate::GtEq(column.clone(), value))
+                }
+                ComparisonOperator::NotEqual => None,
+            }
+        }
+        FilterExpression::And(left, right) => Some(Predicate::And(
+            Box::new(filter_expression_pruning_predicate(left)?),
+            Box::new(filter_expression_pruning_predicate(right)?),
+        )),
+        FilterExpression::Or(left, right) => Some(Predicate::Or(
+            Box::new(filter_expression_pruning_predicate(left)?),
+            Box::new(filter_expression_pruning_predicate(right)?),
+        )),
+        FilterExpression::Not(_) => None,
     }
 }
 
@@ -403,6 +442,227 @@ impl Snapshot {
         }
     }
 
+    /// Builds the stable logical/physical explain DTO for a typed scan.
+    ///
+    /// The DTO reports only the immutable snapshot captured by this value;
+    /// it never incorporates staged transaction rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed validation error as [`Self::scan_query`] for an
+    /// invalid projection or filter.
+    pub fn explain_scan_query(&self, request: &ScanRequest) -> QueryResult<PhysicalPlan> {
+        self.explain_scan_query_with_overlay(request, false)
+    }
+
+    pub(crate) fn explain_scan_query_with_overlay(
+        &self,
+        request: &ScanRequest,
+        transaction_overlay: bool,
+    ) -> QueryResult<PhysicalPlan> {
+        let projection = self.query_schema()?.validate_scan(request)?;
+        let mut operators = vec![LogicalOperator::Source];
+        if let Some(filter) = request.filter.as_ref() {
+            operators.push(LogicalOperator::Predicate {
+                zone_map_eligible: filter_expression_pruning_predicate(filter).is_some(),
+            });
+        }
+        operators.push(LogicalOperator::Projection {
+            columns: projection,
+        });
+        operators.push(LogicalOperator::Materialize);
+        self.plan_query(operators, request.filter.as_ref(), transaction_overlay)
+    }
+
+    /// Executes the physical path selected for a typed scan.
+    ///
+    /// The selected path delegates to [`Self::scan_query`], retaining its
+    /// projection ordering, null, tombstone, and snapshot semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns planner or typed scan-contract errors.
+    pub fn execute_planned_scan_query(&self, request: &ScanRequest) -> QueryResult<ScanResult> {
+        let _plan = self.explain_scan_query(request)?;
+        self.scan_query(request)
+    }
+
+    /// Builds the stable logical/physical explain DTO for grouped aggregation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed validation error as [`Self::group_by_query`].
+    pub fn explain_group_by_query(&self, request: &GroupByRequest) -> QueryResult<PhysicalPlan> {
+        self.explain_group_by_query_with_overlay(request, false)
+    }
+
+    pub(crate) fn explain_group_by_query_with_overlay(
+        &self,
+        request: &GroupByRequest,
+        transaction_overlay: bool,
+    ) -> QueryResult<PhysicalPlan> {
+        let _outputs = self.query_schema()?.validate_group_by(request)?;
+        let mut operators = vec![LogicalOperator::Source];
+        if let Some(filter) = request.filter.as_ref() {
+            operators.push(LogicalOperator::Predicate {
+                zone_map_eligible: filter_expression_pruning_predicate(filter).is_some(),
+            });
+        }
+        operators.push(LogicalOperator::Grouping {
+            keys: request.group_by.clone(),
+            aggregate_count: request.aggregates.len(),
+        });
+        operators.push(LogicalOperator::Materialize);
+        self.plan_query(operators, request.filter.as_ref(), transaction_overlay)
+    }
+
+    /// Executes the physical path selected for grouped aggregation.
+    ///
+    /// # Errors
+    ///
+    /// Returns planner or typed grouped-query errors.
+    pub fn execute_planned_group_by_query(
+        &self,
+        request: &GroupByRequest,
+    ) -> QueryResult<GroupByResult> {
+        let _plan = self.explain_group_by_query(request)?;
+        self.group_by_query(request)
+    }
+
+    /// Builds the stable logical/physical explain DTO for vector search.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed validation error as [`Self::vector_search_query`].
+    pub fn explain_vector_search_query(
+        &self,
+        request: &VectorSearchRequest,
+    ) -> QueryResult<PhysicalPlan> {
+        let hydration = self
+            .query_schema()?
+            .validate_vector_search(request)?
+            .is_some();
+        let has_filter = request.filter.is_some();
+        let mut operators = vec![LogicalOperator::Source];
+        if has_filter {
+            operators.push(LogicalOperator::Predicate {
+                zone_map_eligible: request
+                    .filter
+                    .as_ref()
+                    .and_then(filter_expression_pruning_predicate)
+                    .is_some(),
+            });
+        }
+        operators.push(LogicalOperator::VectorSearch {
+            vector_column: request.vector_column.clone(),
+            k: request.k,
+            has_filter,
+            hydration,
+        });
+        operators.push(LogicalOperator::Materialize);
+        self.plan_query(operators, request.filter.as_ref(), false)
+    }
+
+    /// Executes the physical path selected for vector search.
+    ///
+    /// # Errors
+    ///
+    /// Returns planner or typed vector-search errors.
+    pub fn execute_planned_vector_search_query(
+        &self,
+        request: &VectorSearchRequest,
+    ) -> QueryResult<VectorSearchResult> {
+        let _plan = self.explain_vector_search_query(request)?;
+        self.vector_search_query(request)
+    }
+
+    fn plan_query(
+        &self,
+        operators: Vec<LogicalOperator>,
+        predicate: Option<&FilterExpression>,
+        transaction_overlay: bool,
+    ) -> QueryResult<PhysicalPlan> {
+        let logical = LogicalPlan::new(operators).map_err(QueryExecutionError::Planner)?;
+        let observations =
+            self.plan_observations(logical.operators(), predicate, transaction_overlay);
+        Planner::plan(logical, observations)
+            .map_err(|error| QueryExecutionError::Planner(error).into())
+    }
+
+    fn plan_observations(
+        &self,
+        operators: &[LogicalOperator],
+        predicate: Option<&FilterExpression>,
+        transaction_overlay: bool,
+    ) -> PlanObservations {
+        let pruning = predicate
+            .and_then(filter_expression_pruning_predicate)
+            .map(|predicate| self.explain(&predicate));
+        let data_files_total = self.manifest.data_files.len();
+        let index_segments_total = self.manifest.segments.len();
+        let data_file_selection = || {
+            pruning.as_ref().map_or((data_files_total, 0), |explain| {
+                (explain.scanned.len(), explain.skipped.len())
+            })
+        };
+        let index_segment_selection = || {
+            pruning
+                .as_ref()
+                .map_or((index_segments_total, 0), |explain| {
+                    (
+                        explain.segments_scanned.len(),
+                        explain.segments_skipped.len(),
+                    )
+                })
+        };
+
+        let result_operator = operators.iter().find(|operator| {
+            matches!(
+                operator,
+                LogicalOperator::Projection { .. }
+                    | LogicalOperator::Grouping { .. }
+                    | LogicalOperator::VectorSearch { .. }
+            )
+        });
+        let (data_files_scanned, data_files_pruned, index_segments_scanned, index_segments_pruned) =
+            match result_operator {
+                Some(LogicalOperator::Projection { .. } | LogicalOperator::Grouping { .. }) => {
+                    let (data_files_scanned, data_files_pruned) = data_file_selection();
+                    (data_files_scanned, data_files_pruned, 0, 0)
+                }
+                Some(LogicalOperator::VectorSearch { has_filter, .. }) => {
+                    let (data_files_scanned, data_files_pruned) = if *has_filter {
+                        data_file_selection()
+                    } else {
+                        (0, 0)
+                    };
+                    let (index_segments_scanned, index_segments_pruned) = index_segment_selection();
+                    (
+                        data_files_scanned,
+                        data_files_pruned,
+                        index_segments_scanned,
+                        index_segments_pruned,
+                    )
+                }
+                Some(
+                    LogicalOperator::Source
+                    | LogicalOperator::Predicate { .. }
+                    | LogicalOperator::Materialize,
+                )
+                | None => (0, 0, 0, 0),
+            };
+
+        PlanObservations {
+            data_files_total,
+            data_files_scanned,
+            data_files_pruned,
+            index_segments_total,
+            index_segments_scanned,
+            index_segments_pruned,
+            transaction_overlay,
+        }
+    }
+
     /// Like [`Snapshot::scan`], but skips any file `predicate` provably
     /// can't match (per [`Snapshot::explain`]'s decision) and row-filters
     /// the rest.
@@ -441,8 +701,12 @@ impl Snapshot {
         let projection = self.query_schema()?.validate_scan(request)?;
         let columns = scan_columns(&projection, request.filter.as_ref());
         let query_schema = self.query_schema_for_columns(&columns)?;
+        let pruning_predicate = request
+            .filter
+            .as_ref()
+            .and_then(filter_expression_pruning_predicate);
         let rows = self
-            .read_surviving_files(None, Some(&columns), |batch| {
+            .read_surviving_files(pruning_predicate.as_ref(), Some(&columns), |batch| {
                 let batch = cast_batch_to_schema(&batch, &query_schema)?;
                 let filtered = match &request.filter {
                     Some(filter) => filter_record_batch(&batch, &filter_mask(&batch, filter)?)?,
@@ -450,6 +714,42 @@ impl Snapshot {
                 };
                 projected_rows(&filtered, &projection)
             })?
+            .into_iter()
+            .flatten()
+            .collect();
+        Ok(ScanResult { projection, rows })
+    }
+
+    pub(crate) fn visible_logical_batches_excluding(
+        &self,
+        excluded_row_ids: &[u64],
+    ) -> Result<Vec<RecordBatch>> {
+        self.read_surviving_physical_batches()?
+            .into_iter()
+            .map(|batch| {
+                let batch = filter_row_ids(batch, excluded_row_ids)?;
+                cast_batch_to_schema(&batch, &self.schema)
+            })
+            .collect()
+    }
+
+    pub(crate) fn scan_query_overlay(
+        &self,
+        request: &ScanRequest,
+        batches: &[RecordBatch],
+    ) -> QueryResult<ScanResult> {
+        let projection = self.query_schema()?.validate_scan(request)?;
+        let rows = batches
+            .iter()
+            .map(|batch| {
+                let filtered = match &request.filter {
+                    Some(filter) => filter_record_batch(batch, &filter_mask(batch, filter)?)
+                        .map_err(TxnError::from)?,
+                    None => batch.clone(),
+                };
+                projected_rows(&filtered, &projection)
+            })
+            .collect::<Result<Vec<_>>>()?
             .into_iter()
             .flatten()
             .collect();
@@ -471,13 +771,18 @@ impl Snapshot {
         let outputs = self.query_schema()?.validate_group_by(request)?;
         let columns = group_by_columns(request);
         let query_schema = self.query_schema_for_columns(&columns)?;
-        let batches = self.read_surviving_files(None, Some(&columns), |batch| {
-            let batch = cast_batch_to_schema(&batch, &query_schema)?;
-            match &request.filter {
-                Some(filter) => Ok(filter_record_batch(&batch, &filter_mask(&batch, filter)?)?),
-                None => Ok(batch),
-            }
-        })?;
+        let pruning_predicate = request
+            .filter
+            .as_ref()
+            .and_then(filter_expression_pruning_predicate);
+        let batches =
+            self.read_surviving_files(pruning_predicate.as_ref(), Some(&columns), |batch| {
+                let batch = cast_batch_to_schema(&batch, &query_schema)?;
+                match &request.filter {
+                    Some(filter) => Ok(filter_record_batch(&batch, &filter_mask(&batch, filter)?)?),
+                    None => Ok(batch),
+                }
+            })?;
 
         let aggregate_templates = request
             .aggregates
@@ -567,6 +872,80 @@ impl Snapshot {
         GroupByResult::new(request.group_by.clone(), outputs, rows)
     }
 
+    pub(crate) fn group_by_query_overlay(
+        &self,
+        request: &GroupByRequest,
+        batches: &[RecordBatch],
+    ) -> QueryResult<GroupByResult> {
+        let outputs = self.query_schema()?.validate_group_by(request)?;
+        let aggregate_templates = request
+            .aggregates
+            .iter()
+            .zip(&outputs)
+            .map(|(aggregate, output)| AggregateState::new(aggregate, output))
+            .collect::<QueryResult<Vec<_>>>()?;
+        let mut group_indices = HashMap::new();
+        let mut groups = Vec::new();
+
+        for batch in batches {
+            let batch = match &request.filter {
+                Some(filter) => filter_record_batch(batch, &filter_mask(batch, filter)?)
+                    .map_err(TxnError::from)?,
+                None => batch.clone(),
+            };
+            for row in 0..batch.num_rows() {
+                let keys = request
+                    .group_by
+                    .iter()
+                    .map(|column| {
+                        let index = batch
+                            .schema_ref()
+                            .index_of(column)
+                            .map_err(TxnError::Arrow)?;
+                        result_value(batch.column(index), row)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let key = GroupKey::new(&keys)?;
+                let group_index = if let Some(index) = group_indices.get(&key) {
+                    *index
+                } else {
+                    let index = groups.len();
+                    group_indices.insert(key, index);
+                    groups.push(GroupState {
+                        keys,
+                        aggregates: aggregate_templates.clone(),
+                    });
+                    index
+                };
+
+                for (aggregate, state) in request
+                    .aggregates
+                    .iter()
+                    .zip(&mut groups[group_index].aggregates)
+                {
+                    let index = batch
+                        .schema_ref()
+                        .index_of(&aggregate.column)
+                        .map_err(TxnError::Arrow)?;
+                    state.update(&result_value(batch.column(index), row)?, &aggregate.alias)?;
+                }
+            }
+        }
+
+        let rows = groups
+            .into_iter()
+            .map(|group| GroupedRow {
+                keys: group.keys,
+                aggregates: group
+                    .aggregates
+                    .into_iter()
+                    .map(AggregateState::finish)
+                    .collect(),
+            })
+            .collect();
+        GroupByResult::new(request.group_by.clone(), outputs, rows)
+    }
+
     /// Looks up one physical row as of this immutable snapshot.
     ///
     /// The result distinguishes a row tombstoned in this snapshot from an
@@ -634,6 +1013,17 @@ impl Snapshot {
         })
     }
 
+    pub(crate) fn lookup_projection(&self, request: &RowLookupRequest) -> QueryResult<Vec<String>> {
+        self.query_schema()?.validate_row_lookup(request)
+    }
+
+    pub(crate) fn project_logical_row(
+        batch: &RecordBatch,
+        projection: &[String],
+    ) -> Result<ProjectedRow> {
+        projected_row(batch, 0, projection)
+    }
+
     fn query_schema(&self) -> QueryResult<DatasetSchema> {
         let columns = self
             .schema
@@ -692,6 +1082,7 @@ impl Snapshot {
         let mut matches = match &request.filter {
             Some(filter) => {
                 let live_set = self.vector_filter_live_set(filter)?;
+                let pruning_predicate = filter_expression_pruning_predicate(filter);
                 self.index
                     .search_filtered_pruned_live(
                         &request.query,
@@ -699,7 +1090,11 @@ impl Snapshot {
                         EF_SEARCH_DEFAULT,
                         &live_set,
                         |id| self.is_visible(id),
-                        |_| true,
+                        |zone_map| {
+                            pruning_predicate
+                                .as_ref()
+                                .is_none_or(|predicate| zone_map_permits_scan(zone_map, predicate))
+                        },
                     )
                     .map_err(TxnError::from)?
             }
@@ -753,8 +1148,9 @@ impl Snapshot {
         filter_columns(filter, &mut columns);
         push_unique_column(&mut columns, ROW_ID_COLUMN);
         let query_schema = self.query_schema_for_columns(&columns)?;
+        let pruning_predicate = filter_expression_pruning_predicate(filter);
         let row_ids = self
-            .read_surviving_files(None, Some(&columns), |batch| {
+            .read_surviving_files(pruning_predicate.as_ref(), Some(&columns), |batch| {
                 let batch = cast_batch_to_schema(&batch, &query_schema)?;
                 let selection = filter_mask(&batch, filter)?;
                 let row_ids = batch
@@ -932,6 +1328,24 @@ impl Snapshot {
             })?;
         Ok(per_file_ids.into_iter().flatten().collect())
     }
+}
+
+fn filter_row_ids(batch: RecordBatch, excluded_row_ids: &[u64]) -> Result<RecordBatch> {
+    if excluded_row_ids.is_empty() {
+        return Ok(batch);
+    }
+    let row_id_idx = batch.schema_ref().index_of(ROW_ID_COLUMN)?;
+    let row_ids = batch
+        .column(row_id_idx)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .ok_or_else(|| query_cast_error(ROW_ID_COLUMN, "UInt64"))?;
+    let keep: BooleanArray = row_ids
+        .values()
+        .iter()
+        .map(|row_id| !excluded_row_ids.contains(row_id))
+        .collect();
+    Ok(filter_record_batch(&batch, &keep)?)
 }
 
 fn logical_type(data_type: &DataType) -> Result<LogicalType> {

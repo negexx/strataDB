@@ -9,11 +9,103 @@ use arrow::array::RecordBatch;
 use arrow::error::ArrowError;
 
 mod group_by;
+mod plan;
 mod predicate;
 mod predicate_key;
 pub use group_by::{AggFunc, group_by};
+pub use plan::{
+    LogicalOperator, LogicalPlan, PhysicalOperator, PhysicalPlan, PlanError, PlanObservations,
+    Planner,
+};
 pub use predicate::{Predicate, filter, mask, should_scan_file};
 pub use predicate_key::PredicateKey;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod planner_tests {
+    use super::{
+        LogicalOperator, LogicalPlan, PhysicalOperator, PlanError, PlanObservations, Planner,
+    };
+
+    #[test]
+    fn planner_selects_zone_map_and_tombstone_operators_for_a_filtered_projection() {
+        let plan = Planner::plan(
+            LogicalPlan::new(vec![
+                LogicalOperator::Source,
+                LogicalOperator::Predicate {
+                    zone_map_eligible: true,
+                },
+                LogicalOperator::Projection {
+                    columns: vec!["name".into()],
+                },
+                LogicalOperator::Materialize,
+            ])
+            .unwrap(),
+            PlanObservations {
+                data_files_total: 3,
+                data_files_scanned: 1,
+                data_files_pruned: 2,
+                index_segments_total: 0,
+                index_segments_scanned: 0,
+                index_segments_pruned: 0,
+                transaction_overlay: false,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.physical_operators,
+            vec![
+                PhysicalOperator::ManifestSnapshotSource,
+                PhysicalOperator::ZoneMapPruning,
+                PhysicalOperator::TombstoneFilter,
+                PhysicalOperator::RowFilter,
+                PhysicalOperator::ColumnProjection,
+                PhysicalOperator::Materialize,
+            ]
+        );
+        assert_eq!(plan.observations.data_files_pruned, 2);
+        assert!(!plan.observations.transaction_overlay);
+    }
+
+    #[test]
+    fn planner_rejects_a_logical_plan_that_mixes_grouping_and_vector_search() {
+        let error = LogicalPlan::new(vec![
+            LogicalOperator::Source,
+            LogicalOperator::Grouping {
+                keys: vec!["category".into()],
+                aggregate_count: 1,
+            },
+            LogicalOperator::VectorSearch {
+                vector_column: "vector".into(),
+                k: 3,
+                has_filter: false,
+                hydration: false,
+            },
+            LogicalOperator::Materialize,
+        ])
+        .expect_err("a plan cannot group and vector-search the same result stream");
+
+        assert_eq!(error, PlanError::ConflictingTerminalOperators);
+    }
+
+    #[test]
+    fn planner_rejects_a_predicate_after_a_result_operator() {
+        let error = LogicalPlan::new(vec![
+            LogicalOperator::Source,
+            LogicalOperator::Projection {
+                columns: vec!["name".into()],
+            },
+            LogicalOperator::Predicate {
+                zone_map_eligible: true,
+            },
+            LogicalOperator::Materialize,
+        ])
+        .expect_err("a predicate cannot follow the result operator it must filter");
+
+        assert_eq!(error, PlanError::InvalidLogicalShape);
+    }
+}
 
 /// Returns the rows of `batch` where `column` equals `value`. A thin
 /// convenience wrapper over [`filter`] with [`Predicate::Eq`] — kept for

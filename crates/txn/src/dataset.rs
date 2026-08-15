@@ -25,18 +25,20 @@ use std::sync::Mutex;
 // to avoid an unused-import warning in the loom build.
 #[cfg(not(loom))]
 use arc_swap::ArcSwap;
-use arrow::array::{Array, ArrayRef, Int64Array, RecordBatch, RecordBatchOptions, UInt64Array};
+use arrow::array::{
+    Array, ArrayRef, Int64Array, RecordBatch, RecordBatchOptions, UInt64Array, new_null_array,
+};
 use arrow::compute::{cast, concat_batches};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use strata_index::{EfConstruction, HnswIndex, MaxConnections, MaxElements, MaxLayers};
 #[cfg(test)]
 use strata_storage::commit_manifest;
 use strata_storage::{
-    ColumnStats, DataFileEntry, Manifest, SegmentEntry, StorageOwner, Value, commit_manifest_with,
-    compute_stats, initialize_row_id_high_water_with, read_current_with,
-    read_current_with_byte_count_with, read_manifest_at_key_with_byte_count_with,
-    read_row_id_high_water_with, read_row_id_high_water_with_byte_count_with, sync_dir,
-    write_batch_with, write_bytes_with,
+    ColumnStats, DataFileEntry, Manifest, SchemaMigration, SchemaMigrationResult, SegmentEntry,
+    StorageOwner, Value, commit_manifest_with, compute_stats, initialize_row_id_high_water_with,
+    read_batch_with, read_current_with, read_current_with_byte_count_with,
+    read_manifest_at_key_with_byte_count_with, read_row_id_high_water_with,
+    read_row_id_high_water_with_byte_count_with, sync_dir, write_batch_with, write_bytes_with,
 };
 
 use crate::commit_log::{CommitLog, ConflictCheck};
@@ -51,6 +53,11 @@ use crate::retention::{
 };
 use crate::row_id::{RowIdAllocator, RowIdRange};
 use crate::snapshot::Snapshot;
+use crate::{
+    GroupByRequest, GroupByResult, PhysicalPlan, QueryError, QueryExecutionError, QueryResult,
+    RowLookupOutcome, RowLookupRequest, RowLookupResult, ScanRequest, ScanResult,
+    VectorSearchRequest, VectorSearchResult,
+};
 
 /// The hidden internal row-id column every committed batch carries
 /// alongside its logical columns. Callers can retrieve it through the
@@ -365,11 +372,13 @@ pub mod test_support {
 
     thread_local! {
         static FAIL_AFTER_COMPACTION_MANIFEST_PUBLICATION: Cell<bool> = const { Cell::new(false) };
+        static FAIL_BEFORE_MIGRATION_MANIFEST_PUBLICATION: Cell<bool> = const { Cell::new(false) };
     }
 
     /// Restores the calling test thread's prior compaction fault state.
     pub struct PostPublicationFaultGuard {
         previous: bool,
+        previous_migration: bool,
         // The state is thread-local, so the guard must be dropped on the
         // thread that installed it. Rc makes this guard !Send and !Sync.
         _thread_affine: PhantomData<Rc<()>>,
@@ -378,6 +387,8 @@ pub mod test_support {
     impl Drop for PostPublicationFaultGuard {
         fn drop(&mut self) {
             FAIL_AFTER_COMPACTION_MANIFEST_PUBLICATION.with(|fault| fault.set(self.previous));
+            FAIL_BEFORE_MIGRATION_MANIFEST_PUBLICATION
+                .with(|fault| fault.set(self.previous_migration));
         }
     }
 
@@ -387,14 +398,35 @@ pub mod test_support {
     #[must_use]
     pub fn fail_after_compaction_manifest_publication() -> PostPublicationFaultGuard {
         let previous = FAIL_AFTER_COMPACTION_MANIFEST_PUBLICATION.with(|fault| fault.replace(true));
+        let previous_migration = FAIL_BEFORE_MIGRATION_MANIFEST_PUBLICATION.with(Cell::get);
         PostPublicationFaultGuard {
             previous,
+            previous_migration,
+            _thread_affine: PhantomData,
+        }
+    }
+
+    /// Causes one migration on this test thread to return a typed I/O error
+    /// after its replacement objects have been validated but before its
+    /// manifest becomes reachable.
+    #[must_use]
+    pub fn fail_before_migration_manifest_publication() -> PostPublicationFaultGuard {
+        let previous = FAIL_AFTER_COMPACTION_MANIFEST_PUBLICATION.with(Cell::get);
+        let previous_migration =
+            FAIL_BEFORE_MIGRATION_MANIFEST_PUBLICATION.with(|fault| fault.replace(true));
+        PostPublicationFaultGuard {
+            previous,
+            previous_migration,
             _thread_affine: PhantomData,
         }
     }
 
     pub(super) fn consume_after_compaction_manifest_publication() -> bool {
         FAIL_AFTER_COMPACTION_MANIFEST_PUBLICATION.with(|fault| fault.replace(false))
+    }
+
+    pub(super) fn consume_before_migration_manifest_publication() -> bool {
+        FAIL_BEFORE_MIGRATION_MANIFEST_PUBLICATION.with(|fault| fault.replace(false))
     }
 }
 
@@ -789,7 +821,7 @@ impl Dataset {
         schema: SchemaRef,
         commit_log_capacity: usize,
     ) -> Result<Self> {
-        validate_dataset_schema(&schema)?;
+        Self::validate_schema(&schema)?;
         if read_current_with(&storage)?.is_some() {
             return Err(TxnError::AlreadyExists(dir));
         }
@@ -929,7 +961,7 @@ impl Dataset {
             .join("_versions")
             .join(format!("{:020}.manifest", manifest.version));
         let schema = manifest.schema(&manifest_path)?;
-        validate_dataset_schema(&schema)?;
+        Self::validate_schema(&schema)?;
         // The capacity guard used to live inside the old delta-replay open
         // path, which sized an `HnswIndex` from `next_row_id`. Nothing sizes
         // an allocation from it any more, but the ceiling is still a
@@ -1128,6 +1160,154 @@ impl Dataset {
         self.snapshot().schema()
     }
 
+    /// Returns the durable catalog version captured by the current snapshot.
+    #[must_use]
+    pub fn schema_version(&self) -> u32 {
+        self.snapshot().manifest.schema_version()
+    }
+
+    /// Validates a logical schema against the invariants used by dataset
+    /// creation, recovery, and schema migration.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when a logical field uses a reserved physical
+    /// column name or when field names are duplicated.
+    pub fn validate_schema(schema: &SchemaRef) -> Result<()> {
+        validate_dataset_schema(schema)
+    }
+
+    /// Applies one explicitly requested deterministic schema migration.
+    ///
+    /// Migration writes replacement row files and copied immutable vector
+    /// segments before publishing one new manifest. Existing snapshots keep
+    /// their original manifest, schema, rows, and segments.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed storage, schema, corruption, or durability error and
+    /// leaves the current complete manifest unchanged when publication has
+    /// not succeeded.
+    #[allow(clippy::too_many_lines)]
+    pub fn migrate_schema(&self, migration: &SchemaMigration) -> Result<SchemaMigrationResult> {
+        let _lifecycle_guard = self.lifecycle_coordinator.acquire_exclusive();
+        let mut commit_log = self
+            .commit_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let source = self.current.load_full();
+        let source_schema_version = source.manifest.schema_version();
+        let target_schema = migration
+            .target_schema(source_schema_version, &source.schema)
+            .map_err(TxnError::Storage)?;
+        Self::validate_schema(&target_schema)?;
+        let added_column = migration.added_nullable_column().ok_or_else(|| {
+            TxnError::Storage(strata_storage::StorageError::MigrationUnsupported {
+                name: migration.name(),
+                from_version: migration.source_version(),
+                target: migration.target_version(),
+            })
+        })?;
+        let new_version = source
+            .version
+            .checked_add(1)
+            .ok_or_else(|| TxnError::ManifestOverflow(format!("version {} + 1", source.version)))?;
+
+        let mut data_files = Vec::with_capacity(source.manifest.data_files.len());
+        for (index, entry) in source.manifest.data_files.iter().enumerate() {
+            let source_key = self
+                .storage
+                .data_object_key(&entry.name)
+                .map_err(TxnError::Storage)?;
+            let batch = read_batch_with(&self.storage, &source_key)?;
+            let rewritten = append_migrated_nullable_column(&batch, added_column)?;
+            let name = format!("migration-{new_version:020}-{index:020}.arrow");
+            let target_key = self
+                .storage
+                .data_object_key(&name)
+                .map_err(TxnError::Storage)?;
+            let metadata = write_batch_with(&self.storage, &target_key, &rewritten)?;
+            data_files.push(DataFileEntry {
+                name,
+                byte_len: metadata.byte_len,
+                crc32c: metadata.crc32c,
+                row_count: entry.row_count,
+                row_id_range: entry.row_id_range,
+                stats: compute_stats(&rewritten),
+            });
+        }
+
+        let mut segments = Vec::with_capacity(source.manifest.segments.len());
+        for (index, entry) in source.manifest.segments.iter().enumerate() {
+            let source_key = self
+                .storage
+                .data_object_key(&entry.name)
+                .map_err(TxnError::Storage)?;
+            let bytes = self.storage.get(&source_key).map_err(TxnError::Storage)?;
+            let name = format!("migration-{new_version:020}-{index:020}.seg");
+            let target_key = self
+                .storage
+                .data_object_key(&name)
+                .map_err(TxnError::Storage)?;
+            let metadata = write_bytes_with(&self.storage, &target_key, &bytes)?;
+            if metadata.byte_len != entry.byte_len {
+                return Err(TxnError::CorruptSegment(format!(
+                    "migration copied segment {} as {} bytes but catalog records {}",
+                    entry.name, metadata.byte_len, entry.byte_len
+                )));
+            }
+            let mut copied = entry.clone();
+            copied.name = name;
+            segments.push(copied);
+        }
+
+        let mut manifest = source.manifest.as_ref().clone();
+        manifest.version = new_version;
+        manifest.schema_version = Some(migration.target_version());
+        manifest.set_schema(target_schema.as_ref());
+        manifest.data_files = data_files;
+        manifest.segments = segments;
+        let timestamp = issue_timestamp(&self.last_issued_timestamp)?;
+        manifest.commit_time_high_water = manifest.commit_time_high_water.max(timestamp);
+        manifest.committed_at_us = timestamp;
+
+        // Validate every new object before the manifest becomes reachable.
+        let owned_rows = validate_data_files_with_owner(
+            &self.storage,
+            &self.dir,
+            &manifest,
+            &target_schema,
+            None,
+        )?;
+        validate_tombstones(&self.dir, &manifest, &owned_rows)?;
+        let index = load_segments_with_owner(&self.storage, &manifest, &owned_rows, None)?;
+        #[cfg(feature = "test-fault-injection")]
+        if test_support::consume_before_migration_manifest_publication() {
+            return Err(TxnError::Io(std::io::Error::other(
+                "injected pre-publication migration failure (test fault injection)",
+            )));
+        }
+        commit_manifest_with(&self.storage, &manifest)?;
+
+        // A migration is a version boundary but has no row-level write set.
+        // Transactions captured against the prior schema are rejected by the
+        // schema-version guard in `Transaction::commit` below.
+        commit_log.push(new_version, Vec::new());
+        let snapshot = Snapshot {
+            dir: self.dir.clone(),
+            storage: Arc::clone(&self.storage),
+            version: new_version,
+            lease: self.snapshot_leases.register(new_version),
+            schema: target_schema,
+            manifest: Arc::new(manifest),
+            index,
+            tombstones: Arc::clone(&source.tombstones),
+            live_set_cache: LiveSetCache::new(crate::snapshot::LIVE_SET_CACHE_BYTE_BUDGET),
+        };
+        self.current.store(Arc::new(snapshot));
+        Ok(migration.result(new_version))
+    }
+
     #[must_use]
     /// For datasets opened through [`Dataset::create_with_storage`] or
     /// [`Dataset::open_with_storage`] with a non-local owner, this is only a
@@ -1172,6 +1352,7 @@ impl Dataset {
             base_snapshot: Arc::clone(&snapshot),
             schema: snapshot.schema(),
             pending: Vec::new(),
+            pending_replacements: HashMap::new(),
             pending_tombstones: Vec::new(),
             write_set: Vec::new(),
             current: Arc::clone(&self.current),
@@ -1225,6 +1406,23 @@ fn validate_dataset_schema(schema: &SchemaRef) -> Result<()> {
     Ok(())
 }
 
+fn schema_description(schema: &Schema) -> String {
+    let fields = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let nullability = if field.is_nullable() {
+                "nullable"
+            } else {
+                "required"
+            };
+            format!("{}: {} ({nullability})", field.name(), field.data_type())
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("schema [{fields}]")
+}
+
 /// Creates `dir/data` after checking that `dir`'s immediate parent already
 /// exists, then durably publishes only the dataset-owned directory boundary.
 ///
@@ -1266,6 +1464,9 @@ pub struct Transaction {
     /// Dataset-owned logical schema captured from `base_snapshot`.
     schema: SchemaRef,
     pending: Vec<RecordBatch>,
+    /// Replacement batches keyed by the committed physical row they replace.
+    /// Their physical row IDs are still allocated only by commit.
+    pending_replacements: HashMap<u64, RecordBatch>,
     /// Row-ids queued for tombstoning by [`Transaction::delete`]/
     /// [`Transaction::update`], applied at commit time (see
     /// [`Transaction::commit`]) — mirrors how `pending` buffers inserts.
@@ -1419,6 +1620,13 @@ struct PublishedSegment {
 }
 
 impl Transaction {
+    /// Returns the logical schema captured with this transaction's immutable
+    /// base snapshot.
+    #[must_use]
+    pub fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
     /// # Examples
     ///
     /// Buffered rows are invisible to every reader — including this same
@@ -1540,15 +1748,134 @@ impl Transaction {
         self.validate_target(row_id)?;
         self.pending_tombstones.push(row_id);
         self.write_set.push(row_id);
+        self.pending_replacements.insert(row_id, batch.clone());
         self.pending.push(batch);
         Ok(())
+    }
+
+    /// Scans the immutable base snapshot merged with this transaction's staged writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed validation or execution error from the query contract.
+    pub fn scan_query(&self, request: &ScanRequest) -> QueryResult<ScanResult> {
+        self.base_snapshot
+            .scan_query_overlay(request, &self.overlay_batches()?)
+    }
+
+    /// Builds the planned read path for this transaction's scan view.
+    ///
+    /// # Errors
+    ///
+    /// Returns planner or typed scan-contract errors.
+    pub fn explain_scan_query(&self, request: &ScanRequest) -> QueryResult<PhysicalPlan> {
+        self.base_snapshot
+            .explain_scan_query_with_overlay(request, true)
+    }
+
+    /// Executes the planned read path for this transaction's scan view.
+    ///
+    /// # Errors
+    ///
+    /// Returns planner or typed scan-contract errors.
+    pub fn execute_planned_scan_query(&self, request: &ScanRequest) -> QueryResult<ScanResult> {
+        let _plan = self.explain_scan_query(request)?;
+        self.scan_query(request)
+    }
+
+    /// Groups the immutable base snapshot merged with this transaction's staged writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed validation or execution error from the query contract.
+    pub fn group_by_query(&self, request: &GroupByRequest) -> QueryResult<GroupByResult> {
+        self.base_snapshot
+            .group_by_query_overlay(request, &self.overlay_batches()?)
+    }
+
+    /// Builds the planned read path for this transaction's grouped view.
+    ///
+    /// # Errors
+    ///
+    /// Returns planner or typed grouped-query errors.
+    pub fn explain_group_by_query(&self, request: &GroupByRequest) -> QueryResult<PhysicalPlan> {
+        self.base_snapshot
+            .explain_group_by_query_with_overlay(request, true)
+    }
+
+    /// Executes the planned read path for this transaction's grouped view.
+    ///
+    /// # Errors
+    ///
+    /// Returns planner or typed grouped-query errors.
+    pub fn execute_planned_group_by_query(
+        &self,
+        request: &GroupByRequest,
+    ) -> QueryResult<GroupByResult> {
+        let _plan = self.explain_group_by_query(request)?;
+        self.group_by_query(request)
+    }
+
+    /// Looks up an existing committed physical row through this transaction's overlay.
+    ///
+    /// Staged inserts have no physical row ID until commit and are therefore
+    /// intentionally not addressable through this API.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed validation or execution error from the query contract.
+    pub fn lookup_row(&self, request: &RowLookupRequest) -> QueryResult<RowLookupResult> {
+        let projection = self.base_snapshot.lookup_projection(request)?;
+        let row_id = request.row_id.0;
+        if !self.pending_tombstones.contains(&row_id) {
+            return self.base_snapshot.lookup_row(request);
+        }
+        let outcome = match self.pending_replacements.get(&row_id) {
+            Some(batch) => {
+                RowLookupOutcome::Live(Snapshot::project_logical_row(batch, &projection)?)
+            }
+            None => RowLookupOutcome::Tombstoned,
+        };
+        Ok(RowLookupResult {
+            row_id: request.row_id,
+            projection,
+            outcome,
+        })
+    }
+
+    /// Executes vector search only when the base snapshot is the complete view.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed unsupported-operation error when staged writes would
+    /// make base-only vector results stale.
+    pub fn vector_search_query(
+        &self,
+        request: &VectorSearchRequest,
+    ) -> QueryResult<VectorSearchResult> {
+        if !self.pending.is_empty() || !self.pending_tombstones.is_empty() {
+            return Err(QueryError::Execution(
+                QueryExecutionError::UnsupportedTransactionRead {
+                    operation: "vector search",
+                },
+            ));
+        }
+        self.base_snapshot.vector_search_query(request)
+    }
+
+    fn overlay_batches(&self) -> Result<Vec<RecordBatch>> {
+        let mut batches = self
+            .base_snapshot
+            .visible_logical_batches_excluding(&self.pending_tombstones)?;
+        batches.extend(self.pending.iter().cloned());
+        Ok(batches)
     }
 
     fn validate_batch(&self, batch: &RecordBatch) -> Result<()> {
         if batch.schema_ref().as_ref() != self.schema.as_ref() {
             return Err(TxnError::BatchSchemaMismatch {
-                expected: format!("{:?}", self.schema),
-                actual: format!("{:?}", batch.schema_ref()),
+                expected: format!("dataset {}", schema_description(&self.schema)),
+                actual: format!("batch {}", schema_description(batch.schema_ref().as_ref())),
             });
         }
         Ok(())
@@ -1708,6 +2035,16 @@ impl Transaction {
 
         let latest_snapshot = self.current.load_full();
         let latest_version = latest_snapshot.version;
+
+        if latest_snapshot.manifest.schema_version() != self.base_snapshot.manifest.schema_version()
+        {
+            return Err(TxnError::Storage(
+                strata_storage::StorageError::SchemaVersionChanged {
+                    expected: self.base_snapshot.manifest.schema_version(),
+                    actual: latest_snapshot.manifest.schema_version(),
+                },
+            ));
+        }
 
         // Conflict detection MUST run before the manifest is touched at all:
         // a transaction that turns out to conflict must leave the manifest,
@@ -3296,6 +3633,36 @@ fn append_timestamp_column(batch: &RecordBatch, ts: i64, num_rows: u64) -> Resul
     Ok(RecordBatch::try_new(schema, columns)?)
 }
 
+/// Inserts one nullable logical field immediately before the two physical
+/// system columns while preserving every existing physical row value.
+fn append_migrated_nullable_column(batch: &RecordBatch, column: &Field) -> Result<RecordBatch> {
+    let logical_len = batch
+        .num_columns()
+        .checked_sub(HIDDEN_COLUMNS.len())
+        .ok_or_else(|| {
+            TxnError::Storage(strata_storage::StorageError::MigrationIncompatibleType {
+                detail: "stored row batch does not contain the physical system columns".to_owned(),
+            })
+        })?;
+    let mut fields: Vec<Field> = batch
+        .schema_ref()
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect();
+    fields.insert(logical_len, column.clone());
+    let mut columns = batch.columns().to_vec();
+    columns.insert(
+        logical_len,
+        new_null_array(column.data_type(), batch.num_rows()),
+    );
+    let schema = Arc::new(Schema::new_with_metadata(
+        fields,
+        batch.schema_ref().metadata().clone(),
+    ));
+    Ok(RecordBatch::try_new(schema, columns)?)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -3974,10 +4341,13 @@ mod tests {
         let batch =
             RecordBatch::try_new(renamed, vec![Arc::new(Int64Array::from(vec![1]))]).unwrap();
         let mut txn = ds.begin();
-        assert!(matches!(
-            txn.insert(batch),
-            Err(TxnError::BatchSchemaMismatch { .. })
-        ));
+        let error = txn
+            .insert(batch)
+            .expect_err("renamed schema must be rejected");
+        assert_eq!(
+            error.to_string(),
+            "batch schema does not match the dataset-owned schema: expected dataset schema [id: Int64 (required)], found batch schema [renamed: Int64 (required)]"
+        );
         assert!(
             txn.pending.is_empty(),
             "schema validation must precede buffering or I/O"
@@ -5100,6 +5470,7 @@ mod tests {
         let dir = temp_dir("unreasonable-capacity");
         let hostile = Manifest {
             version: 0,
+            schema_version: Some(strata_storage::INITIAL_SCHEMA_VERSION),
             schema_ipc: Manifest::empty_with_schema(test_schema().as_ref()).schema_ipc,
             data_files: Vec::new(),
             next_row_id: u64::MAX,
@@ -5131,6 +5502,7 @@ mod tests {
         // practice) to simulate a hostile/corrupted manifest.
         let hostile = Manifest {
             version: u64::MAX,
+            schema_version: Some(strata_storage::INITIAL_SCHEMA_VERSION),
             schema_ipc: Manifest::empty_with_schema(test_schema().as_ref()).schema_ipc,
             data_files: Vec::new(),
             next_row_id: 0,
@@ -8437,6 +8809,71 @@ mod tests {
     }
 
     #[test]
+    fn migration_after_a_failed_manifest_commit_uses_only_the_complete_manifest() {
+        // The existing transaction fault hook leaves its prepared row and
+        // segment objects unreachable. A later migration must read and copy
+        // only the complete manifest's objects, then recovery must select the
+        // resulting complete migrated manifest rather than either orphan.
+        let dir = temp_dir("migration-after-failed-manifest-commit");
+        let ds = Dataset::create(&dir, vector_test_schema()).unwrap();
+
+        let mut seed = ds.begin();
+        seed.insert(vector_batch(
+            vec![1_i64],
+            cluster_vectors(1, [0.0, 0.0, 0.0], 0.0),
+        ))
+        .unwrap();
+        seed.commit().unwrap();
+
+        let mut abandoned = ds.begin();
+        abandoned
+            .insert(vector_batch(
+                vec![2_i64],
+                cluster_vectors(1, [900.0, 900.0, 900.0], 0.0),
+            ))
+            .unwrap();
+        abandoned.inject_manifest_commit_failure();
+        assert!(abandoned.commit().is_err());
+        assert_eq!(ds.current_version(), 1);
+
+        ds.migrate_schema(&SchemaMigration::add_nullable_column(
+            1,
+            2,
+            Field::new("tag", DataType::Utf8, true),
+        ))
+        .unwrap();
+        assert_eq!(ds.current_version(), 2);
+        assert_eq!(ds.schema_version(), 2);
+        assert_eq!(
+            ds.snapshot().scan(&ds.schema()).unwrap().num_rows(),
+            1,
+            "the abandoned row must not become visible through the migration"
+        );
+
+        drop(ds);
+        let reopened = Dataset::open(&dir).unwrap();
+        assert_eq!(reopened.schema_version(), 2);
+        assert_eq!(
+            reopened
+                .snapshot()
+                .scan(&reopened.schema())
+                .unwrap()
+                .num_rows(),
+            1
+        );
+        let results = reopened
+            .snapshot()
+            .vector_search(&[900.0, 900.0, 900.0], 1, None)
+            .unwrap();
+        assert!(
+            results.is_empty() || results[0].squared_distance > 1000.0,
+            "the failed transaction's vector must remain unreachable: {results:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn retention_plan_excludes_prepared_unpublished_objects_and_stays_captured_after_commit() {
         // Break caught: treating files written during commit preparation as
         // eligible would let a future executor reclaim row/segment data that
@@ -9372,6 +9809,23 @@ mod loom_tests {
         .expect("loom dataset creation and seed thread panicked")
     }
 
+    fn create_seeded_scalar_dataset(dir: std::path::PathBuf) -> crate::Dataset {
+        spawn_committer(move || {
+            let ds = crate::Dataset::create(dir, test_schema()).unwrap();
+            let batch = arrow::array::RecordBatch::try_new(
+                test_schema(),
+                vec![StdArc::new(arrow::array::Int64Array::from(vec![0, 1, 2]))],
+            )
+            .unwrap();
+            let mut seed = ds.begin();
+            seed.insert(batch).unwrap();
+            seed.commit().unwrap();
+            ds
+        })
+        .join()
+        .expect("loom dataset creation and seed thread panicked")
+    }
+
     #[test]
     fn one_writer_store_races_safely_with_many_readers_load() {
         loom::model(|| {
@@ -9461,6 +9915,169 @@ mod loom_tests {
             assert_eq!(conflicts, 1, "exactly one commit must report a conflict");
 
             std::fs::remove_dir_all(&dir).ok();
+        });
+    }
+
+    #[test]
+    fn transaction_read_overlay_stays_private_while_disjoint_and_contested_writes_commit() {
+        // Full transaction commits perform filesystem and Arrow work in each
+        // schedule. A bound of two reaches the reader-before/after-publish
+        // and contested-write orderings this model exercises without the
+        // unbounded state space exhausting Windows process resources.
+        let mut model = loom::model::Builder::new();
+        model.preemption_bound = Some(2);
+        model.check(|| {
+            let dir = tempfile::Builder::new()
+                .prefix(&format!(
+                    "strata-loom-transaction-read-overlay-{}-{:?}-",
+                    std::process::id(),
+                    loom::thread::current().id()
+                ))
+                .tempdir()
+                .unwrap()
+                .keep();
+            let ds = create_seeded_scalar_dataset(dir.clone());
+            let request = crate::ScanRequest {
+                projection: crate::Projection::Columns(vec!["id".into()]),
+                filter: None,
+            };
+
+            let mut read_view = ds.begin();
+            read_view
+                .insert(
+                    arrow::array::RecordBatch::try_new(
+                        test_schema(),
+                        vec![StdArc::new(arrow::array::Int64Array::from(vec![99]))],
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+
+            let mut disjoint = ds.begin();
+            disjoint.delete(0).unwrap();
+            let mut contender_a = ds.begin();
+            contender_a.delete(2).unwrap();
+            let mut contender_b = ds.begin();
+            contender_b.delete(2).unwrap();
+
+            let ds_reader = ds.clone();
+            let reader = spawn_committer(move || {
+                let own_rows = read_view.scan_query(&request).unwrap().rows.len();
+                let published_contains_staged = ds_reader
+                    .snapshot()
+                    .scan_query(&request)
+                    .unwrap()
+                    .rows
+                    .iter()
+                    .flat_map(|row| &row.fields)
+                    .any(|field| field.value == crate::ResultValue::Int64(99));
+                (own_rows, published_contains_staged)
+            });
+            let writer_a = spawn_committer(move || (disjoint.commit(), contender_a.commit()));
+            let contender_b_commit = spawn_committer(move || contender_b.commit());
+
+            let (disjoint_result, contender_a_result) = writer_a.join().unwrap();
+            let results = [
+                disjoint_result,
+                contender_a_result,
+                contender_b_commit.join().unwrap(),
+            ];
+            assert_eq!(
+                results.iter().filter(|result| result.is_ok()).count(),
+                2,
+                "the disjoint write and exactly one contested write must commit"
+            );
+            let conflicts = results
+                .iter()
+                .filter_map(|result| match result {
+                    Err(crate::TxnError::Conflict { contested_row_ids }) => Some(contested_row_ids),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(conflicts, vec![&vec![2]]);
+            let (own_rows, published_contains_staged) = reader.join().unwrap();
+            assert_eq!(
+                own_rows, 4,
+                "a transaction must see its staged insert alongside its immutable base"
+            );
+            assert!(
+                !published_contains_staged,
+                "the dataset snapshot must never expose another transaction's staged insert"
+            );
+
+            std::fs::remove_dir_all(&dir).ok();
+        });
+    }
+
+    #[test]
+    fn migration_exclusivity_rejects_a_stale_schema_commit_or_migrates_its_published_rows() {
+        // This models the two synchronization boundaries in Dataset directly:
+        // migrate_schema holds lifecycle exclusivity while it changes the
+        // catalog, and Transaction::commit holds a preparation lease until it
+        // either publishes or rejects its captured schema version. Filesystem
+        // and Arrow work are intentionally outside this model; loom cannot run
+        // migration's full recursive decode/encode path within its coroutine
+        // stack, while these gate/version operations are the race under test.
+        loom::model(|| {
+            use loom::sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            };
+
+            let coordinator =
+                Arc::new(crate::lifecycle_coordination::LifecycleCoordinator::default());
+            let schema_version = Arc::new(AtomicUsize::new(1));
+            let active_preparations = Arc::new(AtomicUsize::new(0));
+            let stale_commit_published = Arc::new(AtomicUsize::new(0));
+            let stale_commit_observed_version = Arc::new(AtomicUsize::new(0));
+
+            let migration_coordinator = Arc::clone(&coordinator);
+            let migration_schema_version = Arc::clone(&schema_version);
+            let migration_preparations = Arc::clone(&active_preparations);
+            let migration = loom::thread::spawn(move || {
+                let _exclusive = migration_coordinator.acquire_exclusive();
+                assert_eq!(
+                    migration_preparations.load(Ordering::SeqCst),
+                    0,
+                    "migration must not overlap a transaction publication lease"
+                );
+                migration_schema_version.store(2, Ordering::SeqCst);
+            });
+
+            let commit_coordinator = Arc::clone(&coordinator);
+            let commit_schema_version = Arc::clone(&schema_version);
+            let commit_preparations = Arc::clone(&active_preparations);
+            let commit_published = Arc::clone(&stale_commit_published);
+            let commit_observed_version = Arc::clone(&stale_commit_observed_version);
+            let stale_commit = loom::thread::spawn(move || {
+                let _preparation = commit_coordinator.acquire_preparation();
+                commit_preparations.fetch_add(1, Ordering::SeqCst);
+                let observed = commit_schema_version.load(Ordering::SeqCst);
+                commit_observed_version.store(observed, Ordering::SeqCst);
+                if observed == 1 {
+                    commit_published.store(1, Ordering::SeqCst);
+                } else {
+                    assert_eq!(
+                        observed, 2,
+                        "a stale v1 commit must only observe the migrated catalog"
+                    );
+                }
+                commit_preparations.fetch_sub(1, Ordering::SeqCst);
+            });
+
+            migration.join().unwrap();
+            stale_commit.join().unwrap();
+            assert_eq!(schema_version.load(Ordering::SeqCst), 2);
+            assert!(
+                matches!(
+                    (
+                        stale_commit_published.load(Ordering::SeqCst),
+                        stale_commit_observed_version.load(Ordering::SeqCst),
+                    ),
+                    (1, 1) | (0, 2)
+                ),
+                "the stale transaction may publish only before migration, or observe v2 and reject"
+            );
         });
     }
 
