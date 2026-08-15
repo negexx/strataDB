@@ -75,14 +75,16 @@ single-process boundary.
 `schema_version`, `snapshot`, `begin`, and the explicit
 `migrate_add_nullable_column` operation. `Snapshot` retains the compatible Arrow IPC scan,
 lookup, and grouped-result methods and typed vector-match dictionaries; `explain_scan` returns
-named logical/physical operator lists plus captured observations. A `Transaction` stages one Arrow
-IPC batch at a time and provides bounded transaction-base snapshot reads with read-your-writes for
-lookup, scan (including predicate reads), and group operations; it is terminally `committed` or
-`aborted`, and abort/drop never publishes staged writes. `vector_search` after staged writes returns
-the typed `UnsupportedTransactionReadError`, rather than a merged overlay result. Open, reads,
-commit, and migration release the GIL around engine work. The API is limited to one Python process
-sharing a `Dataset` handle: it does not provide cross-process coordination, serializability, or a
-full/general read/write query interface. `ConflictError` exposes `contested_row_ids`;
+named logical/physical operator lists plus captured observations. The engine `Transaction` supports
+bounded transaction-base snapshot reads with read-your-writes for lookup, scan (including predicate
+reads), and group operations. The current Python `Transaction` facade stages one Arrow IPC batch at
+a time and exposes overlay-aware `scan` reads (including its optional predicate), but does not expose
+transaction lookup or group methods. It is terminally `committed` or `aborted`, and abort/drop never
+publishes staged writes. Its `vector_search` returns the typed
+`UnsupportedTransactionReadError` after staged writes, rather than a merged overlay result. Open,
+reads, commit, and migration release the GIL around engine work. The API is limited to one Python
+process sharing a `Dataset` handle: it does not provide cross-process coordination, serializability,
+or a full/general read/write query interface. `ConflictError` exposes `contested_row_ids`;
 `SchemaMigrationError`, `InvalidQueryError`,
 `UnsupportedTransactionReadError`, `StorageDurabilityError`, and `CorruptionError` are stable
 categories (and retain the existing `ValidationError`/`ExecutionError` base classes). Insufficient
