@@ -125,10 +125,11 @@ pub struct SegmentEntry {
 pub struct Manifest {
     pub version: u64,
     /// Version of the durable logical schema catalog used by these row and
-    /// vector object references. Older supported manifests predate this
-    /// field and therefore default unambiguously to the initial catalog.
-    #[serde(default = "initial_schema_version")]
-    pub schema_version: u32,
+    /// vector object references. `None` denotes a format-v1 envelope written
+    /// before schema catalog metadata existed; it is interpreted as the
+    /// initial catalog without changing that envelope's checksum bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<u32>,
     /// Raw Arrow IPC schema-message bytes for the dataset's owned logical
     /// schema. The physical `_row_id` and `_timestamp` columns are not part
     /// of this schema.
@@ -200,7 +201,7 @@ impl Manifest {
     pub fn empty_with_schema(schema: &Schema) -> Self {
         Self {
             version: 0,
-            schema_version: INITIAL_SCHEMA_VERSION,
+            schema_version: Some(INITIAL_SCHEMA_VERSION),
             schema_ipc: encode_schema(schema),
             data_files: Vec::new(),
             next_row_id: 0,
@@ -221,7 +222,7 @@ impl Manifest {
     ///
     /// Returns an error when the persisted IPC schema bytes are malformed.
     pub fn schema(&self, manifest_path: &Path) -> Result<SchemaRef> {
-        validate_schema_version(self.schema_version, Some(manifest_path))?;
+        validate_schema_version(self.schema_version(), Some(manifest_path))?;
         if self.schema_ipc.is_empty() {
             return Err(StorageError::LegacyFormatNeedsMigration(
                 manifest_path.to_path_buf(),
@@ -240,10 +241,12 @@ impl Manifest {
     pub fn set_schema(&mut self, schema: &Schema) {
         self.schema_ipc = encode_schema(schema);
     }
-}
 
-const fn initial_schema_version() -> u32 {
-    INITIAL_SCHEMA_VERSION
+    /// Returns the effective schema catalog version for this manifest.
+    #[must_use]
+    pub fn schema_version(&self) -> u32 {
+        self.schema_version.unwrap_or(INITIAL_SCHEMA_VERSION)
+    }
 }
 
 /// The exact durable representation of a manifest file.
@@ -299,7 +302,7 @@ impl ManifestEnvelope {
                 ),
             ));
         }
-        validate_schema_version(self.manifest.schema_version, Some(path))?;
+        validate_schema_version(self.manifest.schema_version(), Some(path))?;
         Ok(())
     }
 }
@@ -1037,10 +1040,10 @@ mod tests {
         // Break caught: a manifest that silently drops its catalog version
         // cannot distinguish v1 data from a future incompatible schema.
         let mut manifest = Manifest::empty();
-        manifest.schema_version = 2;
+        manifest.schema_version = Some(2);
         let json = serde_json::to_vec(&manifest).unwrap();
         let round_tripped: Manifest = serde_json::from_slice(&json).unwrap();
-        assert_eq!(round_tripped.schema_version, 2);
+        assert_eq!(round_tripped.schema_version, Some(2));
 
         let legacy_json = serde_json::json!({
             "version": 0,
@@ -1049,7 +1052,44 @@ mod tests {
             "next_row_id": 0,
         });
         let legacy: Manifest = serde_json::from_value(legacy_json).unwrap();
-        assert_eq!(legacy.schema_version, 1);
+        assert_eq!(legacy.schema_version, None);
+        assert_eq!(legacy.schema_version(), 1);
+    }
+
+    #[test]
+    fn read_current_accepts_a_pre_schema_version_v1_envelope_without_rewriting_it() {
+        // Break caught: treating an absent catalog version as an explicit v1
+        // during checksum validation changes the canonical envelope bytes and
+        // makes all format-v1 envelopes written before this field unreadable.
+        let dir = temp_dataset_dir("legacy-schema-version-envelope");
+        let manifest = Manifest::empty();
+        let mut fixture =
+            serde_json::to_value(ManifestEnvelope::new(manifest.clone()).unwrap()).unwrap();
+        fixture
+            .get_mut("manifest")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap()
+            .remove("schema_version");
+        fixture["checksum"] = serde_json::Value::from(0_u32);
+        let checksum =
+            crc32c::crc32c(&serde_json::to_vec(&canonicalize_json(fixture.clone())).unwrap());
+        fixture["checksum"] = serde_json::Value::from(checksum);
+        let bytes = serde_json::to_vec(&fixture).unwrap();
+        let path = manifest_path(&dir, manifest.version);
+        fs::create_dir_all(versions_dir(&dir)).unwrap();
+        fs::write(&path, &bytes).unwrap();
+
+        let recovered = read_current(&dir).unwrap().unwrap();
+
+        assert_eq!(recovered.schema_version, None);
+        assert_eq!(recovered.schema_version(), INITIAL_SCHEMA_VERSION);
+        assert_eq!(recovered.schema_ipc, manifest.schema_ipc);
+        assert_eq!(
+            fs::read(path).unwrap(),
+            bytes,
+            "recovery must not rewrite the fixture"
+        );
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1058,7 +1098,7 @@ mod tests {
         // could reinterpret rows and vector segments without a migration.
         let dir = temp_dataset_dir("unknown-schema-version");
         let mut manifest = Manifest::empty();
-        manifest.schema_version = 99;
+        manifest.schema_version = Some(99);
         commit_manifest(&dir, &manifest).unwrap();
 
         let result = read_current(&dir);

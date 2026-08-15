@@ -54,9 +54,9 @@ use crate::retention::{
 use crate::row_id::{RowIdAllocator, RowIdRange};
 use crate::snapshot::Snapshot;
 use crate::{
-    GroupByRequest, GroupByResult, QueryError, QueryExecutionError, QueryResult, RowLookupOutcome,
-    RowLookupRequest, RowLookupResult, ScanRequest, ScanResult, VectorSearchRequest,
-    VectorSearchResult,
+    GroupByRequest, GroupByResult, PhysicalPlan, QueryError, QueryExecutionError, QueryResult,
+    RowLookupOutcome, RowLookupRequest, RowLookupResult, ScanRequest, ScanResult,
+    VectorSearchRequest, VectorSearchResult,
 };
 
 /// The hidden internal row-id column every committed batch carries
@@ -1163,7 +1163,7 @@ impl Dataset {
     /// Returns the durable catalog version captured by the current snapshot.
     #[must_use]
     pub fn schema_version(&self) -> u32 {
-        self.snapshot().manifest.schema_version
+        self.snapshot().manifest.schema_version()
     }
 
     /// Applies one explicitly requested deterministic schema migration.
@@ -1185,10 +1185,11 @@ impl Dataset {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let source = self.current.load_full();
-        let source_schema_version = source.manifest.schema_version;
+        let source_schema_version = source.manifest.schema_version();
         let target_schema = migration
             .target_schema(source_schema_version, &source.schema)
             .map_err(TxnError::Storage)?;
+        validate_dataset_schema(&target_schema)?;
         let added_column = migration.added_nullable_column().ok_or_else(|| {
             TxnError::Storage(strata_storage::StorageError::MigrationUnsupported {
                 name: migration.name(),
@@ -1251,7 +1252,7 @@ impl Dataset {
 
         let mut manifest = source.manifest.as_ref().clone();
         manifest.version = new_version;
-        manifest.schema_version = migration.target_version();
+        manifest.schema_version = Some(migration.target_version());
         manifest.set_schema(target_schema.as_ref());
         manifest.data_files = data_files;
         manifest.segments = segments;
@@ -1751,6 +1752,26 @@ impl Transaction {
             .scan_query_overlay(request, &self.overlay_batches()?)
     }
 
+    /// Builds the planned read path for this transaction's scan view.
+    ///
+    /// # Errors
+    ///
+    /// Returns planner or typed scan-contract errors.
+    pub fn explain_scan_query(&self, request: &ScanRequest) -> QueryResult<PhysicalPlan> {
+        self.base_snapshot
+            .explain_scan_query_with_overlay(request, self.has_staged_overlay())
+    }
+
+    /// Executes the planned read path for this transaction's scan view.
+    ///
+    /// # Errors
+    ///
+    /// Returns planner or typed scan-contract errors.
+    pub fn execute_planned_scan_query(&self, request: &ScanRequest) -> QueryResult<ScanResult> {
+        let _plan = self.explain_scan_query(request)?;
+        self.scan_query(request)
+    }
+
     /// Groups the immutable base snapshot merged with this transaction's staged writes.
     ///
     /// # Errors
@@ -1759,6 +1780,29 @@ impl Transaction {
     pub fn group_by_query(&self, request: &GroupByRequest) -> QueryResult<GroupByResult> {
         self.base_snapshot
             .group_by_query_overlay(request, &self.overlay_batches()?)
+    }
+
+    /// Builds the planned read path for this transaction's grouped view.
+    ///
+    /// # Errors
+    ///
+    /// Returns planner or typed grouped-query errors.
+    pub fn explain_group_by_query(&self, request: &GroupByRequest) -> QueryResult<PhysicalPlan> {
+        self.base_snapshot
+            .explain_group_by_query_with_overlay(request, self.has_staged_overlay())
+    }
+
+    /// Executes the planned read path for this transaction's grouped view.
+    ///
+    /// # Errors
+    ///
+    /// Returns planner or typed grouped-query errors.
+    pub fn execute_planned_group_by_query(
+        &self,
+        request: &GroupByRequest,
+    ) -> QueryResult<GroupByResult> {
+        let _plan = self.explain_group_by_query(request)?;
+        self.group_by_query(request)
     }
 
     /// Looks up an existing committed physical row through this transaction's overlay.
@@ -1814,6 +1858,10 @@ impl Transaction {
             .visible_logical_batches_excluding(&self.pending_tombstones)?;
         batches.extend(self.pending.iter().cloned());
         Ok(batches)
+    }
+
+    fn has_staged_overlay(&self) -> bool {
+        !self.pending.is_empty() || !self.pending_tombstones.is_empty()
     }
 
     fn validate_batch(&self, batch: &RecordBatch) -> Result<()> {
@@ -1981,11 +2029,12 @@ impl Transaction {
         let latest_snapshot = self.current.load_full();
         let latest_version = latest_snapshot.version;
 
-        if latest_snapshot.manifest.schema_version != self.base_snapshot.manifest.schema_version {
+        if latest_snapshot.manifest.schema_version() != self.base_snapshot.manifest.schema_version()
+        {
             return Err(TxnError::Storage(
                 strata_storage::StorageError::SchemaVersionChanged {
-                    expected: self.base_snapshot.manifest.schema_version,
-                    actual: latest_snapshot.manifest.schema_version,
+                    expected: self.base_snapshot.manifest.schema_version(),
+                    actual: latest_snapshot.manifest.schema_version(),
                 },
             ));
         }
@@ -5414,7 +5463,7 @@ mod tests {
         let dir = temp_dir("unreasonable-capacity");
         let hostile = Manifest {
             version: 0,
-            schema_version: strata_storage::INITIAL_SCHEMA_VERSION,
+            schema_version: Some(strata_storage::INITIAL_SCHEMA_VERSION),
             schema_ipc: Manifest::empty_with_schema(test_schema().as_ref()).schema_ipc,
             data_files: Vec::new(),
             next_row_id: u64::MAX,
@@ -5446,7 +5495,7 @@ mod tests {
         // practice) to simulate a hostile/corrupted manifest.
         let hostile = Manifest {
             version: u64::MAX,
-            schema_version: strata_storage::INITIAL_SCHEMA_VERSION,
+            schema_version: Some(strata_storage::INITIAL_SCHEMA_VERSION),
             schema_ipc: Manifest::empty_with_schema(test_schema().as_ref()).schema_ipc,
             data_files: Vec::new(),
             next_row_id: 0,

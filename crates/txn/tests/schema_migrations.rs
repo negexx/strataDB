@@ -40,6 +40,56 @@ fn add_nullable_tag(source_version: u32, target_version: u32) -> SchemaMigration
     )
 }
 
+fn assert_reserved_column_migration_fails_before_replacement_writes(name: &str) {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().join("dataset");
+    let dataset = Dataset::create(&dir, vector_schema()).unwrap();
+    let mut transaction = dataset.begin();
+    transaction.insert(vector_batch()).unwrap();
+    transaction.commit().unwrap();
+    let manifest_before =
+        std::fs::read(dir.join("_versions").join("00000000000000000001.manifest")).unwrap();
+    let objects_before = std::fs::read_dir(dir.join("data"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+
+    let result = dataset.migrate_schema(&SchemaMigration::add_nullable_column(
+        1,
+        2,
+        Field::new(name, DataType::Utf8, true),
+    ));
+
+    assert!(
+        matches!(result, Err(TxnError::ReservedColumnName(ref rejected)) if rejected == name),
+        "reserved columns must fail validation before migration writes: {result:?}"
+    );
+    assert_eq!(dataset.current_version(), 1);
+    assert_eq!(
+        std::fs::read(dir.join("_versions").join("00000000000000000001.manifest")).unwrap(),
+        manifest_before,
+        "a rejected migration must leave the current manifest bytes unchanged"
+    );
+    assert_eq!(
+        std::fs::read_dir(dir.join("data"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>(),
+        objects_before,
+        "a rejected migration must not create replacement row or segment objects"
+    );
+}
+
+#[test]
+fn migration_rejects_reserved_row_id_before_creating_replacement_objects() {
+    assert_reserved_column_migration_fails_before_replacement_writes("_row_id");
+}
+
+#[test]
+fn migration_rejects_reserved_timestamp_before_creating_replacement_objects() {
+    assert_reserved_column_migration_fails_before_replacement_writes("_timestamp");
+}
+
 #[test]
 fn migration_rewrites_data_and_segments_then_preserves_old_snapshot_and_reopen() {
     // Break caught: publishing only a changed schema would leave the new

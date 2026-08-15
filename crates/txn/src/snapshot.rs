@@ -452,6 +452,14 @@ impl Snapshot {
     /// Returns the same typed validation error as [`Self::scan_query`] for an
     /// invalid projection or filter.
     pub fn explain_scan_query(&self, request: &ScanRequest) -> QueryResult<PhysicalPlan> {
+        self.explain_scan_query_with_overlay(request, false)
+    }
+
+    pub(crate) fn explain_scan_query_with_overlay(
+        &self,
+        request: &ScanRequest,
+        transaction_overlay: bool,
+    ) -> QueryResult<PhysicalPlan> {
         let projection = self.query_schema()?.validate_scan(request)?;
         let mut operators = vec![LogicalOperator::Source];
         if let Some(filter) = request.filter.as_ref() {
@@ -463,7 +471,7 @@ impl Snapshot {
             columns: projection,
         });
         operators.push(LogicalOperator::Materialize);
-        self.plan_query(operators, request.filter.as_ref())
+        self.plan_query(operators, request.filter.as_ref(), transaction_overlay)
     }
 
     /// Executes the physical path selected for a typed scan.
@@ -485,6 +493,14 @@ impl Snapshot {
     ///
     /// Returns the same typed validation error as [`Self::group_by_query`].
     pub fn explain_group_by_query(&self, request: &GroupByRequest) -> QueryResult<PhysicalPlan> {
+        self.explain_group_by_query_with_overlay(request, false)
+    }
+
+    pub(crate) fn explain_group_by_query_with_overlay(
+        &self,
+        request: &GroupByRequest,
+        transaction_overlay: bool,
+    ) -> QueryResult<PhysicalPlan> {
         let _outputs = self.query_schema()?.validate_group_by(request)?;
         let mut operators = vec![LogicalOperator::Source];
         if let Some(filter) = request.filter.as_ref() {
@@ -497,7 +513,7 @@ impl Snapshot {
             aggregate_count: request.aggregates.len(),
         });
         operators.push(LogicalOperator::Materialize);
-        self.plan_query(operators, request.filter.as_ref())
+        self.plan_query(operators, request.filter.as_ref(), transaction_overlay)
     }
 
     /// Executes the physical path selected for grouped aggregation.
@@ -544,7 +560,7 @@ impl Snapshot {
             hydration,
         });
         operators.push(LogicalOperator::Materialize);
-        self.plan_query(operators, request.filter.as_ref())
+        self.plan_query(operators, request.filter.as_ref(), false)
     }
 
     /// Executes the physical path selected for vector search.
@@ -564,19 +580,24 @@ impl Snapshot {
         &self,
         operators: Vec<LogicalOperator>,
         predicate: Option<&FilterExpression>,
+        transaction_overlay: bool,
     ) -> QueryResult<PhysicalPlan> {
         let logical = LogicalPlan::new(operators).map_err(QueryExecutionError::Planner)?;
-        let observations = self.plan_observations(predicate);
+        let observations = self.plan_observations(predicate, transaction_overlay);
         Planner::plan(logical, observations)
             .map_err(|error| QueryExecutionError::Planner(error).into())
     }
 
-    fn plan_observations(&self, predicate: Option<&FilterExpression>) -> PlanObservations {
+    fn plan_observations(
+        &self,
+        predicate: Option<&FilterExpression>,
+        transaction_overlay: bool,
+    ) -> PlanObservations {
         match predicate {
             Some(predicate) => {
                 let pruning_predicate = filter_expression_pruning_predicate(predicate);
                 let Some(pruning_predicate) = pruning_predicate else {
-                    return self.plan_observations(None);
+                    return self.plan_observations(None, transaction_overlay);
                 };
                 let explain = self.explain(&pruning_predicate);
                 PlanObservations {
@@ -586,7 +607,7 @@ impl Snapshot {
                     index_segments_total: explain.segments_total,
                     index_segments_scanned: explain.segments_scanned.len(),
                     index_segments_pruned: explain.segments_skipped.len(),
-                    transaction_overlay: false,
+                    transaction_overlay,
                 }
             }
             None => PlanObservations {
@@ -596,7 +617,7 @@ impl Snapshot {
                 index_segments_total: self.manifest.segments.len(),
                 index_segments_scanned: self.manifest.segments.len(),
                 index_segments_pruned: 0,
-                transaction_overlay: false,
+                transaction_overlay,
             },
         }
     }

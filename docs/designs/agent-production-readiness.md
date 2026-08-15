@@ -1,6 +1,6 @@
 # Agent Production Readiness Design
 
-Status: approved design, awaiting implementation plan review
+Status: approved design; Tasks 1 through 5 are accepted within named bounds, with final production-readiness review fixes in progress
 
 ## Objective
 

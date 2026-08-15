@@ -191,6 +191,59 @@ fn unprunable_filters_still_select_the_row_filter_without_claiming_zone_map_prun
 }
 
 #[test]
+fn planned_transaction_scan_and_group_reads_merge_the_overlay_and_report_it() {
+    // Break caught: exposing the planner only on snapshots bypasses staged
+    // inserts/replacements and makes explain conceal transaction read state.
+    let temp = tempfile::tempdir().unwrap();
+    let dataset = Dataset::create(temp.path().join("dataset"), schema()).unwrap();
+    let mut seed = dataset.begin();
+    seed.insert(batch(vec![Some("base")], vec![Some(10)], vec![[1.0, 1.0]]))
+        .unwrap();
+    seed.commit().unwrap();
+
+    let mut transaction = dataset.begin();
+    transaction
+        .insert(batch(
+            vec![Some("staged")],
+            vec![Some(20)],
+            vec![[2.0, 2.0]],
+        ))
+        .unwrap();
+    let scan = ScanRequest {
+        projection: Projection::Columns(vec!["category".into(), "amount".into()]),
+        filter: None,
+    };
+    let scan_plan = transaction.explain_scan_query(&scan).unwrap();
+    assert!(scan_plan.observations.transaction_overlay);
+    assert!(
+        scan_plan
+            .physical_operators
+            .contains(&PhysicalOperator::TransactionOverlay)
+    );
+    assert_eq!(
+        transaction.execute_planned_scan_query(&scan).unwrap(),
+        transaction.scan_query(&scan).unwrap()
+    );
+
+    let group = GroupByRequest {
+        group_by: vec!["category".into()],
+        aggregates: vec![Aggregate::new("amount", AggregateFunction::Sum, "sum")],
+        filter: None,
+    };
+    let group_plan = transaction.explain_group_by_query(&group).unwrap();
+    assert!(group_plan.observations.transaction_overlay);
+    assert!(
+        group_plan
+            .physical_operators
+            .contains(&PhysicalOperator::TransactionOverlay)
+    );
+    assert_eq!(
+        transaction.execute_planned_group_by_query(&group).unwrap(),
+        transaction.group_by_query(&group).unwrap()
+    );
+}
+
+#[test]
 fn planned_paths_preserve_tombstones_nulls_projection_order_and_invalid_request_errors() {
     let temp = tempfile::tempdir().unwrap();
     let dataset = Dataset::create(temp.path().join("dataset"), schema()).unwrap();
