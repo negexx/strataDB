@@ -455,3 +455,80 @@ current CI-named txn and live-set-cache model.
 
 This is a partial closure record only. It supplies no complete CI, loom, benchmark, package, or
 rustdoc-green claim for `29c70e3` or the evidence commit.
+
+## Task 6 exact-HEAD remaining-gates verification (2026-08-15)
+
+This evidence-only run started at code commit
+`29c70e3f2f6a7886cf108985fa323b2ffd4aafae` and documentation commit
+`a3624d4eb8966148e57b316b083b3f2b29f34287`. The diff from the code commit
+to that documentation baseline contained only `docs/phase-3-verification-report.md`
+and `docs/status.md`; the Cargo commands therefore exercised the stated code
+head. Before this report edit, the only worktree change was the unrelated
+`.superpowers/sdd/agent-production-readiness-plan/reports/task-2-report.md`,
+which was preserved.
+
+Every Cargo invocation used a process-local native x64 MSVC environment with
+MSVC `14.52.36615`'s `Hostx64\\x64` directory first on `PATH`, and its x64
+library plus Windows SDK `10.0.26100.0` UCRT/UM x64 libraries on `LIB`, with
+matching MSVC/SDK include directories on `INCLUDE`. `where.exe cl` and
+`where.exe link` both resolved to that MSVC directory. No repository source,
+dependency, lockfile, or configuration was changed.
+
+The following are the exact CI crate-scoped loom recipes: first
+`cargo rustc -p <crate> --lib --profile test --message-format=json -- --cfg loom`,
+then the produced test binary's CI-listed exact models with
+`--test-threads=1`. This is not a workspace-wide `RUSTFLAGS` invocation.
+
+| Gate | Current result |
+|---|---|
+| Live-set-cache loom build (`strata-txn`) | Exit 0; produced `strata_txn-5c2704560b55f96c.exe`. |
+| `live_set_cache::loom_tests::two_concurrent_misses_on_the_same_key_compute_exactly_once` | Exit 0: 1 passed, 0 failed, 232 filtered; 0.01 s. |
+| `live_set_cache::loom_tests::concurrent_different_key_payloads_do_not_exceed_the_budget` | Exit 0: 1 passed, 0 failed, 232 filtered; 0.02 s. |
+| `live_set_cache::loom_tests::concurrent_different_key_entry_charges_do_not_exceed_the_budget` | Exit 0: 1 passed, 0 failed, 232 filtered; 0.01 s. |
+| Index loom build (`strata-index`) | Exit 0; produced `strata_index-acebb1a09b16ff24.exe`. |
+| `node::loom_tests::full_node_publish_is_completely_visible_to_a_reader` | Exit 0: 1 passed, 0 failed, 25 filtered; 0.01 s. |
+| `node_table::loom_tests::concurrent_chunk_allocation_publishes_exactly_one_chunk` | Exit 0: 1 passed, 0 failed, 25 filtered; 0.04 s. |
+| `slot_array::loom_tests::concurrent_claim_and_shrink_never_corrupts_a_slot` | Exit 0: 1 passed, 0 failed, 25 filtered; 8.43 s. |
+| `graph::loom_tests::concurrent_advances_always_settle_on_the_highest_level` | Exit 0: 1 passed, 0 failed, 25 filtered; 0.01 s. |
+| `graph::loom_tests::concurrent_inserts_of_distinct_rows_are_all_findable_and_uncorrupted` | Exit 0: 1 passed, 0 failed, 25 filtered; 1.69 s. |
+| `graph::loom_tests::concurrent_inserts_racing_on_one_shared_neighbor_always_keep_the_nearest` | Exit 0: 1 passed, 0 failed, 25 filtered; 134.81 s. |
+| `graph::loom_tests::concurrent_inserts_into_a_genuinely_empty_graph_never_strand_a_node_loom` | Exit 0: 1 passed, 0 failed, 25 filtered; 7.17 s. |
+| `graph::loom_tests::concurrent_insert_never_uses_an_unpublished_node_as_a_descent_entry_loom` | Exit 0: 1 passed, 0 failed, 25 filtered; 4.87 s. |
+
+The complete `query_planner_bench` Criterion target was then run with
+`cargo bench -p strata-bench --bench query_planner_bench`. Compilation and
+execution exited 0; compilation took 1m45s. Criterion used the plotters
+backend because Gnuplot was unavailable. It completed all 100 samples for all
+nine registered workloads; it gave its standard target-time advisory for both
+vector-search cases and the shared-handle commit case, not a failure.
+
+| Workload | Current 95% interval |
+|---|---:|
+| Projection scan, direct | 564.54–566.96 µs |
+| Projection scan, planned | 563.75–566.58 µs |
+| Selective predicate scan, direct | 136.34–136.64 µs |
+| Selective predicate scan, planned | 138.38–139.34 µs |
+| Grouped aggregation, direct | 147.08–147.65 µs |
+| Grouped aggregation, planned | 149.10–149.54 µs |
+| Vector search, direct | 1.3567–1.3723 ms |
+| Vector search, planned | 1.3335–1.3393 ms |
+| Shared-handle transaction commit | 49.646–50.436 ms |
+
+For the locked wheel/import smoke, `Get-Command maturin` found no executable
+and `py -3.14 -m maturin --version` exited 1 with `No module named maturin`.
+Maturin is therefore **unavailable**; no wheel was built, installed, or
+imported.
+
+### Remaining limitations and unrun gates
+
+The earlier transaction loom model
+`a_reader_never_sees_one_in_flight_commits_row_while_observing_an_unrelated_commits_row_id_counter`
+remains **aborted**, not passed; it was deliberately not rerun. The earlier
+historically nonterminating transaction model and the remaining transaction
+semantic/lifecycle/row-ID models remain unrun. The cache and index rows above
+are now fresh exact-model results, but no other CI, fuzz, chaos, rustdoc,
+binding-package, or complete-branch gate is newly claimed. The Criterion
+result is only a local fixed-fixture measurement of the `query_planner_bench`
+target, not a universal performance, cost-model, serializability,
+cross-process, durability, or whole-feature claim. Historical CI and status
+qualifications above continue to apply only to their recorded revisions.
