@@ -554,3 +554,34 @@ The broad workspace gates recorded above apply to code head `29c70e3` (or earlie
 heads). They were not rerun at `87d131f`, and this section does not extend those results to the
 final head. The previously aborted/unrun transaction loom models, unavailable `maturin`
 wheel/import smoke, and remaining fuzz, chaos, and package gates are not claimed green.
+
+## Exact-head fuzz and chaos verification (2026-08-15)
+
+This verification-only record applies to code commit
+`756ab70c465491c3329d6d884e2b1c300d971aaf`. Before this report edit, the
+only worktree change was the unrelated
+`.superpowers/sdd/agent-production-readiness-plan/reports/task-2-report.md`,
+which was preserved. No source, dependency, configuration, or lockfile was
+changed; temporary parser inputs were created outside the repository.
+
+All successful fuzz and chaos commands used the documented process-local x64
+MSVC `14.52.36615` and Windows SDK `10.0.26100.0` environment, including the
+matching `INCLUDE` directories, with the pinned
+`nightly-2026-07-25` toolchain and `cargo-fuzz 0.13.2` already available. No
+toolchain or dependency installation was performed.
+
+| Gate | Command/result |
+|---|---|
+| Declared fuzz targets | `cargo +nightly-2026-07-25 fuzz list` exited 0 and listed exactly `datafile_parse`, `manifest_current_parse`, `manifest_parse`, and `segment_parse`. |
+| Initial manifest fuzz build | `CARGO_BUILD_JOBS=1 cargo +nightly-2026-07-25 fuzz build manifest_parse` exited 1 after 22.68 s because that first process-local setup omitted MSVC/SDK `INCLUDE`; `libfuzzer-sys` could not find C++ standard headers. This is an environment failure, not a target pass. |
+| Fuzz builds after documented MSVC setup | All four prescribed builds exited 0: `manifest_parse` 0.29 s, `datafile_parse` 1.51 s, `manifest_current_parse` 1.69 s, and `segment_parse` 1.32 s. |
+| Fuzz lockfile | `fuzz/Cargo.lock` SHA-256 was unchanged before and after: `ECDAB8CA45B67F1B522E4FE2D435171B9B9DCF716C82EBFDE2838C82F3DBACD5`. |
+| Parser smokes | All five `cargo +nightly-2026-07-25 fuzz run <target> <input> -- -runs=1 -seed=24740` smokes exited 0: two checked-in `datafile_parse` Arrow corpus inputs plus temporary manifest, current-manifest, and segment inputs. |
+| Fast chaos | `cargo test -p strata-sim fast_tier_random_seeds_survive_random_crash_points -- --exact --nocapture` exited 0: 1 passed in 33.62 s. |
+| Thorough chaos | `CARGO_BUILD_JOBS=1 STRATA_CHAOS_THOROUGH=1 cargo test -p strata-sim thorough_tier_satisfies_the_phase_7_exit_criterion -- --exact --ignored --nocapture` exited 0: 1 passed in 684.57 s; output reported `2000/2000` seeds checked with zero violations. |
+| 8,000-trial real-thread index tier | `cargo test -p strata-index concurrent_inserts_into_a_genuinely_empty_graph_never_strand_a_node -- --exact --ignored --nocapture` was launched, then interrupted before an exit code or result was collected. It is **aborted/unclaimed**, not passed. |
+
+This section supplies fresh local fuzz and chaos evidence only for the named
+completed gates at `756ab70`. It does not convert the interrupted 8,000-trial
+run, other unrun gates, or historical results at different revisions into a
+pass claim.
