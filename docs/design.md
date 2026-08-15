@@ -15,9 +15,13 @@ The manifest is intended to be the single publication boundary for row and index
 The current design provides explicit snapshot-preserving compaction, age-based manifest retention,
 and vacuum of recognized unprotected objects. It does not provide arbitrary orphan cleanup,
 guaranteed bounded segment growth, or time-travel retention. Dataset-owned schema, manifest identity, row/file integrity, and durable
-row-ID high-water checks are implemented within the named local bounds; schema evolution and
-universal power-loss claims remain deferred. See the audit rather than treating the format as
-corruption proof.
+row-ID high-water checks are implemented within the named local bounds. The versioned schema
+catalog supports one explicit, bounded evolution: version 1 to version 2 may add one nullable
+logical column, rewriting row objects and copying listed immutable segments before one new manifest
+is published. Target schemas must pass the same dataset preflight used by create and recovery; in
+particular `_row_id` and `_timestamp` remain reserved physical names. General schema evolution,
+arbitrary type changes, reverse migrations, and universal power-loss claims remain deferred. See
+the audit rather than treating the format as corruption proof.
 
 ## Transactions and snapshots
 
@@ -55,8 +59,11 @@ reclaims superseded listed objects only after publication and active-snapshot ch
 ## Query primitives
 
 The query crate provides predicates, statistics/zone-map pruning, filtered ANN constraints, explain
-information, and in-memory group-by primitives. It does not yet provide a complete planner, SQL
-parser, stable client contract, or guaranteed cost bound for selective queries.
+information, in-memory group-by primitives, and a bounded logical/physical planner. The planner
+accepts only the supported source/projection/predicate, grouping, and vector-search shapes; it
+records selected physical operators plus captured file/segment pruning and transaction-overlay
+observations, then reuses the immutable-snapshot operators. It is not SQL, a general optimizer, a
+cost model, or a guaranteed cost bound for selective queries.
 
 ## Verification boundary
 

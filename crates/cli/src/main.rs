@@ -107,6 +107,7 @@ fn error_category(error: &(dyn Error + 'static)) -> ExitCategory {
                 | strata_txn::TxnError::UnsafeManifestPath(_) => {
                     return ExitCategory::Corruption;
                 }
+                strata_txn::TxnError::ReservedColumnName(_) => return ExitCategory::Usage,
                 strata_txn::TxnError::Storage(error) => return storage_error_category(error),
                 _ => {}
             }
@@ -371,13 +372,18 @@ fn handle_migration(args: &[String]) -> Result<(), Box<dyn Error>> {
     let action = args
         .get(2)
         .ok_or_else(|| usage_error("migration requires <validate|run|status> <dir> [...]"))?;
+    if !matches!(action.as_str(), "validate" | "run" | "status") {
+        return Err(usage_error(
+            "migration requires validate, run, or status as its first argument",
+        ));
+    }
     let dir = args
         .get(3)
         .ok_or_else(|| usage_error("migration requires <validate|run|status> <dir> [...]"))?;
-    let dataset = strata_txn::Dataset::open(dir)?;
 
     if action == "status" {
         let json = parse_json_flag(args, 4, "migration status")?;
+        let dataset = strata_txn::Dataset::open(dir)?;
         if json {
             println!(
                 "{{\"kind\":\"migration_status\",\"manifest_version\":{},\"schema_version\":{}}}",
@@ -394,11 +400,6 @@ fn handle_migration(args: &[String]) -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    if !matches!(action.as_str(), "validate" | "run") {
-        return Err(usage_error(
-            "migration requires validate, run, or status as its first argument",
-        ));
-    }
     let name = args.get(4).ok_or_else(|| {
         usage_error("migration validate/run requires add-nullable-column <column> <type>")
     })?;
@@ -425,6 +426,10 @@ fn handle_migration(args: &[String]) -> Result<(), Box<dyn Error>> {
     } else {
         parse_json_flag(args, 7, "migration validate/run")?
     };
+    if action == "run" {
+        require_single_writer_ack(args, "migration run")?;
+    }
+    let dataset = strata_txn::Dataset::open(dir)?;
     let migration = strata_txn::SchemaMigration::add_nullable_column(
         dataset.schema_version(),
         strata_storage::ADD_NULLABLE_COLUMN_SCHEMA_VERSION,
@@ -432,7 +437,7 @@ fn handle_migration(args: &[String]) -> Result<(), Box<dyn Error>> {
     );
 
     if action == "validate" {
-        migration.target_schema(dataset.schema_version(), &dataset.schema())?;
+        validate_migration_target_schema(&migration, &dataset)?;
         if json {
             println!(
                 "{{\"kind\":\"migration_validation\",\"name\":\"{}\",\"source_schema_version\":{},\"target_schema_version\":{},\"column\":{{\"name\":{},\"type\":{},\"nullable\":true}}}}",
@@ -455,7 +460,7 @@ fn handle_migration(args: &[String]) -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    require_single_writer_ack(args, "migration run")?;
+    validate_migration_target_schema(&migration, &dataset)?;
     let result = dataset.migrate_schema(&migration)?;
     if json {
         println!(
@@ -475,6 +480,17 @@ fn handle_migration(args: &[String]) -> Result<(), Box<dyn Error>> {
         );
     }
     Ok(())
+}
+
+fn validate_migration_target_schema(
+    migration: &strata_txn::SchemaMigration,
+    dataset: &strata_txn::Dataset,
+) -> Result<(), Box<dyn Error>> {
+    let target_schema = migration.target_schema(dataset.schema_version(), &dataset.schema())?;
+    strata_txn::Dataset::validate_schema(&target_schema).map_err(|error| match error {
+        strata_txn::TxnError::ReservedColumnName(_) => usage_error(error.to_string()),
+        other => Box::new(other) as Box<dyn Error>,
+    })
 }
 
 fn handle_manifest_status(args: &[String], dir: &str) -> Result<(), Box<dyn Error>> {

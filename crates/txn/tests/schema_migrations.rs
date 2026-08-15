@@ -53,6 +53,8 @@ fn assert_reserved_column_migration_fails_before_replacement_writes(name: &str) 
         .unwrap()
         .map(|entry| entry.unwrap().file_name())
         .collect::<Vec<_>>();
+    let mut objects_before = objects_before;
+    objects_before.sort();
 
     let result = dataset.migrate_schema(&SchemaMigration::add_nullable_column(
         1,
@@ -70,12 +72,13 @@ fn assert_reserved_column_migration_fails_before_replacement_writes(name: &str) 
         manifest_before,
         "a rejected migration must leave the current manifest bytes unchanged"
     );
+    let mut objects_after = std::fs::read_dir(dir.join("data"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    objects_after.sort();
     assert_eq!(
-        std::fs::read_dir(dir.join("data"))
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .collect::<Vec<_>>(),
-        objects_before,
+        objects_after, objects_before,
         "a rejected migration must not create replacement row or segment objects"
     );
 }

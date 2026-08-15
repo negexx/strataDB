@@ -446,3 +446,83 @@ fn migration_run_requires_and_accepts_single_writer_acknowledgement() {
         stderr(&accepted)
     );
 }
+
+#[test]
+fn migration_reserved_schema_names_have_validate_run_usage_parity_without_writes() {
+    // Break caught: validate accepted a schema that run rejected later, or a
+    // rejected request created replacement objects before returning.
+    for reserved_name in ["_row_id", "_timestamp"] {
+        let dir = empty_fixture_dir();
+        let dir_str = dir.path().to_str().unwrap();
+        let manifest_before = std::fs::read(
+            dir.path()
+                .join("_versions")
+                .join("00000000000000000000.manifest"),
+        )
+        .unwrap();
+        let mut objects_before = std::fs::read_dir(dir.path().join("data"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        objects_before.sort();
+
+        let validated = command(&[
+            "migration",
+            "validate",
+            dir_str,
+            "add-nullable-column",
+            reserved_name,
+            "utf8",
+        ]);
+        let run = command(&[
+            "migration",
+            "run",
+            dir_str,
+            "add-nullable-column",
+            reserved_name,
+            "utf8",
+            "--ack-single-writer",
+        ]);
+
+        assert_eq!(validated.status.code(), Some(2), "{reserved_name}");
+        assert_eq!(run.status.code(), Some(2), "{reserved_name}");
+        assert_eq!(stderr(&validated), stderr(&run), "{reserved_name}");
+        assert_eq!(
+            std::fs::read(
+                dir.path()
+                    .join("_versions")
+                    .join("00000000000000000000.manifest"),
+            )
+            .unwrap(),
+            manifest_before,
+            "{reserved_name} must not rewrite the current manifest"
+        );
+        let mut objects_after = std::fs::read_dir(dir.path().join("data"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        objects_after.sort();
+        assert_eq!(
+            objects_after, objects_before,
+            "{reserved_name} must not create replacement objects"
+        );
+    }
+}
+
+#[test]
+fn migration_rejects_unknown_action_before_opening_the_dataset() {
+    // Break caught: malformed migration actions open their supplied path and
+    // report an operational filesystem error instead of CLI usage.
+    let missing_dir = tempfile::tempdir().unwrap();
+    let output = command(&[
+        "migration",
+        "bogus",
+        missing_dir.path().join("missing").to_str().unwrap(),
+    ]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        stderr(&output),
+        "error: usage error: migration requires validate, run, or status as its first argument\n"
+    );
+}

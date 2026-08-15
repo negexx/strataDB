@@ -1061,32 +1061,29 @@ mod tests {
         // Break caught: treating an absent catalog version as an explicit v1
         // during checksum validation changes the canonical envelope bytes and
         // makes all format-v1 envelopes written before this field unreadable.
+        //
+        // This is a pinned historical v1 envelope. It intentionally uses
+        // literal bytes and a hand-pinned checksum rather than `Manifest`,
+        // `ManifestEnvelope`, or canonicalization helpers, so a change to
+        // the current serializer cannot manufacture its own compatibility
+        // fixture.
+        const HISTORICAL_V1_ENVELOPE: &[u8] = br#"{"format_version":1,"manifest":{"version":0,"schema_ipc":[16,0,0,0,0,0,10,0,12,0,10,0,9,0,4,0,10,0,0,0,16,0,0,0,0,1,4,0,8,0,8,0,0,0,4,0,8,0,0,0,4,0,0,0,3,0,0,0,196,0,0,0,132,0,0,0,4,0,0,0,88,255,255,255,32,0,0,0,12,0,0,0,0,0,0,16,96,0,0,0,1,0,0,0,36,0,0,0,0,0,6,0,8,0,4,0,6,0,0,0,3,0,0,0,16,0,22,0,16,0,0,0,15,0,4,0,0,0,8,0,16,0,0,0,24,0,0,0,28,0,0,0,0,0,0,3,24,0,0,0,0,0,6,0,8,0,6,0,6,0,0,0,0,0,1,0,0,0,0,0,4,0,0,0,105,116,101,109,0,0,0,0,6,0,0,0,118,101,99,116,111,114,0,0,212,255,255,255,24,0,0,0,12,0,0,0,0,0,0,5,16,0,0,0,0,0,0,0,4,0,4,0,4,0,0,0,4,0,0,0,110,97,109,101,0,0,0,0,16,0,20,0,16,0,0,0,15,0,4,0,0,0,8,0,16,0,0,0,24,0,0,0,32,0,0,0,0,0,0,2,28,0,0,0,8,0,12,0,4,0,11,0,8,0,0,0,64,0,0,0,0,0,0,1,0,0,0,0,2,0,0,0,105,100,0,0],"data_files":[],"next_row_id":0,"tombstones":[],"next_attempt_id":0,"commit_time_high_water":0,"committed_at_us":1786760837484914,"segments":[]},"checksum":2945473902}"#;
         let dir = temp_dataset_dir("legacy-schema-version-envelope");
-        let manifest = Manifest::empty();
-        let mut fixture =
-            serde_json::to_value(ManifestEnvelope::new(manifest.clone()).unwrap()).unwrap();
-        fixture
-            .get_mut("manifest")
-            .and_then(serde_json::Value::as_object_mut)
-            .unwrap()
-            .remove("schema_version");
-        fixture["checksum"] = serde_json::Value::from(0_u32);
-        let checksum =
-            crc32c::crc32c(&serde_json::to_vec(&canonicalize_json(fixture.clone())).unwrap());
-        fixture["checksum"] = serde_json::Value::from(checksum);
-        let bytes = serde_json::to_vec(&fixture).unwrap();
-        let path = manifest_path(&dir, manifest.version);
+        let path = manifest_path(&dir, 0);
         fs::create_dir_all(versions_dir(&dir)).unwrap();
-        fs::write(&path, &bytes).unwrap();
+        fs::write(&path, HISTORICAL_V1_ENVELOPE).unwrap();
 
         let recovered = read_current(&dir).unwrap().unwrap();
 
         assert_eq!(recovered.schema_version, None);
         assert_eq!(recovered.schema_version(), INITIAL_SCHEMA_VERSION);
-        assert_eq!(recovered.schema_ipc, manifest.schema_ipc);
+        let recovered_schema = recovered.schema(&path).unwrap();
+        assert_eq!(recovered_schema.field(0).name(), "id");
+        assert_eq!(recovered_schema.field(1).name(), "name");
+        assert_eq!(recovered_schema.field(2).name(), "vector");
         assert_eq!(
             fs::read(path).unwrap(),
-            bytes,
+            HISTORICAL_V1_ENVELOPE,
             "recovery must not rewrite the fixture"
         );
         fs::remove_dir_all(&dir).ok();

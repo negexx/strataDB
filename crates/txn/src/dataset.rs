@@ -821,7 +821,7 @@ impl Dataset {
         schema: SchemaRef,
         commit_log_capacity: usize,
     ) -> Result<Self> {
-        validate_dataset_schema(&schema)?;
+        Self::validate_schema(&schema)?;
         if read_current_with(&storage)?.is_some() {
             return Err(TxnError::AlreadyExists(dir));
         }
@@ -961,7 +961,7 @@ impl Dataset {
             .join("_versions")
             .join(format!("{:020}.manifest", manifest.version));
         let schema = manifest.schema(&manifest_path)?;
-        validate_dataset_schema(&schema)?;
+        Self::validate_schema(&schema)?;
         // The capacity guard used to live inside the old delta-replay open
         // path, which sized an `HnswIndex` from `next_row_id`. Nothing sizes
         // an allocation from it any more, but the ceiling is still a
@@ -1166,6 +1166,17 @@ impl Dataset {
         self.snapshot().manifest.schema_version()
     }
 
+    /// Validates a logical schema against the invariants used by dataset
+    /// creation, recovery, and schema migration.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when a logical field uses a reserved physical
+    /// column name or when field names are duplicated.
+    pub fn validate_schema(schema: &SchemaRef) -> Result<()> {
+        validate_dataset_schema(schema)
+    }
+
     /// Applies one explicitly requested deterministic schema migration.
     ///
     /// Migration writes replacement row files and copied immutable vector
@@ -1189,7 +1200,7 @@ impl Dataset {
         let target_schema = migration
             .target_schema(source_schema_version, &source.schema)
             .map_err(TxnError::Storage)?;
-        validate_dataset_schema(&target_schema)?;
+        Self::validate_schema(&target_schema)?;
         let added_column = migration.added_nullable_column().ok_or_else(|| {
             TxnError::Storage(strata_storage::StorageError::MigrationUnsupported {
                 name: migration.name(),
