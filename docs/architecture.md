@@ -76,11 +76,14 @@ single-process boundary.
 `migrate_add_nullable_column` operation. `Snapshot` retains the compatible Arrow IPC scan,
 lookup, and grouped-result methods and typed vector-match dictionaries; `explain_scan` returns
 named logical/physical operator lists plus captured observations. A `Transaction` stages one Arrow
-IPC batch at a time, reads its base snapshot plus its own overlay through `scan`, and is terminally
-`committed` or `aborted`; abort/drop never publishes staged writes. Open, reads, commit, and migration
-release the GIL around engine work. The API is limited to one Python process sharing a `Dataset`
-handle: it does not provide cross-process coordination, serializability, or a merged vector-search
-overlay. `ConflictError` exposes `contested_row_ids`; `SchemaMigrationError`, `InvalidQueryError`,
+IPC batch at a time and provides bounded transaction-base snapshot reads with read-your-writes for
+lookup, scan (including predicate reads), and group operations; it is terminally `committed` or
+`aborted`, and abort/drop never publishes staged writes. `vector_search` after staged writes returns
+the typed `UnsupportedTransactionReadError`, rather than a merged overlay result. Open, reads,
+commit, and migration release the GIL around engine work. The API is limited to one Python process
+sharing a `Dataset` handle: it does not provide cross-process coordination, serializability, or a
+full/general read/write query interface. `ConflictError` exposes `contested_row_ids`;
+`SchemaMigrationError`, `InvalidQueryError`,
 `UnsupportedTransactionReadError`, `StorageDurabilityError`, and `CorruptionError` are stable
 categories (and retain the existing `ValidationError`/`ExecutionError` base classes). Insufficient
 history remains a distinct category.
@@ -88,9 +91,10 @@ history remains a distinct category.
 ## Commit lifecycle
 
 1. `Dataset::begin` captures one immutable base snapshot and returns a `Transaction` bound to that
-   snapshot's schema/version. It buffers Arrow batches and tombstones. Transaction `scan`, lookup,
-   and group reads merge that base with its private overlay; vector search uses the base index only
-   and rejects staged overlays with a typed unsupported-read error.
+   snapshot's schema/version. It buffers Arrow batches and tombstones. Transaction lookup, `scan`
+   (including predicate reads), and group reads merge that base with its private overlay;
+   `vector_search` after staged writes uses no merged overlay and returns a typed
+   unsupported-transaction-read error.
 2. Commit preparation allocates row IDs, writes/fsyncs Arrow files, and builds/fsyncs an immutable HNSW
    segment when vectors are present. Failed preparation may leave unreachable files; cleanup is absent.
 3. Under the shared handle's commit lock, the transaction reloads the latest snapshot and checks its
@@ -141,9 +145,10 @@ observation from one completed run, not atomic or continuing storage-bound enfor
 ## Reads, updates, and index behavior
 
 `Dataset::snapshot` returns a fixed manifest/segment/tombstone view. Later commits cannot alter that
-captured view. `Transaction` supplies bounded read-your-writes over that same base snapshot (scan,
-lookup, and grouped reads); it is not a general read/write query interface, and vector reads with a
-staged overlay are explicitly unsupported.
+captured view. `Transaction` supplies bounded transaction-base snapshot reads with read-your-writes
+for lookup, scan (including predicate reads), and group operations; it is not a general read/write
+query interface, and `vector_search` after staged writes returns a typed unsupported-transaction-read
+error rather than reading a merged overlay.
 
 Rows are append-only physical records. `delete` and `update` must target one live physical row in the
 transaction's base snapshot and are revalidated under the commit lock. `update` tombstones that old
@@ -167,9 +172,10 @@ write-write OCC isolation boundary.
 ## Deliberate boundaries
 
 The design ceiling is snapshot isolation rather than serializability. The current API is narrower:
-immutable snapshot reads plus write-write OCC. Strata remains embedded and single-node; distributed
-transactions, full SQL, automatic conflict resolution, stronger isolation, extra ANN families, and an
-agent-memory/belief product are out of scope.
+immutable snapshot reads; bounded transaction-base, read-your-writes lookup, scan/predicate, and
+group operations; and write-write OCC. It is not a full/general read/write query interface. Strata
+remains embedded and single-node; distributed transactions, full SQL, automatic conflict resolution,
+stronger isolation, extra ANN families, and an agent-memory/belief product are out of scope.
 
 Normal tests, loom models, chaos tests, fuzz targets, and benchmarks provide bounded evidence rather
 than a blanket proof. See [decisions](decisions.md), [current design](design.md), and the [roadmap](roadmap.md)

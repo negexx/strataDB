@@ -8,10 +8,12 @@ intent and constraints; current source and tests determine what is actually impl
 
 **Status:** Accepted as the design ceiling; the current API is narrower.
 
-Strata targets snapshot isolation rather than serializability. The implementation currently exposes
-immutable snapshot reads and write-write optimistic conflict detection, not a full read/write
-transaction snapshot API. Stronger isolation requires a new decision and evidence that the extra
-coordination is worth its complexity.
+Strata targets snapshot isolation rather than serializability. The implementation exposes immutable
+snapshot reads and bounded transaction-base snapshot reads with read-your-writes for supported lookup,
+scan (including predicate reads), and group operations, plus write-write optimistic conflict detection.
+`vector_search` after staged writes returns a typed unsupported-transaction-read error; this is not a
+full/general read/write query interface. Stronger isolation requires a new decision and evidence that
+the extra coordination is worth its complexity.
 
 ## 0005 - Rust over C++
 
