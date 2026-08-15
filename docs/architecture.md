@@ -64,10 +64,11 @@ optimizer, or a cost model. Local Criterion evidence for the fixed 256-row fixtu
 the [Phase 3 verification report](phase-3-verification-report.md#task-3-query-planning-evidence);
 it measures that fixture only, not a universal performance guarantee. There is no
 arbitrary orphan cleanup, time
-travel, or cross-process protocol. The Phase 2 Python/CLI surfaces are partial and remain subject to
-their documented typed contracts and integration verification. “Partial” here describes client/API
-maturity, not a claim that completed Phase 2 slices are outside their documented embedded,
-single-process boundary.
+travel, or cross-process protocol. The Phase 2 Python/CLI surfaces provide stable bounded contracts
+within the documented embedded, single-process boundary. Their remaining packaging/runtime limits
+are recorded in [status](status.md); they do not make the accepted interfaces "awaiting
+integration" or broaden the API to cross-process coordination, serializability, or a general
+read/write query interface.
 
 ## Python API 1.0
 

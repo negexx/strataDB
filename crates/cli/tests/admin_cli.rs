@@ -3,7 +3,9 @@
 use std::process::{Command, Output};
 use std::sync::Arc;
 
+use arrow::array::{FixedSizeListArray, Float32Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
 use serde_json::{Value, json};
 
 fn command(args: &[&str]) -> Output {
@@ -61,6 +63,39 @@ fn quoted_backslashed_schema_fixture_dir() -> tempfile::TempDir {
         true,
     )]));
     strata_txn::Dataset::create(dir.path().to_str().unwrap(), schema).unwrap();
+    dir
+}
+
+fn vector_fixture_dir() -> tempfile::TempDir {
+    let dir = tempfile::Builder::new()
+        .prefix("strata-cli-admin-vector-")
+        .tempdir()
+        .unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new(
+            "vector",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 2),
+            false,
+        ),
+    ]));
+    let dataset = strata_txn::Dataset::create(dir.path(), Arc::clone(&schema)).unwrap();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(FixedSizeListArray::new(
+                Arc::new(Field::new("item", DataType::Float32, false)),
+                2,
+                Arc::new(Float32Array::from(vec![0.0, 0.0])),
+                None,
+            )),
+        ],
+    )
+    .unwrap();
+    let mut transaction = dataset.begin();
+    transaction.insert(batch).unwrap();
+    transaction.commit().unwrap();
     dir
 }
 
@@ -168,10 +203,10 @@ fn manifest_and_recovery_status_are_json_after_a_reopen() {
 }
 
 #[test]
-fn explain_json_reports_the_planned_operator_path() {
-    // Break caught: CLI explain reports only legacy file pruning rather than
-    // the stable logical and physical operators selected for a typed scan.
-    let dir = empty_fixture_dir();
+fn explain_json_serializes_scalar_zero_segment_counts() {
+    // Break caught: CLI explain serializes segment scans for a scalar physical
+    // plan even though the plan reads only manifest-listed row files.
+    let dir = vector_fixture_dir();
     let output = command(&[
         "explain",
         dir.path().to_str().unwrap(),
@@ -189,7 +224,7 @@ fn explain_json_reports_the_planned_operator_path() {
     assert_json_value(&stdout(&output));
     assert_eq!(
         stdout(&output),
-        "{\"kind\":\"explain\",\"logical_operators\":[\"source\",\"predicate\",\"projection\",\"materialize\"],\"physical_operators\":[\"manifest_snapshot_source\",\"zone_map_pruning\",\"tombstone_filter\",\"row_filter\",\"column_projection\",\"materialize\"],\"observations\":{\"data_files_total\":0,\"data_files_scanned\":0,\"data_files_pruned\":0,\"index_segments_total\":0,\"index_segments_scanned\":0,\"index_segments_pruned\":0,\"transaction_overlay\":false}}\n"
+        "{\"kind\":\"explain\",\"logical_operators\":[\"source\",\"predicate\",\"projection\",\"materialize\"],\"physical_operators\":[\"manifest_snapshot_source\",\"zone_map_pruning\",\"tombstone_filter\",\"row_filter\",\"column_projection\",\"materialize\"],\"observations\":{\"data_files_total\":1,\"data_files_scanned\":1,\"data_files_pruned\":0,\"index_segments_total\":1,\"index_segments_scanned\":0,\"index_segments_pruned\":0,\"transaction_overlay\":false}}\n"
     );
 }
 

@@ -583,42 +583,83 @@ impl Snapshot {
         transaction_overlay: bool,
     ) -> QueryResult<PhysicalPlan> {
         let logical = LogicalPlan::new(operators).map_err(QueryExecutionError::Planner)?;
-        let observations = self.plan_observations(predicate, transaction_overlay);
+        let observations =
+            self.plan_observations(logical.operators(), predicate, transaction_overlay);
         Planner::plan(logical, observations)
             .map_err(|error| QueryExecutionError::Planner(error).into())
     }
 
     fn plan_observations(
         &self,
+        operators: &[LogicalOperator],
         predicate: Option<&FilterExpression>,
         transaction_overlay: bool,
     ) -> PlanObservations {
-        match predicate {
-            Some(predicate) => {
-                let pruning_predicate = filter_expression_pruning_predicate(predicate);
-                let Some(pruning_predicate) = pruning_predicate else {
-                    return self.plan_observations(None, transaction_overlay);
-                };
-                let explain = self.explain(&pruning_predicate);
-                PlanObservations {
-                    data_files_total: explain.total_files,
-                    data_files_scanned: explain.scanned.len(),
-                    data_files_pruned: explain.skipped.len(),
-                    index_segments_total: explain.segments_total,
-                    index_segments_scanned: explain.segments_scanned.len(),
-                    index_segments_pruned: explain.segments_skipped.len(),
-                    transaction_overlay,
+        let pruning = predicate
+            .and_then(filter_expression_pruning_predicate)
+            .map(|predicate| self.explain(&predicate));
+        let data_files_total = self.manifest.data_files.len();
+        let index_segments_total = self.manifest.segments.len();
+        let data_file_selection = || {
+            pruning.as_ref().map_or((data_files_total, 0), |explain| {
+                (explain.scanned.len(), explain.skipped.len())
+            })
+        };
+        let index_segment_selection = || {
+            pruning
+                .as_ref()
+                .map_or((index_segments_total, 0), |explain| {
+                    (
+                        explain.segments_scanned.len(),
+                        explain.segments_skipped.len(),
+                    )
+                })
+        };
+
+        let result_operator = operators.iter().find(|operator| {
+            matches!(
+                operator,
+                LogicalOperator::Projection { .. }
+                    | LogicalOperator::Grouping { .. }
+                    | LogicalOperator::VectorSearch { .. }
+            )
+        });
+        let (data_files_scanned, data_files_pruned, index_segments_scanned, index_segments_pruned) =
+            match result_operator {
+                Some(LogicalOperator::Projection { .. } | LogicalOperator::Grouping { .. }) => {
+                    let (data_files_scanned, data_files_pruned) = data_file_selection();
+                    (data_files_scanned, data_files_pruned, 0, 0)
                 }
-            }
-            None => PlanObservations {
-                data_files_total: self.manifest.data_files.len(),
-                data_files_scanned: self.manifest.data_files.len(),
-                data_files_pruned: 0,
-                index_segments_total: self.manifest.segments.len(),
-                index_segments_scanned: self.manifest.segments.len(),
-                index_segments_pruned: 0,
-                transaction_overlay,
-            },
+                Some(LogicalOperator::VectorSearch { has_filter, .. }) => {
+                    let (data_files_scanned, data_files_pruned) = if *has_filter {
+                        data_file_selection()
+                    } else {
+                        (0, 0)
+                    };
+                    let (index_segments_scanned, index_segments_pruned) = index_segment_selection();
+                    (
+                        data_files_scanned,
+                        data_files_pruned,
+                        index_segments_scanned,
+                        index_segments_pruned,
+                    )
+                }
+                Some(
+                    LogicalOperator::Source
+                    | LogicalOperator::Predicate { .. }
+                    | LogicalOperator::Materialize,
+                )
+                | None => (0, 0, 0, 0),
+            };
+
+        PlanObservations {
+            data_files_total,
+            data_files_scanned,
+            data_files_pruned,
+            index_segments_total,
+            index_segments_scanned,
+            index_segments_pruned,
+            transaction_overlay,
         }
     }
 

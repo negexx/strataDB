@@ -31,6 +31,20 @@ shared `Dataset` handle, with immutable snapshot reads and write-write OCC. Phas
 a read/write transaction API, distributed coordination, full SQL, or lifecycle
 reclamation.
 
+## Current-state superseding note (2026-08-15)
+
+The original Phase 2 scope and its later **Explicit non-goals** subsection are retained below as
+historical audit evidence; they do not override the checked-in current state. Since that audit,
+Strata has implemented bounded transaction-base reads (scan/predicate and group operations with a
+private overlay, plus existing-base-row lookup) and the one named deterministic
+`add_nullable_column` migration. Those additions remain narrower than a general read/write
+transaction interface: staged inserts still have no pre-commit physical row ID, vector search does
+not merge a staged overlay, and the isolation ceiling remains snapshot isolation rather than
+serializability. The Python and CLI surfaces expose stable bounded contracts with documented
+packaging/runtime limits, not an "awaiting integration" status. [`status.md`](../../status.md),
+[`roadmap.md`](../../roadmap.md), and [`architecture.md`](../../architecture.md) are the controlling
+current-state references.
+
 ## Findings
 
 ### P0 â€” Stable query/schema API (resolved for the approved Phase 2 slice)

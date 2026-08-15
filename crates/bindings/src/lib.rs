@@ -1310,6 +1310,55 @@ mod tests {
     }
 
     #[test]
+    fn python_explain_serializes_scalar_zero_segment_counts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Break caught: the Python explain DTO reports immutable-segment scans
+        // for a scalar snapshot plan that does not select a vector operator.
+        let directory = populated_dataset()?;
+
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let plan = PyDataset::open(py, directory.path().to_path_buf())?
+                .snapshot(py)
+                .explain_scan(py, Some(vec!["name".to_owned()]), None)?;
+            let plan = plan.bind(py);
+            let observations_value = plan
+                .get_item("observations")?
+                .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("missing observations"))?;
+            let observations = observations_value.cast::<PyDict>()?;
+            assert_eq!(
+                observations
+                    .get_item("index_segments_total")?
+                    .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(
+                        "missing segment total"
+                    ))?
+                    .extract::<usize>()?,
+                1
+            );
+            assert_eq!(
+                observations
+                    .get_item("index_segments_scanned")?
+                    .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(
+                        "missing scanned segments"
+                    ))?
+                    .extract::<usize>()?,
+                0
+            );
+            assert_eq!(
+                observations
+                    .get_item("index_segments_pruned")?
+                    .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(
+                        "missing pruned segments"
+                    ))?
+                    .extract::<usize>()?,
+                0
+            );
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
     fn scan_returns_arrow_ipc_and_invalid_projection_is_a_typed_validation_error()
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = populated_dataset()?;

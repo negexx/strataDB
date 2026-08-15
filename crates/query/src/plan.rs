@@ -132,9 +132,13 @@ pub enum PhysicalOperator {
 pub struct PlanObservations {
     /// Number of manifest-listed row data files.
     pub data_files_total: usize,
-    /// Number of row data files selected by the current physical path.
+    /// Number of row data files selected by the current statically-known physical path.
+    ///
+    /// Per-hit vector hydration remains dynamic at explain time, so its
+    /// possible point lookups are represented by [`PhysicalOperator::HydrationLookup`]
+    /// rather than an overclaimed file count here.
     pub data_files_scanned: usize,
-    /// Number of row data files the current physical path proved skippable.
+    /// Number of row data files the current statically-known physical path proved skippable.
     pub data_files_pruned: usize,
     /// Number of manifest-listed immutable vector segments.
     pub index_segments_total: usize,

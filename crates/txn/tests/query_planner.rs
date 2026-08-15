@@ -99,6 +99,9 @@ fn planned_queries_match_direct_snapshot_operators_and_report_selection_evidence
     let scan_plan = snapshot.explain_scan_query(&scan).unwrap();
     assert_eq!(scan_plan.observations.data_files_total, 2);
     assert_eq!(scan_plan.observations.data_files_pruned, 1);
+    assert_eq!(scan_plan.observations.index_segments_total, 2);
+    assert_eq!(scan_plan.observations.index_segments_scanned, 0);
+    assert_eq!(scan_plan.observations.index_segments_pruned, 0);
     assert!(!scan_plan.observations.transaction_overlay);
     assert!(
         scan_plan
@@ -115,6 +118,10 @@ fn planned_queries_match_direct_snapshot_operators_and_report_selection_evidence
         aggregates: vec![Aggregate::new("amount", AggregateFunction::Sum, "sum")],
         filter: Some(filter.clone()),
     };
+    let group_plan = snapshot.explain_group_by_query(&group).unwrap();
+    assert_eq!(group_plan.observations.index_segments_total, 2);
+    assert_eq!(group_plan.observations.index_segments_scanned, 0);
+    assert_eq!(group_plan.observations.index_segments_pruned, 0);
     assert_eq!(
         snapshot.execute_planned_group_by_query(&group).unwrap(),
         snapshot.group_by_query(&group).unwrap()
@@ -138,6 +145,36 @@ fn planned_queries_match_direct_snapshot_operators_and_report_selection_evidence
             .execute_planned_vector_search_query(&vector)
             .unwrap(),
         snapshot.vector_search_query(&vector).unwrap()
+    );
+}
+
+#[test]
+fn snapshot_vector_explain_does_not_claim_row_file_reads_without_a_row_operator() {
+    // Break caught: an unfiltered, non-hydrating vector plan inherits row-file
+    // scans from global snapshot accounting even though its physical path reads
+    // only immutable vector segments.
+    let (_temp, dataset) = dataset_with_selective_vector_segments();
+    let snapshot = dataset.snapshot();
+    let request = VectorSearchRequest {
+        vector_column: "vector".into(),
+        query: vec![2.0, 2.0],
+        k: 2,
+        filter: None,
+        hydration: VectorHydration::NotRequested,
+    };
+
+    let plan = snapshot.explain_vector_search_query(&request).unwrap();
+    assert_eq!(plan.observations.data_files_total, 3);
+    assert_eq!(plan.observations.data_files_scanned, 0);
+    assert_eq!(plan.observations.data_files_pruned, 0);
+    assert_eq!(plan.observations.index_segments_total, 3);
+    assert_eq!(plan.observations.index_segments_scanned, 3);
+    assert_eq!(plan.observations.index_segments_pruned, 0);
+    assert_eq!(
+        snapshot
+            .execute_planned_vector_search_query(&request)
+            .unwrap(),
+        snapshot.vector_search_query(&request).unwrap()
     );
 }
 
