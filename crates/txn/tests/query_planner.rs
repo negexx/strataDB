@@ -45,6 +45,27 @@ fn batch(
     .unwrap()
 }
 
+fn dataset_with_selective_vector_segments() -> (tempfile::TempDir, Dataset) {
+    let temp = tempfile::tempdir().unwrap();
+    let dataset = Dataset::create(temp.path().join("dataset"), schema()).unwrap();
+    for (category, amount, vector) in [
+        ("low", 1, [1.0, 1.0]),
+        ("middle", 2, [2.0, 2.0]),
+        ("high", 100, [100.0, 100.0]),
+    ] {
+        let mut transaction = dataset.begin();
+        transaction
+            .insert(batch(
+                vec![Some(category)],
+                vec![Some(amount)],
+                vec![vector],
+            ))
+            .unwrap();
+        transaction.commit().unwrap();
+    }
+    (temp, dataset)
+}
+
 #[test]
 fn planned_queries_match_direct_snapshot_operators_and_report_selection_evidence() {
     let temp = tempfile::tempdir().unwrap();
@@ -247,23 +268,7 @@ fn planned_transaction_scan_and_group_reads_merge_the_overlay_and_report_it() {
 fn transaction_explain_reports_full_base_scan_before_overlay_filter_and_grouping() {
     // Break caught: reporting snapshot pruning or column pushdown for a transaction
     // whose overlay execution first reads every base file and merges staged rows.
-    let temp = tempfile::tempdir().unwrap();
-    let dataset = Dataset::create(temp.path().join("dataset"), schema()).unwrap();
-    for (category, amount, vector) in [
-        ("low", 1, [1.0, 1.0]),
-        ("middle", 2, [2.0, 2.0]),
-        ("high", 100, [100.0, 100.0]),
-    ] {
-        let mut transaction = dataset.begin();
-        transaction
-            .insert(batch(
-                vec![Some(category)],
-                vec![Some(amount)],
-                vec![vector],
-            ))
-            .unwrap();
-        transaction.commit().unwrap();
-    }
+    let (_temp, dataset) = dataset_with_selective_vector_segments();
 
     let mut transaction = dataset.begin();
     transaction
@@ -326,6 +331,107 @@ fn transaction_explain_reports_full_base_scan_before_overlay_filter_and_grouping
         transaction.execute_planned_group_by_query(&group).unwrap(),
         transaction.group_by_query(&group).unwrap()
     );
+}
+
+#[test]
+fn read_only_transaction_explain_uses_the_full_overlay_path() {
+    // Break caught: treating a transaction with no staged writes as a snapshot
+    // plan even though execution still decodes all base batches into its overlay.
+    let (_temp, dataset) = dataset_with_selective_vector_segments();
+
+    let transaction = dataset.begin();
+    let filter = FilterExpression::Compare(Comparison {
+        column: "amount".into(),
+        operator: ComparisonOperator::GreaterThan,
+        value: FilterLiteral::Int64(50),
+    });
+    let scan = ScanRequest {
+        projection: Projection::Columns(vec!["category".into()]),
+        filter: Some(filter.clone()),
+    };
+
+    let scan_plan = transaction.explain_scan_query(&scan).unwrap();
+    assert!(scan_plan.observations.transaction_overlay);
+    assert_eq!(scan_plan.observations.data_files_scanned, 3);
+    assert_eq!(scan_plan.observations.data_files_pruned, 0);
+    assert_eq!(
+        scan_plan.physical_operators,
+        vec![
+            PhysicalOperator::ManifestSnapshotSource,
+            PhysicalOperator::TombstoneFilter,
+            PhysicalOperator::TransactionOverlay,
+            PhysicalOperator::RowFilter,
+            PhysicalOperator::Materialize,
+        ]
+    );
+    assert_eq!(
+        transaction.execute_planned_scan_query(&scan).unwrap(),
+        transaction.scan_query(&scan).unwrap()
+    );
+
+    let group = GroupByRequest {
+        group_by: vec!["category".into()],
+        aggregates: vec![Aggregate::new("amount", AggregateFunction::Sum, "sum")],
+        filter: Some(filter),
+    };
+    let group_plan = transaction.explain_group_by_query(&group).unwrap();
+    assert!(group_plan.observations.transaction_overlay);
+    assert_eq!(group_plan.observations.data_files_scanned, 3);
+    assert_eq!(group_plan.observations.data_files_pruned, 0);
+    assert_eq!(
+        group_plan.physical_operators,
+        vec![
+            PhysicalOperator::ManifestSnapshotSource,
+            PhysicalOperator::TombstoneFilter,
+            PhysicalOperator::TransactionOverlay,
+            PhysicalOperator::RowFilter,
+            PhysicalOperator::HashGroupBy,
+            PhysicalOperator::Materialize,
+        ]
+    );
+    assert_eq!(
+        transaction.execute_planned_group_by_query(&group).unwrap(),
+        transaction.group_by_query(&group).unwrap()
+    );
+}
+
+#[test]
+fn transaction_scalar_explain_reports_zero_vector_segment_scans() {
+    // Break caught: scalar transaction scan/group explain inheriting vector
+    // segment selections even though only vector search reads those segments.
+    let (_temp, dataset) = dataset_with_selective_vector_segments();
+
+    let mut transaction = dataset.begin();
+    transaction
+        .insert(batch(
+            vec![Some("staged")],
+            vec![Some(200)],
+            vec![[200.0, 200.0]],
+        ))
+        .unwrap();
+    let filter = FilterExpression::Compare(Comparison {
+        column: "amount".into(),
+        operator: ComparisonOperator::GreaterThan,
+        value: FilterLiteral::Int64(50),
+    });
+    let scan = ScanRequest {
+        projection: Projection::Columns(vec!["category".into()]),
+        filter: Some(filter.clone()),
+    };
+    let scan_plan = transaction.explain_scan_query(&scan).unwrap();
+    assert_eq!(scan_plan.observations.index_segments_total, 3);
+    assert_eq!(scan_plan.observations.index_segments_scanned, 0);
+    assert_eq!(scan_plan.observations.index_segments_pruned, 0);
+
+    let group = GroupByRequest {
+        group_by: vec!["category".into()],
+        aggregates: vec![Aggregate::new("amount", AggregateFunction::Sum, "sum")],
+        filter: Some(filter),
+    };
+    let group_plan = transaction.explain_group_by_query(&group).unwrap();
+    assert_eq!(group_plan.observations.index_segments_total, 3);
+    assert_eq!(group_plan.observations.index_segments_scanned, 0);
+    assert_eq!(group_plan.observations.index_segments_pruned, 0);
 }
 
 #[test]

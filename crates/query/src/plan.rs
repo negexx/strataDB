@@ -200,7 +200,7 @@ impl Planner {
                 data_files_scanned: observations.data_files_total,
                 data_files_pruned: 0,
                 index_segments_total: observations.index_segments_total,
-                index_segments_scanned: observations.index_segments_total,
+                index_segments_scanned: 0,
                 index_segments_pruned: 0,
                 transaction_overlay: true,
             }

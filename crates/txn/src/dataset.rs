@@ -1770,7 +1770,7 @@ impl Transaction {
     /// Returns planner or typed scan-contract errors.
     pub fn explain_scan_query(&self, request: &ScanRequest) -> QueryResult<PhysicalPlan> {
         self.base_snapshot
-            .explain_scan_query_with_overlay(request, self.has_staged_overlay())
+            .explain_scan_query_with_overlay(request, true)
     }
 
     /// Executes the planned read path for this transaction's scan view.
@@ -1800,7 +1800,7 @@ impl Transaction {
     /// Returns planner or typed grouped-query errors.
     pub fn explain_group_by_query(&self, request: &GroupByRequest) -> QueryResult<PhysicalPlan> {
         self.base_snapshot
-            .explain_group_by_query_with_overlay(request, self.has_staged_overlay())
+            .explain_group_by_query_with_overlay(request, true)
     }
 
     /// Executes the planned read path for this transaction's grouped view.
@@ -1869,10 +1869,6 @@ impl Transaction {
             .visible_logical_batches_excluding(&self.pending_tombstones)?;
         batches.extend(self.pending.iter().cloned());
         Ok(batches)
-    }
-
-    fn has_staged_overlay(&self) -> bool {
-        !self.pending.is_empty() || !self.pending_tombstones.is_empty()
     }
 
     fn validate_batch(&self, batch: &RecordBatch) -> Result<()> {
