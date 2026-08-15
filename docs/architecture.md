@@ -76,9 +76,11 @@ single-process boundary.
 `migrate_add_nullable_column` operation. `Snapshot` retains the compatible Arrow IPC scan,
 lookup, and grouped-result methods and typed vector-match dictionaries; `explain_scan` returns
 named logical/physical operator lists plus captured observations. The engine `Transaction` supports
-bounded transaction-base snapshot reads with read-your-writes for lookup, scan (including predicate
-reads), and group operations. The current Python `Transaction` facade stages one Arrow IPC batch at
-a time and exposes overlay-aware `scan` reads (including its optional predicate), but does not expose
+bounded transaction-base snapshot reads: scans (including predicate reads) and groups expose staged
+inserts, replacements, and deletes; lookup reflects staged replacements and deletes only for physical
+row IDs already in the base snapshot, because staged inserts receive no physical row ID until commit
+and cannot be looked up before then. The current Python `Transaction` facade stages one Arrow IPC
+batch at a time and exposes overlay-aware `scan` reads (including its optional predicate), but does not expose
 transaction lookup or group methods. It is terminally `committed` or `aborted`, and abort/drop never
 publishes staged writes. Its `vector_search` returns the typed
 `UnsupportedTransactionReadError` after staged writes, rather than a merged overlay result. Open,
@@ -93,9 +95,11 @@ history remains a distinct category.
 ## Commit lifecycle
 
 1. `Dataset::begin` captures one immutable base snapshot and returns a `Transaction` bound to that
-   snapshot's schema/version. It buffers Arrow batches and tombstones. Transaction lookup, `scan`
-   (including predicate reads), and group reads merge that base with its private overlay;
-   `vector_search` after staged writes uses no merged overlay and returns a typed
+   snapshot's schema/version. It buffers Arrow batches and tombstones. Transaction scans (including
+   predicate reads) and group reads merge that base with its private overlay, exposing staged inserts,
+   replacements, and deletes. Lookup reflects staged replacements/deletes for an existing
+   base-snapshot physical row ID; staged inserts have no physical row ID until commit and cannot be
+   looked up pre-commit. `vector_search` after staged writes uses no merged overlay and returns a typed
    unsupported-transaction-read error.
 2. Commit preparation allocates row IDs, writes/fsyncs Arrow files, and builds/fsyncs an immutable HNSW
    segment when vectors are present. Failed preparation may leave unreachable files; cleanup is absent.
@@ -147,10 +151,12 @@ observation from one completed run, not atomic or continuing storage-bound enfor
 ## Reads, updates, and index behavior
 
 `Dataset::snapshot` returns a fixed manifest/segment/tombstone view. Later commits cannot alter that
-captured view. `Transaction` supplies bounded transaction-base snapshot reads with read-your-writes
-for lookup, scan (including predicate reads), and group operations; it is not a general read/write
-query interface, and `vector_search` after staged writes returns a typed unsupported-transaction-read
-error rather than reading a merged overlay.
+captured view. `Transaction` supplies bounded transaction-base snapshot reads: scans (including
+predicate reads) and group operations expose staged inserts, replacements, and deletes; lookup
+reflects staged replacements/deletes for an existing base-snapshot physical row ID, while staged
+inserts have no physical row ID until commit and cannot be looked up pre-commit. It is not a general
+read/write query interface, and `vector_search` after staged writes returns a typed
+unsupported-transaction-read error rather than reading a merged overlay.
 
 Rows are append-only physical records. `delete` and `update` must target one live physical row in the
 transaction's base snapshot and are revalidated under the commit lock. `update` tombstones that old
@@ -174,8 +180,10 @@ write-write OCC isolation boundary.
 ## Deliberate boundaries
 
 The design ceiling is snapshot isolation rather than serializability. The current API is narrower:
-immutable snapshot reads; bounded transaction-base, read-your-writes lookup, scan/predicate, and
-group operations; and write-write OCC. It is not a full/general read/write query interface. Strata
+immutable snapshot reads; bounded transaction-base scans/predicate and group operations that expose
+staged inserts, replacements, and deletes; lookup that reflects staged replacements/deletes only for
+an existing base-snapshot physical row ID (staged inserts receive no physical row ID until commit);
+and write-write OCC. It is not a full/general read/write query interface. Strata
 remains embedded and single-node; distributed transactions, full SQL, automatic conflict resolution,
 stronger isolation, extra ANN families, and an agent-memory/belief product are out of scope.
 

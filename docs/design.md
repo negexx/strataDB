@@ -22,11 +22,13 @@ corruption proof.
 ## Transactions and snapshots
 
 `Dataset::begin` captures an immutable base snapshot for a transaction. The stable, bounded
-transaction read API merges that base with the transaction's private staged writes: row lookup,
-scan (including predicate reads), and group reads provide read-your-writes for staged inserts,
-replacements, and deletes. `vector_search` can use the base index only while the transaction has no
-staged writes; after staged writes it returns a typed unsupported-transaction-read error rather than
-silently returning stale base-snapshot results. Preparation allocates physical row IDs, writes data,
+transaction read API merges that base with the transaction's private staged writes: scans (including
+predicate reads) and group reads expose staged inserts, replacements, and deletes. Lookup is only
+for physical row IDs already present in the base snapshot; it reflects a staged replacement or delete
+of such a row, while a staged insert has no physical row ID until commit and cannot be looked up
+pre-commit. `vector_search` can use the base index only while the transaction has no staged writes;
+after staged writes it returns a typed unsupported-transaction-read error rather than silently
+returning stale base-snapshot results. Preparation allocates physical row IDs, writes data,
 and builds vector segments before the commit lock is taken. Under the shared handle's lock,
 write-write conflicts are checked against recent committed history. A clean commit publishes a new
 manifest and installs a replacement immutable snapshot.
