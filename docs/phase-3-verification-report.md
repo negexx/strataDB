@@ -372,3 +372,50 @@ packaging/wheel-import smoke ran. No Criterion benchmark command ran, so this se
 performance measurement or comparison. These omissions, the intentionally ignored tests, and the
 existing linker informational warning mean this record must not be read as a full-branch-green or
 complete-feature claim.
+
+## Task 6 exact-HEAD partial Windows verification (2026-08-15)
+
+This later run is a partial exact-HEAD record for `29c70e3f2f6a7886cf108985fa323b2ffd4aafae`.
+It used a process-local x64 environment with MSVC `14.52.36615` and Windows SDK
+`10.0.26100.0`: `PATH` began with `...\\VC\\Tools\\MSVC\\14.52.36615\\bin\\Hostx64\\x64`,
+`LIB` began with the MSVC x64, SDK UCRT x64, and SDK UM x64 directories, and `INCLUDE`
+began with the matching MSVC and SDK UCRT/shared/UM/winrt directories. In that environment,
+`link.exe` resolved from the requested MSVC directory and the SDK x64 `kernel32.lib` existed.
+
+| Command | Result |
+|---|---|
+| `cargo fmt --check` | Exit 0. |
+| `cargo metadata --locked --no-deps` | Exit 0; Cargo emitted its compatibility warning requesting an explicit `--format-version`. |
+| `cargo check --workspace` | Exit 0. |
+| `cargo build --workspace` | Exit 0; existing `strata-bindings` `linker_messages` warning reported MSVC creation of `strata_ext.dll.lib` and `strata_ext.dll.exp`. |
+| `cargo test --workspace --no-default-features` | Exit 0; all executed unit, integration, and doctest binaries passed. The normal ignored HNSW real-thread stress test and thorough 2,000-seed chaos test remained ignored. |
+| `cargo clippy --workspace --all-targets -- -D warnings` | Exit 0. |
+| `cargo doc --workspace --no-deps` | Exit 0; existing rustdoc warning: unresolved intra-doc link `crate::backend::LocalFs::put` in `crates/storage/src/manifest.rs`. |
+| `cargo deny check bans sources advisories` | Initial sandbox attempt exited 1 because the advisory DB lock path was read-only. The required rerun with advisory-cache write access exited 0: advisories, bans, and sources were OK; cargo-deny warned about duplicate lock entries for `getrandom`, `hashbrown`, `r-efi`, `thiserror`, and `thiserror-impl`. |
+| `cargo test -p strata-txn --features parallel-insert` | Exit 0; all executed tests and doctests passed, with 0 failures. |
+| `cargo clippy -p strata-txn --all-targets --features parallel-insert -- -D warnings` | Exit 0. |
+| `cargo test -p strata-txn --features test-fault-injection` | Exit 0; all executed tests and doctests passed, with 0 failures. |
+| `cargo test -p strata-txn --no-default-features --features test-fault-injection --test schema_migrations migration_failure_before_publication_reopens_the_prior_complete_manifest -- --exact` | Exit 0: 1 passed, 0 failed, 5 filtered out. |
+| `cargo test -p strata-txn --features chaos-injection --test manifest_retention_executor -- --exact manifest_prune_abort_before_directory_sync_preserves_latest_recovery --nocapture` | Exit 0: 1 passed, 0 failed, 5 filtered out. |
+
+The txn loom gate was started with the CI-style crate-scoped recipe
+`cargo rustc -p strata-txn --lib --profile test --message-format=json -- --cfg loom`, then the
+produced binary was invoked with `--exact <model> --test-threads=1`. The build exited 0 and
+emitted the existing localized MSVC `linker_messages` import-library warning. These two models
+passed: `one_writer_store_races_safely_with_many_readers_load` and
+`two_threads_deleting_the_same_row_exactly_one_conflicts`. The next exact model,
+`dataset::loom_tests::a_failed_commits_segment_is_never_searchable_under_concurrent_commits`,
+did not complete or emit a failure line within the practical run window. At user direction it was
+terminated together with its owning PowerShell process; it is **aborted**, not passed.
+
+### Unrun and not claimed
+
+Because the run stopped at that aborted txn loom model, the remaining txn loom models, all
+live-set-cache loom models, and all `strata-index` loom models were unrun. Criterion benchmark
+compile/run was unrun. `maturin` was unavailable on PATH, so the bindings wheel/import smoke was
+unrun. No additional standalone CLI integration invocation, fault-injection clippy invocation,
+thorough-chaos run, independent Terra review, or Sol final review was run in this partial pass.
+The only pre-existing worktree change was
+`.superpowers/sdd/agent-production-readiness-plan/reports/task-2-report.md`; it was preserved.
+This section records partial local evidence only and makes no whole-feature, complete-branch, or
+unrun-gate-green claim.
