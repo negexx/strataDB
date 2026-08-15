@@ -621,3 +621,37 @@ workflow was changed.
 This is focused local evidence only. It does not claim that unrun workspace-wide
 clippy, transaction loom, benchmark, portability, or historical exact-head
 gates passed at `191337e`.
+
+## Final-head verification closure (2026-08-15, `f872236`)
+
+This additive record supersedes the earlier partial-closure limitations where
+the same gates are listed as aborted or unavailable. The unrelated
+`.superpowers/sdd/agent-production-readiness-plan/reports/task-2-report.md`
+worktree edit remained preserved and was not part of this verification.
+
+The exact transaction loom binary was built with the documented crate-scoped
+recipe under a process-local x64 MSVC environment. The installed Visual Studio
+18 BuildTools environment selected MSVC `14.52.36615` with
+`VsDevCmd.bat -arch=x64 -host_arch=x64 -vcvars_ver=14.52`; `where cl` and
+`where link` resolved to its `Hostx64/x64` directory.
+
+| Gate | Fresh result |
+|---|---|
+| `dataset::loom_tests::a_failed_commits_segment_is_never_searchable_under_concurrent_commits` | Exit 0: 1 passed, 232 filtered; 1,802.46 s. |
+| `dataset::loom_tests::a_reader_never_sees_one_in_flight_commits_row_while_observing_an_unrelated_commits_row_id_counter` | Exit 0: 1 passed, 232 filtered; 1,343.48 s. |
+| `dataset::loom_tests::immutable_snapshot_membership_controls_visibility_despite_claimed_high_water` | Exit 0: 1 passed, 232 filtered; 0.07 s. |
+| `row_id::loom_tests::concurrent_claims_publish_monotonic_high_water` | Exit 0: 1 passed, 232 filtered; 0.02 s. |
+| `retention::loom_tests::concurrent_registration_and_final_drop_prune_after_quiescence` | Exit 0: 1 passed, 232 filtered; 0.01 s. |
+| `lifecycle_coordination::loom_tests::preparation_and_exclusive_execution_never_overlap` | Exit 0: 1 passed, 232 filtered; 3.32 s. |
+| Workspace check | `cargo check --workspace --no-default-features` exited 0 in 33.87 s. |
+
+The previously unavailable packaging gate is also closed: the pinned
+`maturin==1.9.4` temporary Python 3.14 wheel build, installation, and import
+smoke passed, including all 13 current module exports. The corrected 8,000-trial
+HNSW stress test passed, the declared fuzz builds and parser smokes passed,
+thorough chaos passed for 2,000/2,000 seeds with zero violations, and rustdoc
+completed without warnings, as recorded in the preceding exact-head evidence.
+
+The report now has fresh evidence for the previously outstanding transaction
+loom and local workspace-check gates. Hosted CI remains an external PR gate and
+must be observed on the pushed branch before merge.
