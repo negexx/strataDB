@@ -181,6 +181,9 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
     if !KNOWN_COMMANDS.contains(&cmd.as_str()) {
         return Err(Box::new(CliError::UnknownCommand(cmd.clone())));
     }
+    if cmd == "explain" {
+        return handle_explain(args);
+    }
 
     let dir = args
         .get(2)
@@ -260,9 +263,6 @@ fn run_dataset_command(args: &[String], cmd: &str, dir: &str) -> Result<(), Box<
         "schema" => handle_schema(args, dir)?,
         "manifest-status" => handle_manifest_status(args, dir)?,
         "recovery-status" => handle_recovery_status(args, dir)?,
-        "explain" => {
-            handle_explain(dir, args)?;
-        }
         "crash-loop" => {
             require_single_writer_ack(args, "crash-loop")?;
             let n: usize = args.get(3).ok_or("missing <num_commits>")?.parse()?;
@@ -1238,31 +1238,91 @@ fn parse_predicate(
         "lteq" => Ok(Predicate::LtEq(column.to_string(), Value::Int64(value))),
         "gt" => Ok(Predicate::Gt(column.to_string(), Value::Int64(value))),
         "gteq" => Ok(Predicate::GtEq(column.to_string(), Value::Int64(value))),
-        other => Err(format!("unknown op: {other} (expected eq|lt|lteq|gt|gteq)").into()),
+        _ => Err(usage_error("explain <op> must be eq|lt|lteq|gt|gteq")),
     }
 }
 
-fn handle_explain(dir: &str, args: &[String]) -> Result<(), Box<dyn Error>> {
-    let ds = strata_txn::Dataset::open(dir)?;
-    if args.get(6).is_some_and(|argument| argument == "--json") {
-        let (filter, next) = parse_filter(args, 3, ds.schema().as_ref())?;
-        let _json = parse_json_flag(args, next, "explain")?;
-        let plan = ds
-            .snapshot()
-            .explain_scan_query(&strata_txn::ScanRequest {
-                projection: strata_txn::Projection::All,
-                filter: Some(filter),
-            })
-            .map_err(|error| query_error(&error))?;
-        println!("{}", explain_plan_json(&plan));
-        return Ok(());
+enum ExplainRequest<'args> {
+    Legacy(strata_query::Predicate),
+    Json {
+        column: &'args str,
+        operator: &'args str,
+        value: &'args str,
+    },
+}
+
+struct ExplainCommand<'args> {
+    dir: &'args str,
+    request: ExplainRequest<'args>,
+}
+
+fn parse_explain_command(args: &[String]) -> Result<ExplainCommand<'_>, Box<dyn Error>> {
+    let dir = args
+        .get(2)
+        .filter(|argument| !argument.starts_with("--"))
+        .map(String::as_str)
+        .ok_or_else(|| usage_error("explain requires <dir> <column> <op> <value> [--json]"))?;
+    let (column, operator, value, json) = match args.get(3..) {
+        Some([column, operator, value]) => {
+            (column.as_str(), operator.as_str(), value.as_str(), false)
+        }
+        Some([column, operator, value, flag]) if flag == "--json" => {
+            (column.as_str(), operator.as_str(), value.as_str(), true)
+        }
+        _ => {
+            return Err(usage_error(
+                "explain requires <column> <op> <value> and accepts only an optional --json flag",
+            ));
+        }
+    };
+    if column.starts_with("--") || operator.starts_with("--") || value == "--json" {
+        return Err(usage_error(
+            "explain requires <column> <op> <value> and accepts only an optional --json flag",
+        ));
     }
 
-    let column = args.get(3).ok_or("missing <column>")?;
-    let op = args.get(4).ok_or("missing <op: eq|lt|lteq|gt|gteq>")?;
-    let value: i64 = args.get(5).ok_or("missing <value>")?.parse()?;
-    let predicate = parse_predicate(column, op, value)?;
+    let request = if json {
+        parse_comparison_operator(operator)?;
+        ExplainRequest::Json {
+            column,
+            operator,
+            value,
+        }
+    } else {
+        let value = value
+            .parse()
+            .map_err(|_| usage_error("explain <value> must be an Int64"))?;
+        ExplainRequest::Legacy(parse_predicate(column, operator, value)?)
+    };
+    Ok(ExplainCommand { dir, request })
+}
 
+fn handle_explain(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let command = parse_explain_command(args)?;
+    let ds = strata_txn::Dataset::open(command.dir)?;
+    let predicate = match command.request {
+        ExplainRequest::Json {
+            column,
+            operator,
+            value,
+        } => {
+            let filter = strata_txn::FilterExpression::Compare(strata_txn::Comparison {
+                column: column.to_owned(),
+                operator: parse_comparison_operator(operator)?,
+                value: parse_filter_literal(column, value, ds.schema().as_ref())?,
+            });
+            let plan = ds
+                .snapshot()
+                .explain_scan_query(&strata_txn::ScanRequest {
+                    projection: strata_txn::Projection::All,
+                    filter: Some(filter),
+                })
+                .map_err(|error| query_error(&error))?;
+            println!("{}", explain_plan_json(&plan));
+            return Ok(());
+        }
+        ExplainRequest::Legacy(predicate) => predicate,
+    };
     let result = ds.snapshot().explain(&predicate);
     println!(
         "total_files={} scanned={} skipped={} predicate={predicate:?}",
@@ -1478,7 +1538,7 @@ mod tests {
             "eq".to_string(),
             "1".to_string(),
         ];
-        let result = handle_explain(&dir_str, &args);
+        let result = handle_explain(&args);
         assert!(result.is_ok(), "handle_explain failed: {result:?}");
 
         std::fs::remove_dir_all(&dir).ok();

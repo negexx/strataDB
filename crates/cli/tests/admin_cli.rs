@@ -298,6 +298,38 @@ fn missing_dataset_argument_is_a_usage_error() {
 }
 
 #[test]
+fn explain_rejects_missing_and_malformed_grammar_before_opening_a_dataset() {
+    // Break caught: explain opens the supplied path before validating its
+    // complete grammar, causing malformed invocations to report operational
+    // errors instead of the stable usage category.
+    let missing_dir = tempfile::tempdir().unwrap();
+    let missing_dir = missing_dir.path().join("missing");
+    let missing_dir = missing_dir.to_str().unwrap();
+    let cases = [
+        vec!["explain", "--json"],
+        vec!["explain", missing_dir, "id", "--json"],
+        vec!["explain", missing_dir, "id", "bogus", "1", "--json"],
+        vec![
+            "explain",
+            missing_dir,
+            "id",
+            "eq",
+            "1",
+            "--unknown",
+            "--json",
+        ],
+    ];
+
+    for args in cases {
+        let output = command(&args);
+        assert_eq!(output.status.code(), Some(2), "args: {args:?}");
+        let error: Value = serde_json::from_str(&stderr(&output))
+            .unwrap_or_else(|error| panic!("expected JSON error: {error}; args: {args:?}"));
+        assert_eq!(error["error"]["category"], "usage", "args: {args:?}");
+    }
+}
+
+#[test]
 fn inspect_rejects_unknown_trailing_options() {
     // Break caught: inspect silently accepts an unsupported trailing flag and
     // emits a non-JSON inspection result.
