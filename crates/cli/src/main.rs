@@ -162,7 +162,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
 
     let Some(cmd) = args.get(1) else {
         eprintln!(
-            "usage: strata <create|insert|scan|filter|search|explain|inspect|schema|migration|manifest-status|recovery-status|crash-loop|lookup|group-by|query-scan> <dir> [...]"
+            "usage: strata <create|insert|scan|filter|search|explain|inspect|schema|migration|manifest-status|recovery-status|evidence|crash-loop|lookup|group-by|query-scan> <dir> [...]"
         );
         eprintln!(
             "  search <dir> --vector <comma-separated finite floats> [--k <usize>] [--filter <column> <op> <value>]"
@@ -181,7 +181,9 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         return Err(Box::new(CliError::UnknownCommand(cmd.clone())));
     }
 
-    let dir = args.get(2).ok_or("missing <dir> argument")?;
+    let dir = args
+        .get(2)
+        .ok_or_else(|| usage_error("missing <dir> argument"))?;
     run_dataset_command(args, cmd, dir)
 }
 
@@ -238,8 +240,8 @@ fn run_dataset_command(args: &[String], cmd: &str, dir: &str) -> Result<(), Box<
         "inspect" => {
             let ds = strata_txn::Dataset::open(dir)?;
             let snapshot = ds.snapshot();
-            if args.get(3).is_some_and(|argument| argument == "--json") {
-                let _json = parse_json_flag(args, 3, "inspect")?;
+            let json = parse_json_flag(args, 3, "inspect")?;
+            if json {
                 let batch = snapshot.scan(&ds.schema())?;
                 println!(
                     "{{\"kind\":\"inspect\",\"manifest_version\":{},\"schema_version\":{},\"row_count\":{}}}",
@@ -411,7 +413,18 @@ fn handle_migration(args: &[String]) -> Result<(), Box<dyn Error>> {
     let data_type = migration_column_type(args.get(6).ok_or_else(|| {
         usage_error("migration validate/run requires add-nullable-column <column> <type>")
     })?)?;
-    let json = parse_json_flag(args, 7, "migration validate/run")?;
+    let json = if action == "run" {
+        let non_acknowledgement_options = args
+            .get(7..)
+            .unwrap_or_default()
+            .iter()
+            .filter(|argument| argument.as_str() != ACK_SINGLE_WRITER)
+            .cloned()
+            .collect::<Vec<_>>();
+        parse_json_flag(&non_acknowledgement_options, 0, "migration validate/run")?
+    } else {
+        parse_json_flag(args, 7, "migration validate/run")?
+    };
     let migration = strata_txn::SchemaMigration::add_nullable_column(
         dataset.schema_version(),
         strata_storage::ADD_NULLABLE_COLUMN_SCHEMA_VERSION,
@@ -442,6 +455,7 @@ fn handle_migration(args: &[String]) -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
+    require_single_writer_ack(args, "migration run")?;
     let result = dataset.migrate_schema(&migration)?;
     if json {
         println!(
@@ -562,8 +576,14 @@ fn json_string(value: &str) -> String {
     escaped.push('\"');
     for character in value.chars() {
         match character {
-            '\"' => escaped.push_str("\\\\\""),
-            '\\' => escaped.push_str("\\\\"),
+            '\"' => {
+                escaped.push('\\');
+                escaped.push('\"');
+            }
+            '\\' => {
+                escaped.push('\\');
+                escaped.push('\\');
+            }
             '\n' => escaped.push_str("\\n"),
             '\r' => escaped.push_str("\\r"),
             '\t' => escaped.push_str("\\t"),

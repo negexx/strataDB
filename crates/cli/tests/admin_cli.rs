@@ -1,6 +1,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::process::{Command, Output};
+use std::sync::Arc;
+
+use arrow::datatypes::{DataType, Field, Schema};
 
 fn command(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_strata"))
@@ -198,6 +201,20 @@ fn empty_fixture_dir() -> tempfile::TempDir {
     dir
 }
 
+fn quoted_backslashed_schema_fixture_dir() -> tempfile::TempDir {
+    let dir = tempfile::Builder::new()
+        .prefix("strata-cli-admin-quoted-schema-")
+        .tempdir()
+        .unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "quoted\"\\column",
+        DataType::Utf8,
+        true,
+    )]));
+    strata_txn::Dataset::create(dir.path().to_str().unwrap(), schema).unwrap();
+    dir
+}
+
 #[test]
 fn schema_json_reports_the_persisted_catalog_and_fields() {
     // Break caught: CLI schema inspection either assumes the legacy fixture
@@ -221,6 +238,21 @@ fn schema_json_reports_the_persisted_catalog_and_fields() {
             "\n"
         )
     );
+}
+
+#[test]
+fn schema_json_escapes_quoted_and_backslashed_column_names() {
+    // Break caught: schema JSON becomes unparsable when a persisted column
+    // name contains a quote or backslash.
+    let dir = quoted_backslashed_schema_fixture_dir();
+    let output = command(&["schema", dir.path().to_str().unwrap(), "--json"]);
+
+    assert!(
+        output.status.success(),
+        "schema failed: {}",
+        stderr(&output)
+    );
+    assert_json_value(&stdout(&output));
 }
 
 #[test]
@@ -318,6 +350,7 @@ fn admin_errors_use_distinct_stable_exit_categories() {
         "add-nullable-column",
         "tag",
         "utf8",
+        "--ack-single-writer",
     ]);
     assert!(
         first_migration.status.success(),
@@ -331,6 +364,7 @@ fn admin_errors_use_distinct_stable_exit_categories() {
         "add-nullable-column",
         "next_tag",
         "utf8",
+        "--ack-single-writer",
     ]);
     assert_eq!(unsupported.status.code(), Some(4));
 
@@ -355,6 +389,33 @@ fn admin_errors_use_distinct_stable_exit_categories() {
 }
 
 #[test]
+fn missing_dataset_argument_is_a_usage_error() {
+    // Break caught: an omitted dataset argument is reported as an operational
+    // failure even though the invocation is invalid before opening a dataset.
+    let output = command(&["schema"]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        stderr(&output),
+        "error: usage error: missing <dir> argument\n"
+    );
+}
+
+#[test]
+fn inspect_rejects_unknown_trailing_options() {
+    // Break caught: inspect silently accepts an unsupported trailing flag and
+    // emits a non-JSON inspection result.
+    let dir = empty_fixture_dir();
+    let output = command(&["inspect", dir.path().to_str().unwrap(), "--unknown"]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        stderr(&output),
+        "error: usage error: inspect accepts only an optional --json flag\n"
+    );
+}
+
+#[test]
 fn help_and_evidence_commands_describe_the_supported_operational_surface() {
     // Break caught: operators have no stable discovery path for the admin
     // commands or mistake a CLI timing command for the retained Criterion
@@ -364,6 +425,18 @@ fn help_and_evidence_commands_describe_the_supported_operational_surface() {
     assert_eq!(
         stdout(&help),
         "usage: strata <create|insert|scan|filter|search|explain|inspect|schema|migration|manifest-status|recovery-status|evidence|crash-loop|lookup|group-by|query-scan> <dir> [...]\n"
+    );
+
+    let bare = command(&[]);
+    assert!(
+        bare.status.success(),
+        "bare command failed: {}",
+        stderr(&bare)
+    );
+    assert_eq!(
+        stderr(&bare).lines().next(),
+        stdout(&help).lines().next(),
+        "bare usage must expose the same command list as help"
     );
 
     let evidence = command(&["evidence", "--json"]);
@@ -393,6 +466,7 @@ fn migration_validate_run_and_status_publish_the_explicit_catalog_transition() {
         "add-nullable-column",
         "tag",
         "utf8",
+        "--ack-single-writer",
         "--json",
     ]);
     assert!(
@@ -436,5 +510,65 @@ fn migration_validate_run_and_status_publish_the_explicit_catalog_transition() {
     assert_eq!(
         stdout(&status),
         "{\"kind\":\"migration_status\",\"manifest_version\":1,\"schema_version\":2}\n"
+    );
+}
+
+#[test]
+fn migration_validation_json_escapes_quoted_and_backslashed_column_names() {
+    // Break caught: migration validation JSON becomes unparsable when the
+    // requested nullable column name contains a quote or backslash.
+    let dir = empty_fixture_dir();
+    let output = command(&[
+        "migration",
+        "validate",
+        dir.path().to_str().unwrap(),
+        "add-nullable-column",
+        "quoted\"\\column",
+        "utf8",
+        "--json",
+    ]);
+
+    assert!(
+        output.status.success(),
+        "migration validation failed: {}",
+        stderr(&output)
+    );
+    assert_json_value(&stdout(&output));
+}
+
+#[test]
+fn migration_run_requires_and_accepts_single_writer_acknowledgement() {
+    // Break caught: migration execution mutates a dataset without the same
+    // single-writer acknowledgement required by other mutation commands.
+    let dir = empty_fixture_dir();
+    let dir_str = dir.path().to_str().unwrap();
+
+    let rejected = command(&[
+        "migration",
+        "run",
+        dir_str,
+        "add-nullable-column",
+        "tag",
+        "utf8",
+    ]);
+    assert_eq!(rejected.status.code(), Some(2));
+    assert_eq!(
+        stderr(&rejected),
+        "error: usage error: migration run requires --ack-single-writer; this acknowledges only one process using one shared Dataset handle, not cross-process coordination or serialization\n"
+    );
+
+    let accepted = command(&[
+        "migration",
+        "run",
+        dir_str,
+        "add-nullable-column",
+        "tag",
+        "utf8",
+        "--ack-single-writer",
+    ]);
+    assert!(
+        accepted.status.success(),
+        "acknowledged migration run failed: {}",
+        stderr(&accepted)
     );
 }
