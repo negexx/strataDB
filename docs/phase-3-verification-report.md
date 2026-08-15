@@ -333,3 +333,42 @@ discriminator, but it does not manufacture a runtime failure where compilation p
 current Task 3 green evidence and measured benchmark output remain the preceding section; neither
 set of results claims SQL support, a cost model, serializability, cross-process coordination, or
 universal performance.
+
+## Task 6 final branch verification (2026-08-15)
+
+This is a bounded, local Windows record for `codex/agent-production-readiness` at
+`HEAD` `36a3faa` (merge-base with `origin/main` `f362e54`). It preserves the historical
+evidence above and records only the commands actually run against that head; it is not a
+claim that every complete-branch gate passed.
+
+Each Cargo command used a process-local native x64 MSVC/Windows SDK environment. `PATH`
+began with `C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\MSVC\14.52.36615\bin\Hostx64\x64`;
+`LIB` began with the corresponding MSVC x64 directory and Windows SDK `10.0.26100.0`
+UCRT/UM x64 directories; and `INCLUDE` began with the corresponding MSVC and Windows SDK
+UCRT/shared/UM/winrt directories. `where.exe cl` and `where.exe link` both resolved to that
+MSVC x64 directory.
+
+| Command | Result |
+|---|---|
+| `cargo fmt --check` | Exit 0. |
+| `cargo metadata --no-deps --format-version 1` | Exit 0. |
+| `cargo check --workspace` | Exit 0. |
+| `cargo build --workspace` | Exit 0. The existing `strata-bindings` `linker_messages` warning remained: MSVC reported creation of `strata_ext.dll.lib` and `strata_ext.dll.exp`; no Rust-source warning is claimed. |
+| `cargo test --workspace --no-default-features` | Exit 0. The bindings unit binary passed 17/17; `admin_cli` and `phase_2_cli` each passed 12/12. |
+| `cargo test -p strata-txn --no-default-features --test schema_migrations --quiet` | Exit 0: 3 passed, 0 failed, 0 ignored. This separately records the migration-test count also included in the successful workspace run. |
+| `git diff --check` | Exit 0 after this evidence-only edit. |
+
+The normal workspace test selection retained its intentionally ignored real-thread HNSW stress
+test and thorough 2,000-seed chaos/recovery test. Neither ignored test was force-run here.
+
+### Unrun and not claimed
+
+The following Task 6 gates were not run in this local evidence pass and are not claimed: workspace
+clippy, `cargo doc --workspace --no-deps`, `cargo deny check bans sources advisories`, the
+`parallel-insert` test/clippy checks, crate-scoped loom builds and binaries, and the
+fault-injection recovery gates. The native workspace test command does not enable the
+fault-injection feature and is not evidence for those recovery gates. `maturin` was absent, so no
+packaging/wheel-import smoke ran. No Criterion benchmark command ran, so this section adds no
+performance measurement or comparison. These omissions, the intentionally ignored tests, and the
+existing linker informational warning mean this record must not be read as a full-branch-green or
+complete-feature claim.
