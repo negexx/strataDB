@@ -369,37 +369,73 @@ fn handle_evidence(args: &[String]) -> Result<(), Box<dyn Error>> {
 }
 
 fn handle_migration(args: &[String]) -> Result<(), Box<dyn Error>> {
-    let action = args
-        .get(2)
-        .ok_or_else(|| usage_error("migration requires <validate|run|status> <dir> [...]"))?;
-    if !matches!(action.as_str(), "validate" | "run" | "status") {
-        return Err(usage_error(
-            "migration requires validate, run, or status as its first argument",
-        ));
-    }
+    let action = migration_action(args)?;
     let dir = args
         .get(3)
         .ok_or_else(|| usage_error("migration requires <validate|run|status> <dir> [...]"))?;
 
     if action == "status" {
-        let json = parse_json_flag(args, 4, "migration status")?;
-        let dataset = strata_txn::Dataset::open(dir)?;
-        if json {
-            println!(
-                "{{\"kind\":\"migration_status\",\"manifest_version\":{},\"schema_version\":{}}}",
-                dataset.current_version(),
-                dataset.schema_version(),
-            );
-        } else {
-            println!(
-                "migration manifest_version={} schema_version={}",
-                dataset.current_version(),
-                dataset.schema_version(),
-            );
-        }
+        return handle_migration_status(args, dir);
+    }
+
+    let (column, data_type, json) = migration_request(args, action)?;
+    if action == "run" {
+        require_single_writer_ack(args, "migration run")?;
+    }
+    let dataset = strata_txn::Dataset::open(dir)?;
+    let migration = strata_txn::SchemaMigration::add_nullable_column(
+        dataset.schema_version(),
+        strata_storage::ADD_NULLABLE_COLUMN_SCHEMA_VERSION,
+        arrow::datatypes::Field::new(column, data_type.clone(), true),
+    );
+
+    validate_migration_target_schema(&migration, &dataset)?;
+    if action == "validate" {
+        print_migration_validation(&migration, column, &data_type, json);
         return Ok(());
     }
 
+    let result = dataset.migrate_schema(&migration)?;
+    print_migration_result(&result, json);
+    Ok(())
+}
+
+fn migration_action(args: &[String]) -> Result<&str, Box<dyn Error>> {
+    let action = args
+        .get(2)
+        .ok_or_else(|| usage_error("migration requires <validate|run|status> <dir> [...]"))?;
+    if matches!(action.as_str(), "validate" | "run" | "status") {
+        Ok(action)
+    } else {
+        Err(usage_error(
+            "migration requires validate, run, or status as its first argument",
+        ))
+    }
+}
+
+fn handle_migration_status(args: &[String], dir: &str) -> Result<(), Box<dyn Error>> {
+    let json = parse_json_flag(args, 4, "migration status")?;
+    let dataset = strata_txn::Dataset::open(dir)?;
+    if json {
+        println!(
+            "{{\"kind\":\"migration_status\",\"manifest_version\":{},\"schema_version\":{}}}",
+            dataset.current_version(),
+            dataset.schema_version(),
+        );
+    } else {
+        println!(
+            "migration manifest_version={} schema_version={}",
+            dataset.current_version(),
+            dataset.schema_version(),
+        );
+    }
+    Ok(())
+}
+
+fn migration_request<'args>(
+    args: &'args [String],
+    action: &str,
+) -> Result<(&'args str, DataType, bool), Box<dyn Error>> {
     let name = args.get(4).ok_or_else(|| {
         usage_error("migration validate/run requires add-nullable-column <column> <type>")
     })?;
@@ -426,42 +462,37 @@ fn handle_migration(args: &[String]) -> Result<(), Box<dyn Error>> {
     } else {
         parse_json_flag(args, 7, "migration validate/run")?
     };
-    if action == "run" {
-        require_single_writer_ack(args, "migration run")?;
-    }
-    let dataset = strata_txn::Dataset::open(dir)?;
-    let migration = strata_txn::SchemaMigration::add_nullable_column(
-        dataset.schema_version(),
-        strata_storage::ADD_NULLABLE_COLUMN_SCHEMA_VERSION,
-        arrow::datatypes::Field::new(column, data_type.clone(), true),
-    );
+    Ok((column, data_type, json))
+}
 
-    if action == "validate" {
-        validate_migration_target_schema(&migration, &dataset)?;
-        if json {
-            println!(
-                "{{\"kind\":\"migration_validation\",\"name\":\"{}\",\"source_schema_version\":{},\"target_schema_version\":{},\"column\":{{\"name\":{},\"type\":{},\"nullable\":true}}}}",
-                migration.name(),
-                migration.source_version(),
-                migration.target_version(),
-                json_string(column),
-                json_string(&schema_type_name(&data_type)),
-            );
-        } else {
-            println!(
-                "migration validation name={} source_schema_version={} target_schema_version={} column={} type={} nullable=true",
-                migration.name(),
-                migration.source_version(),
-                migration.target_version(),
-                column,
-                schema_type_name(&data_type),
-            );
-        }
-        return Ok(());
+fn print_migration_validation(
+    migration: &strata_txn::SchemaMigration,
+    column: &str,
+    data_type: &DataType,
+    json: bool,
+) {
+    if json {
+        println!(
+            "{{\"kind\":\"migration_validation\",\"name\":\"{}\",\"source_schema_version\":{},\"target_schema_version\":{},\"column\":{{\"name\":{},\"type\":{},\"nullable\":true}}}}",
+            migration.name(),
+            migration.source_version(),
+            migration.target_version(),
+            json_string(column),
+            json_string(&schema_type_name(data_type)),
+        );
+    } else {
+        println!(
+            "migration validation name={} source_schema_version={} target_schema_version={} column={} type={} nullable=true",
+            migration.name(),
+            migration.source_version(),
+            migration.target_version(),
+            column,
+            schema_type_name(data_type),
+        );
     }
+}
 
-    validate_migration_target_schema(&migration, &dataset)?;
-    let result = dataset.migrate_schema(&migration)?;
+fn print_migration_result(result: &strata_txn::SchemaMigrationResult, json: bool) {
     if json {
         println!(
             "{{\"kind\":\"migration_result\",\"name\":\"{}\",\"source_schema_version\":{},\"target_schema_version\":{},\"manifest_version\":{}}}",
@@ -479,7 +510,6 @@ fn handle_migration(args: &[String]) -> Result<(), Box<dyn Error>> {
             result.manifest_version,
         );
     }
-    Ok(())
 }
 
 fn validate_migration_target_schema(
