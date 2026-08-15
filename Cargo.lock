@@ -1989,6 +1989,7 @@ name = "strata-cli"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "serde_json",
  "strata-index",
  "strata-query",
  "strata-storage",

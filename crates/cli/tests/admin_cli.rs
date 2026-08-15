@@ -4,6 +4,7 @@ use std::process::{Command, Output};
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema};
+use serde_json::{Value, json};
 
 fn command(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_strata"))
@@ -21,169 +22,17 @@ fn stderr(output: &Output) -> String {
 }
 
 fn assert_json_value(value: &str) {
-    let mut parser = JsonParser {
-        input: value.as_bytes(),
-        position: 0,
-    };
-    parser.parse_value();
-    parser.skip_whitespace();
-    assert_eq!(parser.position, parser.input.len(), "trailing JSON input");
+    serde_json::from_str::<Value>(value)
+        .unwrap_or_else(|error| panic!("expected JSON stdout: {error}; stdout was: {value}"));
 }
 
-struct JsonParser<'a> {
-    input: &'a [u8],
-    position: usize,
-}
-
-impl JsonParser<'_> {
-    fn parse_value(&mut self) {
-        self.skip_whitespace();
-        match self.peek() {
-            Some(b'{') => self.parse_object(),
-            Some(b'[') => self.parse_array(),
-            Some(b'\"') => self.parse_string(),
-            Some(b'-' | b'0'..=b'9') => self.parse_number(),
-            Some(b't') => self.parse_literal(b"true"),
-            Some(b'f') => self.parse_literal(b"false"),
-            Some(b'n') => self.parse_literal(b"null"),
-            other => panic!("invalid JSON value at {}: {other:?}", self.position),
-        }
-    }
-
-    fn parse_object(&mut self) {
-        self.expect(b'{');
-        self.skip_whitespace();
-        if self.consume(b'}') {
-            return;
-        }
-        loop {
-            self.parse_string();
-            self.skip_whitespace();
-            self.expect(b':');
-            self.parse_value();
-            self.skip_whitespace();
-            if self.consume(b'}') {
-                return;
-            }
-            self.expect(b',');
-            self.skip_whitespace();
-        }
-    }
-
-    fn parse_array(&mut self) {
-        self.expect(b'[');
-        self.skip_whitespace();
-        if self.consume(b']') {
-            return;
-        }
-        loop {
-            self.parse_value();
-            self.skip_whitespace();
-            if self.consume(b']') {
-                return;
-            }
-            self.expect(b',');
-        }
-    }
-
-    fn parse_string(&mut self) {
-        self.expect(b'\"');
-        loop {
-            match self.next() {
-                Some(b'\"') => return,
-                Some(b'\\') => match self.next() {
-                    Some(b'\"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't') => {}
-                    Some(b'u') => {
-                        for _ in 0..4 {
-                            assert!(
-                                matches!(
-                                    self.next(),
-                                    Some(b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F')
-                                ),
-                                "invalid JSON unicode escape"
-                            );
-                        }
-                    }
-                    other => panic!("invalid JSON escape: {other:?}"),
-                },
-                Some(byte) if byte >= 0x20 => {}
-                other => panic!("invalid JSON string byte: {other:?}"),
-            }
-        }
-    }
-
-    fn parse_number(&mut self) {
-        self.consume(b'-');
-        if self.consume(b'0') {
-        } else {
-            self.expect_range(b'1', b'9');
-            while matches!(self.peek(), Some(b'0'..=b'9')) {
-                self.position += 1;
-            }
-        }
-        if self.consume(b'.') {
-            self.expect_range(b'0', b'9');
-            while matches!(self.peek(), Some(b'0'..=b'9')) {
-                self.position += 1;
-            }
-        }
-        if matches!(self.peek(), Some(b'e' | b'E')) {
-            self.position += 1;
-            if matches!(self.peek(), Some(b'+' | b'-')) {
-                self.position += 1;
-            }
-            self.expect_range(b'0', b'9');
-            while matches!(self.peek(), Some(b'0'..=b'9')) {
-                self.position += 1;
-            }
-        }
-    }
-
-    fn parse_literal(&mut self, literal: &[u8]) {
-        for byte in literal {
-            self.expect(*byte);
-        }
-    }
-
-    fn skip_whitespace(&mut self) {
-        while matches!(self.peek(), Some(b' ' | b'\n' | b'\r' | b'\t')) {
-            self.position += 1;
-        }
-    }
-
-    fn expect_range(&mut self, lower: u8, upper: u8) {
-        assert!(
-            matches!(self.next(), Some(value) if (lower..=upper).contains(&value)),
-            "expected JSON digit"
-        );
-    }
-
-    fn expect(&mut self, expected: u8) {
-        assert_eq!(
-            self.next(),
-            Some(expected),
-            "expected JSON byte {expected:?}"
-        );
-    }
-
-    fn consume(&mut self, expected: u8) -> bool {
-        if self.peek() == Some(expected) {
-            self.position += 1;
-            true
-        } else {
-            false
-        }
-    }
-
-    fn peek(&self) -> Option<u8> {
-        self.input.get(self.position).copied()
-    }
-
-    fn next(&mut self) -> Option<u8> {
-        let value = self.peek();
-        self.position += usize::from(value.is_some());
-        value
-    }
+fn json_output(output: &Output) -> Value {
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "expected JSON stdout: {error}; stdout was: {}",
+            stdout(output)
+        )
+    })
 }
 
 fn empty_fixture_dir() -> tempfile::TempDir {
@@ -252,7 +101,19 @@ fn schema_json_escapes_quoted_and_backslashed_column_names() {
         "schema failed: {}",
         stderr(&output)
     );
-    assert_json_value(&stdout(&output));
+    assert_eq!(
+        json_output(&output),
+        json!({
+            "kind": "schema",
+            "manifest_version": 0,
+            "schema_version": 1,
+            "fields": [{
+                "name": "quoted\"\\column",
+                "type": "utf8",
+                "nullable": true,
+            }],
+        })
+    );
 }
 
 #[test]
@@ -466,7 +327,6 @@ fn migration_validate_run_and_status_publish_the_explicit_catalog_transition() {
         "add-nullable-column",
         "tag",
         "utf8",
-        "--ack-single-writer",
         "--json",
     ]);
     assert!(
@@ -487,6 +347,7 @@ fn migration_validate_run_and_status_publish_the_explicit_catalog_transition() {
         "add-nullable-column",
         "tag",
         "utf8",
+        "--ack-single-writer",
         "--json",
     ]);
     assert!(
@@ -533,7 +394,20 @@ fn migration_validation_json_escapes_quoted_and_backslashed_column_names() {
         "migration validation failed: {}",
         stderr(&output)
     );
-    assert_json_value(&stdout(&output));
+    assert_eq!(
+        json_output(&output),
+        json!({
+            "kind": "migration_validation",
+            "name": "add_nullable_column",
+            "source_schema_version": 1,
+            "target_schema_version": 2,
+            "column": {
+                "name": "quoted\"\\column",
+                "type": "utf8",
+                "nullable": true,
+            },
+        })
+    );
 }
 
 #[test]

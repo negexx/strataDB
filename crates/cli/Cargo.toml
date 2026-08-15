@@ -20,4 +20,5 @@ strata-index = { path = "../index" }
 strata-query = { path = "../query" }
 
 [dev-dependencies]
+serde_json.workspace = true
 tempfile = { workspace = true }
