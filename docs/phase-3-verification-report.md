@@ -8,9 +8,9 @@
 uncommitted documentation closeout. Final exact-head provenance must be the commit containing these
 docs.
 
-## Fresh cloud provenance
+## Historical cloud provenance (2026-08-13)
 
-Canonical final exact-head GitHub Actions run
+Canonical final historical exact-head GitHub Actions run
 [31714285971](https://github.com/negexx/strataDB/actions/runs/31714285971) completed successfully
 for final verification head `7be77d5`. The controller reported all
 workflow jobs successful:
@@ -22,7 +22,7 @@ workflow jobs successful:
 - `thorough-chaos`; and
 - `windows-directory-durability`.
 
-This is the canonical final exact-head evidence for the Task 1–6 remediation aggregate, including
+This is the canonical final historical exact-head evidence for the Task 1–6 remediation aggregate, including
 manifest-publication timestamps; Task 6 exact-key protection for recovery-recognized numeric manifest
 keys, with duplicate padded/unpadded aliases rejected fail-closed; constrained vacuum cleanup; lifecycle
 inventory compatibility; and compaction crash/reopen coverage. It also covers the unpadded current-manifest
@@ -31,19 +31,19 @@ dataset the vector search returns physical row ID `0`. The active-snapshot compa
 correctly asserts that two unprotected superseded objects are reclaimed while the historical snapshot's
 row file and vector segment remain readable.
 
-## Prior cloud provenance
+## Earlier historical cloud provenance
 
-The earlier exact-head GitHub Actions run
+The earlier historical exact-head GitHub Actions run
 [31701969422](https://github.com/negexx/strataDB/actions/runs/31701969422) completed successfully
 for remediation head `105c24f74dc68d8c4c552bfa9d4b63b1a4c79a2c`, with the same controller job set
 listed above. It remains retained provenance for the earlier Task 1–4 remediation aggregate.
 
-The still earlier exact-head GitHub Actions run
+The still earlier historical exact-head GitHub Actions run
 [31698710652](https://github.com/negexx/strataDB/actions/runs/31698710652) completed successfully
 for remediation head `0141355d1261ee20d8128cbc11c38b23e83045c9`, with the same controller job set
 listed above. It remains retained provenance for the earlier Task 1–4 remediation aggregate.
 
-## Fresh local Windows verification
+## Historical local Windows verification
 
 The 2026-08-13 native x64 MSVC environment was verified by explicit `PATH` setup and
 `where.exe cl`/`where.exe link`. The seven targeted lifecycle test binaries passed:
@@ -57,8 +57,8 @@ The 2026-08-13 native x64 MSVC environment was verified by explicit `PATH` setup
 | `git diff --check` | Exit 0. |
 
 These native Windows results include the workspace test suite, lint, format, and diff checks, but
-make no local loom claim. The canonical exact-head cloud run above remains authoritative for the
-loom and broader CI gates.
+make no local loom claim. The canonical historical exact-head cloud run above remains authoritative
+only for its recorded head and does not establish a CI result for later code or evidence commits.
 
 ## Claim boundary
 
@@ -419,3 +419,39 @@ The only pre-existing worktree change was
 `.superpowers/sdd/agent-production-readiness-plan/reports/task-2-report.md`; it was preserved.
 This section records partial local evidence only and makes no whole-feature, complete-branch, or
 unrun-gate-green claim.
+
+## Task 6 verification-only closure attempt (2026-08-15)
+
+This entry is the current local record for code commit
+`29c70e3f2f6a7886cf108985fa323b2ffd4aafae`; the evidence baseline before this documentation
+edit was `95ca832f9c865e6a6bae54e9fa6f0b35d6af19bb`. `git diff --name-status
+29c70e3..95ca832` named only this report, so the compiled source tree was the stated code head.
+The historical cloud runs above are retained provenance for their own recorded revisions, not
+exact-head CI provenance for `29c70e3` or this evidence commit.
+
+The process-local environment called `VsDevCmd.bat -arch=x64 -host_arch=x64`, then placed MSVC
+`14.52.36615` x64 and Windows SDK `10.0.26100.0` UCRT/UM x64 directories first on `PATH`/`LIB`
+with matching `INCLUDE` directories. `where.exe cl` and `where.exe link` resolved to the requested
+MSVC x64 tools. The CI-style command
+`cargo rustc -p strata-txn --lib --profile test --message-format=json -- --cfg loom` exited 0 and
+produced `strata_txn-5c2704560b55f96c.exe`; its `--list --format terse` output included every
+current CI-named txn and live-set-cache model.
+
+| Gate | Current result |
+|---|---|
+| Txn loom: `one_writer_store_races_safely_with_many_readers_load` | Exit 0: 1 passed, 232 filtered, 0.00 s. |
+| Txn loom: `two_threads_deleting_the_same_row_exactly_one_conflicts` | Exit 0: 1 passed, 232 filtered, 8.40 s. |
+| Txn loom: `two_threads_deleting_disjoint_rows_both_succeed` | Exit 0: 1 passed, 232 filtered, 60.64 s. |
+| Txn loom: `concurrent_first_vector_commits_at_different_dimensions_are_not_both_accepted` | Exit 0: 1 passed, 232 filtered, 3.83 s. |
+| Txn loom: `a_failed_commits_segment_is_never_visible_to_a_concurrent_reader` | Exit 0: 1 passed, 232 filtered, 2.46 s. |
+| Txn loom: `a_commits_row_and_its_segment_become_visible_as_one_atomic_step` | Exit 0: 1 passed, 232 filtered, 3.88 s. |
+| Txn loom: `a_reader_never_sees_one_in_flight_commits_row_while_observing_an_unrelated_commits_row_id_counter` | No result. Two active invocations (PIDs 18128 started 06:46:41 and 18164 started 06:50:37) had emitted no failure or completion line; at the user's stop instruction their CPU times were 117.281 s and 58.062 s. Both exact-model processes were terminated and a subsequent process check found no active txn loom binary. This is **aborted**, not passed. |
+| Historically nonterminating txn loom: `a_failed_commits_segment_is_never_searchable_under_concurrent_commits` | Unrun in this closure attempt. Inspection of the locked `loom 0.7.2` source found bounded controls (`LOOM_MAX_PREEMPTIONS`, `LOOM_MAX_PERMUTATIONS`, and `LOOM_MAX_DURATION`), but no bounded invocation was started after the stop instruction; no bounded result is claimed. |
+| Remaining txn semantic/lifecycle/row-ID models, all live-set-cache models, and all index models | Unrun after the aborted reader/row-ID model; not claimed. |
+| Criterion `cargo bench -p strata-bench --bench query_planner_bench` | Unrun after the stop instruction. The intervals in the earlier Task 3 section are historical local measurements, not a rerun after final planner fixes at `29c70e3`. |
+| Locked wheel/import smoke | Unavailable: `Get-Command maturin` found no command, and `py -3.14 -m maturin --version` exited 1 with `No module named maturin`; no wheel was built or installed. |
+| Status provenance scan | Completed with `rg`: the status ledger's former unqualified `Exact-head CI run` reference was historical provenance and is qualified below. |
+| Rustdoc warning check | No fresh invocation after the stop instruction. The immediately preceding exact-head partial record remains the only recorded result: `cargo doc --workspace --no-deps` exited 0 with the unresolved `crate::backend::LocalFs::put` intra-doc link in `crates/storage/src/manifest.rs`. This source-doc fix is outside this verification-only, no-code edit. |
+
+This is a partial closure record only. It supplies no complete CI, loom, benchmark, package, or
+rustdoc-green claim for `29c70e3` or the evidence commit.

@@ -9,8 +9,9 @@ The historical Phase 1 audit branch was `codex/phase-1-audit` at commit `4d8fa3d
 [Phase 0 foundation audit](audit/phase-0/audit.md)
 records implementation closure only within its named local bounds; platform and loom evidence
 remains incomplete. The [Phase 1 closeout ledger](phase-1-closeout-ledger.md) tracks the remaining
-finding-level acceptance and evidence obligations; current exact-head evidence closes the phase
-within its named bounds.
+finding-level acceptance and evidence obligations; retained historical exact-head evidence closes
+the original phase within its named bounds, while later evidence is scoped to the results recorded
+in the current verification report.
 
 The closeout work is merged into `main` at `65449a9` (PR #68).
 
@@ -19,7 +20,7 @@ complete platform or loom coverage. The local Arrow/manifest/segmented-index fou
 restart-safe row-ID regression are covered by local tests, retained Ubuntu foundation provenance.
 Current CI configures 90-day retention of a native Windows restart transcript on future workflow
 runs regardless of outcome, but no completed Windows run or retained artifact is linked in this
-branch; Windows execution evidence is retained by the exact-head CI run. The exact loom gates build
+branch; Windows execution evidence is retained by a historical exact-head CI run. The exact loom gates build
 and invoke crate-scoped binaries directly; normal Cargo summaries, timeouts, and interrupted jobs are
 not loom passes. This does not claim portable filesystem behavior, cross-process coordination, serializability,
 compaction, migration, object storage, or universal power-loss durability.
@@ -54,7 +55,7 @@ provide explicit history and one final inventory observation of requested storag
 continuous enforcement. Active snapshots, protected history, unknown objects, and noncontiguous
 physical row IDs can prevent the requested bound; the API is not a cross-process quota or SLO.
 Snapshots remain protected rather than being deleted. Cross-process lifecycle work remains later
-design. Fresh exact-head lifecycle evidence is recorded in the
+design. Historical exact-head lifecycle evidence, plus the scoped current local record, is recorded in the
 [Phase 3 closeout audit](audit/phase-3/audit.md) and
 [Phase 3 verification report](phase-3-verification-report.md). See
 the [inventory design](designs/phase-3/lifecycle-inventory.md), [manifest executor
@@ -78,7 +79,7 @@ tests.
 | Durability/recovery | Partial | File/directory durability, immutable row-ID high-water, manifest integrity, and crash/reopen evidence exist within named local bounds; full branch verification remains. |
 | Schema/migrations | Implemented within named bounds | New manifests capture explicit supported schema/catalog version metadata. Legacy format-v1 envelopes may omit `schema_version` and are interpreted as catalog v1 without inserting the field, preserving checksum compatibility. The one explicit `add_nullable_column` transition rewrites row objects/copies immutable segments before atomically publishing the new manifest; unsupported, stale, reverse, incompatible, and lossy requests remain typed errors. The CLI exposes validation and execution only for that named transition; it does not provide arbitrary schema evolution. |
 | Lifecycle diagnostics, planning, pruning, and compaction | Implemented within named bounds | `Dataset::lifecycle_report()` inventories one captured snapshot, retention APIs delete eligible historical manifests, and `Dataset::compact()` writes zero row files for an empty live set or one per maximal contiguous live physical-row-ID run for a nonempty set, with at most one vector segment, while protecting active snapshots. `Dataset::vacuum()` removes recognized unprotected objects. `Dataset::maintain()` returns `storage_bound_met` only as one explicit run's final inventory observation, not atomic or continuous enforcement: active snapshots, protected history, unknown objects, and noncontiguous physical row IDs can prevent a requested bound. It is not a cross-process quota or SLO; universal cross-process bounds remain outside scope. See the lifecycle design documents, [Phase 3 closeout audit](audit/phase-3/audit.md), [Phase 3 verification report](phase-3-verification-report.md), and focused tests. |
-| Loom/chaos/fuzz/bench evidence | Implemented within named bounds | Exact-head CI run [31644869407](https://github.com/negexx/strataDB/actions/runs/31644869407) passed the named functional gates; benchmark run [31647664161](https://github.com/negexx/strataDB/actions/runs/31647664161) passed the synthetic and full pinned-fixture matrices with retained provenance. Universal bounds and final limitations remain explicit non-claims. |
+| Loom/chaos/fuzz/bench evidence | Implemented within named bounds | Historical exact-head CI run [31644869407](https://github.com/negexx/strataDB/actions/runs/31644869407) passed the named functional gates for its recorded revision; historical benchmark run [31647664161](https://github.com/negexx/strataDB/actions/runs/31647664161) passed the synthetic and full pinned-fixture matrices with retained provenance. Neither is a CI or benchmark result for later code/evidence heads; see the scoped current results and unrun gates in the [Phase 3 verification report](phase-3-verification-report.md#task-6-verification-only-closure-attempt-2026-08-15). Universal bounds and final limitations remain explicit non-claims. |
 | Compaction/GC | Implemented within named bounds | Explicit snapshot-preserving compaction writes zero row files for an empty live set or one per maximal contiguous live physical-row-ID run for a nonempty set, plus at most one vector segment. Post-publication reclamation, age-based manifest retention, recognized-object vacuum, and a maintenance operation whose final inventory may report `storage_bound_met` are implemented. That field is one explicit run's final observation, not an atomic or continuing bound: active snapshots, protected history, unknown objects, and noncontiguous physical row IDs can keep physical growth above a requested limit. It is not a cross-process quota or SLO. |
 | Cross-process coordination | Proposed | Independent openers do not share transaction state or durable conditional publication. The reserved future seam includes versioned capability negotiation, expected-manifest-version preconditions, request IDs with idempotent retries, typed conflicts, and explicit visibility/durability acknowledgements; Phase 4 entry gates are recorded in the [roadmap](roadmap.md#phase-4-reservation-and-entry-gates) and [decision 0010](decisions.md#0010---deferred-cross-process-coordination-seam). |
 | Branching/object storage | Proposed | No branch/merge or object-store backend is implemented. |
