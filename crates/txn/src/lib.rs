@@ -10,6 +10,7 @@ pub mod compaction;
 pub mod dataset;
 pub mod error;
 pub mod facade;
+mod filter_key;
 mod lifecycle;
 mod lifecycle_coordination;
 pub(crate) mod live_set_cache;

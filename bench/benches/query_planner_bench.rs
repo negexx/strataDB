@@ -111,6 +111,47 @@ fn selective_filter() -> FilterExpression {
     })
 }
 
+fn filtered_vector_request() -> VectorSearchRequest {
+    VectorSearchRequest {
+        vector_column: "vector".into(),
+        query: vec![200.0, 0.0],
+        k: 10,
+        filter: Some(selective_filter()),
+        hydration: VectorHydration::Projection(Projection::Columns(vec!["id".into()])),
+    }
+}
+
+fn bench_filtered_vector_cache(c: &mut Criterion) {
+    let mut group = c.benchmark_group("filtered_vector_cache");
+    group.bench_function("cold", |b| {
+        b.iter_batched(
+            || {
+                let fixture = fixture();
+                let snapshot = fixture.dataset.snapshot();
+                (fixture, snapshot, filtered_vector_request())
+            },
+            |(_fixture, snapshot, request)| {
+                std::hint::black_box(snapshot.vector_search_query(&request).unwrap())
+            },
+            BatchSize::LargeInput,
+        );
+    });
+
+    let warm_fixture = fixture();
+    let warm_snapshot = warm_fixture.dataset.snapshot();
+    let warm_request = filtered_vector_request();
+    std::hint::black_box(warm_snapshot.vector_search_query(&warm_request).unwrap());
+    let warmed = warm_snapshot.live_set_cache_accounting();
+    assert_eq!(
+        warmed.entry_count, 1,
+        "warm benchmark setup must retain the filtered vector live set"
+    );
+    group.bench_function("warm", |b| {
+        b.iter(|| std::hint::black_box(warm_snapshot.vector_search_query(&warm_request).unwrap()));
+    });
+    group.finish();
+}
+
 fn bench_query_planner(c: &mut Criterion) {
     let query_fixture = fixture();
     let snapshot = query_fixture.dataset.snapshot();
@@ -127,13 +168,7 @@ fn bench_query_planner(c: &mut Criterion) {
         aggregates: vec![Aggregate::new("amount", AggregateFunction::Sum, "sum")],
         filter: Some(selective_filter()),
     };
-    let vector = VectorSearchRequest {
-        vector_column: "vector".into(),
-        query: vec![200.0, 0.0],
-        k: 10,
-        filter: Some(selective_filter()),
-        hydration: VectorHydration::Projection(Projection::Columns(vec!["id".into()])),
-    };
+    let vector = filtered_vector_request();
 
     let mut group = c.benchmark_group("query_planner");
     group.bench_function("projection_scan/direct", |b| {
@@ -224,6 +259,7 @@ fn bench_shared_handle_transaction_commit(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_query_planner,
+    bench_filtered_vector_cache,
     bench_shared_handle_transaction_commit
 );
 criterion_main!(benches);
