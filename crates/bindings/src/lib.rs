@@ -1019,7 +1019,10 @@ fn map_txn_error(error: &TxnError) -> PyErr {
             | StorageError::Arrow(_)
             | StorageError::Serde(_)
             | StorageError::DurabilityUnsupported(_)
-            | StorageError::AlreadyExists(_) => StorageDurabilityError::new_err(error.to_string()),
+            | StorageError::AlreadyExists(_)
+            | StorageError::PublicationIndeterminate(_) => {
+                StorageDurabilityError::new_err(error.to_string())
+            }
         },
         TxnError::Io(_)
         | TxnError::Arrow(_)
@@ -1028,6 +1031,7 @@ fn map_txn_error(error: &TxnError) -> PyErr {
         | TxnError::NotFound(_)
         | TxnError::ManifestOverflow(_)
         | TxnError::RowIdReservationDurability { .. }
+        | TxnError::IndeterminateManifestPublication { .. }
         | TxnError::Clock(_) => StorageDurabilityError::new_err(error.to_string()),
         TxnError::CorruptSegment(_)
         | TxnError::UnsafeManifestPath(_)
@@ -1225,6 +1229,21 @@ mod tests {
                 source: strata_txn::StorageError::DurabilityUnsupported(PathBuf::from("dataset")),
             });
             assert!(durability.is_instance_of::<StorageDurabilityError>(py));
+
+            let indeterminate = map_txn_error(&TxnError::Storage(
+                strata_txn::StorageError::PublicationIndeterminate(
+                    "_versions/00000000000000000007.manifest".to_owned(),
+                ),
+            ));
+            assert!(indeterminate.is_instance_of::<StorageDurabilityError>(py));
+
+            let direct_indeterminate = map_txn_error(&TxnError::IndeterminateManifestPublication {
+                manifest_version: 7,
+                source: strata_txn::StorageError::PublicationIndeterminate(
+                    "_versions/00000000000000000007.manifest".to_owned(),
+                ),
+            });
+            assert!(direct_indeterminate.is_instance_of::<StorageDurabilityError>(py));
 
             let corruption = map_txn_error(&TxnError::Storage(
                 strata_txn::StorageError::CorruptManifest(

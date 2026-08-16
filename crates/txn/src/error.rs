@@ -44,6 +44,14 @@ pub enum TxnError {
         source: strata_storage::StorageError,
     },
     #[error(
+        "manifest version {manifest_version} may be visible but its durable publication confirmation failed: {source}"
+    )]
+    IndeterminateManifestPublication {
+        manifest_version: u64,
+        #[source]
+        source: strata_storage::StorageError,
+    },
+    #[error(
         "manifest declares an unreasonably large row-id capacity ({0}); maximum allowed is {1}"
     )]
     UnreasonableCapacity(u64, u64),
@@ -124,6 +132,16 @@ mod tests {
             }
             .to_string(),
             "row-id reservation through 7 may be visible but its durable confirmation failed: I/O error: sync failed"
+        );
+        assert_eq!(
+            TxnError::IndeterminateManifestPublication {
+                manifest_version: 7,
+                source: strata_storage::StorageError::PublicationIndeterminate(
+                    "_versions/00000000000000000007.manifest".to_owned(),
+                ),
+            }
+            .to_string(),
+            "manifest version 7 may be visible but its durable publication confirmation failed: manifest publication is indeterminate after final-name creation: _versions/00000000000000000007.manifest"
         );
         assert_eq!(
             TxnError::UnsafeManifestPath("../escape".to_string()).to_string(),

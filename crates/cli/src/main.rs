@@ -138,7 +138,8 @@ fn storage_error_category(error: &strata_txn::StorageError) -> ExitCategory {
         | strata_txn::StorageError::CorruptDataFile(_, _) => ExitCategory::Corruption,
         strata_txn::StorageError::Io(_)
         | strata_txn::StorageError::Arrow(_)
-        | strata_txn::StorageError::AlreadyExists(_) => ExitCategory::Operational,
+        | strata_txn::StorageError::AlreadyExists(_)
+        | strata_txn::StorageError::PublicationIndeterminate(_) => ExitCategory::Operational,
     }
 }
 
@@ -1552,6 +1553,17 @@ mod tests {
 
         assert_eq!(error_category(&error).code(), 3);
         assert_eq!(error_category(&error).name(), "conflict");
+    }
+
+    #[test]
+    fn indeterminate_manifest_publication_uses_the_operational_exit_category() {
+        let error =
+            strata_txn::TxnError::Storage(strata_txn::StorageError::PublicationIndeterminate(
+                "_versions/00000000000000000007.manifest".to_owned(),
+            ));
+
+        assert_eq!(error_category(&error).code(), 1);
+        assert_eq!(error_category(&error).name(), "operational");
     }
 
     #[test]
