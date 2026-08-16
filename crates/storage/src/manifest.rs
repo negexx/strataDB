@@ -360,7 +360,8 @@ fn manifest_path(dataset_dir: &Path, version: u64) -> PathBuf {
 /// # Errors
 ///
 /// Returns an error if the `_versions/` directory can't be created, if the
-/// manifest can't be serialized or written, or if the atomic rename fails.
+/// manifest can't be serialized or written, if its version already exists,
+/// or if durable publication is indeterminate after final-name creation.
 pub fn commit_manifest(dataset_dir: &Path, manifest: &Manifest) -> Result<()> {
     commit_manifest_with(&crate::backend::StorageOwner::local(dataset_dir), manifest)
 }
@@ -373,17 +374,22 @@ pub fn commit_manifest_with(
 ) -> Result<()> {
     let key = owner.manifest_object_key(manifest.version);
     let json = serde_json::to_vec(&ManifestEnvelope::new(manifest.clone())?)?;
-    // `LocalFs::put` fsyncs the containing directory internally (see Task
-    // 1), so there is no separate `sync_dir` call here the way the
-    // pre-Backend code had one -- folding that step into `put` itself
-    // (rather than leaving it a caller-remembered step) is what makes
-    // `Backend::put`'s durability contract self-contained. Do not add a
-    // second explicit `sync_dir` call here: `versions_dir(dataset_dir)` is
-    // exactly the directory `put` already fsyncs for this key, so a second
-    // call would double a chaos checkpoint and break the "checkpoint count
-    // unchanged" global constraint below.
-    owner.put(&key, &json)?;
-    Ok(())
+    // `put_if_absent` makes a manifest version immutable: a retry can never
+    // overwrite the bytes recovery may already select. `LocalFs` publishes
+    // its final hard-link name before synchronizing the directory, so a
+    // sync failure may leave these exact bytes observable. Classify only
+    // that verified post-publication state as indeterminate; pre-publication
+    // failures and duplicate-version collisions retain their original errors.
+    match owner.put_if_absent(&key, &json) {
+        Ok(()) => Ok(()),
+        Err(error) if !matches!(error, StorageError::AlreadyExists(_)) => match owner.get(&key) {
+            Ok(published) if published == json => Err(StorageError::PublicationIndeterminate(
+                key.as_str().to_owned(),
+            )),
+            _ => Err(error),
+        },
+        Err(error) => Err(error),
+    }
 }
 
 /// Returns the highest committed version's manifest, or `None` if the
@@ -580,6 +586,64 @@ mod tests {
 
         let current = read_current(&dir).unwrap().unwrap();
         assert_eq!(current, m1);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn commit_manifest_reports_indeterminate_after_final_name_creation_sync_failure() {
+        // Break caught: a generic directory-sync error after a manifest has
+        // reached its final name leaves callers unable to distinguish an
+        // unpublished version from one recovery can already observe.
+        let dir = temp_dataset_dir("indeterminate-publication");
+        let m0 = manifest(0, vec![data_file("a.arrow")]);
+        let _fault = crate::datafile::test_support::fail_directory_sync_on_call(
+            1,
+            std::io::ErrorKind::Other,
+        );
+
+        let error = commit_manifest(&dir, &m0).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "manifest publication is indeterminate after final-name creation: _versions/00000000000000000000.manifest",
+            "a post-publication directory-sync failure needs its own outcome"
+        );
+        assert_eq!(
+            fs::read(manifest_path(&dir, m0.version)).unwrap(),
+            serde_json::to_vec(&ManifestEnvelope::new(m0.clone()).unwrap()).unwrap(),
+            "the final-name manifest must exist when publication is indeterminate"
+        );
+        assert_eq!(
+            read_current(&dir).unwrap(),
+            Some(m0),
+            "recovery must already be able to observe the final-name manifest"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn commit_manifest_rejects_a_duplicate_version_without_changing_existing_bytes() {
+        // Break caught: overwriting a version after a retry can replace the
+        // manifest recovery selects for a version that was already published.
+        let dir = temp_dataset_dir("immutable-version-collision");
+        let original = manifest(0, vec![data_file("original.arrow")]);
+        commit_manifest(&dir, &original).unwrap();
+        let path = manifest_path(&dir, original.version);
+        let original_bytes = fs::read(&path).unwrap();
+        let replacement = manifest(0, vec![data_file("replacement.arrow")]);
+
+        let result = commit_manifest(&dir, &replacement);
+
+        assert!(
+            matches!(result, Err(StorageError::AlreadyExists(ref key)) if key == "_versions/00000000000000000000.manifest"),
+            "a duplicate manifest version must report the typed collision, got {result:?}"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            original_bytes,
+            "a rejected duplicate manifest publication must not overwrite or delete existing bytes"
+        );
+        assert_eq!(read_current(&dir).unwrap(), Some(original));
         fs::remove_dir_all(&dir).ok();
     }
 

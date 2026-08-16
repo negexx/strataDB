@@ -832,7 +832,16 @@ impl Dataset {
         let last_issued_timestamp = Arc::new(AtomicI64::new(manifest.commit_time_high_water));
         manifest.committed_at_us = issue_timestamp(&last_issued_timestamp)?;
         initialize_row_id_high_water_with(&storage)?;
-        commit_manifest_with(&storage, &manifest)?;
+        match commit_manifest_with(&storage, &manifest) {
+            Ok(()) => {}
+            Err(source @ strata_storage::StorageError::PublicationIndeterminate(_)) => {
+                return Err(TxnError::IndeterminateManifestPublication {
+                    manifest_version: manifest.version,
+                    source,
+                });
+            }
+            Err(source) => return Err(TxnError::Storage(source)),
+        }
         let durable_high_water = read_row_id_high_water_with(&storage)?.unwrap_or(0);
         let row_ids = Arc::new(RowIdAllocator::new_with_storage(
             Arc::clone(&storage),
@@ -2228,13 +2237,18 @@ impl Transaction {
         );
 
         let storage = Arc::clone(&self.current.load_full().storage);
-        commit_manifest_with(&storage, &manifest)?;
+        let indeterminate_publication = match commit_manifest_with(&storage, &manifest) {
+            Ok(()) => None,
+            Err(source @ strata_storage::StorageError::PublicationIndeterminate(_)) => Some(source),
+            Err(source) => return Err(TxnError::Storage(source)),
+        };
 
-        // This is the durability point: `commit_manifest` has returned
-        // successfully, so this commit's rows and segment are now on disk
-        // and reachable by a future `Dataset::open`. Nothing from here on
-        // may run in a way that could undo the commit — nor does anything
-        // need to, since there is nothing left to compensate for.
+        // This is the visibility point: either `commit_manifest` returned
+        // successfully, or storage verified the exact candidate manifest is
+        // already readable after its final-name publication. In both cases,
+        // the candidate must be installed under `commit_lock` before the
+        // caller is told its durability acknowledgement is indeterminate.
+        // Nothing from here on may run in a way that could undo the commit.
 
         commit_log.push(new_version, self.write_set);
 
@@ -2274,7 +2288,13 @@ impl Transaction {
         };
         self.current.store(Arc::new(snapshot));
 
-        Ok(())
+        match indeterminate_publication {
+            Some(source) => Err(TxnError::IndeterminateManifestPublication {
+                manifest_version: new_version,
+                source,
+            }),
+            None => Ok(()),
+        }
     }
 
     /// Spec §3 step 3's durable write, run *before* `commit_lock` is
@@ -4077,14 +4097,90 @@ mod tests {
         };
 
         assert!(
-            matches!(error, TxnError::Storage(strata_storage::StorageError::Io(ref error)) if error.kind() == std::io::ErrorKind::Other),
-            "the final dataset-directory sync failure must be returned, got {error:?}"
+            matches!(
+                error,
+                TxnError::IndeterminateManifestPublication {
+                    manifest_version: 0,
+                    source: strata_storage::StorageError::PublicationIndeterminate(ref key),
+                } if key == "_versions/00000000000000000000.manifest"
+            ),
+            "the final dataset-directory sync failure must report the visible manifest, got {error:?}"
         );
         assert!(
             strata_storage::read_current(&dir).unwrap().is_some(),
             "the error is uncertain: atomic manifest publication may already be visible"
         );
         std::fs::remove_dir_all(&parent).ok();
+    }
+
+    #[cfg(feature = "test-fault-injection")]
+    #[test]
+    fn indeterminate_manifest_publication_installs_the_candidate_before_reporting_it() {
+        // Break caught: if final-name visibility is reported as an ordinary
+        // failed commit, the shared Dataset remains at the old snapshot and
+        // omits the candidate write from OCC history even though recovery
+        // can already select the candidate manifest.
+        let dir = temp_dir("indeterminate-manifest-publication-reconciles-transaction-state");
+        let ds = Dataset::create(&dir, test_schema()).unwrap();
+
+        let mut seed = ds.begin();
+        seed.insert(
+            RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![1_i64]))])
+                .unwrap(),
+        )
+        .unwrap();
+        seed.commit().unwrap();
+
+        let mut candidate = ds.begin();
+        candidate.delete(0).unwrap();
+        let mut stale = ds.begin();
+        stale.delete(0).unwrap();
+        let fault = strata_storage::datafile::test_support::fail_directory_sync_on_call(
+            1,
+            std::io::ErrorKind::Other,
+        );
+
+        let error = candidate.commit().unwrap_err();
+        drop(fault);
+
+        assert!(
+            matches!(
+                error,
+                TxnError::IndeterminateManifestPublication {
+                    manifest_version: 2,
+                    source: strata_storage::StorageError::PublicationIndeterminate(ref key),
+                } if key == "_versions/00000000000000000002.manifest"
+            ),
+            "the caller must receive the typed uncertainty after the candidate is installed"
+        );
+        assert_eq!(ds.snapshot().version, 2);
+        assert!(
+            !ds.snapshot().owns_live_row(0),
+            "the candidate tombstone must be visible without replaying the transaction"
+        );
+
+        let stale_error = stale.commit().unwrap_err();
+        assert!(
+            matches!(
+                stale_error,
+                TxnError::Conflict { contested_row_ids } if contested_row_ids == vec![0]
+            ),
+            "the installed candidate write-set must participate in OCC"
+        );
+
+        let next = ds.begin();
+        assert_eq!(
+            next.base_version, 2,
+            "the next transaction starts at the candidate"
+        );
+        next.commit().unwrap();
+        assert_eq!(
+            ds.snapshot().version,
+            3,
+            "the next successful commit advances exactly one version beyond the candidate"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Proves 8 concurrent claims hand out non-overlapping, contiguous
@@ -6934,7 +7030,7 @@ mod tests {
         txn.commit().unwrap();
         drop(ds);
 
-        // Directly overwrite the on-disk manifest with a commit_time_high_water
+        // Publish an equivalent later manifest with a commit_time_high_water
         // far in the future - simulating what a real prior session's clock
         // would eventually produce, without waiting for it. If Dataset::open
         // does NOT seed last_issued_timestamp from this persisted value (e.g.
@@ -6943,6 +7039,7 @@ mod tests {
         // assertions below catch it.
         let mut manifest = strata_storage::read_current(&dir).unwrap().unwrap();
         let far_future = manifest.commit_time_high_water + 1_000_000_000_000; // ~11.6 days ahead, in microseconds
+        manifest.version = 2;
         manifest.commit_time_high_water = far_future;
         strata_storage::commit_manifest(&dir, &manifest).unwrap();
 

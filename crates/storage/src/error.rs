@@ -54,6 +54,8 @@ pub enum StorageError {
     DurabilityUnsupported(PathBuf),
     #[error("key already exists: {0}")]
     AlreadyExists(String),
+    #[error("manifest publication is indeterminate after final-name creation: {0}")]
+    PublicationIndeterminate(String),
 }
 
 pub type Result<T> = std::result::Result<T, StorageError>;

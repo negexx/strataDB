@@ -8,7 +8,7 @@ use std::sync::Arc;
 use arrow::array::{FixedSizeListArray, Float32Array, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use strata_storage::{Backend, LocalFs, StorageError, commit_manifest, read_current};
-use strata_txn::{Dataset, RetentionPlan, RetentionPolicy, TxnError};
+use strata_txn::{CompactionPolicy, Dataset, RetentionPlan, RetentionPolicy, TxnError};
 
 fn id_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]))
@@ -67,6 +67,22 @@ fn object_bytes(backend: &LocalFs, prefix: &str) -> BTreeMap<String, Vec<u8>> {
         .collect()
 }
 
+fn publish_older_manifest_and_reopen(
+    dir: &Path,
+    amend_older: impl FnOnce(&mut strata_storage::Manifest),
+) -> Dataset {
+    let latest = read_current(dir).unwrap().unwrap();
+    let mut older = latest.clone();
+    older.version = 2;
+    amend_older(&mut older);
+    commit_manifest(dir, &older).unwrap();
+
+    let mut latest = latest;
+    latest.version = 3;
+    commit_manifest(dir, &latest).unwrap();
+    Dataset::open(dir).unwrap()
+}
+
 struct NonCumulativeHistory {
     _root: tempfile::TempDir,
     dataset: Dataset,
@@ -77,36 +93,15 @@ struct NonCumulativeHistory {
 fn non_cumulative_history() -> NonCumulativeHistory {
     let root = tempfile::tempdir().unwrap();
     let dir = root.path().join("non-cumulative-history");
-    let seed = Dataset::create(&dir, vector_schema()).unwrap();
-    commit_vector(&seed);
+    let dataset = Dataset::create(&dir, vector_schema()).unwrap();
+    commit_vector(&dataset);
 
     let backend = LocalFs::new(&dir);
     let current = read_current(&dir).unwrap().unwrap();
-    let mut historical_manifest = current.clone();
-    historical_manifest.version = 0;
-
     let current_row = current.data_files[0].name.clone();
-    let historical_row = "historical-row.arrow";
     let row_bytes = backend.get(&format!("data/{current_row}")).unwrap();
-    historical_manifest.data_files[0].name = historical_row.to_string();
-    backend
-        .put(&format!("data/{historical_row}"), &row_bytes)
-        .unwrap();
-
     let current_segment = current.segments[0].name.clone();
-    let historical_segment = "historical-segment.seg";
     let segment_bytes = backend.get(&format!("data/{current_segment}")).unwrap();
-    historical_manifest.segments[0].name = historical_segment.to_string();
-    backend
-        .put(&format!("data/{historical_segment}"), &segment_bytes)
-        .unwrap();
-    commit_manifest(&dir, &historical_manifest).unwrap();
-
-    let current_manifest_key = "_versions/00000000000000000001.manifest";
-    backend.delete(current_manifest_key).unwrap();
-    drop(seed);
-
-    let dataset = Dataset::open(&dir).unwrap();
     let historical = dataset.snapshot();
     assert_eq!(historical.scan(&dataset.schema()).unwrap().num_rows(), 1);
     assert_eq!(
@@ -116,9 +111,9 @@ fn non_cumulative_history() -> NonCumulativeHistory {
             .len(),
         1
     );
-
-    commit_vector(&dataset);
-    commit_manifest(&dir, &current).unwrap();
+    dataset
+        .compact(CompactionPolicy::retain_snapshots())
+        .unwrap();
 
     NonCumulativeHistory {
         _root: root,
@@ -126,11 +121,11 @@ fn non_cumulative_history() -> NonCumulativeHistory {
         historical,
         historical_candidates: vec![
             strata_txn::RetentionCandidate {
-                key: format!("data/{historical_row}"),
+                key: format!("data/{current_row}"),
                 bytes: row_bytes.len() as u64,
             },
             strata_txn::RetentionCandidate {
-                key: format!("data/{historical_segment}"),
+                key: format!("data/{current_segment}"),
                 bytes: segment_bytes.len() as u64,
             },
         ],
@@ -148,8 +143,8 @@ fn historical_non_cumulative_row_and_segment_are_eligible_only_after_lease_relea
             keep_latest_versions: 1,
         })
         .unwrap();
-    assert_eq!(held.observed_version, 1);
-    assert_eq!(held.retained_manifest_versions, vec![0, 1]);
+    assert_eq!(held.observed_version, 2);
+    assert_eq!(held.retained_manifest_versions, vec![1, 2]);
     assert_eq!(held.retained_data_object_count, 4);
     assert!(held.eligible_data_objects.is_empty());
 
@@ -160,8 +155,8 @@ fn historical_non_cumulative_row_and_segment_are_eligible_only_after_lease_relea
             keep_latest_versions: 1,
         })
         .unwrap();
-    assert_eq!(released.retained_manifest_versions, vec![1]);
-    assert_eq!(released.eligible_manifest_versions, vec![0]);
+    assert_eq!(released.retained_manifest_versions, vec![2]);
+    assert_eq!(released.eligible_manifest_versions, vec![0, 1]);
     assert_eq!(released.eligible_data_objects, historical_candidates);
 }
 
@@ -318,10 +313,10 @@ fn older_manifest_data_is_eligible_only_when_listed_in_the_inventory() {
     let dataset = Dataset::create(&dir, id_schema()).unwrap();
     commit_id(&dataset, 1);
     let backend = LocalFs::new(&dir);
-    let mut older_manifest = read_current(&dir).unwrap().unwrap();
-    older_manifest.version = 0;
-    older_manifest.data_files[0].name = "older-only.bin".to_string();
-    commit_manifest(&dir, &older_manifest).unwrap();
+    drop(dataset);
+    let dataset = publish_older_manifest_and_reopen(&dir, |older| {
+        older.data_files[0].name = "older-only.bin".to_string();
+    });
     backend.put("data/older-only.bin", b"older-data").unwrap();
 
     let plan = dataset
@@ -346,10 +341,10 @@ fn temporary_data_referenced_by_an_older_manifest_is_not_eligible() {
     let dataset = Dataset::create(&dir, id_schema()).unwrap();
     commit_id(&dataset, 1);
     let backend = LocalFs::new(&dir);
-    let mut older_manifest = read_current(&dir).unwrap().unwrap();
-    older_manifest.version = 0;
-    older_manifest.data_files[0].name = ".tmp-older.bin".to_string();
-    commit_manifest(&dir, &older_manifest).unwrap();
+    drop(dataset);
+    let dataset = publish_older_manifest_and_reopen(&dir, |older| {
+        older.data_files[0].name = ".tmp-older.bin".to_string();
+    });
     backend.put("data/.tmp-older.bin", b"temporary").unwrap();
 
     let plan = dataset
@@ -367,10 +362,10 @@ fn missing_data_referenced_only_by_an_older_manifest_fails_closed() {
     let dir = root.path().join("missing-older-data");
     let dataset = Dataset::create(&dir, id_schema()).unwrap();
     commit_id(&dataset, 1);
-    let mut older_manifest = read_current(&dir).unwrap().unwrap();
-    older_manifest.version = 0;
-    older_manifest.data_files[0].name = "missing-older.bin".to_string();
-    commit_manifest(&dir, &older_manifest).unwrap();
+    drop(dataset);
+    let dataset = publish_older_manifest_and_reopen(&dir, |older| {
+        older.data_files[0].name = "missing-older.bin".to_string();
+    });
 
     let error = dataset
         .retention_plan(RetentionPolicy {
