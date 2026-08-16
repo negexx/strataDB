@@ -1,5 +1,5 @@
 //! A bounded, per-[`Snapshot`](crate::snapshot::Snapshot) cache from a
-//! predicate's identity to its resolved [`LiveSet`]. See
+//! query filter's identity to its resolved [`LiveSet`]. See
 //! `docs/phase-1-performance.md`
 //! for why this exists: `Snapshot::row_ids_matching` re-reads a whole data
 //! file's Arrow IPC body per query to resolve which rows match a predicate,
@@ -58,6 +58,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use strata_index::LiveSet;
 use strata_query::PredicateKey;
 
+use crate::filter_key::FilterKey;
+
 /// One cache entry's storage, including an eviction marker so callers never
 /// compute into a slot that has been removed from the outer map.
 type Slot = Arc<Mutex<SlotState>>;
@@ -93,9 +95,29 @@ enum SlotState {
 const ENTRY_OVERHEAD_BYTES: usize = 256;
 
 pub(crate) struct LiveSetCache {
-    slots: Mutex<HashMap<PredicateKey, Slot>>,
+    slots: Mutex<HashMap<LiveSetCacheKey, Slot>>,
     bytes: AtomicUsize,
     byte_budget: usize,
+}
+
+/// Exact identities accepted by the per-snapshot live-set cache.
+///
+/// Predicate and public filter-expression paths are intentionally distinct:
+/// both keys preserve their source tree without normalization, and neither can
+/// accidentally reuse the other's cached rows.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum LiveSetCacheKey {
+    Predicate(PredicateKey),
+    Filter(FilterKey),
+}
+
+impl LiveSetCacheKey {
+    fn variable_byte_size(&self) -> usize {
+        match self {
+            Self::Predicate(key) => key.variable_byte_size(),
+            Self::Filter(key) => key.variable_byte_size(),
+        }
+    }
 }
 
 /// A best-effort observation of one snapshot's live-set cache.
@@ -133,14 +155,14 @@ impl LiveSetCache {
     }
 
     #[cfg(not(loom))]
-    fn lock_slots(&self) -> std::sync::MutexGuard<'_, HashMap<PredicateKey, Slot>> {
+    fn lock_slots(&self) -> std::sync::MutexGuard<'_, HashMap<LiveSetCacheKey, Slot>> {
         self.slots
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     #[cfg(loom)]
-    fn lock_slots(&self) -> loom::sync::MutexGuard<'_, HashMap<PredicateKey, Slot>> {
+    fn lock_slots(&self) -> loom::sync::MutexGuard<'_, HashMap<LiveSetCacheKey, Slot>> {
         self.slots
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -208,7 +230,7 @@ impl LiveSetCache {
     /// requirement to document lock order at the acquisition site).
     pub(crate) fn get_or_try_compute<E>(
         &self,
-        key: PredicateKey,
+        key: LiveSetCacheKey,
         compute: impl FnOnce() -> Result<LiveSet, E>,
     ) -> Result<Arc<LiveSet>, E> {
         let entry_charge = ENTRY_OVERHEAD_BYTES + key.variable_byte_size();
@@ -288,23 +310,35 @@ mod tests {
 
     use strata_storage::Value;
 
+    use crate::filter_key::FilterKey;
+
     use super::*;
 
     #[derive(Debug, PartialEq, Eq)]
     struct Unreachable;
 
-    fn key(n: i64) -> PredicateKey {
-        PredicateKey::from(&strata_query::Predicate::Eq(
+    fn key(n: i64) -> LiveSetCacheKey {
+        LiveSetCacheKey::Predicate(PredicateKey::from(&strata_query::Predicate::Eq(
             "category".to_string(),
             Value::Int64(n),
-        ))
+        )))
     }
 
-    fn key_with_string_value(value: &str) -> PredicateKey {
-        PredicateKey::from(&strata_query::Predicate::Eq(
+    fn key_with_string_value(value: &str) -> LiveSetCacheKey {
+        LiveSetCacheKey::Predicate(PredicateKey::from(&strata_query::Predicate::Eq(
             "category".to_string(),
             Value::Utf8(value.to_string()),
-        ))
+        )))
+    }
+
+    fn filter_key(selected: bool) -> LiveSetCacheKey {
+        LiveSetCacheKey::Filter(FilterKey::from(&crate::FilterExpression::Compare(
+            crate::Comparison {
+                column: "selected".into(),
+                operator: crate::ComparisonOperator::Equal,
+                value: crate::FilterLiteral::Boolean(selected),
+            },
+        )))
     }
 
     #[test]
@@ -356,7 +390,7 @@ mod tests {
                 )),
             );
         }
-        let deep_key = PredicateKey::from(&deep);
+        let deep_key = LiveSetCacheKey::Predicate(PredicateKey::from(&deep));
         let cache = LiveSetCache::new(ENTRY_OVERHEAD_BYTES + 10);
         let _ = cache.get_or_try_compute(deep_key, || -> Result<LiveSet, Unreachable> {
             Ok(LiveSet::from_row_ids(&[1]))
@@ -496,6 +530,25 @@ mod tests {
             2,
             "a failed compute must not poison the slot for the next call"
         );
+    }
+
+    #[test]
+    fn a_filter_compute_error_is_not_cached_and_is_retried_next_call() {
+        let cache = LiveSetCache::new(64 * 1024 * 1024);
+        let calls = AtomicUsize::new(0);
+
+        let first = cache.get_or_try_compute(filter_key(true), || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Err::<LiveSet, _>(Unreachable)
+        });
+        assert!(first.is_err());
+
+        let second = cache.get_or_try_compute(filter_key(true), || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Ok::<LiveSet, Unreachable>(LiveSet::from_row_ids(&[1]))
+        });
+        assert!(second.is_ok());
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 
     #[test]
@@ -654,10 +707,10 @@ mod loom_tests {
     #[derive(Debug, PartialEq, Eq)]
     struct Unreachable;
 
-    fn key(n: i64) -> PredicateKey {
-        PredicateKey::from(&strata_query::Predicate::Eq(
+    fn key(n: i64) -> LiveSetCacheKey {
+        LiveSetCacheKey::Predicate(PredicateKey::from(&strata_query::Predicate::Eq(
             "category".to_string(),
             strata_storage::Value::Int64(n),
-        ))
+        )))
     }
 }

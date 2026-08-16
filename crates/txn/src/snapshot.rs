@@ -42,8 +42,9 @@ use crate::query::{
     VectorHydrationState, VectorSearchRequest, VectorSearchResult,
 };
 
-use crate::live_set_cache::LiveSetCache;
+use crate::filter_key::FilterKey;
 pub use crate::live_set_cache::LiveSetCacheAccounting;
+use crate::live_set_cache::{LiveSetCache, LiveSetCacheKey};
 use crate::retention::SnapshotLease;
 
 /// Downcasts a `SegmentSet` part's opaque zone-map payload back to the
@@ -116,7 +117,7 @@ pub struct Snapshot {
     pub(crate) manifest: Arc<Manifest>,
     pub(crate) index: strata_index::SegmentSet,
     pub(crate) tombstones: Arc<imbl::HashSet<u64>>,
-    /// Per-predicate resolved-row-id cache — see
+    /// Per-query-filter resolved-row-id cache — see
     /// `docs/phase-1-performance.md`
     /// and `crate::live_set_cache`'s module doc for why this is sound (this
     /// `Snapshot` is immutable) and how it's bounded (a byte budget, not an
@@ -1081,7 +1082,7 @@ impl Snapshot {
         let hydration_projection = self.query_schema()?.validate_vector_search(request)?;
         let mut matches = match &request.filter {
             Some(filter) => {
-                let live_set = self.vector_filter_live_set(filter)?;
+                let live_set = self.resolve_filter_live_set(filter)?;
                 let pruning_predicate = filter_expression_pruning_predicate(filter);
                 self.index
                     .search_filtered_pruned_live(
@@ -1167,6 +1168,12 @@ impl Snapshot {
             .flatten()
             .collect::<Vec<_>>();
         Ok(LiveSet::from_row_ids(&row_ids))
+    }
+
+    fn resolve_filter_live_set(&self, filter: &FilterExpression) -> QueryResult<Arc<LiveSet>> {
+        let key = LiveSetCacheKey::Filter(FilterKey::from(filter));
+        self.live_set_cache
+            .get_or_try_compute(key, || self.vector_filter_live_set(filter))
     }
 
     /// Approximate nearest-neighbor search over the vector column, as of
@@ -1264,7 +1271,7 @@ impl Snapshot {
     /// it with [`Snapshot::row_ids_matching`] on a miss. See
     /// `crate::live_set_cache`'s module doc for the caching/locking policy.
     fn resolve_live_set(&self, predicate: &Predicate) -> Result<Arc<LiveSet>> {
-        let key = PredicateKey::from(predicate);
+        let key = LiveSetCacheKey::Predicate(PredicateKey::from(predicate));
         self.live_set_cache.get_or_try_compute(key, || {
             let ids = self.row_ids_matching(predicate)?;
             Ok(LiveSet::from_row_ids(&ids))
@@ -3911,6 +3918,120 @@ mod tests {
         assert_eq!(result.hits().len(), 1);
         assert_eq!(result.hits()[0].row_id.0, 1);
         assert!((result.hits()[0].squared_l2_distance - 200.0).abs() < f32::EPSILON);
+    }
+
+    #[cfg(feature = "test-fault-injection")]
+    #[test]
+    fn identical_filtered_vector_searches_reuse_one_filter_row_file_read() {
+        use crate::{
+            Comparison, ComparisonOperator, FilterExpression, FilterLiteral, VectorHydration,
+            VectorSearchRequest,
+        };
+        use strata_storage::datafile::test_support::{ProjectedRead, record_projected_reads};
+
+        let (_temp, dataset, _schema) = vector_query_dataset(&[
+            ("near-but-filtered", false, Some([0.0, 0.0])),
+            ("far-and-selected", true, Some([10.0, 10.0])),
+        ]);
+        let snapshot = dataset.snapshot();
+        let request = VectorSearchRequest {
+            vector_column: "vector".into(),
+            query: vec![0.0, 0.0],
+            k: 4,
+            filter: Some(FilterExpression::Compare(Comparison {
+                column: "selected".into(),
+                operator: ComparisonOperator::Equal,
+                value: FilterLiteral::Boolean(true),
+            })),
+            hydration: VectorHydration::NotRequested,
+        };
+        let accounting = record_projected_reads();
+
+        let first = snapshot.vector_search_query(&request).unwrap();
+        let second = snapshot.vector_search_query(&request).unwrap();
+
+        assert_eq!(first.hits(), second.hits());
+        assert_eq!(
+            accounting.projected_reads(),
+            vec![ProjectedRead::new(["selected", "_row_id"])],
+            "identical filtered vector searches must read their filter row file once"
+        );
+    }
+
+    #[cfg(feature = "test-fault-injection")]
+    #[test]
+    fn distinct_filtered_vector_searches_do_not_collide_in_the_live_set_cache() {
+        use crate::{
+            Comparison, ComparisonOperator, FilterExpression, FilterLiteral, VectorHydration,
+            VectorSearchRequest,
+        };
+        use strata_storage::datafile::test_support::record_projected_reads;
+
+        let (_temp, dataset, _schema) = vector_query_dataset(&[
+            ("not-selected", false, Some([0.0, 0.0])),
+            ("selected", true, Some([10.0, 10.0])),
+        ]);
+        let snapshot = dataset.snapshot();
+        let request = |selected| VectorSearchRequest {
+            vector_column: "vector".into(),
+            query: vec![0.0, 0.0],
+            k: 2,
+            filter: Some(FilterExpression::Compare(Comparison {
+                column: "selected".into(),
+                operator: ComparisonOperator::Equal,
+                value: FilterLiteral::Boolean(selected),
+            })),
+            hydration: VectorHydration::NotRequested,
+        };
+        let accounting = record_projected_reads();
+
+        let selected = snapshot.vector_search_query(&request(true)).unwrap();
+        let not_selected = snapshot.vector_search_query(&request(false)).unwrap();
+        let selected_again = snapshot.vector_search_query(&request(true)).unwrap();
+
+        assert_eq!(selected.hits()[0].row_id.0, 1);
+        assert_eq!(not_selected.hits()[0].row_id.0, 0);
+        assert_eq!(selected.hits(), selected_again.hits());
+        assert_eq!(
+            accounting.projected_reads().len(),
+            2,
+            "distinct filters must compute independently while an identical filter stays warm"
+        );
+    }
+
+    #[cfg(feature = "test-fault-injection")]
+    #[test]
+    fn a_failed_filtered_vector_live_set_compute_is_retried_after_the_row_file_returns() {
+        use crate::{
+            Comparison, ComparisonOperator, FilterExpression, FilterLiteral, VectorHydration,
+            VectorSearchRequest,
+        };
+
+        let (temp, dataset, _schema) =
+            vector_query_dataset(&[("selected", true, Some([0.0, 0.0]))]);
+        let snapshot = dataset.snapshot();
+        let file = snapshot.data_files()[0].name.clone();
+        let file_path = temp.path().join("dataset").join("data").join(&file);
+        let hidden_path = temp.path().join("hidden-filter.arrow");
+        let request = VectorSearchRequest {
+            vector_column: "vector".into(),
+            query: vec![0.0, 0.0],
+            k: 1,
+            filter: Some(FilterExpression::Compare(Comparison {
+                column: "selected".into(),
+                operator: ComparisonOperator::Equal,
+                value: FilterLiteral::Boolean(true),
+            })),
+            hydration: VectorHydration::NotRequested,
+        };
+
+        std::fs::rename(&file_path, &hidden_path).unwrap();
+        assert!(snapshot.vector_search_query(&request).is_err());
+        std::fs::rename(&hidden_path, &file_path).unwrap();
+
+        let retry = snapshot.vector_search_query(&request).unwrap();
+        assert_eq!(retry.hits().len(), 1);
+        assert_eq!(retry.hits()[0].row_id.0, 0);
     }
 
     #[test]
