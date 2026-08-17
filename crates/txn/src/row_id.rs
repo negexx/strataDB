@@ -265,6 +265,61 @@ mod tests {
     }
 
     #[test]
+    fn claim_starts_at_a_durable_high_water_above_its_in_memory_seed() {
+        let dir = allocator_dir("durable-floor");
+        strata_storage::persist_row_id_high_water_at_least(&dir, 41).unwrap();
+        let allocator = RowIdAllocator::new(&dir, 7);
+
+        let claimed = allocator.claim(2).unwrap();
+
+        assert_eq!(claimed, RowIdRange { base: 41, len: 2 });
+        assert_eq!(allocator.next_row_id(), 43);
+        assert_eq!(
+            strata_storage::read_row_id_high_water(&dir).unwrap(),
+            Some(43)
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn new_with_storage_claims_from_the_durable_high_water_floor() {
+        let dir = allocator_dir("durable-floor-with-storage");
+        let storage = std::sync::Arc::new(strata_storage::StorageOwner::local(&dir));
+        assert_eq!(
+            strata_storage::persist_row_id_high_water_at_least_with(storage.as_ref(), 41).unwrap(),
+            41
+        );
+        let allocator = RowIdAllocator::new_with_storage(std::sync::Arc::clone(&storage), 7);
+
+        let claimed = allocator.claim(2).unwrap();
+
+        assert_eq!(claimed, RowIdRange { base: 41, len: 2 });
+        assert_eq!(allocator.next_row_id(), 43);
+        assert_eq!(
+            strata_storage::read_row_id_high_water_with(storage.as_ref()).unwrap(),
+            Some(43)
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn claim_returns_the_exact_nonempty_range_and_advances_the_allocator() {
+        let dir = allocator_dir("exact-range");
+        let allocator = RowIdAllocator::new(&dir, 17);
+
+        let claimed = allocator.claim(3).unwrap();
+
+        assert_eq!(claimed, RowIdRange { base: 17, len: 3 });
+        assert_ne!(claimed.len(), 0, "a successful claim must be nonempty");
+        assert_eq!(allocator.next_row_id(), 20);
+        assert_eq!(
+            strata_storage::read_row_id_high_water(&dir).unwrap(),
+            Some(20)
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn a_claim_that_would_overflow_is_rejected_without_consuming_row_ids() {
         let dir = allocator_dir("overflow");
         let allocator = RowIdAllocator::new(&dir, u64::MAX - 1);

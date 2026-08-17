@@ -65,6 +65,31 @@ fn vacuum_preserves_unknown_dotfiles() {
 }
 
 #[test]
+fn vacuum_preserves_temporary_looking_names_without_canonical_numeric_prefixes() {
+    // Break caught: accepting partial numeric matches grants deletion
+    // authority over user files that merely resemble Strata temporaries.
+    let directory = temp_dataset("malformed-temporary-names");
+    let dataset = Dataset::create(directory.path(), mvp_schema()).unwrap();
+    let non_numeric_process_id = dataset.data_dir().join(".tmp-x-0-user.data");
+    let non_numeric_counter = dataset.data_dir().join(".tmp-123-x-user.data");
+    let padded_process_id = dataset.data_dir().join(".tmp-00123-0-user.data");
+    let padded_counter = dataset.data_dir().join(".tmp-123-000-user.data");
+    std::fs::write(&non_numeric_process_id, b"user data").unwrap();
+    std::fs::write(&non_numeric_counter, b"user data").unwrap();
+    std::fs::write(&padded_process_id, b"user data").unwrap();
+    std::fs::write(&padded_counter, b"user data").unwrap();
+
+    let report = dataset.vacuum().unwrap();
+
+    assert_eq!(report.objects_deleted, 0);
+    assert_eq!(report.bytes_deleted, 0);
+    assert!(non_numeric_process_id.exists());
+    assert!(non_numeric_counter.exists());
+    assert!(padded_process_id.exists());
+    assert!(padded_counter.exists());
+}
+
+#[test]
 fn vacuum_preserves_active_snapshot_objects() {
     let directory = temp_dataset("snapshot");
     let dataset = Dataset::create(directory.path(), mvp_schema()).unwrap();

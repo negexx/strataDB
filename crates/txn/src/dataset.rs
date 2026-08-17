@@ -3690,7 +3690,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use arrow::array::{Int64Array, RecordBatchOptions};
+    use arrow::array::{ArrayRef, Int64Array, RecordBatchOptions, UInt64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use strata_storage::{Backend, LocalFs, read_batch};
 
@@ -4420,6 +4420,319 @@ mod tests {
         }
     }
 
+    fn physical_batch(
+        logical_field: Field,
+        logical_values: ArrayRef,
+        row_id_field: Field,
+        row_id_values: ArrayRef,
+        timestamp_field: Field,
+        timestamp_values: ArrayRef,
+        metadata: HashMap<String, String>,
+    ) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new_with_metadata(
+                vec![logical_field, row_id_field, timestamp_field],
+                metadata,
+            )),
+            vec![logical_values, row_id_values, timestamp_values],
+        )
+        .unwrap()
+    }
+
+    fn assert_exact_corrupt_catalog(
+        error: TxnError,
+        dir: &Path,
+        version: u64,
+        expected_reason: &str,
+    ) {
+        match error {
+            TxnError::Storage(strata_storage::StorageError::CorruptManifest(path, reason)) => {
+                assert_eq!(
+                    path,
+                    dir.join("_versions")
+                        .join(format!("{version:020}.manifest"))
+                );
+                assert_eq!(reason, expected_reason);
+            }
+            other => panic!("expected CorruptManifest, got {other}"),
+        }
+    }
+
+    #[test]
+    fn physical_schema_validation_rejects_schema_metadata_that_differs_from_the_logical_schema() {
+        // Break caught: removing the physical-vs-logical schema metadata
+        // guard would let this otherwise valid physical representation pass.
+        let dir = Path::new("physical-schema-metadata-validation");
+        let manifest = Manifest {
+            version: 7,
+            ..Manifest::empty()
+        };
+        let logical_schema = Arc::new(Schema::new_with_metadata(
+            vec![Field::new("id", DataType::Int64, false)],
+            HashMap::from([("owner".to_owned(), "logical".to_owned())]),
+        ));
+        let batch = physical_batch(
+            Field::new("id", DataType::Int64, false),
+            Arc::new(Int64Array::from(vec![1, 2])),
+            Field::new(ROW_ID_COLUMN, DataType::UInt64, false),
+            Arc::new(UInt64Array::from(vec![0, 1])),
+            Field::new(TIMESTAMP_COLUMN, DataType::Int64, false),
+            Arc::new(Int64Array::from(vec![9, 9])),
+            HashMap::from([("owner".to_owned(), "physical".to_owned())]),
+        );
+
+        let error = validate_physical_batch_schema(
+            dir,
+            &manifest,
+            &logical_schema,
+            &batch,
+            "schema-metadata.arrow",
+        )
+        .expect_err("physical schema metadata must exactly preserve logical schema metadata");
+
+        assert_exact_corrupt_catalog(
+            error,
+            dir,
+            manifest.version,
+            "data file schema-metadata.arrow does not preserve owned schema metadata",
+        );
+    }
+
+    #[test]
+    fn physical_schema_validation_rejects_a_missing_field_when_all_remaining_fields_are_valid() {
+        // Break caught: without the expected-length guard, the later zips
+        // validate `id` and `_row_id` then silently accept the missing
+        // `_timestamp` field.
+        let dir = Path::new("physical-schema-field-count-validation");
+        let manifest = Manifest {
+            version: 7,
+            ..Manifest::empty()
+        };
+        let logical_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new(ROW_ID_COLUMN, DataType::UInt64, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(UInt64Array::from(vec![0, 1])),
+            ],
+        )
+        .unwrap();
+
+        let error = validate_physical_batch_schema(
+            dir,
+            &manifest,
+            &logical_schema,
+            &batch,
+            "missing-timestamp.arrow",
+        )
+        .expect_err("a physical batch missing one field must be rejected before zip validation");
+
+        assert_exact_corrupt_catalog(
+            error,
+            dir,
+            manifest.version,
+            "data file missing-timestamp.arrow has 2 schema fields; expected 3",
+        );
+    }
+
+    #[test]
+    fn physical_schema_validation_rejects_each_owned_field_mismatch() {
+        let dir = Path::new("physical-schema-validation");
+        let manifest = Manifest {
+            version: 7,
+            ..Manifest::empty()
+        };
+        let field_metadata = HashMap::from([("semantic_type".to_owned(), "identifier".to_owned())]);
+        let schema_metadata = HashMap::from([("owner".to_owned(), "dataset".to_owned())]);
+        let logical_field =
+            Field::new("id", DataType::Int64, false).with_metadata(field_metadata.clone());
+        let logical_schema = Arc::new(Schema::new_with_metadata(
+            vec![logical_field.clone()],
+            schema_metadata.clone(),
+        ));
+        let row_ids: ArrayRef = Arc::new(UInt64Array::from(vec![0, 1]));
+        let timestamps: ArrayRef = Arc::new(Int64Array::from(vec![9, 9]));
+
+        let owned_field_cases: Vec<(&str, Field, ArrayRef)> = vec![
+            (
+                "name",
+                Field::new("renamed", DataType::Int64, false).with_metadata(field_metadata.clone()),
+                Arc::new(Int64Array::from(vec![1, 2])),
+            ),
+            (
+                "nullability",
+                Field::new("id", DataType::Int64, true).with_metadata(field_metadata.clone()),
+                Arc::new(Int64Array::from(vec![1, 2])),
+            ),
+            (
+                "metadata",
+                Field::new("id", DataType::Int64, false).with_metadata(HashMap::new()),
+                Arc::new(Int64Array::from(vec![1, 2])),
+            ),
+            (
+                "type",
+                Field::new("id", DataType::Int32, false).with_metadata(field_metadata.clone()),
+                Arc::new(arrow::array::Int32Array::from(vec![1, 2])),
+            ),
+        ];
+        for (label, stored_field, values) in owned_field_cases {
+            let batch = physical_batch(
+                stored_field,
+                values,
+                Field::new(ROW_ID_COLUMN, DataType::UInt64, false),
+                Arc::clone(&row_ids),
+                Field::new(TIMESTAMP_COLUMN, DataType::Int64, false),
+                Arc::clone(&timestamps),
+                schema_metadata.clone(),
+            );
+            let error = validate_physical_batch_schema(
+                dir,
+                &manifest,
+                &logical_schema,
+                &batch,
+                "owned.arrow",
+            )
+            .expect_err(&format!("a changed owned field {label} must be rejected"));
+            assert_exact_corrupt_catalog(
+                error,
+                dir,
+                manifest.version,
+                "data file owned.arrow does not preserve owned field \"id\"",
+            );
+        }
+    }
+
+    #[test]
+    fn physical_schema_validation_rejects_each_hidden_column_mismatch() {
+        let dir = Path::new("physical-hidden-schema-validation");
+        let manifest = Manifest {
+            version: 7,
+            ..Manifest::empty()
+        };
+        let logical_field = Field::new("id", DataType::Int64, false);
+        let logical_schema = Arc::new(Schema::new(vec![logical_field.clone()]));
+        let row_ids: ArrayRef = Arc::new(UInt64Array::from(vec![0, 1]));
+        let timestamps: ArrayRef = Arc::new(Int64Array::from(vec![9, 9]));
+        let hidden_cases: Vec<(&str, Field, ArrayRef)> = vec![
+            (
+                "name",
+                Field::new("_different_row_id", DataType::UInt64, false),
+                Arc::clone(&row_ids),
+            ),
+            (
+                "type",
+                Field::new(ROW_ID_COLUMN, DataType::Int64, false),
+                Arc::new(Int64Array::from(vec![0, 1])),
+            ),
+            (
+                "nullability",
+                Field::new(ROW_ID_COLUMN, DataType::UInt64, true),
+                Arc::clone(&row_ids),
+            ),
+        ];
+        for (label, row_id_field, values) in hidden_cases {
+            let batch = physical_batch(
+                logical_field.clone(),
+                Arc::new(Int64Array::from(vec![1, 2])),
+                row_id_field,
+                values,
+                Field::new(TIMESTAMP_COLUMN, DataType::Int64, false),
+                Arc::clone(&timestamps),
+                HashMap::new(),
+            );
+            let error = validate_physical_batch_schema(
+                dir,
+                &manifest,
+                &logical_schema,
+                &batch,
+                "hidden.arrow",
+            )
+            .expect_err(&format!("a changed hidden-column {label} must be rejected"));
+            assert_exact_corrupt_catalog(
+                error,
+                dir,
+                manifest.version,
+                "data file hidden.arrow has an invalid physical _row_id column",
+            );
+        }
+    }
+
+    #[test]
+    fn physical_schema_validation_accepts_a_dictionary_encoded_timestamp() {
+        let dir = Path::new("dictionary-timestamp-schema-validation");
+        let manifest = Manifest {
+            version: 3,
+            ..Manifest::empty()
+        };
+        let logical_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let timestamp_type =
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Int64));
+        let timestamps =
+            arrow::compute::cast(&Int64Array::from(vec![7, 7]), &timestamp_type).unwrap();
+        let batch = physical_batch(
+            Field::new("id", DataType::Int64, false),
+            Arc::new(Int64Array::from(vec![1, 2])),
+            Field::new(ROW_ID_COLUMN, DataType::UInt64, false),
+            Arc::new(UInt64Array::from(vec![0, 1])),
+            Field::new(TIMESTAMP_COLUMN, timestamp_type, false),
+            timestamps,
+            HashMap::new(),
+        );
+
+        validate_physical_batch_schema(
+            dir,
+            &manifest,
+            &logical_schema,
+            &batch,
+            "dictionary-timestamp.arrow",
+        )
+        .expect("a dictionary-encoded Int64 timestamp is a valid physical representation");
+    }
+
+    #[test]
+    fn seed_write_attempt_counter_prefers_the_persisted_nonzero_value() {
+        let manifest = Manifest {
+            next_attempt_id: 41,
+            data_files: vec![fixture_data_file("99-0.arrow")],
+            ..Manifest::empty()
+        };
+
+        assert_eq!(seed_write_attempt_counter(&manifest).unwrap(), 41);
+    }
+
+    #[test]
+    fn seed_write_attempt_counter_uses_the_highest_numeric_prefix_and_ignores_malformed_names() {
+        let manifest = Manifest {
+            data_files: vec![
+                fixture_data_file("7-0.arrow"),
+                fixture_data_file("not-an-attempt"),
+                fixture_data_file("-0.arrow"),
+                fixture_data_file("18446744073709551616-0.arrow"),
+                fixture_data_file("42-3.arrow"),
+            ],
+            ..Manifest::empty()
+        };
+
+        assert_eq!(seed_write_attempt_counter(&manifest).unwrap(), 43);
+    }
+
+    #[test]
+    fn seed_write_attempt_counter_returns_exact_manifest_overflow_for_the_maximum_prefix() {
+        let manifest = Manifest {
+            data_files: vec![fixture_data_file("18446744073709551615-0.arrow")],
+            ..Manifest::empty()
+        };
+
+        assert!(matches!(
+            seed_write_attempt_counter(&manifest),
+            Err(TxnError::ManifestOverflow(message))
+                if message == "legacy attempt-id prefix 18446744073709551615 + 1"
+        ));
+    }
+
     #[test]
     fn dataset_schema_is_persisted_and_rejects_renamed_or_castable_batches() {
         let dir = temp_dir("owned-schema");
@@ -4491,6 +4804,50 @@ mod tests {
             3,
             "a zero-column projection must retain every committed row after reopen"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn compacting_rows_in_an_empty_schema_reopens_and_scans() {
+        // Break caught: changing compaction's zero-column guard from `==`
+        // to `!=` would send this nonempty zero-column logical batch through
+        // `encode_batch`, which rejects it before a replacement manifest can
+        // be published.
+        let dir = temp_dir("empty-schema-compaction");
+        let schema = Arc::new(Schema::empty());
+        let dataset = Dataset::create(&dir, Arc::clone(&schema)).unwrap();
+        let batch = RecordBatch::try_new_with_options(
+            Arc::clone(&schema),
+            Vec::new(),
+            &RecordBatchOptions::new().with_row_count(Some(3)),
+        )
+        .unwrap();
+
+        let mut transaction = dataset.begin();
+        transaction.insert(batch).unwrap();
+        transaction.commit().unwrap();
+
+        let report = dataset
+            .compact(CompactionPolicy::retain_snapshots())
+            .unwrap();
+        assert_eq!(report.source_version, 1);
+        assert_eq!(report.published_version, 2);
+        assert_eq!(report.row_files_written, 1);
+        assert_eq!(report.segments_written, 0);
+
+        let compacted = dataset.snapshot();
+        assert_eq!(compacted.manifest.version, report.published_version);
+        assert_eq!(compacted.manifest.data_files.len(), 1);
+        assert_eq!(compacted.manifest.data_files[0].row_count, 3);
+        assert!(compacted.manifest.segments.is_empty());
+        drop(compacted);
+        drop(dataset);
+
+        let reopened = Dataset::open(&dir).unwrap();
+        let scanned = reopened.snapshot().scan(&schema).unwrap();
+        assert_eq!(scanned.num_columns(), 0);
+        assert_eq!(scanned.num_rows(), 3);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -4693,6 +5050,53 @@ mod tests {
         assert!(
             matches!(error, TxnError::CorruptSegment(ref reason) if reason.contains("no row-file owner")),
             "every vector row-id must be owned by a validated data file: {error:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn recovery_returns_the_exact_corrupt_manifest_path_for_a_malformed_physical_schema() {
+        let dir = temp_dir("recovery-malformed-physical-schema");
+        let ds = Dataset::create(&dir, test_schema()).unwrap();
+        let mut txn = ds.begin();
+        txn.insert(
+            RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![7, 8]))])
+                .unwrap(),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+
+        let malformed = physical_batch(
+            Field::new("renamed", DataType::Int64, false),
+            Arc::new(Int64Array::from(vec![7, 8])),
+            Field::new(ROW_ID_COLUMN, DataType::UInt64, false),
+            Arc::new(UInt64Array::from(vec![0, 1])),
+            Field::new(TIMESTAMP_COLUMN, DataType::Int64, false),
+            Arc::new(Int64Array::from(vec![1, 1])),
+            HashMap::new(),
+        );
+        let mut corrupt = (*ds.snapshot().manifest).clone();
+        corrupt.version += 1;
+        let entry = &mut corrupt.data_files[0];
+        let metadata =
+            strata_storage::datafile::write_batch(&ds.data_dir().join(&entry.name), &malformed)
+                .unwrap();
+        entry.byte_len = metadata.byte_len;
+        entry.crc32c = metadata.crc32c;
+        commit_manifest(&dir, &corrupt).unwrap();
+
+        let Err(error) = Dataset::open(&dir) else {
+            panic!("recovery must route malformed physical schemas through CorruptManifest");
+        };
+        assert_exact_corrupt_catalog(
+            error,
+            &dir,
+            corrupt.version,
+            &format!(
+                "data file {} does not preserve owned field \"id\"",
+                corrupt.data_files[0].name
+            ),
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -5029,6 +5433,48 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn recovery_rejects_each_segment_row_id_range_endpoint_mismatch() {
+        for endpoint in ["minimum", "maximum"] {
+            let dir = temp_dir(&format!("recovery-segment-row-id-{endpoint}"));
+            let ds = Dataset::create(&dir, vector_test_schema()).unwrap();
+            let mut txn = ds.begin();
+            txn.insert(vector_batch(
+                vec![1, 2],
+                vec![[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]],
+            ))
+            .unwrap();
+            txn.commit().unwrap();
+
+            let mut corrupt = (*ds.snapshot().manifest).clone();
+            corrupt.version += 1;
+            let entry = &mut corrupt.segments[0];
+            let (actual_min, actual_max) = (entry.row_id_min, entry.row_id_max);
+            match endpoint {
+                "minimum" => entry.row_id_min += 1,
+                "maximum" => entry.row_id_max -= 1,
+                _ => unreachable!("the endpoint matrix is closed"),
+            }
+            let expected_reason = format!(
+                "segment {} has row-id range [{actual_min}, {actual_max}] on disk but the manifest records [{}, {}]",
+                entry.name, entry.row_id_min, entry.row_id_max
+            );
+            commit_manifest(&dir, &corrupt).unwrap();
+
+            let Err(error) = Dataset::open(&dir) else {
+                panic!(
+                    "a manifest segment whose row-id range endpoint disagrees with its bytes must be rejected"
+                );
+            };
+            assert!(matches!(
+                error,
+                TxnError::CorruptSegment(reason) if reason == expected_reason
+            ));
+
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 
     #[test]
@@ -5588,6 +6034,53 @@ mod tests {
             result.err()
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn open_accepts_the_exact_row_id_capacity_and_rejects_one_more() {
+        let accepted_dir = temp_dir("maximum-row-id-capacity");
+        let accepted = Manifest {
+            version: 0,
+            schema_version: Some(strata_storage::INITIAL_SCHEMA_VERSION),
+            schema_ipc: Manifest::empty_with_schema(test_schema().as_ref()).schema_ipc,
+            data_files: Vec::new(),
+            next_row_id: MAX_REASONABLE_ROW_ID_CAPACITY,
+            tombstones: Vec::new(),
+            next_attempt_id: 0,
+            commit_time_high_water: 0,
+            committed_at_us: 0,
+            segments: Vec::new(),
+        };
+        strata_storage::initialize_row_id_high_water(&accepted_dir).unwrap();
+        strata_storage::commit_manifest(&accepted_dir, &accepted).unwrap();
+
+        let reopened = Dataset::open(&accepted_dir)
+            .expect("the documented maximum row-id capacity must remain openable");
+        assert_eq!(
+            reopened.snapshot().manifest.next_row_id,
+            MAX_REASONABLE_ROW_ID_CAPACITY
+        );
+
+        let rejected_dir = temp_dir("over-maximum-row-id-capacity");
+        let rejected = Manifest {
+            next_row_id: MAX_REASONABLE_ROW_ID_CAPACITY + 1,
+            ..accepted
+        };
+        strata_storage::initialize_row_id_high_water(&rejected_dir).unwrap();
+        strata_storage::commit_manifest(&rejected_dir, &rejected).unwrap();
+
+        let Err(error) = Dataset::open(&rejected_dir) else {
+            panic!("a row-id capacity one past the documented maximum must be rejected");
+        };
+        assert!(matches!(
+            error,
+            TxnError::UnreasonableCapacity(actual, maximum)
+                if actual == MAX_REASONABLE_ROW_ID_CAPACITY + 1
+                    && maximum == MAX_REASONABLE_ROW_ID_CAPACITY
+        ));
+
+        std::fs::remove_dir_all(&accepted_dir).ok();
+        std::fs::remove_dir_all(&rejected_dir).ok();
     }
 
     #[test]
@@ -6527,6 +7020,48 @@ mod tests {
     }
 
     #[test]
+    fn multi_batch_commit_merges_utf8_zone_map_extrema_from_later_batches() {
+        // Break caught: dropping the Utf8 merge arm, or changing either
+        // comparison, loses an extreme that exists only after the first
+        // batch.
+        let dir = temp_dir("zone-map-multi-batch-utf8-merge");
+        let ds = Dataset::create(&dir, zone_map_test_schema()).unwrap();
+
+        let mut txn = ds.begin();
+        txn.insert(zone_map_batch(
+            vec![50, 60],
+            vec!["middle-a", "middle-b"],
+            cluster_vectors(2, [0.0, 0.0, 0.0], 0.01),
+        ))
+        .unwrap();
+        txn.insert(zone_map_batch(
+            vec![10, 55],
+            vec!["alpha", "middle-c"],
+            cluster_vectors(2, [100.0, 100.0, 100.0], 0.01),
+        ))
+        .unwrap();
+        txn.insert(zone_map_batch(
+            vec![90, 45],
+            vec!["omega", "middle-d"],
+            cluster_vectors(2, [200.0, 200.0, 200.0], 0.01),
+        ))
+        .unwrap();
+        txn.commit().unwrap();
+
+        let zone_map = &ds.snapshot().manifest.segments[0].zone_map;
+        assert_eq!(
+            zone_map.get("category"),
+            Some(&ColumnStats {
+                min: Value::Utf8("alpha".to_owned()),
+                max: Value::Utf8("omega".to_owned()),
+            }),
+            "the later batches exclusively own the UTF-8 extrema: {zone_map:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn multi_batch_commit_merges_float64_zone_map_across_every_batch() {
         // Analogous to
         // `multi_batch_commit_merges_zone_map_across_every_batch_not_just_the_first`
@@ -6734,6 +7269,146 @@ mod tests {
         assert_eq!(
             &zone_map_before, zone_map_after,
             "the zone map computed at commit time must round-trip through Dataset::open unchanged"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn compaction_merges_utf8_zone_map_when_the_first_source_file_owns_the_minimum() {
+        // Break caught: treating any source file other than index zero as the
+        // initial zone map drops the first file's unique UTF-8 minimum.
+        let dir = temp_dir("compaction-zone-map-first-utf8-extreme");
+        let ds = Dataset::create(&dir, zone_map_test_schema()).unwrap();
+
+        for (id, category, center) in [
+            (1, "alpha", [0.0, 0.0, 0.0]),
+            (2, "middle", [100.0, 100.0, 100.0]),
+            (3, "omega", [200.0, 200.0, 200.0]),
+        ] {
+            let mut txn = ds.begin();
+            txn.insert(zone_map_batch(
+                vec![id],
+                vec![category],
+                cluster_vectors(1, center, 0.01),
+            ))
+            .unwrap();
+            txn.commit().unwrap();
+        }
+
+        ds.compact(CompactionPolicy::retain_snapshots()).unwrap();
+
+        let snapshot = ds.snapshot();
+        assert_eq!(snapshot.manifest.segments.len(), 1);
+        assert_eq!(
+            snapshot.manifest.segments[0].zone_map.get("category"),
+            Some(&ColumnStats {
+                min: Value::Utf8("alpha".to_owned()),
+                max: Value::Utf8("omega".to_owned()),
+            }),
+            "compaction must merge the first source file before widening with later files"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dataset_segment_info_exactly_describes_a_committed_vector_segment() {
+        // Break caught: returning an empty facade result (or stale metadata)
+        // hides an immutable segment that the vector commit durably listed.
+        let dir = temp_dir("dataset-segment-info-vector-commit");
+        let ds = Dataset::create(&dir, vector_test_schema()).unwrap();
+        let mut txn = ds.begin();
+        txn.insert(vector_batch(
+            vec![41, 42],
+            vec![[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]],
+        ))
+        .unwrap();
+        txn.commit().unwrap();
+
+        let committed = &ds.snapshot().manifest.segments;
+        assert_eq!(
+            committed.len(),
+            1,
+            "the vector commit must list one segment"
+        );
+        let entry = &committed[0];
+        assert!(!entry.name.is_empty());
+        assert!(entry.byte_len > 0);
+        assert_eq!(entry.vector_count, 2);
+        assert_eq!(entry.dimension, 3);
+        assert_eq!((entry.row_id_min, entry.row_id_max), (0, 1));
+
+        let info = ds.segment_info();
+        assert_eq!(
+            info.len(),
+            1,
+            "the facade must expose the committed segment"
+        );
+        let info = &info[0];
+        assert_eq!(info.name, entry.name);
+        assert_eq!(info.format_version, entry.format_version);
+        assert_eq!(info.vector_count, entry.vector_count);
+        assert_eq!(info.dimension, entry.dimension);
+        assert_eq!(info.row_id_min, entry.row_id_min);
+        assert_eq!(info.row_id_max, entry.row_id_max);
+        assert_eq!(info.byte_len, entry.byte_len);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn compaction_preserves_a_historical_row_file_without_a_segment() {
+        // Break caught: a deletion predicate that protects only segment names
+        // can reclaim a scalar snapshot's sole row file.
+        let dir = temp_dir("compaction-protect-row-file-only");
+        let ds = Dataset::create(&dir, test_schema()).unwrap();
+        let mut txn = ds.begin();
+        txn.insert(
+            RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![7]))]).unwrap(),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+        let historical = ds.snapshot();
+        let protected = ds.data_dir().join(&historical.manifest.data_files[0].name);
+        assert!(historical.manifest.segments.is_empty());
+
+        ds.compact(CompactionPolicy::retain_snapshots()).unwrap();
+
+        assert!(
+            protected.is_file(),
+            "compaction must retain the row-only historical snapshot object"
+        );
+        assert_eq!(historical.scan(&test_schema()).unwrap().num_rows(), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn compaction_preserves_a_historical_segment_file_independently_of_its_row_file() {
+        // Break caught: a deletion predicate that protects only row-file
+        // names can reclaim a historical immutable vector segment.
+        let dir = temp_dir("compaction-protect-segment-only");
+        let ds = Dataset::create(&dir, vector_test_schema()).unwrap();
+        let mut txn = ds.begin();
+        txn.insert(vector_batch(vec![7], vec![[7.0, 0.0, 0.0]]))
+            .unwrap();
+        txn.commit().unwrap();
+        let historical = ds.snapshot();
+        let protected = ds.data_dir().join(&historical.manifest.segments[0].name);
+
+        ds.compact(CompactionPolicy::retain_snapshots()).unwrap();
+
+        assert!(
+            protected.is_file(),
+            "compaction must retain the segment-only historical snapshot object"
+        );
+        assert_eq!(
+            historical
+                .vector_search(&[7.0, 0.0, 0.0], 1, None)
+                .unwrap()
+                .len(),
+            1
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -7674,11 +8349,19 @@ mod tests {
 
         let mut manifest_a = ds_a.snapshot().manifest.as_ref().clone();
         manifest_a.version += 1;
+        let established_dimension = manifest_a.segments[0].dimension;
+        let expected_reason = format!(
+            "segment {} has dimension {} but an earlier segment in this manifest already established dimension {established_dimension}",
+            foreign_entry.name, foreign_entry.dimension
+        );
         manifest_a.segments.push(foreign_entry);
         strata_storage::commit_manifest(&dir_a, &manifest_a).unwrap();
 
         match Dataset::open(&dir_a) {
-            Err(TxnError::CorruptSegment(_)) => {}
+            Err(TxnError::CorruptSegment(reason)) if reason == expected_reason => {}
+            Err(TxnError::CorruptSegment(reason)) => {
+                panic!("expected exact CorruptSegment reason {expected_reason:?}, got {reason:?}")
+            }
             Err(other) => panic!("expected CorruptSegment, got a different error: {other}"),
             Ok(_) => panic!(
                 "open must not succeed against a manifest whose segments disagree on dimension"
@@ -8782,9 +9465,14 @@ mod tests {
         failing.inject_manifest_commit_failure();
         let failing_result = failing.commit();
         assert!(
-            failing_result.is_err(),
-            "the injected manifest-commit failure must make T1 fail, else this \
-             test proves nothing: {failing_result:?}"
+            matches!(
+                &failing_result,
+                Err(TxnError::Io(source))
+                    if source.kind() == std::io::ErrorKind::Other
+                        && source.to_string() == "injected manifest-commit failure (test fault injection)"
+            ),
+            "the injected manifest-commit failure must return its expected typed I/O error: \
+             {failing_result:?}"
         );
         assert_eq!(
             ds.snapshot().version,
@@ -8878,9 +9566,16 @@ mod tests {
             )
             .unwrap();
         abandoned.inject_manifest_commit_failure();
+        let abandoned_result = abandoned.commit();
         assert!(
-            abandoned.commit().is_err(),
-            "the injected manifest failure must abandon a claimed range"
+            matches!(
+                &abandoned_result,
+                Err(TxnError::Io(source))
+                    if source.kind() == std::io::ErrorKind::Other
+                        && source.to_string() == "injected manifest-commit failure (test fault injection)"
+            ),
+            "the injected manifest failure must return its expected typed I/O error: \
+             {abandoned_result:?}"
         );
         drop(ds);
 
@@ -8930,7 +9625,17 @@ mod tests {
             ))
             .unwrap();
         abandoned.inject_manifest_commit_failure();
-        assert!(abandoned.commit().is_err());
+        let abandoned_result = abandoned.commit();
+        assert!(
+            matches!(
+                &abandoned_result,
+                Err(TxnError::Io(source))
+                    if source.kind() == std::io::ErrorKind::Other
+                        && source.to_string() == "injected manifest-commit failure (test fault injection)"
+            ),
+            "the injected manifest failure must return its expected typed I/O error: \
+             {abandoned_result:?}"
+        );
         assert_eq!(ds.current_version(), 1);
 
         ds.migrate_schema(&SchemaMigration::add_nullable_column(
@@ -9388,9 +10093,14 @@ mod tests {
         // (a)
         let result = failing.commit();
         assert!(
-            result.is_err(),
-            "the injected manifest-commit failure must make this commit fail, \
-             else this test proves nothing: {result:?}"
+            matches!(
+                &result,
+                Err(TxnError::Io(source))
+                    if source.kind() == std::io::ErrorKind::Other
+                        && source.to_string() == "injected manifest-commit failure (test fault injection)"
+            ),
+            "the injected manifest-commit failure must return its expected typed I/O error: \
+             {result:?}"
         );
 
         assert_failed_commit_left_no_trace(
@@ -9761,6 +10471,7 @@ mod tests {
 #[cfg(loom)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod loom_tests {
+    use crate::TxnError;
     use std::sync::Arc as StdArc;
 
     /// Stack for any loom thread that runs a full `Transaction::commit`.
@@ -9819,14 +10530,17 @@ mod loom_tests {
     /// assert inside loom, so a commit that only needs the stack — not the
     /// concurrency — still costs a hard-capped slot.
     ///
-    /// **Two models use explicit preemption bounds rather than the default
-    /// environment setting:** Model 3 above races two full
-    /// `Transaction::commit`s across 4 threads and, unbounded, exhausts the
-    /// machine's commit charge before it finishes; it uses
-    /// `preemption_bound = Some(3)`. The compact semantic publication model
-    /// below uses `Some(2)`, the smallest measured bound that reaches its
-    /// required four states; its fixed state machine is deliberately kept
-    /// separate from Model 3's full-stack resource limitation. All remaining
+    /// **Four models use explicit preemption bounds rather than the default
+    /// environment setting:** `transaction_read_overlay_stays_private_while_disjoint_and_contested_writes_commit`
+    /// uses `Some(2)` for its reader-before/after-publish and contested-write
+    /// orderings; the compact semantic publication model below uses `Some(2)`,
+    /// the smallest measured bound that reaches its required four states; and
+    /// the third bounded model,
+    /// `a_failed_commits_segment_is_never_searchable_under_concurrent_commits`,
+    /// uses `Some(3)`. Prior runs at bounds 1, 2, and 3 took ~2.04s, ~13.81s,
+    /// and ~58.65s; subsequent bound-3 runs took ~59.50s, ~79.06s, and ~81.03s.
+    /// Bound 3 is finite to avoid unbounded Windows resource exhaustion. Model 3 below also uses
+    /// `Some(3)` for its separate full-stack resource limitation. All remaining
     /// models run through `loom::model(...)` with the environment's default.
     /// See each bounded test's own comment for its evidence.
     ///
@@ -10297,11 +11011,17 @@ mod loom_tests {
 
     #[test]
     fn a_failed_commits_segment_is_never_searchable_under_concurrent_commits() {
+        // This aggregate witness records both orders in which the two returned
+        // commit outcomes are observed after `commit()` returns. It does not
+        // observe internal commit progress or commit-lock acquisition order.
+        static POST_COMMIT_OBSERVATION_ORDERS_OBSERVED: std::sync::atomic::AtomicU8 =
+            std::sync::atomic::AtomicU8::new(0);
+
         // The interleaving counterpart to
         // `dataset::tests::a_failed_commits_vector_is_never_searchable_after_a_later_commit_advances_the_row_id_counter`.
         // That test fixes the order (fail, then commit); this one lets loom
-        // explore every order in which a *failing* committer and a
-        // *succeeding* committer reach and release the commit lock.
+        // explore the relevant interleavings between a *failing* committer and
+        // a *succeeding* committer.
         //
         // **Why this needs a seed commit.** Without a vector-carrying commit
         // that lands before the racing pair, the snapshot's `SegmentSet` has
@@ -10349,11 +11069,14 @@ mod loom_tests {
         //
         // Deliberately minimal otherwise: only the failing transaction
         // inserts a vector beyond the seed (one HNSW node), and the
-        // concurrent committer uses a vector-free batch. `loom::model`
-        // re-runs this closure once per interleaving, and every run does
-        // real filesystem I/O, so keeping per-run work down is what makes
-        // the model tractable.
-        loom::model(|| {
+        // concurrent committer uses a vector-free batch. Prior runs at bounds
+        // 1, 2, and 3 took ~2.04s, ~13.81s, and ~58.65s; subsequent bound-3
+        // runs took ~59.50s, ~79.06s, and ~81.03s. Bound 3 is finite and
+        // selected to avoid unbounded Windows resource exhaustion.
+        POST_COMMIT_OBSERVATION_ORDERS_OBSERVED.store(0, std::sync::atomic::Ordering::SeqCst);
+        let mut model = loom::model::Builder::new();
+        model.preemption_bound = Some(3);
+        model.check(|| {
             let dir = tempfile::Builder::new()
                 .prefix(&format!(
                     "strata-loom-residue-{}-{:?}-",
@@ -10373,27 +11096,57 @@ mod loom_tests {
 
             let ds_failing = ds.clone();
             let ds_ok = ds.clone();
+            let post_commit_observation = StdArc::new(loom::sync::atomic::AtomicU8::new(0));
 
+            let failing_post_commit_observation = StdArc::clone(&post_commit_observation);
             let failing = spawn_committer(move || {
                 let mut txn = ds_failing.begin();
                 txn.insert(loom_vector_batch(1, &[900.0, 900.0, 900.0]))
                     .unwrap();
                 txn.inject_manifest_commit_failure();
-                txn.commit()
+                let result = txn.commit();
+                let _ = failing_post_commit_observation.compare_exchange(
+                    0,
+                    0b01,
+                    loom::sync::atomic::Ordering::SeqCst,
+                    loom::sync::atomic::Ordering::SeqCst,
+                );
+                result
             });
+            let succeeding_post_commit_observation = StdArc::clone(&post_commit_observation);
             let succeeding = spawn_committer(move || {
                 let mut txn = ds_ok.begin();
                 txn.insert(loom_plain_batch(2)).unwrap();
-                txn.commit()
+                let result = txn.commit();
+                let _ = succeeding_post_commit_observation.compare_exchange(
+                    0,
+                    0b10,
+                    loom::sync::atomic::Ordering::SeqCst,
+                    loom::sync::atomic::Ordering::SeqCst,
+                );
+                result
             });
 
+            let failing_result = failing.join().unwrap();
             assert!(
-                failing.join().unwrap().is_err(),
-                "the injected manifest-commit failure must make this commit fail"
+                matches!(
+                    &failing_result,
+                    Err(TxnError::Io(source))
+                        if source.kind() == std::io::ErrorKind::Other
+                            && source.to_string()
+                                == "injected manifest-commit failure (test fault injection)"
+                ),
+                "the injected manifest-commit failure must return its expected typed I/O error: \
+                 {failing_result:?}"
             );
+            let succeeding_result = succeeding.join().unwrap();
             assert!(
-                succeeding.join().unwrap().is_ok(),
+                succeeding_result.is_ok(),
                 "an insert-only transaction has an empty write-set and cannot conflict"
+            );
+            POST_COMMIT_OBSERVATION_ORDERS_OBSERVED.fetch_or(
+                post_commit_observation.load(loom::sync::atomic::Ordering::SeqCst),
+                std::sync::atomic::Ordering::SeqCst,
             );
 
             // Exercises the row-id allocator's continued progress after a
@@ -10446,9 +11199,10 @@ mod loom_tests {
             );
 
             // The structural property a leaked failed-commit segment would
-            // actually violate: exactly one segment — the seed's — no
-            // matter which of the two racing committers reached
-            // `commit_lock` first, or in which order they released it. Both
+            // actually violate: exactly one segment — the seed's — in every
+            // schedule explored by this model's bounded preemption search.
+            // The post-commit witness below records return-observation order,
+            // not internal `commit_lock` acquisition or release order. Both
             // `succeeding` and the final committer above are vector-free
             // and therefore publish no segment of their own (see
             // `build_and_write_segment`'s doc comment on why a vector-less
@@ -10468,6 +11222,11 @@ mod loom_tests {
 
             std::fs::remove_dir_all(&dir).ok();
         });
+        assert_eq!(
+            POST_COMMIT_OBSERVATION_ORDERS_OBSERVED.load(std::sync::atomic::Ordering::SeqCst),
+            0b11,
+            "loom must witness both post-commit observation orders: failing then succeeding, and succeeding then failing"
+        );
     }
 
     #[test]
@@ -10673,9 +11432,17 @@ mod loom_tests {
                 (snapshot.version, snapshot.index.len(), hits, segment_names)
             });
 
+            let failing_result = failing.join().unwrap();
             assert!(
-                failing.join().unwrap().is_err(),
-                "the injected manifest-commit failure must make this commit fail"
+                matches!(
+                    &failing_result,
+                    Err(TxnError::Io(source))
+                        if source.kind() == std::io::ErrorKind::Other
+                            && source.to_string()
+                                == "injected manifest-commit failure (test fault injection)"
+                ),
+                "the injected manifest-commit failure must return its expected typed I/O error: \
+                 {failing_result:?}"
             );
             let (observed_version, observed_parts, hits, segment_names) = reader.join().unwrap();
 
@@ -11036,11 +11803,12 @@ mod loom_tests {
         // Budget: root + create + committer_a + committer_b + reader = 5 of
         // loom's 5-created-threads-per-execution cap.
         //
-        // **Preemption-bounded at 3, deliberately not exhaustive -- a
-        // scoped exception for this one model.** Every other model in this
-        // module runs unbounded through `loom::model(...)` and stays that
-        // way; this is not a signal to bound them. An unbounded run of
-        // *this* model explores for ~22 minutes and then dies inside
+        // **Preemption-bounded at 3, deliberately not exhaustive.** This
+        // Model 3 gate is one of four models in this module with an explicit
+        // preemption bound; the other three document their own bounds and
+        // evidence. The unbounded-exhaustion evidence below is specific to
+        // this model. An unbounded run of *this* model explores for ~22
+        // minutes and then dies inside
         // `generator`'s stack allocator with Windows OS error 1455,
         // `ERROR_COMMITMENT_LIMIT` ("Il file di paging e' troppo piccolo
         // per essere completato" -- the paging file is too small to

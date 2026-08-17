@@ -1884,6 +1884,48 @@ mod tests {
         assert_eq!(dataset.current_version(), 2);
     }
 
+    #[test]
+    fn snapshot_version_reports_the_later_captured_commit() {
+        let (_temp, dataset) = query_test_dataset(&[("first", Some(1), true, 1)]);
+        let first = dataset.snapshot();
+
+        let mut transaction = dataset.begin();
+        transaction.delete(0).unwrap();
+        transaction.commit().unwrap();
+
+        assert_eq!(first.version(), 1);
+        assert_eq!(dataset.snapshot().version(), 2);
+    }
+
+    #[test]
+    fn snapshot_ownership_includes_only_ids_inside_committed_ranges() {
+        let (_temp, dataset) = query_test_dataset(&[("only", Some(1), true, 1)]);
+        let snapshot = dataset.snapshot();
+
+        assert!(snapshot.owns_row(0));
+        assert!(!snapshot.owns_row(1));
+    }
+
+    #[test]
+    fn logical_type_accepts_only_float32_fixed_size_vectors() {
+        use arrow::datatypes::{DataType, Field};
+
+        let float32_vector =
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 2);
+        assert!(matches!(
+            logical_type(&float32_vector),
+            Ok(LogicalType::Vector { dimensions: 2 })
+        ));
+
+        let int64_vector =
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int64, false)), 2);
+        assert!(logical_type(&int64_vector).is_err());
+
+        let float64_vector =
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float64, false)), 2);
+        assert!(logical_type(&float64_vector).is_err());
+    }
+
     fn group_by_test_dataset() -> (tempfile::TempDir, crate::Dataset, SchemaRef) {
         use crate::Dataset;
         use arrow::datatypes::{DataType, Field, Schema};
@@ -1957,6 +1999,30 @@ mod tests {
     fn a_tombstoned_row_is_not_visible() {
         let snapshot = test_snapshot(&[5]);
         assert!(!snapshot.is_visible(5));
+    }
+
+    #[test]
+    fn segment_info_lists_every_committed_vector_segment() {
+        let (_temp, dataset, schema) = vector_query_dataset(&[("first", true, Some([0.0, 1.0]))]);
+        append_vector_query_rows(
+            &dataset,
+            &schema,
+            &[
+                ("second", true, Some([1.0, 0.0])),
+                ("third", true, Some([1.0, 1.0])),
+            ],
+        );
+
+        let segments = dataset.snapshot().segment_info();
+        assert_eq!(segments.len(), 2);
+        assert_ne!(segments[0].name, segments[1].name);
+        assert_eq!(
+            segments
+                .iter()
+                .map(|segment| (segment.vector_count, segment.row_id_min, segment.row_id_max,))
+                .collect::<Vec<_>>(),
+            vec![(1, 0, 0), (2, 1, 2)]
+        );
     }
 
     #[test]
@@ -3135,6 +3201,96 @@ mod tests {
     }
 
     #[test]
+    fn filter_mask_preserves_false_arms_under_three_valued_logic() {
+        use crate::{Comparison, ComparisonOperator, FilterExpression, FilterLiteral};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("left", DataType::Boolean, true),
+            Field::new("right", DataType::Boolean, true),
+        ]));
+        let and_batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(BooleanArray::from(vec![Some(false), None])),
+                Arc::new(BooleanArray::from(vec![None, Some(false)])),
+            ],
+        )
+        .unwrap();
+        let true_comparison = |column: &str| {
+            FilterExpression::Compare(Comparison {
+                column: column.into(),
+                operator: ComparisonOperator::Equal,
+                value: FilterLiteral::Boolean(true),
+            })
+        };
+        let and_filter = FilterExpression::And(
+            Box::new(true_comparison("left")),
+            Box::new(true_comparison("right")),
+        );
+        assert_eq!(
+            filter_mask(&and_batch, &and_filter).unwrap(),
+            BooleanArray::from(vec![Some(false), Some(false)])
+        );
+
+        let or_batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(BooleanArray::from(vec![false])),
+                Arc::new(BooleanArray::from(vec![false])),
+            ],
+        )
+        .unwrap();
+        let or_filter = FilterExpression::Or(
+            Box::new(true_comparison("left")),
+            Box::new(true_comparison("right")),
+        );
+        assert_eq!(
+            filter_mask(&or_batch, &or_filter).unwrap(),
+            BooleanArray::from(vec![Some(false)])
+        );
+    }
+
+    #[test]
+    fn comparison_mask_for_respects_every_operator_at_its_boundary() {
+        use crate::ComparisonOperator;
+
+        let values = Int64Array::from(vec![Some(4), Some(5), Some(6), None]);
+        for (operator, expected) in [
+            (
+                ComparisonOperator::Equal,
+                vec![Some(false), Some(true), Some(false), None],
+            ),
+            (
+                ComparisonOperator::NotEqual,
+                vec![Some(true), Some(false), Some(true), None],
+            ),
+            (
+                ComparisonOperator::LessThan,
+                vec![Some(true), Some(false), Some(false), None],
+            ),
+            (
+                ComparisonOperator::LessThanOrEqual,
+                vec![Some(true), Some(true), Some(false), None],
+            ),
+            (
+                ComparisonOperator::GreaterThan,
+                vec![Some(false), Some(false), Some(true), None],
+            ),
+            (
+                ComparisonOperator::GreaterThanOrEqual,
+                vec![Some(false), Some(true), Some(true), None],
+            ),
+        ] {
+            assert_eq!(
+                comparison_mask_for(&&values, 5, operator),
+                BooleanArray::from(expected),
+                "{operator:?}"
+            );
+        }
+    }
+
+    #[test]
     fn row_lookup_returns_a_vectorless_live_row_in_requested_projection_order() {
         use crate::{Projection, ResultValue, RowId, RowLookupOutcome, RowLookupRequest};
 
@@ -3190,6 +3346,48 @@ mod tests {
         );
         assert_eq!(new_result.projection, vec!["title"]);
         assert_eq!(new_result.outcome, RowLookupOutcome::Tombstoned);
+    }
+
+    #[test]
+    fn row_lookup_reads_only_its_owning_file_and_reports_tombstones() {
+        use crate::{Projection, RowId, RowLookupOutcome, RowLookupRequest};
+
+        let (temp, dataset) = query_test_dataset(&[("first", Some(1), true, 1)]);
+        let appended = RecordBatch::try_new(
+            dataset.snapshot().schema(),
+            vec![
+                Arc::new(StringArray::from(vec!["second"])),
+                Arc::new(Int64Array::from(vec![Some(2)])),
+                Arc::new(BooleanArray::from(vec![true])),
+                Arc::new(UInt64Array::from(vec![2])),
+            ],
+        )
+        .unwrap();
+        let mut transaction = dataset.begin();
+        transaction.insert(appended).unwrap();
+        transaction.commit().unwrap();
+
+        let mut transaction = dataset.begin();
+        transaction.delete(1).unwrap();
+        transaction.commit().unwrap();
+
+        let snapshot = dataset.snapshot();
+        let unrelated_file = snapshot.data_files()[0].name.clone();
+        std::fs::remove_file(
+            temp.path()
+                .join("dataset")
+                .join("data")
+                .join(unrelated_file),
+        )
+        .unwrap();
+
+        let result = snapshot
+            .lookup_row(&RowLookupRequest {
+                row_id: RowId(1),
+                projection: Projection::Columns(vec!["title".into()]),
+            })
+            .unwrap();
+        assert_eq!(result.outcome, RowLookupOutcome::Tombstoned);
     }
 
     #[test]
@@ -3691,6 +3889,38 @@ mod tests {
             }),
             Err(QueryError::Execution(QueryExecutionError::Int64SumOverflow { alias })) if alias == "sum"
         ));
+    }
+
+    #[test]
+    fn aggregate_state_sum_accumulates_non_null_int64_values() {
+        let mut state = AggregateState::Int64Sum(None);
+
+        state.update(&ResultValue::Int64(2), "sum").unwrap();
+        state.update(&ResultValue::Null, "sum").unwrap();
+        state.update(&ResultValue::Int64(3), "sum").unwrap();
+
+        assert_eq!(state.finish(), ResultValue::Int64(5));
+    }
+
+    #[test]
+    fn aggregate_state_type_reports_each_state_label() {
+        let states = [
+            (AggregateState::Count(0), "Count"),
+            (AggregateState::Int64Sum(None), "Int64Sum"),
+            (AggregateState::Int64Minimum(None), "Int64Minimum"),
+            (AggregateState::Int64Maximum(None), "Int64Maximum"),
+            (AggregateState::Float64Sum(None), "Float64Sum"),
+            (AggregateState::Float64Minimum(None), "Float64Minimum"),
+            (AggregateState::Float64Maximum(None), "Float64Maximum"),
+            (
+                AggregateState::Float64Average { sum: 0.0, count: 0 },
+                "Float64Average",
+            ),
+        ];
+
+        for (state, label) in states {
+            assert_eq!(aggregate_state_type(&state), label, "{state:?}");
+        }
     }
 
     #[test]

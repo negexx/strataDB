@@ -1,7 +1,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use strata_txn::mvp_fixtures::{mvp_batch, mvp_schema};
-use strata_txn::{Dataset, LifecycleMaintenancePolicy};
+use strata_txn::{Dataset, LifecycleMaintenancePolicy, TxnError};
 
 #[test]
 fn maintenance_reduces_unprotected_history_and_reports_the_bound() {
@@ -62,4 +62,55 @@ fn maintenance_reports_when_an_active_snapshot_prevents_the_bound() {
     assert!(!report.storage_bound_met);
     assert!(report.inventory.data_object_count() > 1);
     assert_eq!(historical.scan(&mvp_schema()).unwrap().num_rows(), 1);
+}
+
+#[test]
+fn maintenance_rejects_zero_keep_latest_versions_before_mutation() {
+    let directory = tempfile::tempdir().unwrap();
+    let dataset = Dataset::create(directory.path(), mvp_schema()).unwrap();
+    let version_before = dataset.current_version();
+
+    let result = dataset.maintain(LifecycleMaintenancePolicy {
+        keep_latest_versions: 0,
+        max_age_us: 0,
+        max_data_objects: 1,
+        max_segments: 1,
+    });
+
+    assert!(matches!(result, Err(TxnError::InvalidRetentionPolicy)));
+    assert_eq!(dataset.current_version(), version_before);
+}
+
+#[test]
+fn maintenance_rejects_zero_max_data_objects_before_mutation() {
+    let directory = tempfile::tempdir().unwrap();
+    let dataset = Dataset::create(directory.path(), mvp_schema()).unwrap();
+    let version_before = dataset.current_version();
+
+    let result = dataset.maintain(LifecycleMaintenancePolicy {
+        keep_latest_versions: 1,
+        max_age_us: 0,
+        max_data_objects: 0,
+        max_segments: 1,
+    });
+
+    assert!(matches!(result, Err(TxnError::InvalidRetentionPolicy)));
+    assert_eq!(dataset.current_version(), version_before);
+}
+
+#[test]
+fn maintenance_rejects_zero_max_segments_before_mutation() {
+    let directory = tempfile::tempdir().unwrap();
+    let dataset = Dataset::create(directory.path(), mvp_schema()).unwrap();
+    let version_before = dataset.current_version();
+
+    let result = dataset.maintain(LifecycleMaintenancePolicy {
+        keep_latest_versions: 1,
+        max_age_us: 0,
+        max_data_objects: 1,
+        max_segments: 0,
+    });
+
+    assert!(matches!(result, Err(TxnError::InvalidRetentionPolicy)));
+    assert_eq!(dataset.current_version(), version_before);
 }

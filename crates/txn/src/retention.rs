@@ -258,9 +258,11 @@ pub(crate) fn build_age_manifest_prune_authority(
             continue;
         }
         let (manifest, _) = read_manifest_at_key_with_byte_count_with(&storage, &key.key, version)?;
-        if manifest.committed_at_us == 0
-            || now_us.saturating_sub(manifest.committed_at_us) < i64::try_from(policy.max_age_us)?
-        {
+        if !manifest_is_old_enough_for_age_prune(
+            manifest.committed_at_us,
+            now_us,
+            policy.max_age_us,
+        )? {
             continue;
         }
         candidates.push(ManifestPruneCandidate {
@@ -273,6 +275,17 @@ pub(crate) fn build_age_manifest_prune_authority(
         observed_version,
         candidates,
     })
+}
+
+fn manifest_is_old_enough_for_age_prune(
+    committed_at_us: i64,
+    now_us: i64,
+    max_age_us: u64,
+) -> Result<bool> {
+    Ok(
+        committed_at_us != 0
+            && now_us.saturating_sub(committed_at_us) >= i64::try_from(max_age_us)?,
+    )
 }
 
 pub(crate) fn index_manifest_objects(
@@ -450,6 +463,17 @@ mod tests {
     #[test]
     fn latest_versions_keeps_the_newest_window() {
         assert_eq!(latest_versions([0, 1, 2, 3].into_iter(), 2), vec![2, 3]);
+    }
+
+    #[test]
+    fn age_eligibility_retains_a_manifest_one_microsecond_younger_than_the_limit() -> Result<()> {
+        assert!(!manifest_is_old_enough_for_age_prune(
+            1_000_001, 1_000_010, 10
+        )?);
+        assert!(manifest_is_old_enough_for_age_prune(
+            1_000_000, 1_000_010, 10
+        )?);
+        Ok(())
     }
 
     #[test]

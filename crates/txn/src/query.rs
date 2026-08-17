@@ -1011,6 +1011,46 @@ mod tests {
     }
 
     #[test]
+    fn dataset_schema_columns_returns_its_logical_fields() {
+        let columns = vec![
+            LogicalColumn::new("title", LogicalType::Utf8, false),
+            LogicalColumn::new("embedding", LogicalType::Vector { dimensions: 3 }, true),
+        ];
+        let schema = DatasetSchema::new(columns.clone()).unwrap();
+
+        assert_eq!(schema.columns(), columns.as_slice());
+    }
+
+    #[test]
+    fn result_value_logical_type_reports_scalar_vector_and_null_types() {
+        assert_eq!(
+            ResultValue::Boolean(true).logical_type(),
+            Some(LogicalType::Boolean)
+        );
+        assert_eq!(
+            ResultValue::Int64(-7).logical_type(),
+            Some(LogicalType::Int64)
+        );
+        assert_eq!(
+            ResultValue::UInt64(7).logical_type(),
+            Some(LogicalType::UInt64)
+        );
+        assert_eq!(
+            ResultValue::Float64(1.5).logical_type(),
+            Some(LogicalType::Float64)
+        );
+        assert_eq!(
+            ResultValue::Utf8("title".into()).logical_type(),
+            Some(LogicalType::Utf8)
+        );
+        assert_eq!(
+            ResultValue::Vector(vec![0.0, 1.0, 2.0]).logical_type(),
+            Some(LogicalType::Vector { dimensions: 3 })
+        );
+        assert_eq!(ResultValue::Null.logical_type(), None);
+    }
+
+    #[test]
     fn query_contract_preserves_projection_order_and_rejects_invalid_projection_names() {
         let schema = schema();
         let request = ScanRequest {
