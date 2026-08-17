@@ -60,6 +60,12 @@
 - [x] Run `cargo test --workspace --no-default-features`, clippy, fmt, and docs.
 - [x] Run the Python wheel smoke if maturin is available; otherwise record the exact environment blocker without claiming it passed.
 
+Verification note: on Windows, the workspace test, clippy, and documentation gates were run
+through the installed Visual Studio Developer Command Prompt with the MSVC and Windows SDK
+include paths initialized. A plain PowerShell invocation is not valid evidence because it cannot
+compile the native `alloca`/zstd dependencies without those paths. The corrected runs passed;
+`maturin` was not installed, so the wheel smoke remains explicitly unavailable.
+
 ### Task 5: Finish and publish
 
 - [ ] Inspect the exact diff and exclude `mutants.out/` and build artifacts.

@@ -565,6 +565,19 @@ fn lookup_rejects_json_as_a_missing_columns_value() {
 }
 
 #[test]
+fn lookup_usage_describes_json_as_a_supported_option() {
+    let dir = lookup_json_fixture_dir();
+    let output = command(&["lookup", dir.path().to_str().unwrap(), "0", "--unexpected"]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        stderr(&output).contains("--columns <column,...> and --json"),
+        "usage text should describe both supported lookup options: {}",
+        stderr(&output)
+    );
+}
+
+#[test]
 fn lookup_json_preserves_typed_live_values() {
     // Break caught: values lose their logical types, strings are not escaped,
     // vectors are flattened, or nullable values stop using a JSON null.

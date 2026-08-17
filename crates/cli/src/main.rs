@@ -917,7 +917,7 @@ fn handle_lookup(args: &[String], dir: &str) -> Result<(), Box<dyn Error>> {
         ),
         _ => {
             return Err(usage_error(
-                "lookup accepts only an optional --columns <column,...> argument",
+                "lookup accepts optional --columns <column,...> and --json arguments",
             ));
         }
     };
