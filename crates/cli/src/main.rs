@@ -864,7 +864,13 @@ fn lookup_value_json(value: &strata_txn::ResultValue) -> String {
         strata_txn::ResultValue::Vector(value) => {
             let values = value
                 .iter()
-                .map(ToString::to_string)
+                .map(|value| {
+                    if value.is_finite() {
+                        value.to_string()
+                    } else {
+                        "null".to_owned()
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join(",");
             format!("{{\"type\":\"vector\",\"value\":[{values}]}}")
@@ -898,29 +904,39 @@ fn handle_lookup(args: &[String], dir: &str) -> Result<(), Box<dyn Error>> {
         .get(3)
         .ok_or_else(|| usage_error("lookup requires <row_id>"))?
         .parse()?;
-    let (projection, json) = match args.get(4..) {
-        Some([]) => (strata_txn::Projection::All, false),
-        Some([flag]) if flag == "--json" => (strata_txn::Projection::All, true),
-        Some([columns_flag]) if columns_flag == "--columns" => {
-            return Err(usage_error("missing <column,...> after --columns"));
+    let mut columns = None;
+    let mut json = false;
+    let mut index = 4;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => {
+                if json {
+                    return Err(usage_error("lookup accepts --json at most once"));
+                }
+                json = true;
+                index += 1;
+            }
+            "--columns" => {
+                if columns.is_some() {
+                    return Err(usage_error("lookup accepts --columns at most once"));
+                }
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| usage_error("missing <column,...> after --columns"))?;
+                if value.starts_with("--") {
+                    return Err(usage_error("missing <column,...> after --columns"));
+                }
+                columns = Some(parse_columns(value)?);
+                index += 2;
+            }
+            _ => {
+                return Err(usage_error(
+                    "lookup accepts optional --columns <column,...> and --json arguments",
+                ));
+            }
         }
-        Some([columns_flag, json_flag]) if columns_flag == "--columns" && json_flag == "--json" => {
-            return Err(usage_error("missing <column,...> after --columns"));
-        }
-        Some([columns_flag, columns]) if columns_flag == "--columns" => (
-            strata_txn::Projection::Columns(parse_columns(columns)?),
-            false,
-        ),
-        Some([columns_flag, columns, flag]) if columns_flag == "--columns" && flag == "--json" => (
-            strata_txn::Projection::Columns(parse_columns(columns)?),
-            true,
-        ),
-        _ => {
-            return Err(usage_error(
-                "lookup accepts optional --columns <column,...> and --json arguments",
-            ));
-        }
-    };
+    }
+    let projection = columns.map_or(strata_txn::Projection::All, strata_txn::Projection::Columns);
 
     let result = strata_txn::Dataset::open(dir)?
         .snapshot()
@@ -1470,6 +1486,16 @@ mod tests {
             assert_eq!(parsed["type"], "float64");
             assert!(parsed["value"].is_null());
         }
+
+        let encoded = lookup_value_json(&strata_txn::ResultValue::Vector(vec![
+            1.0,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ]));
+        let parsed: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(parsed["type"], "vector");
+        assert_eq!(parsed["value"], serde_json::json!([1, null, null, null]));
     }
 
     #[test]

@@ -578,6 +578,38 @@ fn lookup_usage_describes_json_as_a_supported_option() {
 }
 
 #[test]
+fn lookup_json_accepts_flags_in_either_order() {
+    let dir = lookup_json_fixture_dir();
+    for args in [
+        [
+            "lookup",
+            dir.path().to_str().unwrap(),
+            "0",
+            "--json",
+            "--columns",
+            "id",
+        ],
+        [
+            "lookup",
+            dir.path().to_str().unwrap(),
+            "0",
+            "--columns",
+            "id",
+            "--json",
+        ],
+    ] {
+        let output = command(&args);
+        assert!(
+            output.status.success(),
+            "lookup failed for {:?}: {}",
+            args,
+            stderr(&output)
+        );
+        assert_eq!(json_output(&output)["fields"].as_array().unwrap().len(), 1);
+    }
+}
+
+#[test]
 fn lookup_json_preserves_typed_live_values() {
     // Break caught: values lose their logical types, strings are not escaped,
     // vectors are flattened, or nullable values stop using a JSON null.

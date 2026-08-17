@@ -121,12 +121,16 @@ The PyO3 extension is packaged as `strata_ext` through maturin:
 python -m venv .venv
 .venv\Scripts\activate
 python -m pip install maturin
-maturin build --release
-python -m pip install --force-reinstall (Get-ChildItem target/wheels/strata_bindings-*.whl | Select-Object -First 1).FullName
+maturin build --release --out target/wheels
+$wheel = Get-ChildItem target/wheels/strata_bindings-*.whl | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+python -m pip install --force-reinstall $wheel.FullName
 python -c "import strata_ext; print(strata_ext.Dataset)"
 ```
 
-The final two commands install the generated wheel and smoke-test its import.
+The generated wheel is selected by newest modification time immediately after the
+build, so the install targets the artifact just produced rather than an older
+wheel left in `target/wheels`. The final two commands install that wheel and
+smoke-test its import.
 Run them in your environment; this guide does not claim that the wheel build or
 smoke test has passed.
 
