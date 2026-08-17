@@ -1793,6 +1793,14 @@ fn projected_row(batch: &RecordBatch, row: usize, projection: &[String]) -> Resu
 }
 
 fn result_value(array: &arrow::array::ArrayRef, row: usize) -> Result<ResultValue> {
+    if let DataType::FixedSizeList(field, _) = array.data_type()
+        && field.is_nullable()
+    {
+        return Err(query_cast_error(
+            "vector",
+            "FixedSizeList<Float32> with a non-nullable child",
+        ));
+    }
     if array.is_null(row) {
         return Ok(ResultValue::Null);
     }
@@ -1807,14 +1815,6 @@ fn result_value(array: &arrow::array::ArrayRef, row: usize) -> Result<ResultValu
     } else if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
         ResultValue::Utf8(array.value(row).to_owned())
     } else if let Some(array) = array.as_any().downcast_ref::<FixedSizeListArray>() {
-        if let DataType::FixedSizeList(field, _) = array.data_type()
-            && field.is_nullable()
-        {
-            return Err(query_cast_error(
-                "vector",
-                "FixedSizeList<Float32> with a non-nullable child",
-            ));
-        }
         let values = array.value(row);
         let values = values
             .as_any()
@@ -1907,6 +1907,16 @@ mod tests {
 
         let vector: arrow::array::ArrayRef = Arc::new(vector);
         let error = result_value(&vector, 0).unwrap_err();
+        assert!(error.to_string().contains("non-nullable"));
+
+        let outer_null = FixedSizeListArray::new(
+            item,
+            2,
+            Arc::new(Float32Array::from(vec![1.0, 2.0])),
+            Some(arrow::buffer::NullBuffer::from(vec![false])),
+        );
+        let outer_null: arrow::array::ArrayRef = Arc::new(outer_null);
+        let error = result_value(&outer_null, 0).unwrap_err();
         assert!(error.to_string().contains("non-nullable"));
     }
 

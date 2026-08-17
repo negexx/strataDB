@@ -581,6 +581,21 @@ fn lookup_rejects_json_as_a_missing_columns_value() {
 }
 
 #[test]
+fn lookup_rejects_lookup_flag_as_a_missing_columns_value() {
+    let dir = lookup_json_fixture_dir();
+    let output = command(&[
+        "lookup",
+        dir.path().to_str().unwrap(),
+        "0",
+        "--columns",
+        "--columns",
+    ]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr(&output).contains("missing <column,...> after --columns"));
+}
+
+#[test]
 fn lookup_usage_describes_json_as_a_supported_option() {
     let dir = lookup_json_fixture_dir();
     let output = command(&["lookup", dir.path().to_str().unwrap(), "0", "--unexpected"]);
