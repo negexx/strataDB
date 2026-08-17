@@ -116,9 +116,19 @@ fn lookup_json_fixture_dir() -> tempfile::TempDir {
         .prefix("strata-cli-admin-lookup-json-")
         .tempdir()
         .unwrap();
-    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("--score", DataType::Int64, false),
+    ]));
     let dataset = strata_txn::Dataset::create(dir.path(), Arc::clone(&schema)).unwrap();
-    let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1]))]).unwrap();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(Int64Array::from(vec![7])),
+        ],
+    )
+    .unwrap();
     let mut transaction = dataset.begin();
     transaction.insert(batch).unwrap();
     transaction.commit().unwrap();
@@ -502,10 +512,16 @@ fn lookup_json_returns_a_stable_envelope_for_live_tombstoned_and_not_found_rows(
             "kind": "lookup",
             "row_id": 0,
             "outcome": "live",
-            "fields": [{
-                "name": "id",
-                "value": { "type": "int64", "value": 1 },
-            }],
+            "fields": [
+                {
+                    "name": "id",
+                    "value": { "type": "int64", "value": 1 },
+                },
+                {
+                    "name": "--score",
+                    "value": { "type": "int64", "value": 7 },
+                },
+            ],
         })
     );
 
@@ -607,6 +623,26 @@ fn lookup_json_accepts_flags_in_either_order() {
         );
         assert_eq!(json_output(&output)["fields"].as_array().unwrap().len(), 1);
     }
+}
+
+#[test]
+fn lookup_json_accepts_dash_prefixed_column_names() {
+    let dir = lookup_json_fixture_dir();
+    let output = command(&[
+        "lookup",
+        dir.path().to_str().unwrap(),
+        "0",
+        "--columns",
+        "--score",
+        "--json",
+    ]);
+
+    assert!(
+        output.status.success(),
+        "lookup failed: {}",
+        stderr(&output)
+    );
+    assert_eq!(json_output(&output)["fields"][0]["name"], "--score");
 }
 
 #[test]

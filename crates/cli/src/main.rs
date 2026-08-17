@@ -923,7 +923,7 @@ fn handle_lookup(args: &[String], dir: &str) -> Result<(), Box<dyn Error>> {
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| usage_error("missing <column,...> after --columns"))?;
-                if value.starts_with("--") {
+                if value == "--json" {
                     return Err(usage_error("missing <column,...> after --columns"));
                 }
                 columns = Some(parse_columns(value)?);

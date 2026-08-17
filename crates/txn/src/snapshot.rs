@@ -1807,6 +1807,14 @@ fn result_value(array: &arrow::array::ArrayRef, row: usize) -> Result<ResultValu
     } else if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
         ResultValue::Utf8(array.value(row).to_owned())
     } else if let Some(array) = array.as_any().downcast_ref::<FixedSizeListArray>() {
+        if let DataType::FixedSizeList(field, _) = array.data_type()
+            && field.is_nullable()
+        {
+            return Err(query_cast_error(
+                "vector",
+                "FixedSizeList<Float32> with a non-nullable child",
+            ));
+        }
         let values = array.value(row);
         let values = values
             .as_any()
@@ -1882,6 +1890,24 @@ mod tests {
 
         assert_eq!(snapshot.version(), 1);
         assert_eq!(dataset.current_version(), 2);
+    }
+
+    #[test]
+    fn result_value_rejects_nullable_vector_children() {
+        use arrow::array::{FixedSizeListArray, Float32Array};
+        use arrow::datatypes::{DataType, Field};
+
+        let item = Arc::new(Field::new("item", DataType::Float32, true));
+        let vector = FixedSizeListArray::new(
+            Arc::clone(&item),
+            2,
+            Arc::new(Float32Array::from(vec![1.0, 2.0])),
+            None,
+        );
+
+        let vector: arrow::array::ArrayRef = Arc::new(vector);
+        let error = result_value(&vector, 0).unwrap_err();
+        assert!(error.to_string().contains("non-nullable"));
     }
 
     #[test]
