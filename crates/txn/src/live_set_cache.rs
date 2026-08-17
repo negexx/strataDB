@@ -371,6 +371,26 @@ mod tests {
     }
 
     #[test]
+    fn exact_entry_budget_includes_fixed_and_predicate_key_bytes() {
+        // The `category` predicate key is 8 variable bytes. Its fixed
+        // 256-byte entry charge therefore exactly fits a 264-byte budget.
+        // A failed compute leaves the entry charge observable without any
+        // LiveSet payload bytes contributing to the result.
+        let cache = LiveSetCache::new(264);
+        let result = cache.get_or_try_compute(key(7), || Err::<LiveSet, _>(Unreachable));
+
+        assert!(result.is_err());
+        assert_eq!(
+            cache.accounting(),
+            LiveSetCacheAccounting {
+                entry_count: 1,
+                charged_bytes: 264,
+                byte_budget: 264,
+            }
+        );
+    }
+
+    #[test]
     fn a_deep_compound_predicates_tree_shape_counts_against_the_budget() {
         // Same shape of proof as the string-value test above, but for
         // PredicateKey's recursive And/Or case: a deeply-nested compound

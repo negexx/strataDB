@@ -117,6 +117,8 @@ impl From<&FilterExpression> for FilterKey {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::FilterKey;
     use crate::{Comparison, ComparisonOperator, FilterExpression, FilterLiteral};
 
@@ -168,5 +170,48 @@ mod tests {
             FilterKey::from(&positive_zero),
             FilterKey::from(&negative_zero)
         );
+    }
+
+    #[test]
+    fn comparison_operators_have_distinct_cache_identities() {
+        let operators = [
+            ComparisonOperator::Equal,
+            ComparisonOperator::NotEqual,
+            ComparisonOperator::LessThan,
+            ComparisonOperator::LessThanOrEqual,
+            ComparisonOperator::GreaterThan,
+            ComparisonOperator::GreaterThanOrEqual,
+        ];
+        let keys: HashSet<_> = operators
+            .into_iter()
+            .map(|operator| {
+                FilterKey::from(&FilterExpression::Compare(Comparison {
+                    column: "score".into(),
+                    operator,
+                    value: FilterLiteral::Int64(7),
+                }))
+            })
+            .collect();
+
+        assert_eq!(
+            keys.len(),
+            6,
+            "each comparison meaning needs its own cache key"
+        );
+    }
+
+    #[test]
+    fn variable_size_counts_string_bytes_and_each_tree_node() {
+        let filter = FilterExpression::And(
+            Box::new(compare("tag", FilterLiteral::Utf8("rust".into()))),
+            Box::new(FilterExpression::Not(Box::new(compare(
+                "active",
+                FilterLiteral::Boolean(true),
+            )))),
+        );
+
+        // `tag` + `rust` is 7 bytes; `active` is 6 bytes; the `Not` and
+        // `And` nodes each add 128 bytes, for 269 bytes total.
+        assert_eq!(FilterKey::from(&filter).variable_byte_size(), 269);
     }
 }
