@@ -169,7 +169,8 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         eprintln!(
             "  search <dir> --vector <comma-separated finite floats> [--k <usize>] [--filter <column> <op> <value>]"
         );
-        eprintln!("  lookup <dir> <row_id> [--columns <column,...>]");
+        eprintln!("  explain <dir> <column> <op> <value> [--json]");
+        eprintln!("  lookup <dir> <row_id> [--columns <column,...>] [--json]");
         eprintln!(
             "  group-by <dir> <key,...> --agg <count|sum|avg:column> [--filter <column> <op> <value>]"
         );
@@ -205,6 +206,9 @@ fn handle_command_without_dataset(
         println!(
             "usage: strata <create|insert|scan|filter|search|explain|inspect|schema|migration|manifest-status|recovery-status|evidence|crash-loop|lookup|group-by|query-scan> <dir> [...]"
         );
+        println!("  explain <dir> <column> <op> <value> [--json]");
+        println!("  lookup <dir> <row_id> [--columns <column,...>] [--json]");
+        println!("  query-scan <dir> --columns <column,...> [--filter <column> <op> <value>]");
         return Some(Ok(()));
     }
     if cmd == "evidence" {
@@ -832,6 +836,42 @@ fn format_value(value: &strata_txn::ResultValue) -> String {
     }
 }
 
+fn lookup_value_json(value: &strata_txn::ResultValue) -> String {
+    match value {
+        strata_txn::ResultValue::Null => "{\"type\":\"null\",\"value\":null}".to_owned(),
+        strata_txn::ResultValue::Boolean(value) => {
+            format!("{{\"type\":\"boolean\",\"value\":{value}}}")
+        }
+        strata_txn::ResultValue::Int64(value) => {
+            format!("{{\"type\":\"int64\",\"value\":{value}}}")
+        }
+        strata_txn::ResultValue::UInt64(value) => {
+            format!("{{\"type\":\"uint64\",\"value\":{value}}}")
+        }
+        strata_txn::ResultValue::Float64(value) => {
+            // JSON has no NaN or infinity literals; preserve the logical
+            // type while representing every non-finite value as null.
+            let value = if value.is_finite() {
+                value.to_string()
+            } else {
+                "null".to_owned()
+            };
+            format!("{{\"type\":\"float64\",\"value\":{value}}}")
+        }
+        strata_txn::ResultValue::Utf8(value) => {
+            format!("{{\"type\":\"utf8\",\"value\":{}}}", json_string(value))
+        }
+        strata_txn::ResultValue::Vector(value) => {
+            let values = value
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{\"type\":\"vector\",\"value\":[{values}]}}")
+        }
+    }
+}
+
 fn format_logical_type(data_type: &strata_txn::LogicalType) -> String {
     match data_type {
         strata_txn::LogicalType::Boolean => "Boolean".to_owned(),
@@ -858,23 +898,29 @@ fn handle_lookup(args: &[String], dir: &str) -> Result<(), Box<dyn Error>> {
         .get(3)
         .ok_or_else(|| usage_error("lookup requires <row_id>"))?
         .parse()?;
-    let projection = match args.get(4).map(String::as_str) {
-        None => strata_txn::Projection::All,
-        Some("--columns") => strata_txn::Projection::Columns(parse_columns(
-            args.get(5)
-                .ok_or_else(|| usage_error("missing <column,...> after --columns"))?,
-        )?),
-        Some(_) => {
+    let (projection, json) = match args.get(4..) {
+        Some([]) => (strata_txn::Projection::All, false),
+        Some([flag]) if flag == "--json" => (strata_txn::Projection::All, true),
+        Some([columns_flag]) if columns_flag == "--columns" => {
+            return Err(usage_error("missing <column,...> after --columns"));
+        }
+        Some([columns_flag, json_flag]) if columns_flag == "--columns" && json_flag == "--json" => {
+            return Err(usage_error("missing <column,...> after --columns"));
+        }
+        Some([columns_flag, columns]) if columns_flag == "--columns" => (
+            strata_txn::Projection::Columns(parse_columns(columns)?),
+            false,
+        ),
+        Some([columns_flag, columns, flag]) if columns_flag == "--columns" && flag == "--json" => (
+            strata_txn::Projection::Columns(parse_columns(columns)?),
+            true,
+        ),
+        _ => {
             return Err(usage_error(
                 "lookup accepts only an optional --columns <column,...> argument",
             ));
         }
     };
-    if args.len() > 6 {
-        return Err(usage_error(
-            "lookup accepts only an optional --columns <column,...> argument",
-        ));
-    }
 
     let result = strata_txn::Dataset::open(dir)?
         .snapshot()
@@ -883,22 +929,34 @@ fn handle_lookup(args: &[String], dir: &str) -> Result<(), Box<dyn Error>> {
             projection,
         })
         .map_err(|error| query_error(&error))?;
-    match result.outcome {
-        strata_txn::RowLookupOutcome::Live(row) => {
-            println!("lookup row_id={row_id} outcome=live");
-            for field in row.fields {
-                println!(
-                    "field name={} value={}",
-                    field.name,
-                    format_value(&field.value)
-                );
-            }
-        }
-        strata_txn::RowLookupOutcome::Tombstoned => {
-            println!("lookup row_id={row_id} outcome=tombstoned");
-        }
-        strata_txn::RowLookupOutcome::NotFound => {
-            println!("lookup row_id={row_id} outcome=not_found");
+    let (outcome, fields) = match result.outcome {
+        strata_txn::RowLookupOutcome::Live(row) => ("live", row.fields),
+        strata_txn::RowLookupOutcome::Tombstoned => ("tombstoned", Vec::new()),
+        strata_txn::RowLookupOutcome::NotFound => ("not_found", Vec::new()),
+    };
+    if json {
+        let fields = fields
+            .iter()
+            .map(|field| {
+                format!(
+                    "{{\"name\":{},\"value\":{}}}",
+                    json_string(&field.name),
+                    lookup_value_json(&field.value),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        println!(
+            "{{\"kind\":\"lookup\",\"row_id\":{row_id},\"outcome\":\"{outcome}\",\"fields\":[{fields}]}}"
+        );
+    } else {
+        println!("lookup row_id={row_id} outcome={outcome}");
+        for field in fields {
+            println!(
+                "field name={} value={}",
+                field.name,
+                format_value(&field.value)
+            );
         }
     }
     Ok(())
@@ -1400,6 +1458,19 @@ fn physical_operator_name(operator: &strata_txn::PhysicalOperator) -> &'static s
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lookup_json_uses_null_for_non_finite_float64_values() {
+        // Stable contract: JSON has no non-finite numbers, so float64 NaN and
+        // infinities serialize as a null value while retaining type=float64.
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let encoded = lookup_value_json(&strata_txn::ResultValue::Float64(value));
+            let parsed: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+
+            assert_eq!(parsed["type"], "float64");
+            assert!(parsed["value"].is_null());
+        }
+    }
 
     #[test]
     fn unknown_command_errors_even_without_a_dir_argument() {

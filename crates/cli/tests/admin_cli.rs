@@ -3,7 +3,10 @@
 use std::process::{Command, Output};
 use std::sync::Arc;
 
-use arrow::array::{FixedSizeListArray, Float32Array, Int64Array};
+use arrow::array::{
+    BooleanArray, FixedSizeListArray, Float32Array, Float64Array, Int64Array, StringArray,
+    UInt64Array,
+};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use serde_json::{Value, json};
@@ -33,6 +36,15 @@ fn json_output(output: &Output) -> Value {
         panic!(
             "expected JSON stdout: {error}; stdout was: {}",
             stdout(output)
+        )
+    })
+}
+
+fn json_error_output(output: &Output) -> Value {
+    serde_json::from_slice(&output.stderr).unwrap_or_else(|error| {
+        panic!(
+            "expected JSON stderr: {error}; stderr was: {}",
+            stderr(output)
         )
     })
 }
@@ -90,6 +102,61 @@ fn vector_fixture_dir() -> tempfile::TempDir {
                 Arc::new(Float32Array::from(vec![0.0, 0.0])),
                 None,
             )),
+        ],
+    )
+    .unwrap();
+    let mut transaction = dataset.begin();
+    transaction.insert(batch).unwrap();
+    transaction.commit().unwrap();
+    dir
+}
+
+fn lookup_json_fixture_dir() -> tempfile::TempDir {
+    let dir = tempfile::Builder::new()
+        .prefix("strata-cli-admin-lookup-json-")
+        .tempdir()
+        .unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let dataset = strata_txn::Dataset::create(dir.path(), Arc::clone(&schema)).unwrap();
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1]))]).unwrap();
+    let mut transaction = dataset.begin();
+    transaction.insert(batch).unwrap();
+    transaction.commit().unwrap();
+    dir
+}
+
+fn lookup_json_value_fixture_dir() -> tempfile::TempDir {
+    let dir = tempfile::Builder::new()
+        .prefix("strata-cli-admin-lookup-json-values-")
+        .tempdir()
+        .unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("flag", DataType::Boolean, false),
+        Field::new("count", DataType::UInt64, false),
+        Field::new("score", DataType::Float64, false),
+        Field::new("label", DataType::Utf8, false),
+        Field::new(
+            "embedding",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 2),
+            false,
+        ),
+        Field::new("missing_score", DataType::Float64, true),
+    ]));
+    let dataset = strata_txn::Dataset::create(dir.path(), Arc::clone(&schema)).unwrap();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(BooleanArray::from(vec![true])),
+            Arc::new(UInt64Array::from(vec![42])),
+            Arc::new(Float64Array::from(vec![1.5])),
+            Arc::new(StringArray::from(vec!["quote\"\\line\nend"])),
+            Arc::new(FixedSizeListArray::new(
+                Arc::new(Field::new("item", DataType::Float32, false)),
+                2,
+                Arc::new(Float32Array::from(vec![0.25, 0.75])),
+                None,
+            )),
+            Arc::new(Float64Array::from(vec![None])),
         ],
     )
     .unwrap();
@@ -229,6 +296,35 @@ fn explain_json_serializes_scalar_zero_segment_counts() {
 }
 
 #[test]
+fn explain_accepts_the_readme_predicate_form_with_json_output() {
+    // Break caught: the README-compatible predicate-bearing invocation either
+    // fails to parse or stops producing a structured explain result.
+    let dir = vector_fixture_dir();
+    let output = command(&[
+        "explain",
+        dir.path().to_str().unwrap(),
+        "id",
+        "eq",
+        "1",
+        "--json",
+    ]);
+
+    assert!(
+        output.status.success(),
+        "README-compatible explain command failed: {}",
+        stderr(&output)
+    );
+    let explanation = json_output(&output);
+    assert_eq!(explanation["kind"], "explain");
+    assert!(
+        explanation["logical_operators"]
+            .as_array()
+            .is_some_and(|operators| operators.contains(&json!("predicate"))),
+        "explain JSON must record the parsed predicate: {explanation}"
+    );
+}
+
+#[test]
 fn admin_errors_use_distinct_stable_exit_categories() {
     // Break caught: automation cannot distinguish a bad invocation from an
     // unsupported migration, corrupt durable state, or an operational open
@@ -345,15 +441,21 @@ fn inspect_rejects_unknown_trailing_options() {
 
 #[test]
 fn help_and_evidence_commands_describe_the_supported_operational_surface() {
-    // Break caught: operators have no stable discovery path for the admin
-    // commands or mistake a CLI timing command for the retained Criterion
-    // evidence fixture.
+    // Break caught: CLI help omits executable forms for predicate, lookup
+    // JSON, or typed query-scan syntax.
     let help = command(&["help"]);
     assert!(help.status.success(), "help failed: {}", stderr(&help));
-    assert_eq!(
-        stdout(&help),
-        "usage: strata <create|insert|scan|filter|search|explain|inspect|schema|migration|manifest-status|recovery-status|evidence|crash-loop|lookup|group-by|query-scan> <dir> [...]\n"
-    );
+    let help_output = stdout(&help);
+    for required_line in [
+        "  explain <dir> <column> <op> <value> [--json]",
+        "  lookup <dir> <row_id> [--columns <column,...>] [--json]",
+        "  query-scan <dir> --columns <column,...> [--filter <column> <op> <value>]",
+    ] {
+        assert!(
+            help_output.lines().any(|line| line == required_line),
+            "help must document `{required_line}`; help output was: {help_output}"
+        );
+    }
 
     let bare = command(&[]);
     assert!(
@@ -377,6 +479,118 @@ fn help_and_evidence_commands_describe_the_supported_operational_surface() {
     assert_eq!(
         stdout(&evidence),
         "{\"kind\":\"evidence\",\"criterion_command\":\"cargo bench -p strata-bench --bench query_planner_bench\",\"report\":\"docs/phase-3-verification-report.md#task-3-query-planning-evidence\"}\n"
+    );
+}
+
+#[test]
+fn lookup_json_returns_a_stable_envelope_for_live_tombstoned_and_not_found_rows() {
+    // Break caught: lookup's JSON mode is missing or changes the stable
+    // envelope. Every response carries kind, row_id, outcome, and fields;
+    // fields is an array and is empty when no live row can be projected.
+    let dir = lookup_json_fixture_dir();
+    let dir_str = dir.path().to_str().unwrap();
+
+    let live = command(&["lookup", dir_str, "0", "--json"]);
+    assert!(
+        live.status.success(),
+        "live lookup failed: {}",
+        stderr(&live)
+    );
+    assert_eq!(
+        json_output(&live),
+        json!({
+            "kind": "lookup",
+            "row_id": 0,
+            "outcome": "live",
+            "fields": [{
+                "name": "id",
+                "value": { "type": "int64", "value": 1 },
+            }],
+        })
+    );
+
+    let dataset = strata_txn::Dataset::open(dir.path()).unwrap();
+    let mut transaction = dataset.begin();
+    transaction.delete(0).unwrap();
+    transaction.commit().unwrap();
+
+    let tombstoned = command(&["lookup", dir_str, "0", "--json"]);
+    assert!(
+        tombstoned.status.success(),
+        "tombstoned lookup failed: {}",
+        stderr(&tombstoned)
+    );
+    assert_eq!(
+        json_output(&tombstoned),
+        json!({
+            "kind": "lookup",
+            "row_id": 0,
+            "outcome": "tombstoned",
+            "fields": [],
+        })
+    );
+
+    let not_found = command(&["lookup", dir_str, "999", "--json"]);
+    assert!(
+        not_found.status.success(),
+        "not-found lookup failed: {}",
+        stderr(&not_found)
+    );
+    assert_eq!(
+        json_output(&not_found),
+        json!({
+            "kind": "lookup",
+            "row_id": 999,
+            "outcome": "not_found",
+            "fields": [],
+        })
+    );
+}
+
+#[test]
+fn lookup_rejects_json_as_a_missing_columns_value() {
+    // Break caught: `--json` is consumed as a projection name, so malformed
+    // syntax reaches query validation and loses the stable usage category.
+    let dir = lookup_json_fixture_dir();
+    let output = command(&[
+        "lookup",
+        dir.path().to_str().unwrap(),
+        "0",
+        "--columns",
+        "--json",
+    ]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(json_error_output(&output)["error"]["category"], "usage");
+}
+
+#[test]
+fn lookup_json_preserves_typed_live_values() {
+    // Break caught: values lose their logical types, strings are not escaped,
+    // vectors are flattened, or nullable values stop using a JSON null.
+    let dir = lookup_json_value_fixture_dir();
+    let output = command(&["lookup", dir.path().to_str().unwrap(), "0", "--json"]);
+
+    assert!(
+        output.status.success(),
+        "lookup failed: {}",
+        stderr(&output)
+    );
+    assert_eq!(
+        json_output(&output),
+        json!({
+            "kind": "lookup",
+            "row_id": 0,
+            "outcome": "live",
+            "fields": [
+                { "name": "flag", "value": { "type": "boolean", "value": true } },
+                { "name": "count", "value": { "type": "uint64", "value": 42 } },
+                { "name": "score", "value": { "type": "float64", "value": 1.5 } },
+                { "name": "label", "value": { "type": "utf8", "value": "quote\"\\line\nend" } },
+                { "name": "embedding", "value": { "type": "vector", "value": [0.25, 0.75] } },
+                { "name": "missing_score", "value": { "type": "null", "value": null } },
+            ],
+        })
     );
 }
 

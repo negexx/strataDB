@@ -73,14 +73,44 @@ Build and invoke the local administration tool with Cargo:
 cargo run -p strata-cli -- help
 cargo run -p strata-cli -- inspect ./my-dataset --json
 cargo run -p strata-cli -- schema ./my-dataset --json
-cargo run -p strata-cli -- explain ./my-dataset --json
+cargo run -p strata-cli -- query-scan ./my-dataset --columns id,category --filter id gteq 1
+cargo run -p strata-cli -- search ./my-dataset --vector 0.0,0.0,0.0 --k 3
+cargo run -p strata-cli -- lookup ./my-dataset 0 --json
+cargo run -p strata-cli -- group-by ./my-dataset category --agg avg:amount
+cargo run -p strata-cli -- explain ./my-dataset id eq 1 --json
 cargo run -p strata-cli -- manifest-status ./my-dataset --json
 cargo run -p strata-cli -- recovery-status ./my-dataset --json
 cargo run -p strata-cli -- evidence --json
 ```
 
-The CLI has stable human and JSON output for inspection, schema, planned
-explain, migration, manifest, recovery, query, and evidence operations. Local
+The query examples assume that `my-dataset` has `id` (`Int64`), `category`
+(`Utf8`), `amount` (`Float64`), and a three-dimensional `vector` column. The
+typed `query-scan` and `group-by` forms validate the named columns and values;
+`search --vector` accepts comma-separated finite floats and `--k` accepts a
+`usize` result count.
+
+`lookup --json` emits a stable envelope with `kind`, the physical `row_id`, an
+`outcome`, and `fields`. Outcomes are `live`, `tombstoned`, or `not_found`;
+only a live result has fields. Each field has a name and a typed value:
+
+```json
+{
+  "kind": "lookup",
+  "row_id": 0,
+  "outcome": "live",
+  "fields": [
+    {"name": "amount", "value": {"type": "float64", "value": 1.5}}
+  ]
+}
+```
+
+Because JSON has no `NaN` or infinity literals, a non-finite `Float64` is
+represented as `{"type":"float64","value":null}`. This preserves the
+logical `float64` type; it is distinct from a database null, which uses
+`{"type":"null","value":null}`.
+
+The CLI has stable human and JSON output for inspection, schema, explain,
+migration, manifest, recovery, query, and evidence operations. Local
 mutation commands retain explicit single-writer acknowledgement requirements.
 
 ## Python
@@ -91,8 +121,14 @@ The PyO3 extension is packaged as `strata_ext` through maturin:
 python -m venv .venv
 .venv\Scripts\activate
 python -m pip install maturin
-maturin develop --release
+maturin build --release
+python -m pip install --force-reinstall (Get-ChildItem target/wheels/strata_bindings-*.whl | Select-Object -First 1).FullName
+python -c "import strata_ext; print(strata_ext.Dataset)"
 ```
+
+The final two commands install the generated wheel and smoke-test its import.
+Run them in your environment; this guide does not claim that the wheel build or
+smoke test has passed.
 
 The Python facade supports dataset creation/open, immutable snapshots, bounded
 transaction overlays, Arrow IPC batch insertion, commits, vector search, and
