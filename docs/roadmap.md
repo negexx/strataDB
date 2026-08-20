@@ -6,7 +6,7 @@ in [documentation history](history/README.md). Current implementation claims liv
 | Phase | Status | Scope | Exit signal |
 |---|---|---|---|
 | 0 — Foundation | Implemented within named local bounds | Local format, manifests, row allocation, and bounded transaction primitives. See the [Phase 0 foundation audit](audit/phase-0/audit.md). | Restart-safe row-ID non-reuse and retained foundation evidence pass within the named local-filesystem boundary. |
-| 1 — Correctness and durability baseline | Implemented within named bounds | Shared-handle commits, immutable snapshots, typed conflicts, recovery/integrity, schema/error semantics, supported facade, and boundedness evidence. | All asserted guarantees have scope, implementation evidence, regression coverage, and current bounded performance evidence. |
+| 1 — Correctness and durability baseline | Implemented within named bounds | Shared-handle commits, immutable snapshots, typed conflicts, recovery/integrity, schema/error semantics, supported facade, and boundedness evidence. Publication reports acknowledged success, definite pre-publication failure, or an indeterminate final-name-visible/directory-sync-failed result without durability acknowledgement. | All asserted guarantees have scope, implementation evidence, regression coverage, and current bounded performance evidence. |
 | 2 — Query and usability | Implemented within named bounds | Stable versioned-schema/query APIs, scan/projection/filter/group-by integration, point lookup, administration CLI, and Python surface. The CLI includes inspect/schema, planned explain, explicit `add_nullable_column` migration validation/execution/status, and recovery/manifest status with human/JSON output and typed process categories. See the [Phase 2 audit](audit/phase-2/audit.md). | Supported query/client behavior is documented and integration-tested within the embedded single-process boundary; schema evolution remains limited to the one named deterministic transition. |
 | 3 — Operational lifecycle | Implemented within named bounds | Lifecycle diagnostics, explicit snapshot-preserving compaction, manifest retention including age policy, recognized orphan vacuum, and `Dataset::maintain(LifecycleMaintenancePolicy)` are implemented for one shared handle. Maintenance reports one run's final data-object and segment observation; active snapshots, protected history, unknown objects, and noncontiguous physical row IDs remain explicit limitations. See the [Phase 3 closeout audit](audit/phase-3/audit.md), [inventory design](designs/phase-3/lifecycle-inventory.md), [executor design](designs/phase-3/manifest-retention-executor.md), [vacuum design](designs/phase-3/vacuum.md), and focused lifecycle tests. | One explicit maintenance run safely applies the supported retention/reclamation policy and reports its final storage observation; it is neither atomic nor continuous enforcement and does not provide cross-process quota or SLO semantics. |
 | 4 — Cross-process coordination | Proposed | Durable conditional publication, independent opener semantics, shared allocation, and process-boundary guarantees. | Separate processes coordinate without violating visibility, conflict, or durability invariants. |
@@ -21,6 +21,13 @@ Phase 3 lifecycle now also includes explicit snapshot-preserving compaction and 
 `Dataset::maintain(LifecycleMaintenancePolicy)` composes compaction, age retention, vacuum, and
 inventory evidence. Universal growth enforcement across independent processes or unknown object
 types remains outside the embedded single-process product boundary.
+
+Lifecycle mutations are stop-the-world only for write preparation, publication, migration, and
+lifecycle execution on one shared handle: lifecycle exclusivity and `commit_lock` cover live-data
+materialization, publication, protected-history validation, and eligible reclamation, while immutable
+snapshot reads continue. Cost scales with live data/history. The retained 79.49-second median and
+1,289.2 MB peak-live-memory fixture/runner result is evidence, not an SLO or maximum; physical
+accounting for lifecycle reports and `storage_bound_met` excludes `_meta/row-id-high-water`.
 
 The Phase 3 exit signal above denotes evidence from one explicit maintenance run. In particular,
 `storage_bound_met` is that run's final inventory observation, not atomic or continuous

@@ -5,6 +5,10 @@
 //! manifest. This collection keeps those pre-publication claims monotonic
 //! across a restart. Each record is immutable and named by its exclusive
 //! high-water end, so no retry ever overwrites a possibly visible record.
+//! Each inserting transaction creates one reservation object. Recovering the
+//! floor reads O(commits) reservation metadata per inserting commit, for
+//! O(commits²) cumulative reads; lifecycle physical accounting deliberately
+//! excludes this `_meta/row-id-high-water` collection.
 
 use std::path::Path;
 

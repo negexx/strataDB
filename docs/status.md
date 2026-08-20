@@ -54,8 +54,14 @@ provide explicit history and one final inventory observation of requested storag
 `storage_bound_met` is the final observation of one explicit maintenance run, not atomic or
 continuous enforcement. Active snapshots, protected history, unknown objects, and noncontiguous
 physical row IDs can prevent the requested bound; the API is not a cross-process quota or SLO.
-Snapshots remain protected rather than being deleted. Cross-process lifecycle work remains later
-design. Historical exact-head lifecycle evidence, plus the scoped current local record, is recorded in the
+Snapshots remain protected rather than being deleted. Mutating lifecycle work explicitly stops
+write preparation, publication, migration, and other lifecycle execution on the shared handle: it
+takes lifecycle exclusivity then `commit_lock` while materializing live data, publishing, validating
+protected history, and reclaiming eligible objects; immutable snapshot reads continue. Its cost
+scales with live data and retained/protected history. The retained fixture/runner record of a
+79.49-second median and 1,289.2 MB peak live memory is bounded evidence, not an SLO or maximum.
+`lifecycle_report` and `storage_bound_met` exclude `_meta/row-id-high-water` from physical
+accounting. Cross-process lifecycle work remains later design. Historical exact-head lifecycle evidence, plus the scoped current local record, is recorded in the
 [Phase 3 closeout audit](audit/phase-3/audit.md) and
 [Phase 3 verification report](phase-3-verification-report.md). See
 the [inventory design](designs/phase-3/lifecycle-inventory.md), [manifest executor
@@ -109,6 +115,22 @@ A final dataset-directory sync failure can occur after the initial manifest beco
 the filesystem boundary before relying on the dataset; only `NotFound` permits a later retry, which
 again synchronizes the bounded dataset/parent chain. See the [Phase 1 audit](audit/phase-1/audit.md#task-1-durability-recovery-boundary)
 for the recovery procedure.
+
+More generally, local manifest publication has three outcomes: acknowledged success, definite
+pre-publication failure, and indeterminate publication. The indeterminate case has a readable
+immutable final-name candidate but a failed directory sync, so it reports no durability
+acknowledgement. Commit records its write set and installs that candidate before returning
+`TxnError::IndeterminateManifestPublication`; that transaction is terminal and must not be replayed.
+Create returns no handle, so callers open before retrying and never create again when open succeeds.
+`compact`, `migrate_schema`, and `maintain` may return
+`TxnError::Storage(StorageError::PublicationIndeterminate(...))` before updating the existing handle;
+callers must stop using it, drop/reopen, and inspect the recovered version and schema. Reopening proves visibility,
+not durability. Existing snapshots stay immutable, while independent handles remain uncoordinated.
+
+Each inserting transaction writes one immutable row-ID reservation object. The allocation-floor
+recovery scan reads O(commits) reservation metadata per inserting commit, or O(commits²)
+cumulatively. This is a local filesystem, one-process/shared-`Dataset` cost; it does not coordinate
+independent handles.
 
 ## Status vocabulary
 

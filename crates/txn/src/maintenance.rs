@@ -1,4 +1,11 @@
 //! Coordinated lifecycle maintenance and conditional storage bounds.
+//!
+//! On one shared `Dataset` handle, mutating lifecycle execution takes
+//! lifecycle exclusivity and then `commit_lock`, stopping write preparation,
+//! publication, migration, and other lifecycle work while live data is
+//! materialized, published, protected history validated, and eligible objects
+//! reclaimed. Immutable snapshot reads continue; cost scales with live data
+//! and retained/protected history. Independent handles are not coordinated.
 
 use crate::{
     CompactionPolicy, CompactionReport, Dataset, ManifestPruneReport, Result, VacuumReport,
@@ -23,7 +30,8 @@ pub struct LifecycleMaintenancePolicy {
 /// not an atomic or continuously enforced storage bound. Active snapshots,
 /// protected history, unknown objects, and noncontiguous physical row IDs can
 /// keep the final inventory above a requested bound. This API does not provide
-/// cross-process quota or SLO semantics.
+/// cross-process quota or SLO semantics. Its physical accounting excludes
+/// `_meta/row-id-high-water` reservation metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LifecycleMaintenanceReport {
     pub retention: ManifestPruneReport,
@@ -35,7 +43,8 @@ pub struct LifecycleMaintenanceReport {
     /// This is an observation, not atomic or continuous enforcement. It is
     /// false when active snapshots, protected history, unknown objects, or
     /// noncontiguous physical row IDs keep the final inventory above a bound.
-    /// It does not provide cross-process quota or SLO semantics.
+    /// It does not provide cross-process quota or SLO semantics, and excludes
+    /// `_meta/row-id-high-water` reservation metadata from accounting.
     pub storage_bound_met: bool,
 }
 
@@ -55,7 +64,11 @@ impl Dataset {
     /// # Errors
     ///
     /// Returns a typed error if the policy is invalid or any compaction,
-    /// retention, vacuum, or inventory operation fails.
+    /// retention, vacuum, or inventory operation fails. If one of the
+    /// publishing lifecycle operations reports `TxnError::Storage` wrapping
+    /// `StorageError::PublicationIndeterminate`, it can do so before this
+    /// handle is updated; stop using it, drop/reopen, and inspect recovered
+    /// version/schema. Reopen proves visibility, not durability.
     pub fn maintain(
         &self,
         policy: LifecycleMaintenancePolicy,
