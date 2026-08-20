@@ -360,8 +360,11 @@ fn manifest_path(dataset_dir: &Path, version: u64) -> PathBuf {
 /// # Errors
 ///
 /// Returns an error if the `_versions/` directory can't be created, if the
-/// manifest can't be serialized or written, if its version already exists,
-/// or if durable publication is indeterminate after final-name creation.
+/// manifest can't be serialized or written, or if its version already exists.
+/// Those are definite failures when they occur before final-name publication.
+/// If the immutable final-name candidate is readable after an error but its
+/// directory sync failed, returns `StorageError::PublicationIndeterminate`:
+/// visibility may exist, but no durability acknowledgement is reported.
 pub fn commit_manifest(dataset_dir: &Path, manifest: &Manifest) -> Result<()> {
     commit_manifest_with(&crate::backend::StorageOwner::local(dataset_dir), manifest)
 }

@@ -436,8 +436,12 @@ impl Dataset {
     /// # Errors
     ///
     /// Returns a typed storage, manifest, schema, or index error if the
-    /// replacement objects cannot be written or the durable publication
-    /// fails.
+    /// replacement objects cannot be written or publication fails. A
+    /// [`TxnError::Storage`] wrapping
+    /// [`strata_storage::StorageError::PublicationIndeterminate`] can follow
+    /// final-name publication but precede this handle's update; stop using
+    /// this handle, drop/reopen it, and inspect the recovered version and
+    /// schema. Reopen proves visibility, not durability.
     #[allow(clippy::too_many_lines)]
     pub fn compact(&self, policy: CompactionPolicy) -> Result<CompactionReport> {
         if !policy.retain_snapshots {
@@ -726,8 +730,10 @@ impl Dataset {
     /// arbitrary caller-owned ancestor chain.
     ///
     /// A directory-sync failure after initial-manifest publication is
-    /// uncertain: the manifest can be visible although this call returns an
-    /// error. In that case, call [`Dataset::open`] before retrying creation.
+    /// indeterminate: the immutable final-name manifest can be readable
+    /// although this call returns no durability acknowledgement and no
+    /// handle. Call [`Dataset::open`] before retrying creation; do not create
+    /// again if open succeeds. Reopen proves visibility, not durability.
     ///
     /// # Examples
     ///
@@ -1079,6 +1085,9 @@ impl Dataset {
     ///
     /// # Errors
     ///
+    /// The physical accounting deliberately excludes `_meta/row-id-high-water`
+    /// reservation metadata; it covers manifest/data objects only.
+    ///
     /// Returns a typed error if the backend cannot list lifecycle objects, or
     /// if the captured manifest and object inventory contain invalid,
     /// duplicate, missing, or overflowing lifecycle metadata.
@@ -1194,9 +1203,13 @@ impl Dataset {
     ///
     /// # Errors
     ///
-    /// Returns a typed storage, schema, corruption, or durability error and
-    /// leaves the current complete manifest unchanged when publication has
-    /// not succeeded.
+    /// Returns a typed storage, schema, corruption, or durability error.
+    /// Definite failures before final-name publication leave the current
+    /// handle unchanged. An indeterminate publication can return
+    /// [`TxnError::Storage`] wrapping
+    /// [`strata_storage::StorageError::PublicationIndeterminate`] before this
+    /// handle is updated; stop using it, drop/reopen, and inspect recovered
+    /// version/schema. Reopen proves visibility, not durability.
     #[allow(clippy::too_many_lines)]
     pub fn migrate_schema(&self, migration: &SchemaMigration) -> Result<SchemaMigrationResult> {
         let _lifecycle_guard = self.lifecycle_coordinator.acquire_exclusive();
@@ -1979,19 +1992,24 @@ impl Transaction {
     /// at different dimensions (the pre-lock check alone would let both
     /// pass when neither has established a dimension yet). Also returns an
     /// error if any pending batch fails to dictionary-encode, if the segment
-    /// can't be serialized or written, or if the manifest commit's atomic
-    /// rename fails.
+    /// can't be serialized or written, or if manifest publication definitely
+    /// fails before final-name creation.
     ///
-    /// **Every one of these leaves the dataset with nothing this transaction
-    /// wrote reachable by any later reader**, and needs no compensating
-    /// action to make that true. The manifest stays unadvanced, so this
+    /// **Every definite failure before final-name publication leaves the
+    /// dataset with nothing this transaction wrote reachable by any later
+    /// reader**, and needs no compensating action to make that true. The
+    /// manifest stays unadvanced, so this
     /// commit's data files and its `.seg` file are orphaned on disk and
     /// invisible to both [`crate::Snapshot::scan`] (which reads only
     /// manifest-listed data files) and [`crate::Snapshot::vector_search`]
     /// (which searches only manifest-listed segments). There is no shared
     /// mutable graph for a failed commit to leave residue in — the old
     /// graph-residue guard that used to compensate for that hazard was
-    /// removed in S1 W3.2b once this structural guarantee took over.
+    /// removed in S1 W3.2b once this structural guarantee took over. In
+    /// contrast, `TxnError::IndeterminateManifestPublication` installs the
+    /// readable candidate and records its write set before returning; the
+    /// transaction is terminal and must not be replayed. Reopening proves
+    /// visibility, not durability.
     ///
     /// Two in-memory traces do outlive a failed commit, neither reachable
     /// as data: the row-ids it claimed (never recycled — a row-id gap is

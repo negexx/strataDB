@@ -43,6 +43,11 @@ pub enum TxnError {
         #[source]
         source: strata_storage::StorageError,
     },
+    /// Final-name manifest publication was observable but directory durability
+    /// confirmation failed. The commit candidate is installed and its write
+    /// set recorded before this terminal error is returned; callers must not
+    /// replay the transaction. This is limited to the local filesystem and a
+    /// one-process/shared-`Dataset` handle.
     #[error(
         "manifest version {manifest_version} may be visible but its durable publication confirmation failed: {source}"
     )]

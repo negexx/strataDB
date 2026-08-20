@@ -112,6 +112,19 @@ history remains a distinct category.
    boundary; directory durability and end-to-end integrity are limited to the named local filesystem
    evidence and typed fail-closed paths documented in `docs/status.md`.
 
+Within the supported local-filesystem, one-process/shared-`Dataset` boundary, publication has three
+outcomes: acknowledged success; a definite failure before final-name publication; or indeterminate
+publication. An indeterminate result means the immutable final-name manifest candidate was readable
+after publication while directory synchronization failed, so Strata reports no durability
+acknowledgement. A committing transaction installs that candidate and records its write set before it
+returns `TxnError::IndeterminateManifestPublication`; the transaction is terminal and must not be
+replayed. `Dataset::create` returns no handle on that outcome, so callers must `open` before any
+retry and must not create again if open succeeds. `compact`, `migrate_schema`, and `maintain` can
+return `TxnError::Storage(StorageError::PublicationIndeterminate(...))` before updating the existing
+handle; callers stop using that handle, drop and reopen it, then inspect the recovered version and schema. A successful
+reopen proves visibility, not durability. Existing snapshots remain immutable throughout, and
+independent handles are not coordinated.
+
 Publication is lock-serialized inside one `Dataset` handle. Independent handles/processes do not share
 the lock, allocator, history, or in-memory snapshot, so the implementation is not a cross-process
 conditional-CAS protocol.
@@ -148,6 +161,20 @@ current/latest/active versions and protects legacy manifests whose publication t
 unknown objects, including unknown dotfiles, remain outside its authority. `Dataset::maintain()`
 composes those operations and returns `storage_bound_met` from its final inventory. That field is an
 observation from one completed run, not atomic or continuing storage-bound enforcement.
+
+Mutating lifecycle operations are explicitly stop-the-world for write preparation, publication,
+migration, and lifecycle execution on the shared handle: lifecycle exclusivity is taken before
+`commit_lock`, which remains held while live data is materialized, a replacement is published,
+protected history is validated, and eligible objects are reclaimed. Immutable snapshot reads can
+continue. Cost therefore scales with live data and retained/protected history. The retained bounded
+fixture/runner evidence is a 79.49-second median and 1,289.2 MB peak live memory; it is evidence
+for that fixture and runner, not an SLO or a maximum. `lifecycle_report` and `storage_bound_met`
+exclude `_meta/row-id-high-water` reservation objects from physical accounting.
+
+Every inserting transaction creates one immutable row-ID reservation metadata object. Recovering the
+allocation floor reads that catalog, making metadata reads O(commits) per inserting commit and
+O(commits²) cumulatively; this is a documented shared-handle/local-filesystem cost, not an
+independent-handle coordination mechanism.
 
 ## Reads, updates, and index behavior
 

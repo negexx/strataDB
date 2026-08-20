@@ -12,6 +12,12 @@ tombstones, statistics, and immutable vector segments visible in a snapshot. Loc
 operations are behind the `Backend`/`LocalFs` boundary, although some paths remain local-disk-specific.
 The manifest is intended to be the single publication boundary for row and index visibility.
 
+Within the local-filesystem and one-process/shared-`Dataset` boundary, publication has three
+outcomes: acknowledged success, a definite failure before final-name publication, or indeterminate
+publication. In the indeterminate case, the immutable final-name candidate is readable but directory
+sync failed; no durability acknowledgement is reported. Reopening can establish visibility but not
+durability, and independent handles have no coordination protocol.
+
 The current design provides explicit snapshot-preserving compaction, age-based manifest retention,
 and vacuum of recognized unprotected objects. It does not provide arbitrary orphan cleanup,
 guaranteed bounded segment growth, or time-travel retention. Dataset-owned schema, manifest identity, row/file integrity, and durable
@@ -36,6 +42,17 @@ returning stale base-snapshot results. Preparation allocates physical row IDs, w
 and builds vector segments before the commit lock is taken. Under the shared handle's lock,
 write-write conflicts are checked against recent committed history. A clean commit publishes a new
 manifest and installs a replacement immutable snapshot.
+
+Before returning `TxnError::IndeterminateManifestPublication`, commit installs the readable candidate
+and records the write set, so that transaction is terminal and must not be replayed. Create returns
+no handle; callers must open before retrying and must not create again when open succeeds. Compact,
+migrate, and maintain can return `TxnError::Storage(StorageError::PublicationIndeterminate(...))`
+before changing the existing handle, so callers must stop using it, drop/reopen, and inspect recovered version/schema.
+Existing snapshots remain immutable in every outcome.
+
+Inserting transactions each write one immutable row-ID reservation. Recovering the allocation floor
+reads O(commits) reservation metadata per insert, yielding O(commits²) cumulative metadata reads.
+This deliberately bounded cost does not coordinate independent handles.
 
 The supported concurrency boundary is one process sharing one `Dataset` handle. This bounded read
 API and write-write OCC have snapshot isolation as their ceiling, not full serializability; it is not
@@ -66,6 +83,14 @@ observations, then reuses the immutable-snapshot operators. It is not SQL, a gen
 cost model, or a guaranteed cost bound for selective queries.
 
 ## Verification boundary
+
+Lifecycle mutation takes explicit lifecycle exclusivity followed by `commit_lock`, stopping write
+preparation, publication, migration, and other lifecycle execution for that shared handle while it
+materializes live data, publishes, validates protected history, and reclaims eligible objects.
+Immutable snapshot reads continue. Its cost scales with live data and retained/protected history.
+The retained fixture/runner evidence—79.49 seconds median and 1,289.2 MB peak live memory—is not an
+SLO or maximum. `lifecycle_report` and `storage_bound_met` exclude
+`_meta/row-id-high-water` reservation objects from physical accounting.
 
 Normal unit/integration tests, loom models, property tests, fuzz targets, real-process chaos/reopen
 tests, and Criterion benchmarks cover useful slices. Several important suites are opt-in or not yet
