@@ -393,8 +393,8 @@ pub mod test_support {
     }
 
     /// Causes one compaction on this test thread to return a typed I/O error
-    /// immediately after its manifest is durable and before in-memory
-    /// installation or reclamation.
+    /// immediately after its manifest is durable and after in-memory
+    /// installation, but before reclamation.
     #[must_use]
     pub fn fail_after_compaction_manifest_publication() -> PostPublicationFaultGuard {
         let previous = FAIL_AFTER_COMPACTION_MANIFEST_PUBLICATION.with(|fault| fault.replace(true));
@@ -427,6 +427,25 @@ pub mod test_support {
 
     pub(super) fn consume_before_migration_manifest_publication() -> bool {
         FAIL_BEFORE_MIGRATION_MANIFEST_PUBLICATION.with(|fault| fault.replace(false))
+    }
+}
+
+/// Publishes an immutable candidate and classifies a verified-visible
+/// post-publication durability error for callers that must reconcile the
+/// candidate before returning it to the user.
+fn publish_candidate_manifest(
+    storage: &StorageOwner,
+    manifest: &Manifest,
+) -> Result<Option<TxnError>> {
+    match commit_manifest_with(storage, manifest) {
+        Ok(()) => Ok(None),
+        Err(source @ strata_storage::StorageError::PublicationIndeterminate(_)) => {
+            Ok(Some(TxnError::IndeterminateManifestPublication {
+                manifest_version: manifest.version,
+                source,
+            }))
+        }
+        Err(source) => Err(TxnError::Storage(source)),
     }
 }
 
@@ -595,13 +614,7 @@ impl Dataset {
         if self.storage.is_local() {
             sync_dir(&data_dir)?;
         }
-        commit_manifest_with(&self.storage, &manifest)?;
-        #[cfg(feature = "test-fault-injection")]
-        if test_support::consume_after_compaction_manifest_publication() {
-            return Err(TxnError::Io(std::io::Error::other(
-                "injected post-publication compaction failure (test fault injection)",
-            )));
-        }
+        let indeterminate_publication = publish_candidate_manifest(&self.storage, &manifest)?;
         let report = CompactionReport {
             source_version,
             published_version,
@@ -627,7 +640,20 @@ impl Dataset {
             live_set_cache: LiveSetCache::new(crate::snapshot::LIVE_SET_CACHE_BYTE_BUDGET),
         };
         self.current.store(Arc::new(snapshot));
+        if let Some(error) = indeterminate_publication {
+            // The exact candidate is already visible. Install it before
+            // returning the typed uncertainty so this shared handle cannot
+            // publish a later version over a state recovery would select.
+            return Err(error);
+        }
         drop(source);
+
+        #[cfg(feature = "test-fault-injection")]
+        if test_support::consume_after_compaction_manifest_publication() {
+            return Err(TxnError::Io(std::io::Error::other(
+                "injected post-publication compaction failure (test fault injection)",
+            )));
+        }
 
         let manifest_keys = index_manifest_objects(&self.storage.list("_versions")?)?;
         let mut protected_data = HashSet::new();
@@ -1296,7 +1322,7 @@ impl Dataset {
                 "injected pre-publication migration failure (test fault injection)",
             )));
         }
-        commit_manifest_with(&self.storage, &manifest)?;
+        let indeterminate_publication = publish_candidate_manifest(&self.storage, &manifest)?;
 
         // A migration is a version boundary but has no row-level write set.
         // Transactions captured against the prior schema are rejected by the
@@ -1314,6 +1340,9 @@ impl Dataset {
             live_set_cache: LiveSetCache::new(crate::snapshot::LIVE_SET_CACHE_BYTE_BUDGET),
         };
         self.current.store(Arc::new(snapshot));
+        if let Some(error) = indeterminate_publication {
+            return Err(error);
+        }
         Ok(migration.result(new_version))
     }
 
