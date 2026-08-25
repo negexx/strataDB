@@ -449,6 +449,20 @@ fn publish_candidate_manifest(
     }
 }
 
+/// Completes the in-memory side of a verified-visible publication while the
+/// caller holds the shared publication lock. The durable manifest has already
+/// been published before this helper is called; commit history and the current
+/// snapshot must be installed before an indeterminate result is returned.
+fn complete_visible_publication<T>(
+    publish_commit_log: impl FnOnce(),
+    publish_current: impl FnOnce(),
+    outcome: Result<T>,
+) -> Result<T> {
+    publish_commit_log();
+    publish_current();
+    outcome
+}
+
 impl Dataset {
     /// Rewrites the current logical snapshot into a compacted physical layout.
     ///
@@ -627,7 +641,6 @@ impl Dataset {
         // logical row ownership. Record an empty write-set entry so the
         // bounded OCC history has no version gap for transactions that
         // began before compaction.
-        commit_log.push(published_version, Vec::new());
         let snapshot = Snapshot {
             dir: self.dir.clone(),
             storage: Arc::clone(&self.storage),
@@ -639,13 +652,14 @@ impl Dataset {
             tombstones: Arc::new(imbl::HashSet::new()),
             live_set_cache: LiveSetCache::new(crate::snapshot::LIVE_SET_CACHE_BYTE_BUDGET),
         };
-        self.current.store(Arc::new(snapshot));
-        if let Some(error) = indeterminate_publication {
-            // The exact candidate is already visible. Install it before
-            // returning the typed uncertainty so this shared handle cannot
-            // publish a later version over a state recovery would select.
-            return Err(error);
-        }
+        let report = complete_visible_publication(
+            || commit_log.push(published_version, Vec::new()),
+            || self.current.store(Arc::new(snapshot)),
+            match indeterminate_publication {
+                Some(error) => Err(error),
+                None => Ok(report),
+            },
+        )?;
         drop(source);
 
         #[cfg(feature = "test-fault-injection")]
@@ -1324,10 +1338,6 @@ impl Dataset {
         }
         let indeterminate_publication = publish_candidate_manifest(&self.storage, &manifest)?;
 
-        // A migration is a version boundary but has no row-level write set.
-        // Transactions captured against the prior schema are rejected by the
-        // schema-version guard in `Transaction::commit` below.
-        commit_log.push(new_version, Vec::new());
         let snapshot = Snapshot {
             dir: self.dir.clone(),
             storage: Arc::clone(&self.storage),
@@ -1339,11 +1349,17 @@ impl Dataset {
             tombstones: Arc::clone(&source.tombstones),
             live_set_cache: LiveSetCache::new(crate::snapshot::LIVE_SET_CACHE_BYTE_BUDGET),
         };
-        self.current.store(Arc::new(snapshot));
-        if let Some(error) = indeterminate_publication {
-            return Err(error);
-        }
-        Ok(migration.result(new_version))
+        // A migration is a version boundary but has no row-level write set.
+        // Transactions captured against the prior schema are rejected by the
+        // schema-version guard in `Transaction::commit` below.
+        complete_visible_publication(
+            || commit_log.push(new_version, Vec::new()),
+            || self.current.store(Arc::new(snapshot)),
+            match indeterminate_publication {
+                Some(error) => Err(error),
+                None => Ok(migration.result(new_version)),
+            },
+        )
     }
 
     #[must_use]
@@ -11996,65 +12012,144 @@ mod loom_tests {
         );
     }
 
-    #[derive(Default)]
     struct ReconciliationPublication {
-        visible_version: u64,
-        commit_log_version: u64,
+        commit_log_version: loom::sync::Mutex<usize>,
+        visible_version: loom::sync::atomic::AtomicUsize,
+        returned_indeterminate: loom::sync::atomic::AtomicBool,
+        reader_finished: loom::sync::atomic::AtomicBool,
     }
 
     #[test]
     fn indeterminate_reconciliation_precedes_readers_and_a_subsequent_publisher() {
         // Audit 4 semantic model: a verified-visible indeterminate candidate
-        // must install both the commit-log entry and current snapshot before
-        // its typed error is returned. A reader may race that installation,
-        // while a subsequent publisher must begin from the reconciled state.
-        // This models the observable ordering, not ArcSwap internals.
+        // must install the commit-log entry and current snapshot before the
+        // typed error-return boundary. A reader may race the snapshot store,
+        // while a subsequent publisher must not begin after that boundary
+        // from a state whose snapshot is still old. The separate mutex,
+        // atomic snapshot, and return marker model the three distinct
+        // publication observations. The model invokes the same production
+        // sequencing helper used by compaction and schema migration.
+        static OBSERVED_READER_VERSIONS: std::sync::atomic::AtomicU8 =
+            std::sync::atomic::AtomicU8::new(0);
         loom::model(|| {
-            let publication =
-                loom::sync::Arc::new(loom::sync::Mutex::new(ReconciliationPublication::default()));
+            let publication = loom::sync::Arc::new(ReconciliationPublication {
+                commit_log_version: loom::sync::Mutex::new(0),
+                visible_version: loom::sync::atomic::AtomicUsize::new(0),
+                returned_indeterminate: loom::sync::atomic::AtomicBool::new(false),
+                reader_finished: loom::sync::atomic::AtomicBool::new(false),
+            });
             let reconciled = loom::sync::Arc::clone(&publication);
-            let reconciliation_done = loom::sync::Arc::new(loom::sync::atomic::AtomicUsize::new(0));
-            let reconciled_done = loom::sync::Arc::clone(&reconciliation_done);
             let reconciliation = loom::thread::spawn(move || {
-                let mut state = reconciled.lock().unwrap();
-                state.commit_log_version = 1;
-                state.visible_version = 1;
-                // Production returns the typed indeterminate error only
-                // after this coherent state has been installed.
-                reconciled_done.store(1, std::sync::atomic::Ordering::SeqCst);
+                let mut commit_log = reconciled.commit_log_version.lock().unwrap();
+                let result: Result<(), TxnError> = super::complete_visible_publication(
+                    || *commit_log = 1,
+                    || {
+                        reconciled
+                            .visible_version
+                            .store(1, std::sync::atomic::Ordering::SeqCst);
+                    },
+                    Err(TxnError::IndeterminateManifestPublication {
+                        manifest_version: 1,
+                        source: strata_storage::StorageError::PublicationIndeterminate(
+                            "_versions/00000000000000000001.manifest".to_owned(),
+                        ),
+                    }),
+                );
+                assert!(matches!(
+                    result,
+                    Err(TxnError::IndeterminateManifestPublication {
+                        manifest_version: 1,
+                        ..
+                    })
+                ));
+                // The lock guard remains held until the helper has completed
+                // both publications and this error-return observation.
+                reconciled
+                    .returned_indeterminate
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
             });
 
             let reader_publication = loom::sync::Arc::clone(&publication);
             let reader = loom::thread::spawn(move || {
-                let state = reader_publication.lock().unwrap();
-                assert_eq!(
-                    state.visible_version, state.commit_log_version,
-                    "a reader must not observe a split publication"
+                let returned = reader_publication
+                    .returned_indeterminate
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                let visible = reader_publication
+                    .visible_version
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                assert!(
+                    visible == 0 || visible == 1,
+                    "reader observed an unpublished version: {visible}"
                 );
+                if returned {
+                    assert_eq!(visible, 1, "error return requires the candidate snapshot");
+                }
+                OBSERVED_READER_VERSIONS
+                    .fetch_or(1 << visible, std::sync::atomic::Ordering::Relaxed);
+                reader_publication
+                    .reader_finished
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
             });
 
             let publisher_publication = loom::sync::Arc::clone(&publication);
-            let publisher_done = loom::sync::Arc::clone(&reconciliation_done);
             let following_publisher = loom::thread::spawn(move || {
-                while publisher_done.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                while !publisher_publication
+                    .returned_indeterminate
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    || !publisher_publication
+                        .reader_finished
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                {
                     loom::thread::yield_now();
                 }
-                let mut state = publisher_publication.lock().unwrap();
+                let mut commit_log = publisher_publication.commit_log_version.lock().unwrap();
                 assert_eq!(
-                    (state.visible_version, state.commit_log_version),
+                    (
+                        *commit_log,
+                        publisher_publication
+                            .visible_version
+                            .load(std::sync::atomic::Ordering::SeqCst)
+                    ),
                     (1, 1),
-                    "a subsequent publisher must begin from the reconciled state"
+                    "a subsequent publisher must observe the reconciled commit-log entry"
                 );
-                state.visible_version = 2;
-                state.commit_log_version = 2;
+                super::complete_visible_publication(
+                    || *commit_log = 2,
+                    || {
+                        publisher_publication
+                            .visible_version
+                            .store(2, std::sync::atomic::Ordering::SeqCst)
+                    },
+                    Ok(()),
+                )
+                .unwrap();
+                assert_eq!(
+                    publisher_publication
+                        .visible_version
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    2,
+                    "following publication must advance from the reconciled snapshot"
+                );
             });
 
             reconciliation.join().unwrap();
             reader.join().unwrap();
             following_publisher.join().unwrap();
 
-            let state = publication.lock().unwrap();
-            assert_eq!((state.visible_version, state.commit_log_version), (2, 2));
+            assert_eq!(
+                (
+                    *publication.commit_log_version.lock().unwrap(),
+                    publication
+                        .visible_version
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                ),
+                (2, 2)
+            );
         });
+        assert_eq!(
+            OBSERVED_READER_VERSIONS.load(std::sync::atomic::Ordering::Relaxed),
+            0b11,
+            "loom must exercise readers before and after snapshot publication"
+        );
     }
 }
