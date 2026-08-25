@@ -11995,4 +11995,66 @@ mod loom_tests {
              loom_tests`)."
         );
     }
+
+    #[derive(Default)]
+    struct ReconciliationPublication {
+        visible_version: u64,
+        commit_log_version: u64,
+    }
+
+    #[test]
+    fn indeterminate_reconciliation_precedes_readers_and_a_subsequent_publisher() {
+        // Audit 4 semantic model: a verified-visible indeterminate candidate
+        // must install both the commit-log entry and current snapshot before
+        // its typed error is returned. A reader may race that installation,
+        // while a subsequent publisher must begin from the reconciled state.
+        // This models the observable ordering, not ArcSwap internals.
+        loom::model(|| {
+            let publication =
+                loom::sync::Arc::new(loom::sync::Mutex::new(ReconciliationPublication::default()));
+            let reconciled = loom::sync::Arc::clone(&publication);
+            let reconciliation_done = loom::sync::Arc::new(loom::sync::atomic::AtomicUsize::new(0));
+            let reconciled_done = loom::sync::Arc::clone(&reconciliation_done);
+            let reconciliation = loom::thread::spawn(move || {
+                let mut state = reconciled.lock().unwrap();
+                state.commit_log_version = 1;
+                state.visible_version = 1;
+                // Production returns the typed indeterminate error only
+                // after this coherent state has been installed.
+                reconciled_done.store(1, std::sync::atomic::Ordering::SeqCst);
+            });
+
+            let reader_publication = loom::sync::Arc::clone(&publication);
+            let reader = loom::thread::spawn(move || {
+                let state = reader_publication.lock().unwrap();
+                assert_eq!(
+                    state.visible_version, state.commit_log_version,
+                    "a reader must not observe a split publication"
+                );
+            });
+
+            let publisher_publication = loom::sync::Arc::clone(&publication);
+            let publisher_done = loom::sync::Arc::clone(&reconciliation_done);
+            let following_publisher = loom::thread::spawn(move || {
+                while publisher_done.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                    loom::thread::yield_now();
+                }
+                let mut state = publisher_publication.lock().unwrap();
+                assert_eq!(
+                    (state.visible_version, state.commit_log_version),
+                    (1, 1),
+                    "a subsequent publisher must begin from the reconciled state"
+                );
+                state.visible_version = 2;
+                state.commit_log_version = 2;
+            });
+
+            reconciliation.join().unwrap();
+            reader.join().unwrap();
+            following_publisher.join().unwrap();
+
+            let state = publication.lock().unwrap();
+            assert_eq!((state.visible_version, state.commit_log_version), (2, 2));
+        });
+    }
 }

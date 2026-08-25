@@ -300,6 +300,7 @@ jobs:
               row_id::loom_tests::concurrent_claims_publish_monotonic_high_water
               retention::loom_tests::concurrent_registration_and_final_drop_prune_after_quiescence
               lifecycle_coordination::loom_tests::preparation_and_exclusive_execution_never_overlap
+              dataset::loom_tests::indeterminate_reconciliation_precedes_readers_and_a_subsequent_publisher
             )
             for model in "${models[@]}"; do
               "$bin" --list --format terse | grep -Fx "${model}: test"

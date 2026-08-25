@@ -275,17 +275,23 @@ mod tests {
         later.pause_after_row_id_claim(later_checkpoint);
         let later_commit = std::thread::spawn(move || later.commit());
 
+        // Join the first preparation before waiting for pruning's exclusive
+        // checkpoint. On a loaded Windows runner, native manifest I/O can
+        // outlive the two-second checkpoint deadline even after its rendezvous
+        // is released; the join waits for the actual prerequisite rather than
+        // attributing that scheduling delay to lifecycle admission.
         first_control.release();
+        assert!(first_commit.join().unwrap().is_ok());
         assert!(
             prune_checkpoint.is_reached_within(DEADLINE),
             "queued pruning must win lifecycle admission after the first preparation"
         );
+
         assert!(
             !later_control.is_reached_within(WAIT),
             "later preparation must block before its file-creation checkpoint"
         );
         prune_checkpoint.release();
-        assert!(first_commit.join().unwrap().is_ok());
         assert!(pruned_result.recv_timeout(DEADLINE).unwrap().is_ok());
         pruning.join().unwrap().unwrap();
         later_control.wait();
