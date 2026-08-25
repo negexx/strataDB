@@ -393,8 +393,8 @@ pub mod test_support {
     }
 
     /// Causes one compaction on this test thread to return a typed I/O error
-    /// immediately after its manifest is durable and before in-memory
-    /// installation or reclamation.
+    /// immediately after its manifest is durable and after in-memory
+    /// installation, but before reclamation.
     #[must_use]
     pub fn fail_after_compaction_manifest_publication() -> PostPublicationFaultGuard {
         let previous = FAIL_AFTER_COMPACTION_MANIFEST_PUBLICATION.with(|fault| fault.replace(true));
@@ -428,6 +428,39 @@ pub mod test_support {
     pub(super) fn consume_before_migration_manifest_publication() -> bool {
         FAIL_BEFORE_MIGRATION_MANIFEST_PUBLICATION.with(|fault| fault.replace(false))
     }
+}
+
+/// Publishes an immutable candidate and classifies a verified-visible
+/// post-publication durability error for callers that must reconcile the
+/// candidate before returning it to the user.
+fn publish_candidate_manifest(
+    storage: &StorageOwner,
+    manifest: &Manifest,
+) -> Result<Option<TxnError>> {
+    match commit_manifest_with(storage, manifest) {
+        Ok(()) => Ok(None),
+        Err(source @ strata_storage::StorageError::PublicationIndeterminate(_)) => {
+            Ok(Some(TxnError::IndeterminateManifestPublication {
+                manifest_version: manifest.version,
+                source,
+            }))
+        }
+        Err(source) => Err(TxnError::Storage(source)),
+    }
+}
+
+/// Completes the in-memory side of a verified-visible publication while the
+/// caller holds the shared publication lock. The durable manifest has already
+/// been published before this helper is called; commit history and the current
+/// snapshot must be installed before an indeterminate result is returned.
+fn complete_visible_publication<T>(
+    publish_commit_log: impl FnOnce(),
+    publish_current: impl FnOnce(),
+    outcome: Result<T>,
+) -> Result<T> {
+    publish_commit_log();
+    publish_current();
+    outcome
 }
 
 impl Dataset {
@@ -599,13 +632,7 @@ impl Dataset {
         if self.storage.is_local() {
             sync_dir(&data_dir)?;
         }
-        commit_manifest_with(&self.storage, &manifest)?;
-        #[cfg(feature = "test-fault-injection")]
-        if test_support::consume_after_compaction_manifest_publication() {
-            return Err(TxnError::Io(std::io::Error::other(
-                "injected post-publication compaction failure (test fault injection)",
-            )));
-        }
+        let indeterminate_publication = publish_candidate_manifest(&self.storage, &manifest)?;
         let report = CompactionReport {
             source_version,
             published_version,
@@ -618,7 +645,6 @@ impl Dataset {
         // logical row ownership. Record an empty write-set entry so the
         // bounded OCC history has no version gap for transactions that
         // began before compaction.
-        commit_log.push(published_version, Vec::new());
         let snapshot = Snapshot {
             dir: self.dir.clone(),
             storage: Arc::clone(&self.storage),
@@ -630,8 +656,22 @@ impl Dataset {
             tombstones: Arc::new(imbl::HashSet::new()),
             live_set_cache: LiveSetCache::new(crate::snapshot::LIVE_SET_CACHE_BYTE_BUDGET),
         };
-        self.current.store(Arc::new(snapshot));
+        let report = complete_visible_publication(
+            || commit_log.push(published_version, Vec::new()),
+            || self.current.store(Arc::new(snapshot)),
+            match indeterminate_publication {
+                Some(error) => Err(error),
+                None => Ok(report),
+            },
+        )?;
         drop(source);
+
+        #[cfg(feature = "test-fault-injection")]
+        if test_support::consume_after_compaction_manifest_publication() {
+            return Err(TxnError::Io(std::io::Error::other(
+                "injected post-publication compaction failure (test fault injection)",
+            )));
+        }
 
         let manifest_keys = index_manifest_objects(&self.storage.list("_versions")?)?;
         let mut protected_data = HashSet::new();
@@ -1309,12 +1349,8 @@ impl Dataset {
                 "injected pre-publication migration failure (test fault injection)",
             )));
         }
-        commit_manifest_with(&self.storage, &manifest)?;
+        let indeterminate_publication = publish_candidate_manifest(&self.storage, &manifest)?;
 
-        // A migration is a version boundary but has no row-level write set.
-        // Transactions captured against the prior schema are rejected by the
-        // schema-version guard in `Transaction::commit` below.
-        commit_log.push(new_version, Vec::new());
         let snapshot = Snapshot {
             dir: self.dir.clone(),
             storage: Arc::clone(&self.storage),
@@ -1326,8 +1362,17 @@ impl Dataset {
             tombstones: Arc::clone(&source.tombstones),
             live_set_cache: LiveSetCache::new(crate::snapshot::LIVE_SET_CACHE_BYTE_BUDGET),
         };
-        self.current.store(Arc::new(snapshot));
-        Ok(migration.result(new_version))
+        // A migration is a version boundary but has no row-level write set.
+        // Transactions captured against the prior schema are rejected by the
+        // schema-version guard in `Transaction::commit` below.
+        complete_visible_publication(
+            || commit_log.push(new_version, Vec::new()),
+            || self.current.store(Arc::new(snapshot)),
+            match indeterminate_publication {
+                Some(error) => Err(error),
+                None => Ok(migration.result(new_version)),
+            },
+        )
     }
 
     #[must_use]
@@ -11982,6 +12027,147 @@ mod loom_tests {
              means DPOR collapsed this model to a narrower set of schedules than \
              it should explore (see the module doc comment above `mod \
              loom_tests`)."
+        );
+    }
+
+    struct ReconciliationPublication {
+        commit_log_version: loom::sync::Mutex<usize>,
+        visible_version: loom::sync::atomic::AtomicUsize,
+        returned_indeterminate: loom::sync::atomic::AtomicBool,
+        reader_finished: loom::sync::atomic::AtomicBool,
+    }
+
+    #[test]
+    fn indeterminate_reconciliation_precedes_readers_and_a_subsequent_publisher() {
+        // Audit 4 semantic model: a verified-visible indeterminate candidate
+        // must install the commit-log entry and current snapshot before the
+        // typed error-return boundary. A reader may race the snapshot store,
+        // while a subsequent publisher must not begin after that boundary
+        // from a state whose snapshot is still old. The separate mutex,
+        // atomic snapshot, and return marker model the three distinct
+        // publication observations. The model invokes the same production
+        // sequencing helper used by compaction and schema migration.
+        static OBSERVED_READER_VERSIONS: std::sync::atomic::AtomicU8 =
+            std::sync::atomic::AtomicU8::new(0);
+        loom::model(|| {
+            let publication = loom::sync::Arc::new(ReconciliationPublication {
+                commit_log_version: loom::sync::Mutex::new(0),
+                visible_version: loom::sync::atomic::AtomicUsize::new(0),
+                returned_indeterminate: loom::sync::atomic::AtomicBool::new(false),
+                reader_finished: loom::sync::atomic::AtomicBool::new(false),
+            });
+            let reconciled = loom::sync::Arc::clone(&publication);
+            let reconciliation = loom::thread::spawn(move || {
+                let mut commit_log = reconciled.commit_log_version.lock().unwrap();
+                let result: Result<(), TxnError> = super::complete_visible_publication(
+                    || *commit_log = 1,
+                    || {
+                        reconciled
+                            .visible_version
+                            .store(1, std::sync::atomic::Ordering::SeqCst);
+                    },
+                    Err(TxnError::IndeterminateManifestPublication {
+                        manifest_version: 1,
+                        source: strata_storage::StorageError::PublicationIndeterminate(
+                            "_versions/00000000000000000001.manifest".to_owned(),
+                        ),
+                    }),
+                );
+                assert!(matches!(
+                    result,
+                    Err(TxnError::IndeterminateManifestPublication {
+                        manifest_version: 1,
+                        ..
+                    })
+                ));
+                // The lock guard remains held until the helper has completed
+                // both publications and this error-return observation.
+                reconciled
+                    .returned_indeterminate
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+
+            let reader_publication = loom::sync::Arc::clone(&publication);
+            let reader = loom::thread::spawn(move || {
+                let returned = reader_publication
+                    .returned_indeterminate
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                let visible = reader_publication
+                    .visible_version
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                assert!(
+                    visible == 0 || visible == 1,
+                    "reader observed an unpublished version: {visible}"
+                );
+                if returned {
+                    assert_eq!(visible, 1, "error return requires the candidate snapshot");
+                }
+                OBSERVED_READER_VERSIONS
+                    .fetch_or(1 << visible, std::sync::atomic::Ordering::Relaxed);
+                reader_publication
+                    .reader_finished
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+
+            let publisher_publication = loom::sync::Arc::clone(&publication);
+            let following_publisher = loom::thread::spawn(move || {
+                while !publisher_publication
+                    .returned_indeterminate
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    || !publisher_publication
+                        .reader_finished
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    loom::thread::yield_now();
+                }
+                let mut commit_log = publisher_publication.commit_log_version.lock().unwrap();
+                assert_eq!(
+                    (
+                        *commit_log,
+                        publisher_publication
+                            .visible_version
+                            .load(std::sync::atomic::Ordering::SeqCst)
+                    ),
+                    (1, 1),
+                    "a subsequent publisher must observe the reconciled commit-log entry"
+                );
+                super::complete_visible_publication(
+                    || *commit_log = 2,
+                    || {
+                        publisher_publication
+                            .visible_version
+                            .store(2, std::sync::atomic::Ordering::SeqCst)
+                    },
+                    Ok(()),
+                )
+                .unwrap();
+                assert_eq!(
+                    publisher_publication
+                        .visible_version
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    2,
+                    "following publication must advance from the reconciled snapshot"
+                );
+            });
+
+            reconciliation.join().unwrap();
+            reader.join().unwrap();
+            following_publisher.join().unwrap();
+
+            assert_eq!(
+                (
+                    *publication.commit_log_version.lock().unwrap(),
+                    publication
+                        .visible_version
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                ),
+                (2, 2)
+            );
+        });
+        assert_eq!(
+            OBSERVED_READER_VERSIONS.load(std::sync::atomic::Ordering::Relaxed),
+            0b11,
+            "loom must exercise readers before and after snapshot publication"
         );
     }
 }

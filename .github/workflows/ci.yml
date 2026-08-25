@@ -300,6 +300,7 @@ jobs:
               row_id::loom_tests::concurrent_claims_publish_monotonic_high_water
               retention::loom_tests::concurrent_registration_and_final_drop_prune_after_quiescence
               lifecycle_coordination::loom_tests::preparation_and_exclusive_execution_never_overlap
+              dataset::loom_tests::indeterminate_reconciliation_precedes_readers_and_a_subsequent_publisher
             )
             for model in "${models[@]}"; do
               "$bin" --list --format terse | grep -Fx "${model}: test"
@@ -580,5 +581,94 @@ jobs:
         with:
           name: thorough-chaos-${{ github.run_id }}-attempt-${{ github.run_attempt }}
           path: artifacts/strata-chaos-thorough.log
+          if-no-files-found: error
+          retention-days: 90
+
+  audit4-concurrency-arm64:
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master at 2026-08-03
+        with:
+          toolchain: "1.97.1"
+      - name: Run Audit 4 ARM64 concurrency evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          log=artifacts/audit4-arm64.log
+          {
+            printf 'revision=%s\nrunner.os=%s\nrunner.arch=%s\n' "$(git rev-parse HEAD)" "$RUNNER_OS" "$RUNNER_ARCH"
+            rustc -Vv
+            cargo -Vv
+          } 2>&1 | tee "$log"
+          set +e
+          status=0
+          run_case() {
+            label="$1"; shift
+            echo "===== $label =====" | tee -a "$log"
+            set -x
+            "$@" 2>&1 | tee -a "$log"
+            command_status=(${PIPESTATUS[@]})
+            set +x
+            if [ "${command_status[0]}" -ne 0 ] || [ "${command_status[1]}" -ne 0 ]; then status=1; fi
+          }
+          run_case snapshot-isolation cargo test -p strata-txn --no-default-features --test concurrent_snapshot_isolation
+          run_case production-stress env STRATA_CONCURRENCY_STRESS_COMMITS=128 cargo test -p strata-txn --no-default-features --test concurrency_stress shared_dataset_publication_stress_preserves_complete_snapshots -- --exact --ignored --nocapture
+          grep -F 'AUDIT4_CONCURRENCY_STRESS_COMPLETE' "$log" >/dev/null || status=1
+          exit "$status"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: audit4-arm64-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: artifacts/audit4-arm64.log
+          if-no-files-found: error
+          retention-days: 90
+
+  audit4-concurrency-tsan:
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master at 2026-08-03
+        with:
+          toolchain: nightly-2026-07-25
+          components: rust-src
+      - name: Run Audit 4 ThreadSanitizer concurrency evidence
+        shell: bash
+        env:
+          RUSTFLAGS: -Zsanitizer=thread
+          RUSTDOCFLAGS: -Zsanitizer=thread
+          TSAN_OPTIONS: halt_on_error=1
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          log=artifacts/audit4-tsan.log
+          {
+            printf 'revision=%s\nrunner.os=%s\nrunner.arch=%s\n' "$(git rev-parse HEAD)" "$RUNNER_OS" "$RUNNER_ARCH"
+            rustc +nightly-2026-07-25 -Vv
+            cargo +nightly-2026-07-25 -Vv
+          } 2>&1 | tee "$log"
+          set +e
+          status=0
+          run_case() {
+            label="$1"; shift
+            echo "===== $label =====" | tee -a "$log"
+            set -x
+            "$@" 2>&1 | tee -a "$log"
+            command_status=(${PIPESTATUS[@]})
+            set +x
+            if [ "${command_status[0]}" -ne 0 ] || [ "${command_status[1]}" -ne 0 ]; then status=1; fi
+          }
+          run_case snapshot-isolation cargo +nightly-2026-07-25 test -Zbuild-std --target x86_64-unknown-linux-gnu -p strata-txn --no-default-features --test concurrent_snapshot_isolation
+          run_case production-stress env STRATA_CONCURRENCY_STRESS_COMMITS=128 cargo +nightly-2026-07-25 test -Zbuild-std --target x86_64-unknown-linux-gnu -p strata-txn --no-default-features --test concurrency_stress shared_dataset_publication_stress_preserves_complete_snapshots -- --exact --ignored --nocapture --test-threads=1
+          grep -F 'AUDIT4_CONCURRENCY_STRESS_COMPLETE' "$log" >/dev/null || status=1
+          exit "$status"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: audit4-tsan-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: artifacts/audit4-tsan.log
           if-no-files-found: error
           retention-days: 90

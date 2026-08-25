@@ -250,6 +250,41 @@ fn transaction_captured_before_migration_cannot_publish_old_schema_rows() {
 
 #[cfg(feature = "test-fault-injection")]
 #[test]
+fn migration_indeterminate_publication_installs_schema_before_returning_error() {
+    for sync_call in 1..=12 {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("dataset");
+        let dataset = Dataset::create(&dir, vector_schema()).unwrap();
+        let mut transaction = dataset.begin();
+        transaction.insert(vector_batch()).unwrap();
+        transaction.commit().unwrap();
+
+        let fault = strata_storage::datafile::test_support::fail_directory_sync_on_call(
+            sync_call,
+            std::io::ErrorKind::Other,
+        );
+        let result = dataset.migrate_schema(&add_nullable_tag(1, 2));
+        drop(fault);
+        if matches!(
+            result,
+            Err(TxnError::IndeterminateManifestPublication {
+                manifest_version: 2,
+                ..
+            })
+        ) {
+            assert_eq!(dataset.current_version(), 2);
+            assert_eq!(dataset.schema_version(), 2);
+            drop(dataset);
+            let reopened = Dataset::open(&dir).unwrap();
+            assert_eq!(reopened.current_version(), 2);
+            assert_eq!(reopened.schema_version(), 2);
+            return;
+        }
+    }
+    panic!("failed to exercise migration's indeterminate publication boundary");
+}
+#[cfg(feature = "test-fault-injection")]
+#[test]
 fn migration_failure_before_publication_reopens_the_prior_complete_manifest() {
     // Break caught: a migration that returns an error after writing replacement
     // objects but before manifest publication must not replace the prior

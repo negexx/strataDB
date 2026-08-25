@@ -261,6 +261,48 @@ fn compaction_records_an_empty_occ_history_entry_for_preexisting_transactions() 
 
 #[cfg(feature = "test-fault-injection")]
 #[test]
+fn compaction_indeterminate_publication_installs_candidate_before_returning_error() {
+    for sync_call in 1..=12 {
+        let directory = temp_dataset("indeterminate-publication-reconcile");
+        let dataset = Dataset::create(directory.path(), mvp_schema()).unwrap();
+        let mut transaction = dataset.begin();
+        transaction
+            .insert(mvp_batch(&[(1, "row", [1.0, 0.0, 1.0])]).unwrap())
+            .unwrap();
+        transaction.commit().unwrap();
+
+        let fault = strata_storage::datafile::test_support::fail_directory_sync_on_call(
+            sync_call,
+            std::io::ErrorKind::Other,
+        );
+        let result = dataset.compact(CompactionPolicy::retain_snapshots());
+        drop(fault);
+        if matches!(
+            result,
+            Err(TxnError::IndeterminateManifestPublication {
+                manifest_version: 2,
+                ..
+            })
+        ) {
+            assert_eq!(dataset.current_version(), 2);
+            assert_eq!(
+                dataset.snapshot().scan(&mvp_schema()).unwrap().num_rows(),
+                1
+            );
+            drop(dataset);
+            let reopened = Dataset::open(directory.path()).unwrap();
+            assert_eq!(reopened.current_version(), 2);
+            assert_eq!(
+                reopened.snapshot().scan(&mvp_schema()).unwrap().num_rows(),
+                1
+            );
+            return;
+        }
+    }
+    panic!("failed to exercise compaction's indeterminate publication boundary");
+}
+#[cfg(feature = "test-fault-injection")]
+#[test]
 fn compaction_prepublication_directory_sync_failure_reopens_old_state_and_allows_a_unique_commit() {
     // Break caught: publishing a compacted manifest after its replacement
     // directory entry failed to sync would expose a manifest whose objects
@@ -374,6 +416,11 @@ fn compaction_postpublication_fault_reopens_new_manifest_and_retains_old_objects
         .compact(CompactionPolicy::retain_snapshots())
         .expect_err("the test seam must stop compaction after durable manifest publication");
     assert!(matches!(error, TxnError::Io(_)));
+    assert_eq!(
+        dataset.current_version(),
+        old_manifest.version + 1,
+        "post-publication failure must leave the shared handle reconciled"
+    );
     drop(dataset);
 
     for object in &old_objects {
