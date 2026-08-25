@@ -2,6 +2,81 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex};
+
+struct GateState {
+    arrived: usize,
+    released: bool,
+    failed: bool,
+}
+
+struct CancelableGate {
+    state: Mutex<GateState>,
+    wake: Condvar,
+}
+
+impl CancelableGate {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(GateState {
+                arrived: 0,
+                released: false,
+                failed: false,
+            }),
+            wake: Condvar::new(),
+        }
+    }
+
+    fn arrive_and_wait(&self, participants: usize) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.failed {
+            return false;
+        }
+        state.arrived += 1;
+        if state.arrived == participants {
+            state.released = true;
+            self.wake.notify_all();
+            return true;
+        }
+        while !state.released && !state.failed {
+            state = self
+                .wake
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        !state.failed
+    }
+
+    fn fail(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.failed = true;
+        self.wake.notify_all();
+    }
+
+    fn is_failed(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .failed
+    }
+}
+
+#[test]
+fn cancelable_gate_releases_waiters_when_a_peer_fails() {
+    let gate = Arc::new(CancelableGate::new());
+    let waiting_gate = Arc::clone(&gate);
+    let waiter = std::thread::spawn(move || waiting_gate.arrive_and_wait(2));
+
+    gate.fail();
+
+    assert!(matches!(waiter.join(), Ok(false)));
+}
 
 use strata_txn::Dataset;
 use strata_txn::mvp_fixtures::{mvp_batch, mvp_schema};
@@ -29,7 +104,7 @@ fn shared_dataset_publication_stress_preserves_complete_snapshots() {
     let readers_ready = Arc::new(AtomicUsize::new(0));
     let start = Arc::new(std::sync::Barrier::new(5));
     let post_publication_readers = Arc::new(AtomicUsize::new(0));
-    let post_publication = Arc::new(std::sync::Barrier::new(5));
+    let post_publication = Arc::new(CancelableGate::new());
 
     let readers: Vec<_> = (0..4)
         .map(|_| {
@@ -40,44 +115,54 @@ fn shared_dataset_publication_stress_preserves_complete_snapshots() {
             let reader_post_publication_readers = Arc::clone(&post_publication_readers);
             let reader_post_publication = Arc::clone(&post_publication);
             std::thread::spawn(move || {
-                reader_start.wait();
-                let mut checks = 0_u64;
-                let mut last_version = 0_u64;
-                let mut observed_post_publication = false;
-                loop {
-                    let snapshot = reader_dataset.snapshot();
-                    let version = snapshot.version();
-                    assert!(version >= last_version, "snapshot version regressed");
-                    assert_eq!(
-                        snapshot.data_files().len(),
-                        usize::try_from(version).expect("stress version fits usize"),
-                        "row-file catalog must match the committed version"
-                    );
-                    assert_eq!(
-                        snapshot.segment_info().len(),
-                        usize::try_from(version).expect("stress version fits usize"),
-                        "segment catalog must match the committed version"
-                    );
-                    assert_eq!(
-                        snapshot.scan(&mvp_schema()).unwrap().num_rows(),
-                        usize::try_from(version).expect("stress version fits usize"),
-                        "a published snapshot must contain every committed row"
-                    );
-                    last_version = version;
-                    checks += 1;
-                    if checks == 1 {
-                        reader_gate.fetch_add(1, Ordering::Release);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    reader_start.wait();
+                    let mut checks = 0_u64;
+                    let mut last_version = 0_u64;
+                    let mut observed_post_publication = false;
+                    loop {
+                        let snapshot = reader_dataset.snapshot();
+                        let version = snapshot.version();
+                        assert!(version >= last_version, "snapshot version regressed");
+                        assert_eq!(
+                            snapshot.data_files().len(),
+                            usize::try_from(version).expect("stress version fits usize"),
+                            "row-file catalog must match the committed version"
+                        );
+                        assert_eq!(
+                            snapshot.segment_info().len(),
+                            usize::try_from(version).expect("stress version fits usize"),
+                            "segment catalog must match the committed version"
+                        );
+                        assert_eq!(
+                            snapshot.scan(&mvp_schema()).unwrap().num_rows(),
+                            usize::try_from(version).expect("stress version fits usize"),
+                            "a published snapshot must contain every committed row"
+                        );
+                        last_version = version;
+                        checks += 1;
+                        if checks == 1 {
+                            reader_gate.fetch_add(1, Ordering::Release);
+                        }
+                        if version > 0 && !observed_post_publication {
+                            observed_post_publication = true;
+                            reader_post_publication_readers.fetch_add(1, Ordering::Release);
+                            assert!(
+                                reader_post_publication.arrive_and_wait(5),
+                                "publication gate cancelled after a peer reader failed"
+                            );
+                        }
+                        if reader_stop.load(Ordering::Acquire) {
+                            break;
+                        }
                     }
-                    if version > 0 && !observed_post_publication {
-                        observed_post_publication = true;
-                        reader_post_publication_readers.fetch_add(1, Ordering::Release);
-                        reader_post_publication.wait();
-                    }
-                    if reader_stop.load(Ordering::Acquire) {
-                        break;
-                    }
+                    (checks, observed_post_publication)
+                }));
+                if result.is_err() {
+                    reader_post_publication.fail();
+                    reader_stop.store(true, Ordering::Release);
                 }
-                (checks, observed_post_publication)
+                result.unwrap_or_else(|payload| std::panic::resume_unwind(payload))
             })
         })
         .collect();
@@ -89,6 +174,9 @@ fn shared_dataset_publication_stress_preserves_complete_snapshots() {
     let writer = std::thread::spawn(move || {
         start.wait();
         while writer_ready.load(Ordering::Acquire) != 4 {
+            if writer_post_publication.is_failed() {
+                return Err("a reader failed before readiness".to_owned());
+            }
             std::thread::yield_now();
         }
         let mut writer_interval_readers = 0_usize;
@@ -100,19 +188,29 @@ fn shared_dataset_publication_stress_preserves_complete_snapshots() {
                 .unwrap();
             transaction.commit().unwrap();
             if raw_id == 0 {
-                writer_post_publication.wait();
+                if !writer_post_publication.arrive_and_wait(5) {
+                    return Err("a reader failed during post-publication coordination".to_owned());
+                }
                 writer_interval_readers = writer_post_publication_readers.load(Ordering::Acquire);
             }
         }
-        writer_interval_readers
+        Ok(writer_interval_readers)
     });
-    let writer_interval_readers = writer.join().unwrap();
+    let writer_result = writer.join();
     stop.store(true, Ordering::Release);
 
-    let total_checks: u64 = readers
+    let reader_results: Vec<_> = readers
         .into_iter()
-        .map(|reader| {
-            let (checks, observed_post_publication) = reader.join().unwrap();
+        .map(std::thread::JoinHandle::join)
+        .collect();
+    let writer_interval_readers = writer_result
+        .expect("writer thread panicked")
+        .expect("writer coordination failed");
+    let total_checks: u64 = reader_results
+        .into_iter()
+        .map(|reader_result| {
+            let (checks, observed_post_publication) =
+                reader_result.expect("reader thread panicked");
             assert!(checks > 0, "reader must perform at least one check");
             assert!(
                 observed_post_publication,
