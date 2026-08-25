@@ -172,29 +172,38 @@ fn shared_dataset_publication_stress_preserves_complete_snapshots() {
     let writer_post_publication_readers = Arc::clone(&post_publication_readers);
     let writer_post_publication = Arc::clone(&post_publication);
     let writer = std::thread::spawn(move || {
-        start.wait();
-        while writer_ready.load(Ordering::Acquire) != 4 {
-            if writer_post_publication.is_failed() {
-                return Err("a reader failed before readiness".to_owned());
-            }
-            std::thread::yield_now();
-        }
-        let mut writer_interval_readers = 0_usize;
-        for raw_id in 0..commits {
-            let id = i64::try_from(raw_id).expect("stress row id fits i64");
-            let mut transaction = writer_dataset.begin();
-            transaction
-                .insert(mvp_batch(&[(id, "stress", [id as f32, 0.0, 1.0])]).unwrap())
-                .unwrap();
-            transaction.commit().unwrap();
-            if raw_id == 0 {
-                if !writer_post_publication.arrive_and_wait(5) {
-                    return Err("a reader failed during post-publication coordination".to_owned());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            start.wait();
+            while writer_ready.load(Ordering::Acquire) != 4 {
+                if writer_post_publication.is_failed() {
+                    return Err("a reader failed before readiness".to_owned());
                 }
-                writer_interval_readers = writer_post_publication_readers.load(Ordering::Acquire);
+                std::thread::yield_now();
             }
+            let mut writer_interval_readers = 0_usize;
+            for raw_id in 0..commits {
+                let id = i64::try_from(raw_id).expect("stress row id fits i64");
+                let mut transaction = writer_dataset.begin();
+                transaction
+                    .insert(mvp_batch(&[(id, "stress", [id as f32, 0.0, 1.0])]).unwrap())
+                    .unwrap();
+                transaction.commit().unwrap();
+                if raw_id == 0 {
+                    if !writer_post_publication.arrive_and_wait(5) {
+                        return Err(
+                            "a reader failed during post-publication coordination".to_owned()
+                        );
+                    }
+                    writer_interval_readers =
+                        writer_post_publication_readers.load(Ordering::Acquire);
+                }
+            }
+            Ok(writer_interval_readers)
+        }));
+        if result.is_err() {
+            writer_post_publication.fail();
         }
-        Ok(writer_interval_readers)
+        result.unwrap_or_else(|payload| std::panic::resume_unwind(payload))
     });
     let writer_result = writer.join();
     stop.store(true, Ordering::Release);
