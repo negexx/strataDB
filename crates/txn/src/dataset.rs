@@ -37,7 +37,7 @@ use strata_storage::{
     ColumnStats, DataFileEntry, Manifest, SchemaMigration, SchemaMigrationResult, SegmentEntry,
     StorageOwner, Value, commit_manifest_with, compute_stats, initialize_row_id_high_water_with,
     read_batch_with, read_current_with, read_current_with_byte_count_with,
-    read_manifest_at_key_with_byte_count_with, read_row_id_high_water_with,
+    read_manifest_at_key_with_byte_count_and_size_with, read_row_id_high_water_with,
     read_row_id_high_water_with_byte_count_with, sync_dir, write_batch_with, write_bytes_with,
 };
 
@@ -684,8 +684,12 @@ impl Dataset {
                     "protected manifest is missing from inventory".to_owned(),
                 ))
             })?;
-            let (manifest, _) =
-                read_manifest_at_key_with_byte_count_with(&self.storage, &key.key, version)?;
+            let (manifest, _) = read_manifest_at_key_with_byte_count_and_size_with(
+                &self.storage,
+                &key.key,
+                version,
+                key.bytes,
+            )?;
             let owned_rows = validate_data_files_with_owner(
                 &self.storage,
                 &self.dir,
@@ -700,8 +704,12 @@ impl Dataset {
         }
         let mut manifest_listed_objects = HashSet::new();
         for (version, key) in manifest_keys {
-            let (historical, _) =
-                read_manifest_at_key_with_byte_count_with(&self.storage, &key.key, version)?;
+            let (historical, _) = read_manifest_at_key_with_byte_count_and_size_with(
+                &self.storage,
+                &key.key,
+                version,
+                key.bytes,
+            )?;
             let reachable = crate::lifecycle::reachable_keys(&historical)?;
             manifest_listed_objects.extend(reachable.data_files);
             manifest_listed_objects.extend(reachable.segments);
@@ -5989,9 +5997,8 @@ mod tests {
     #[test]
     fn opening_a_legacy_manifest_requires_explicit_migration() {
         let dir = temp_dir("legacy-manifest-migration");
-        let mut legacy_manifest = Manifest::empty();
-        legacy_manifest.schema_ipc.clear();
-        strata_storage::commit_manifest(&dir, &legacy_manifest).unwrap();
+        std::fs::create_dir_all(dir.join("_versions")).unwrap();
+        std::fs::write(dir.join("_versions/00000000000000000000.manifest"), b"{}").unwrap();
 
         let result = Dataset::open(&dir);
         assert!(

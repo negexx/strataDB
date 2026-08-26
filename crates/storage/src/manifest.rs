@@ -28,6 +28,7 @@ use std::path::PathBuf;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::ipc::convert::try_schema_from_flatbuffer_bytes;
 use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator, IpcWriteOptions};
+use serde::de::{self, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, StorageError};
@@ -37,6 +38,24 @@ use crate::stats::ColumnStats;
 /// The version of the manifest envelope, deliberately distinct from a
 /// manifest's commit [`Manifest::version`].
 pub const MANIFEST_FORMAT_VERSION: u32 = 1;
+
+/// Maximum encoded manifest size accepted during recovery. This bounds the
+/// first allocation made by JSON parsing for untrusted on-disk input.
+const MAX_MANIFEST_BYTES: usize = 64 * 1024 * 1024;
+/// `serde_json`'s default recursion guard is intentionally made explicit here
+/// so the format's recovery bound is visible and testable.
+const MAX_MANIFEST_JSON_DEPTH: usize = 128;
+const MAX_MANIFEST_OBJECT_FIELDS: usize = 4_096;
+const MAX_MANIFEST_STRING_BYTES: usize = 1024 * 1024;
+const MAX_MANIFEST_ARRAY_ITEMS: usize = 1_000_000;
+const MAX_MANIFEST_DATA_FILES: usize = 900_000;
+const MAX_MANIFEST_SEGMENTS: usize = 1_000_000;
+const MAX_MANIFEST_TOMBSTONES: usize = 10_000_000;
+const MAX_MANIFEST_SCHEMA_IPC_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum number of JSON values visited by the streaming preflight. This is
+/// deliberately lower than the largest field-specific collection limits so a
+/// large array is rejected before `serde_json::Value` can materialize it.
+const MAX_MANIFEST_PRE_PARSE_NODES: usize = 1_000_000;
 
 /// One committed data file's name and the per-column statistics computed
 /// for it at commit time — see `docs/design.md`.
@@ -287,16 +306,6 @@ impl ManifestEnvelope {
                 ),
             ));
         }
-        let expected_checksum = self.canonical_checksum()?;
-        if self.checksum != expected_checksum {
-            return Err(StorageError::CorruptManifest(
-                path.to_path_buf(),
-                format!(
-                    "checksum {} does not match canonical payload checksum {expected_checksum}",
-                    self.checksum
-                ),
-            ));
-        }
         if self.manifest.version != filename_version {
             return Err(StorageError::CorruptManifest(
                 path.to_path_buf(),
@@ -346,6 +355,350 @@ fn canonicalize_json(value: serde_json::Value) -> serde_json::Value {
     }
 }
 
+fn manifest_limit_error(path: &Path, detail: impl Into<String>) -> StorageError {
+    StorageError::CorruptManifest(path.to_path_buf(), detail.into())
+}
+
+fn validate_json_limits(
+    value: &serde_json::Value,
+    path: &Path,
+    depth: usize,
+    array_limit: usize,
+) -> Result<()> {
+    if depth > MAX_MANIFEST_JSON_DEPTH {
+        return Err(manifest_limit_error(
+            path,
+            format!("JSON nesting exceeds maximum depth {MAX_MANIFEST_JSON_DEPTH}"),
+        ));
+    }
+
+    match value {
+        serde_json::Value::Array(values) => {
+            if values.len() > array_limit {
+                return Err(manifest_limit_error(
+                    path,
+                    format!(
+                        "JSON array contains {} items; maximum is {array_limit}",
+                        values.len(),
+                    ),
+                ));
+            }
+            for value in values {
+                validate_json_limits(value, path, depth + 1, array_limit)?;
+            }
+        }
+        serde_json::Value::Object(values) => {
+            if values.len() > MAX_MANIFEST_OBJECT_FIELDS {
+                return Err(manifest_limit_error(
+                    path,
+                    format!(
+                        "JSON object contains {} fields; maximum is {MAX_MANIFEST_OBJECT_FIELDS}",
+                        values.len()
+                    ),
+                ));
+            }
+            for (key, value) in values {
+                if key.len() > MAX_MANIFEST_STRING_BYTES {
+                    return Err(manifest_limit_error(
+                        path,
+                        format!(
+                            "JSON object key exceeds maximum length {MAX_MANIFEST_STRING_BYTES}"
+                        ),
+                    ));
+                }
+                let child_array_limit = match key.as_str() {
+                    "tombstones" => MAX_MANIFEST_TOMBSTONES,
+                    "schema_ipc" => MAX_MANIFEST_SCHEMA_IPC_BYTES,
+                    "data_files" => MAX_MANIFEST_DATA_FILES,
+                    "segments" => MAX_MANIFEST_SEGMENTS,
+                    _ => MAX_MANIFEST_ARRAY_ITEMS,
+                };
+                validate_json_limits(value, path, depth + 1, child_array_limit)?;
+            }
+        }
+        serde_json::Value::String(value) if value.len() > MAX_MANIFEST_STRING_BYTES => {
+            return Err(manifest_limit_error(
+                path,
+                format!("JSON string exceeds maximum length {MAX_MANIFEST_STRING_BYTES}"),
+            ));
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+#[derive(Default)]
+struct ManifestJsonBudget {
+    nodes: usize,
+}
+
+impl ManifestJsonBudget {
+    fn visit<E: de::Error>(&mut self) -> std::result::Result<(), E> {
+        self.nodes = self.nodes.saturating_add(1);
+        if self.nodes > MAX_MANIFEST_PRE_PARSE_NODES {
+            return Err(E::custom(format!(
+                "JSON contains more than {MAX_MANIFEST_PRE_PARSE_NODES} values"
+            )));
+        }
+        Ok(())
+    }
+}
+
+struct ManifestJsonSeed<'a> {
+    budget: &'a mut ManifestJsonBudget,
+    array_limit: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for ManifestJsonSeed<'_> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(ManifestJsonVisitor {
+            budget: self.budget,
+            array_limit: self.array_limit,
+        })
+    }
+}
+
+struct ManifestJsonVisitor<'a> {
+    budget: &'a mut ManifestJsonBudget,
+    array_limit: usize,
+}
+
+impl<'de> Visitor<'de> for ManifestJsonVisitor<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a bounded JSON manifest")
+    }
+
+    fn visit_bool<E>(self, _: bool) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.budget.visit()?;
+        Ok(())
+    }
+
+    fn visit_i64<E>(self, _: i64) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.budget.visit()?;
+        Ok(())
+    }
+
+    fn visit_u64<E>(self, _: u64) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.budget.visit()?;
+        Ok(())
+    }
+
+    fn visit_f64<E>(self, _: f64) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.budget.visit()?;
+        Ok(())
+    }
+
+    fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.budget.visit()?;
+        if value.len() > MAX_MANIFEST_STRING_BYTES {
+            return Err(E::custom(format!(
+                "JSON string exceeds maximum length {MAX_MANIFEST_STRING_BYTES}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn visit_borrowed_str<E>(self, value: &'de str) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.visit_str(value)
+    }
+
+    fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.visit_str(&value)
+    }
+
+    fn visit_none<E>(self) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.budget.visit()?;
+        Ok(())
+    }
+
+    fn visit_unit<E>(self) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.budget.visit()?;
+        Ok(())
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(self)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        self.budget.visit()?;
+        let mut items = 0;
+        while let Some(()) = sequence.next_element_seed(ManifestJsonSeed {
+            budget: self.budget,
+            array_limit: self.array_limit,
+        })? {
+            items += 1;
+            if items > self.array_limit {
+                return Err(de::Error::custom(format!(
+                    "JSON array contains more than {} items",
+                    self.array_limit
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        self.budget.visit()?;
+        let mut fields = 0;
+        while let Some(key) = map.next_key::<String>()? {
+            fields += 1;
+            if fields > MAX_MANIFEST_OBJECT_FIELDS {
+                return Err(de::Error::custom(format!(
+                    "JSON object contains more than {MAX_MANIFEST_OBJECT_FIELDS} fields"
+                )));
+            }
+            if key.len() > MAX_MANIFEST_STRING_BYTES {
+                return Err(de::Error::custom(format!(
+                    "JSON object key exceeds maximum length {MAX_MANIFEST_STRING_BYTES}"
+                )));
+            }
+            let array_limit = match key.as_str() {
+                "tombstones" => MAX_MANIFEST_TOMBSTONES,
+                "schema_ipc" => MAX_MANIFEST_SCHEMA_IPC_BYTES,
+                "data_files" => MAX_MANIFEST_DATA_FILES,
+                "segments" => MAX_MANIFEST_SEGMENTS,
+                _ => MAX_MANIFEST_ARRAY_ITEMS,
+            };
+            map.next_value_seed(ManifestJsonSeed {
+                budget: self.budget,
+                array_limit,
+            })?;
+        }
+        Ok(())
+    }
+}
+
+fn preflight_manifest_json(bytes: &[u8], path: &Path) -> Result<()> {
+    let mut budget = ManifestJsonBudget::default();
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    deserializer
+        .deserialize_any(ManifestJsonVisitor {
+            budget: &mut budget,
+            array_limit: MAX_MANIFEST_ARRAY_ITEMS,
+        })
+        .map_err(|error| manifest_limit_error(path, error.to_string()))?;
+    deserializer
+        .end()
+        .map_err(|error| manifest_limit_error(path, error.to_string()))
+}
+
+fn validate_manifest_collection_limits(value: &serde_json::Value, path: &Path) -> Result<()> {
+    let Some(manifest) = value.get("manifest").and_then(serde_json::Value::as_object) else {
+        return Err(manifest_limit_error(
+            path,
+            "manifest envelope payload is not an object",
+        ));
+    };
+
+    for (field, limit) in [
+        ("data_files", MAX_MANIFEST_DATA_FILES),
+        ("segments", MAX_MANIFEST_SEGMENTS),
+        ("tombstones", MAX_MANIFEST_TOMBSTONES),
+    ] {
+        if let Some(items) = manifest.get(field).and_then(serde_json::Value::as_array)
+            && items.len() > limit
+        {
+            return Err(manifest_limit_error(
+                path,
+                format!(
+                    "manifest field '{field}' contains {} items; maximum is {limit}",
+                    items.len()
+                ),
+            ));
+        }
+    }
+
+    if let Some(schema_ipc) = manifest
+        .get("schema_ipc")
+        .and_then(serde_json::Value::as_array)
+        && schema_ipc.len() > MAX_MANIFEST_SCHEMA_IPC_BYTES
+    {
+        return Err(manifest_limit_error(
+            path,
+            format!(
+                "schema_ipc contains {} bytes; maximum is {MAX_MANIFEST_SCHEMA_IPC_BYTES}",
+                schema_ipc.len()
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+fn raw_envelope_checksum(value: &serde_json::Value, path: &Path) -> Result<(u32, u32, u32)> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| manifest_limit_error(path, "manifest envelope is not a JSON object"))?;
+    let format_version = object
+        .get("format_version")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| {
+            manifest_limit_error(path, "manifest format_version is missing or invalid")
+        })?;
+    let stored_checksum = object
+        .get("checksum")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| manifest_limit_error(path, "manifest checksum is missing or invalid"))?;
+
+    let mut zeroed = value.clone();
+    let Some(zeroed_object) = zeroed.as_object_mut() else {
+        return Err(manifest_limit_error(
+            path,
+            "manifest envelope is not a JSON object",
+        ));
+    };
+    zeroed_object.insert("checksum".to_string(), serde_json::Value::from(0));
+    let canonical = serde_json::to_vec(&canonicalize_json(zeroed))?;
+    Ok((format_version, stored_checksum, crc32c::crc32c(&canonical)))
+}
+
 #[cfg(test)]
 fn versions_dir(dataset_dir: &Path) -> PathBuf {
     dataset_dir.join("_versions")
@@ -384,6 +737,10 @@ pub fn commit_manifest_with(
 ) -> Result<()> {
     let key = owner.manifest_object_key(manifest.version);
     let json = serde_json::to_vec(&ManifestEnvelope::new(manifest.clone())?)?;
+    // Validate the exact serialized bytes before publication. Recovery applies
+    // the same bounds and raw-checksum rules, so a successful commit must never
+    // create a final-name manifest that the next reopen would reject.
+    decode_manifest_with_byte_count(owner.root(), key.as_str(), manifest.version, &json)?;
     // `put_if_absent` makes a manifest version immutable: a retry can never
     // overwrite the bytes recovery may already select. `LocalFs` publishes
     // its final hard-link name before synchronizing the directory, so a
@@ -467,8 +824,59 @@ pub fn read_manifest_at_key_with_byte_count_with(
     version: u64,
 ) -> Result<(Manifest, u64)> {
     let key = crate::backend::DatasetKey::new(key)?;
-    let bytes = owner.get(&key)?;
+    let bytes = read_bounded_manifest_bytes(owner, &key, None)?;
     decode_manifest_with_byte_count(owner.root(), key.as_str(), version, &bytes)
+}
+
+/// Reads one exact manifest key when the caller already has its inventory size.
+///
+/// Lifecycle callers commonly enumerate `_versions/` once and then inspect
+/// several manifests from that inventory. Supplying the observed size avoids
+/// re-enumerating the namespace for every manifest while preserving the same
+/// pre-allocation byte bound as the standalone reader.
+#[allow(clippy::missing_errors_doc)]
+pub fn read_manifest_at_key_with_byte_count_and_size_with(
+    owner: &crate::backend::StorageOwner,
+    key: &str,
+    version: u64,
+    size: u64,
+) -> Result<(Manifest, u64)> {
+    let key = crate::backend::DatasetKey::new(key)?;
+    let bytes = read_bounded_manifest_bytes(owner, &key, Some(size))?;
+    decode_manifest_with_byte_count(owner.root(), key.as_str(), version, &bytes)
+}
+
+fn read_bounded_manifest_bytes(
+    owner: &crate::backend::StorageOwner,
+    key: &crate::backend::DatasetKey,
+    known_size: Option<u64>,
+) -> Result<Vec<u8>> {
+    let size = if let Some(size) = known_size {
+        size
+    } else {
+        let prefix = key
+            .as_str()
+            .rsplit_once('/')
+            .map_or("", |(prefix, _)| prefix);
+        owner
+            .list(prefix)?
+            .into_iter()
+            .find(|meta| meta.key == key.as_str())
+            .ok_or_else(|| {
+                StorageError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("manifest object '{}' is missing", key.as_str()),
+                ))
+            })?
+            .size
+    };
+    if size > MAX_MANIFEST_BYTES as u64 {
+        return Err(manifest_limit_error(
+            &owner.root().join(key.as_str()),
+            format!("manifest contains {size} bytes; maximum is {MAX_MANIFEST_BYTES}"),
+        ));
+    }
+    owner.get_range(key, 0..size)
 }
 
 fn decode_manifest_with_byte_count(
@@ -478,6 +886,19 @@ fn decode_manifest_with_byte_count(
     bytes: &[u8],
 ) -> Result<(Manifest, u64)> {
     let path = dataset_dir.join(key);
+    if bytes.len() > MAX_MANIFEST_BYTES {
+        return Err(manifest_limit_error(
+            &path,
+            format!(
+                "manifest contains {} bytes; maximum is {MAX_MANIFEST_BYTES}",
+                bytes.len()
+            ),
+        ));
+    }
+    // Perform cardinality/depth checks while streaming the JSON tokens. This
+    // must precede `serde_json::Value` parsing: a compact array can be tiny on
+    // disk but expand into hundreds of megabytes of heap allocations.
+    preflight_manifest_json(bytes, &path)?;
     let value: serde_json::Value = serde_json::from_slice(bytes)
         .map_err(|error| StorageError::CorruptManifest(path.clone(), error.to_string()))?;
     if !value
@@ -485,6 +906,26 @@ fn decode_manifest_with_byte_count(
         .is_some_and(|object| object.contains_key("format_version"))
     {
         return Err(StorageError::LegacyFormatNeedsMigration(path));
+    }
+    validate_json_limits(&value, &path, 0, MAX_MANIFEST_ARRAY_ITEMS)?;
+    validate_manifest_collection_limits(&value, &path)?;
+    let (raw_format_version, stored_checksum, expected_checksum) =
+        raw_envelope_checksum(&value, &path)?;
+    if raw_format_version != MANIFEST_FORMAT_VERSION {
+        return Err(StorageError::CorruptManifest(
+            path.clone(),
+            format!(
+                "format_version {raw_format_version} is unsupported; expected {MANIFEST_FORMAT_VERSION}"
+            ),
+        ));
+    }
+    if stored_checksum != expected_checksum {
+        return Err(StorageError::CorruptManifest(
+            path.clone(),
+            format!(
+                "checksum {stored_checksum} does not match canonical payload checksum {expected_checksum}"
+            ),
+        ));
     }
     let envelope: ManifestEnvelope = serde_json::from_value(value)
         .map_err(|error| StorageError::CorruptManifest(path.clone(), error.to_string()))?;
@@ -519,7 +960,7 @@ pub fn read_current_with_byte_count(dataset_dir: &Path) -> Result<Option<(Manife
 pub fn read_current_with_byte_count_with(
     owner: &crate::backend::StorageOwner,
 ) -> Result<Option<(Manifest, u64)>> {
-    let mut best: Option<(u64, String)> = None;
+    let mut best: Option<(u64, String, u64)> = None;
     for meta in owner.list("_versions")? {
         let Some(stem) = meta
             .key
@@ -531,17 +972,17 @@ pub fn read_current_with_byte_count_with(
         let Ok(version) = stem.parse::<u64>() else {
             continue;
         };
-        let is_newer = best.as_ref().is_none_or(|(v, _)| version > *v);
+        let is_newer = best.as_ref().is_none_or(|(v, _, _)| version > *v);
         if is_newer {
-            best = Some((version, meta.key.clone()));
+            best = Some((version, meta.key.clone(), meta.size));
         }
     }
 
-    let Some((filename_version, key)) = best else {
+    let Some((filename_version, key, size)) = best else {
         return Ok(None);
     };
     let manifest_key = crate::backend::DatasetKey::new(&key)?;
-    let bytes = owner.get(&manifest_key)?;
+    let bytes = read_bounded_manifest_bytes(owner, &manifest_key, Some(size))?;
     decode_manifest_with_byte_count(owner.root(), &key, filename_version, &bytes).map(Some)
 }
 
@@ -872,6 +1313,201 @@ mod tests {
     }
 
     #[test]
+    fn commit_manifest_rejects_output_that_recovery_would_bound() {
+        let dir = temp_dataset_dir("writer-bound");
+        let manifest = manifest(
+            0,
+            vec![data_file(&"x".repeat(MAX_MANIFEST_STRING_BYTES + 1))],
+        );
+
+        let result = commit_manifest(&dir, &manifest);
+
+        assert!(
+            matches!(result, Err(StorageError::CorruptManifest(_, ref detail)) if detail.contains("JSON string")),
+            "expected the writer-side bound, got {result:?}"
+        );
+        assert!(!versions_dir(&dir).exists());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_current_accepts_a_checksum_valid_manifest_without_committed_at_us() {
+        // This is a real historical shape: format-v1 writers predated the
+        // `committed_at_us` field. The checksum must cover the bytes that
+        // were actually written, not a typed struct with today's defaults
+        // inserted into it during deserialization.
+        let dir = temp_dataset_dir("historical-committed-at");
+        let m0 = manifest(0, vec![data_file("legacy.arrow")]);
+        let mut value = serde_json::to_value(ManifestEnvelope::new(m0).unwrap()).unwrap();
+        {
+            let object = value.as_object_mut().unwrap();
+            let manifest_value = object
+                .get_mut("manifest")
+                .and_then(serde_json::Value::as_object_mut)
+                .unwrap();
+            manifest_value.remove("committed_at_us");
+            object.insert("checksum".to_string(), serde_json::json!(0));
+        }
+        let checksum_bytes = serde_json::to_vec(&canonicalize_json(value.clone())).unwrap();
+        let checksum = crc32c::crc32c(&checksum_bytes);
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("checksum".to_string(), serde_json::json!(checksum));
+
+        fs::create_dir_all(versions_dir(&dir)).unwrap();
+        fs::write(manifest_path(&dir, 0), serde_json::to_vec(&value).unwrap()).unwrap();
+
+        let recovered = read_current(&dir).unwrap().unwrap();
+
+        assert_eq!(recovered.version, 0);
+        assert_eq!(recovered.committed_at_us, 0);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    fn write_raw_manifest_bytes(dir: &Path, bytes: &[u8]) {
+        fs::create_dir_all(versions_dir(dir)).unwrap();
+        fs::write(manifest_path(dir, 0), bytes).unwrap();
+    }
+
+    fn raw_manifest_value() -> serde_json::Value {
+        serde_json::to_value(ManifestEnvelope::new(manifest(0, Vec::new())).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn read_current_rejects_a_manifest_over_the_encoded_byte_limit() {
+        let dir = temp_dataset_dir("manifest-byte-limit");
+        write_raw_manifest_bytes(&dir, &vec![b'x'; MAX_MANIFEST_BYTES + 1]);
+
+        let result = read_current(&dir);
+
+        assert!(
+            matches!(result, Err(StorageError::CorruptManifest(_, ref detail)) if detail.contains("maximum is 67108864")),
+            "expected the encoded manifest bound, got {result:?}"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_current_rejects_manifest_json_that_is_too_deep() {
+        let dir = temp_dataset_dir("manifest-depth-limit");
+        let mut bytes = Vec::with_capacity((MAX_MANIFEST_JSON_DEPTH + 1) * 2 + 1);
+        bytes.extend(std::iter::repeat_n(b'[', MAX_MANIFEST_JSON_DEPTH + 1));
+        bytes.push(b'0');
+        bytes.extend(std::iter::repeat_n(b']', MAX_MANIFEST_JSON_DEPTH + 1));
+        write_raw_manifest_bytes(&dir, &bytes);
+
+        let result = read_current(&dir);
+
+        assert!(
+            matches!(result, Err(StorageError::CorruptManifest(_, ref detail)) if detail.contains("JSON nesting") || detail.contains("recursion limit")),
+            "expected the JSON depth bound, got {result:?}"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_current_rejects_manifest_json_with_too_many_object_fields() {
+        let dir = temp_dataset_dir("manifest-object-limit");
+        let mut value = raw_manifest_value();
+        let object = value
+            .get_mut("manifest")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap();
+        for index in 0..=MAX_MANIFEST_OBJECT_FIELDS {
+            object.insert(format!("unknown_{index}"), serde_json::Value::Null);
+        }
+        write_raw_manifest_bytes(&dir, &serde_json::to_vec(&value).unwrap());
+
+        let result = read_current(&dir);
+
+        assert!(
+            matches!(result, Err(StorageError::CorruptManifest(_, ref detail)) if detail.contains("JSON object")),
+            "expected the JSON object-field bound, got {result:?}"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_current_rejects_manifest_with_too_many_data_files() {
+        let dir = temp_dataset_dir("manifest-data-file-limit");
+        let mut value = raw_manifest_value();
+        value["manifest"]["data_files"] = serde_json::Value::Array(
+            std::iter::repeat_n(serde_json::Value::Null, MAX_MANIFEST_DATA_FILES + 1).collect(),
+        );
+        write_raw_manifest_bytes(&dir, &serde_json::to_vec(&value).unwrap());
+
+        let result = read_current(&dir);
+
+        assert!(
+            matches!(result, Err(StorageError::CorruptManifest(_, ref detail)) if detail.contains("data_files") || detail.contains("maximum is 900000") || detail.contains("array contains")),
+            "expected the data-file bound, got {result:?}"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_current_rejects_large_json_arrays_before_value_materialization() {
+        let dir = temp_dataset_dir("manifest-preflight-node-limit");
+        let mut bytes = br#"{"format_version":1,"checksum":0,"manifest":{"tombstones":["#.to_vec();
+        for index in 0..=MAX_MANIFEST_PRE_PARSE_NODES {
+            if index != 0 {
+                bytes.push(b',');
+            }
+            bytes.push(b'0');
+        }
+        bytes.extend_from_slice(br"]}}");
+        write_raw_manifest_bytes(&dir, &bytes);
+
+        let result = read_current(&dir);
+
+        assert!(
+            matches!(result, Err(StorageError::CorruptManifest(_, ref detail)) if detail.contains("more than 1000000") || detail.contains("array contains")),
+            "expected the streaming preflight bound, got {result:?}"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn field_specific_array_limits_are_not_shadowed_by_generic_limit() {
+        let value = serde_json::json!({
+            "manifest": {
+                "tombstones": std::iter::repeat_n(serde_json::Value::from(0),
+                    MAX_MANIFEST_ARRAY_ITEMS + 1).collect::<Vec<_>>()
+            }
+        });
+
+        assert!(
+            validate_json_limits(&value, Path::new("manifest"), 0, MAX_MANIFEST_ARRAY_ITEMS)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn read_current_rejects_manifest_with_an_oversized_string() {
+        let dir = temp_dataset_dir("manifest-string-limit");
+        let mut value = raw_manifest_value();
+        value["manifest"]["schema_ipc"] = serde_json::json!([1]);
+        value["manifest"]["data_files"] = serde_json::json!([{
+            "name": "x".repeat(MAX_MANIFEST_STRING_BYTES + 1),
+            "byte_len": 0,
+            "crc32c": 0,
+            "row_count": 0,
+            "row_id_range": null,
+            "stats": {}
+        }]);
+        write_raw_manifest_bytes(&dir, &serde_json::to_vec(&value).unwrap());
+
+        let result = read_current(&dir);
+
+        assert!(
+            matches!(result, Err(StorageError::CorruptManifest(_, ref detail)) if detail.contains("JSON string")),
+            "expected the JSON string bound, got {result:?}"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn manifest_without_next_attempt_id_field_deserializes_with_default_zero() {
         // Simulates a manifest written to disk before `next_attempt_id`
         // existed — must still deserialize, defaulting to 0, same as
@@ -1169,9 +1805,15 @@ mod tests {
         // Break caught: treating a newer catalog version as a known schema
         // could reinterpret rows and vector segments without a migration.
         let dir = temp_dataset_dir("unknown-schema-version");
-        let mut manifest = Manifest::empty();
-        manifest.schema_version = Some(99);
-        commit_manifest(&dir, &manifest).unwrap();
+        let mut value =
+            serde_json::to_value(ManifestEnvelope::new(Manifest::empty()).unwrap()).unwrap();
+        value["manifest"]["schema_version"] = serde_json::json!(99);
+        value["checksum"] = serde_json::json!(0);
+        let checksum =
+            crc32c::crc32c(&serde_json::to_vec(&canonicalize_json(value.clone())).unwrap());
+        value["checksum"] = serde_json::json!(checksum);
+        fs::create_dir_all(versions_dir(&dir)).unwrap();
+        fs::write(manifest_path(&dir, 0), serde_json::to_vec(&value).unwrap()).unwrap();
 
         let result = read_current(&dir);
         assert!(

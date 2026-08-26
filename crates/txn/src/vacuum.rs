@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use strata_storage::read_manifest_at_key_with_byte_count_with;
+use strata_storage::read_manifest_at_key_with_byte_count_and_size_with;
 
 use crate::dataset::{
     Dataset, load_segments_with_owner, validate_data_files_with_owner, validate_tombstones,
@@ -51,8 +51,9 @@ impl Dataset {
                     "protected manifest is missing from inventory".to_owned(),
                 ))
             })?;
-            let (manifest, _) =
-                read_manifest_at_key_with_byte_count_with(&storage, &key.key, version)?;
+            let (manifest, _) = read_manifest_at_key_with_byte_count_and_size_with(
+                &storage, &key.key, version, key.bytes,
+            )?;
             let owned_rows = validate_data_files_with_owner(
                 &storage,
                 self.retention_dir(),
@@ -81,8 +82,9 @@ impl Dataset {
         }
 
         for (version, key) in manifest_keys {
-            let (manifest, _) =
-                read_manifest_at_key_with_byte_count_with(&storage, &key.key, version)?;
+            let (manifest, _) = read_manifest_at_key_with_byte_count_and_size_with(
+                &storage, &key.key, version, key.bytes,
+            )?;
             let reachable = crate::lifecycle::reachable_keys(&manifest)?;
             protected.extend(reachable.data_files.into_iter().chain(reachable.segments));
         }
