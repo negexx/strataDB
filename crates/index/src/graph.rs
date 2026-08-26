@@ -612,6 +612,19 @@ impl<D: Distance> Graph<D> {
             Err(existing) => existing,
         };
 
+        // `claim_if_empty` publishes the first node as the entry point before
+        // Graph::insert can mark that node published. A racing inserter may
+        // therefore observe the provisional entry while its edge lists are
+        // still empty. Wait for the owning insert to finish publishing before
+        // using the entry for traversal; later entry-point advances already
+        // happen after publication and take the fast path through this loop.
+        while !self.is_published(entry) {
+            #[cfg(loom)]
+            loom::thread::yield_now();
+            #[cfg(not(loom))]
+            std::thread::yield_now();
+        }
+
         // The node table now owns the vector (moved into the `Node` above,
         // never cloned) — borrow it back for the rest of this call rather
         // than keeping a second owned copy alive, so an embedding-sized
