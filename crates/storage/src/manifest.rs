@@ -3,11 +3,12 @@
 //!
 //! A manifest is one immutable file per version, named so lexicographic
 //! order equals numeric order (`{version:020}.manifest`, following Lance's
-//! own convention). Commit is: write to a temp name (via `LocalFs::put`),
-//! fsync, atomically rename into place, then synchronize the containing
-//! directory. A final-name candidate can be readable if that last sync fails;
-//! this is a verified-visible indeterminate publication, not a durability
-//! acknowledgement.
+//! own convention). Commit is: write to a temp name, fsync it, publish the
+//! final name with `StorageOwner::put_if_absent` (the local backend uses a
+//! hard link), then synchronize the bounded directory chain from `_versions`
+//! through the dataset root. A final-name candidate can be readable if a
+//! directory sync fails; this is a verified-visible indeterminate
+//! publication, not a durability acknowledgement.
 //! A crash mid-write leaves only a `.tmp-*` file behind. Its stem (the
 //! part before `.manifest`) always starts with a `.` from the temp-name
 //! prefix, so it can never parse as a `u64` version — `read_current`
@@ -403,7 +404,7 @@ pub fn commit_manifest_with(
 
 /// Returns the highest readable final-name version's manifest, or `None` if
 /// the dataset has no final-name manifest. This is the crash-recovery selection
-/// mechanism: it only ever sees fully-renamed `*.manifest` files, including a
+/// mechanism: it only ever sees fully-published final-name `*.manifest` files, including a
 /// candidate whose publication outcome was indeterminate.
 ///
 /// # Errors
