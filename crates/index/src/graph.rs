@@ -1935,6 +1935,7 @@ mod tests {
         let seed = graph.nodes.get(0).unwrap();
         assert!(seed.layer(0).claim(1));
         assert!(seed.layer(0).claim(2));
+        assert_eq!(seed.layer(0).occupied(), vec![1, 2]);
         let barrier = Arc::new(Barrier::new(3));
 
         let handles: Vec<_> = (3..=5u64)
@@ -3128,7 +3129,7 @@ mod loom_tests {
     #[test]
     fn physical_claim_exhaustion_retries_before_pruning() {
         let mut model = loom::model::Builder::new();
-        model.preemption_bound = Some(1);
+        model.preemption_bound = Some(2);
         model.check(move || {
             let graph = loom::sync::Arc::new(Graph::new(crate::distance::L2, 4));
             graph
