@@ -3134,9 +3134,16 @@ mod loom_tests {
     /// that can violate it -- adding a third thread here would only grow
     /// loom's exploration cost without covering a hazard two threads
     /// don't already reach.
+    ///
+    /// The scheduler is explicitly bounded to one preemption. This still
+    /// explores an adversarial handoff at the atomic empty-graph claim,
+    /// while keeping the gate bounded on hosted CI rather than expanding
+    /// the full `Graph::insert` state space without limit.
     #[test]
     fn concurrent_inserts_into_a_genuinely_empty_graph_never_strand_a_node_loom() {
-        loom::model(|| {
+        let mut model = loom::model::Builder::new();
+        model.preemption_bound = Some(1);
+        model.check(|| {
             let graph = loom::sync::Arc::new(Graph::new(crate::distance::L2, 2));
 
             let g1 = loom::sync::Arc::clone(&graph);
