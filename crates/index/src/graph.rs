@@ -33,6 +33,14 @@ const NO_ENTRY: u64 = u64::MAX;
 /// would be worse than a loud failure.
 const MAX_SHRINK_RETRIES: u32 = 64;
 
+#[inline]
+fn cooperative_yield() {
+    #[cfg(loom)]
+    loom::thread::yield_now();
+    #[cfg(not(loom))]
+    std::thread::yield_now();
+}
+
 /// `(row_id, level)` are packed into the low/high bits of a single
 /// `AtomicU64` and updated with ONE compare-exchange, not two separate
 /// atomics. This is not stylistic: an earlier version of this design used
@@ -346,22 +354,83 @@ impl<D: Distance> Graph<D> {
         true
     }
 
+    /// Claims one adjacency and retries until that adjacency survives a
+    /// concurrent prune. A physical slot array has one transient slot above
+    /// logical capacity; losing a one-shot claim while that slot is occupied
+    /// must not silently lose the edge.
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    fn claim_and_prune(
+        &self,
+        neighbor_node: &Node,
+        row_id: u64,
+        neighbor_id: u64,
+        lc: usize,
+        capacity: usize,
+        alpha: f64,
+    ) -> Result<(), crate::hnsw::IndexError> {
+        for attempt in 0..MAX_SHRINK_RETRIES {
+            let claimed = neighbor_node.layer(lc).claim(row_id);
+            let mut edge_survived = false;
+            let mut shrink_error = None;
+            SEARCH_SCRATCH.with(|scratch_cell| {
+                let mut scratch = scratch_cell.borrow_mut();
+                let result = run_shrink_retry_loop(|| {
+                    neighbor_node
+                        .layer(lc)
+                        .occupied_into(&mut scratch.occupied_buf);
+                    if scratch.occupied_buf.len() <= capacity {
+                        // A successful claim may be removed by the normal
+                        // distance/diversity prune; that is a valid outcome.
+                        // A failed claim, however, must be retried because
+                        // the candidate never entered the heuristic's input.
+                        edge_survived = claimed || scratch.occupied_buf.contains(&row_id);
+                        return ShrinkStep::Converged;
+                    }
+                    if self.shrink_and_check(neighbor_node, lc, capacity, alpha, &mut scratch) {
+                        ShrinkStep::Progressed
+                    } else {
+                        ShrinkStep::Stuck
+                    }
+                });
+                if let Err(attempts) = result {
+                    shrink_error = Some(attempts);
+                }
+            });
+            if let Some(attempts) = shrink_error {
+                return Err(crate::hnsw::IndexError::NeighborShrinkDidNotConverge {
+                    row_id,
+                    neighbor_id,
+                    layer: lc,
+                    capacity,
+                    attempts,
+                });
+            }
+            if edge_survived {
+                return Ok(());
+            }
+            if attempt + 1 < MAX_SHRINK_RETRIES {
+                cooperative_yield();
+            }
+        }
+        Err(crate::hnsw::IndexError::NeighborShrinkDidNotConverge {
+            row_id,
+            neighbor_id,
+            layer: lc,
+            capacity,
+            attempts: MAX_SHRINK_RETRIES,
+        })
+    }
+
     /// Algorithm 1, `INSERT`. `unif` is a caller-supplied draw from
     /// `(0, 1)` (exclusive of 0) used for this node's random level
     /// assignment — see `crate::node::assign_level`. No OCC-retry-loop in
     /// the `Transaction::commit()` sense (retrying this method's WHOLE
     /// operation after a conflict) exists anywhere in this method. One
-    /// narrower thing DOES loop on CAS/decision failure, and it's the
-    /// ordinary lock-free CAS idiom instead (re-check a fresh value,
-    /// terminate once it already satisfies the postcondition, never
-    /// re-attempt the surrounding method's own work) -- the same idiom
-    /// `EntryPoint::advance_if_higher` (called at the end of this method)
-    /// already uses: the neighbor-shrink step's retry loop (inside the
-    /// connection-building phase below), described in full here. Every
-    /// OTHER slot-claim or slot-clear CAS in this method is still simply
-    /// abandoned on failure, never retried — self-resolving, per design
-    /// doc §3, which now additionally documents this one narrower
-    /// exception (see that doc's own amendment).
+    /// narrower things DO loop on CAS/decision failure: connection claims
+    /// use `claim_and_prune` to retry physical-slot exhaustion, and the
+    /// neighbor shrink step rechecks a fresh snapshot after every clear.
+    /// These are bounded lock-free retries; they do not retry the whole
+    /// insertion operation.
     ///
     /// ## The clustered-data recall hazard: mechanisms found, and the fix
     ///
@@ -393,28 +462,18 @@ impl<D: Distance> Graph<D> {
     /// fourth is the actual dominant mechanism, and fixing it closes the
     /// clustered-data hazard completely (verified below).
     ///
-    /// 1. **Physical claim-slot exhaustion — investigated, then reverted
-    ///    as dead code.** `SlotArray::layer_slot_count` gives layer 0
-    ///    `mmax0 + 1` physical slots (33, since `mmax0 = 2*M`) and every
-    ///    layer above `mmax + 1` (17). A first hypothesis was that
-    ///    `neighbor_node.layer(lc).claim(row_id)` discarding its return
-    ///    value mattered in production: if a neighbor's physical array
-    ///    were ever full, a claim would silently fail with no chance to
-    ///    compete via the heuristic. Measurement disproved the premise:
-    ///    instrumented over 180 real commits of the fixture above, `claim`
-    ///    failed **zero** times (`PARALLEL_INSERT_THREADS = 4` concurrent
-    ///    claimants per neighbor never gets close to either headroom
-    ///    figure, and rows within one parallel-insert chunk are inserted
-    ///    SEQUENTIALLY by that chunk's own single thread, so a large chunk
-    ///    does not mean many concurrent claimants on one neighbor). A fix
-    ///    for this path was implemented, then removed once the
-    ///    measurement above showed it never executes in this
-    ///    configuration -- keeping unreachable, unexercised code in a
-    ///    lock-free primitive this sensitive is a worse trade than not
-    ///    having it. Left here as a documented dead end: if
-    ///    `PARALLEL_INSERT_THREADS` or `M` ever change enough to make
-    ///    claim failure reachable, this mechanism needs to be revisited,
-    ///    not assumed still irrelevant.
+    /// 1. **Physical claim-slot exhaustion — now handled.**
+    ///    `SlotArray::layer_slot_count` gives each layer one transient
+    ///    physical slot above logical capacity. Under sufficiently high
+    ///    contention, a one-shot `claim` can therefore fail before the
+    ///    candidate reaches the shrink heuristic. `claim_and_prune` now
+    ///    helps the neighbor return to logical capacity, retries the
+    ///    failed claim, and returns a typed error if bounded convergence
+    ///    is impossible. The dedicated Loom model
+    ///    `physical_claim_exhaustion_retries_before_pruning` covers this
+    ///    previously untested path. It is not the dominant production
+    ///    failure mechanism at the current four-thread/default-M setting,
+    ///    but it is a real correctness boundary for the public graph API.
     /// 2. **Stale-decision compounding in the capacity-based shrink --
     ///    investigated, kept as a guard, NOT the dominant mechanism.**
     ///    Once a claim succeeds and pushes the neighbor over LOGICAL
@@ -619,10 +678,7 @@ impl<D: Distance> Graph<D> {
         // using the entry for traversal; later entry-point advances already
         // happen after publication and take the fast path through this loop.
         while !self.is_published(entry) {
-            #[cfg(loom)]
-            loom::thread::yield_now();
-            #[cfg(not(loom))]
-            std::thread::yield_now();
+            cooperative_yield();
         }
 
         // The node table now owns the vector (moved into the `Node` above,
@@ -702,58 +758,13 @@ impl<D: Distance> Graph<D> {
                 continue;
             };
             for &neighbor_id in &chosen {
-                new_node.layer(lc).claim(neighbor_id);
+                // The reciprocal claim is performed only after the
+                // neighbor-side claim has been confirmed and pruned.
                 if let Some(neighbor_node) = self.nodes.get(neighbor_id)
                     && lc <= neighbor_node.level()
                 {
-                    neighbor_node.layer(lc).claim(row_id);
-                    // Shrink the neighbor's list if it now exceeds
-                    // capacity. See this method's own doc comment above
-                    // for the full writeup, the measured numbers, and the
-                    // residual risk this doesn't close -- this site only
-                    // sketches the mechanism. `run_shrink_retry_loop`
-                    // itself doesn't know about `Graph`/`Node` at all --
-                    // this closure supplies one attempt's worth of real
-                    // work (read occupancy, shrink if still over
-                    // capacity), so the retry/bound bookkeeping stays
-                    // unit-testable in isolation (see that function's own
-                    // doc comment and this module's tests).
-                    //
-                    // occupied_buf/heuristic_working are distinct scratch
-                    // fields accessed sequentially within this one borrow —
-                    // never simultaneously live borrows of the same field.
-                    SEARCH_SCRATCH
-                        .with(|scratch_cell| {
-                            let mut scratch = scratch_cell.borrow_mut();
-                            run_shrink_retry_loop(|| {
-                                neighbor_node
-                                    .layer(lc)
-                                    .occupied_into(&mut scratch.occupied_buf);
-                                if scratch.occupied_buf.len() <= capacity {
-                                    return ShrinkStep::Converged;
-                                }
-                                if self.shrink_and_check(
-                                    neighbor_node,
-                                    lc,
-                                    capacity,
-                                    alpha,
-                                    &mut scratch,
-                                ) {
-                                    ShrinkStep::Progressed
-                                } else {
-                                    ShrinkStep::Stuck
-                                }
-                            })
-                        })
-                        .map_err(|attempts| {
-                            crate::hnsw::IndexError::NeighborShrinkDidNotConverge {
-                                row_id,
-                                neighbor_id,
-                                layer: lc,
-                                capacity,
-                                attempts,
-                            }
-                        })?;
+                    self.claim_and_prune(neighbor_node, row_id, neighbor_id, lc, capacity, alpha)?;
+                    self.claim_and_prune(new_node, neighbor_id, row_id, lc, capacity, alpha)?;
                 }
             }
         }
@@ -3053,6 +3064,49 @@ mod loom_tests {
                 "row 1 (strictly nearest to row 0) did not survive row 0's shrink step \
                  (occupied = {occupied:?}) -- the nearest-candidate-always-kept invariant \
                  was violated by this concurrent schedule"
+            );
+        });
+    }
+
+    /// Physical claim exhaustion is a separate race from concurrent pruning:
+    /// with logical capacity one, three inserters can contend for the two
+    /// physical slots (`capacity + 1`) on the seeded neighbor.  A failed
+    /// claim must be retried after pruning frees a slot; otherwise the
+    /// nearest row can disappear before the heuristic ever sees it.
+    #[test]
+    fn physical_claim_exhaustion_retries_before_pruning() {
+        let mut model = loom::model::Builder::new();
+        model.preemption_bound = Some(3);
+        model.check(move || {
+            let graph = loom::sync::Arc::new(Graph::new(crate::distance::L2, 4));
+            graph
+                .insert(0, vec![0.0, 0.0, 0.0], 1, 1, 1, 1, 1.0, 1.0, 0.5)
+                .unwrap();
+
+            let g1 = loom::sync::Arc::clone(&graph);
+            let t1 = loom::thread::spawn(move || {
+                g1.insert(1, vec![1.0, 0.0, 0.0], 1, 1, 1, 1, 1.0, 1.0, 0.5)
+            });
+            let g2 = loom::sync::Arc::clone(&graph);
+            let t2 = loom::thread::spawn(move || {
+                g2.insert(2, vec![2.0, 0.0, 0.0], 1, 1, 1, 1, 1.0, 1.0, 0.5)
+            });
+            let g3 = loom::sync::Arc::clone(&graph);
+            let t3 = loom::thread::spawn(move || {
+                g3.insert(3, vec![3.0, 0.0, 0.0], 1, 1, 1, 1, 1.0, 1.0, 0.5)
+            });
+
+            t1.join().unwrap().unwrap();
+            t2.join().unwrap().unwrap();
+            t3.join().unwrap().unwrap();
+
+            let seed = graph.nodes.get(0).expect("seed node must exist");
+            let mut occupied = Vec::new();
+            seed.layer(0).occupied_into(&mut occupied);
+            assert_eq!(occupied.len(), 1, "logical capacity must be restored");
+            assert!(
+                occupied.contains(&1),
+                "the nearest candidate must survive claim-slot exhaustion: {occupied:?}"
             );
         });
     }
