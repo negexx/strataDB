@@ -450,9 +450,10 @@ fn publish_candidate_manifest(
 }
 
 /// Completes the in-memory side of a verified-visible publication while the
-/// caller holds the shared publication lock. The durable manifest has already
-/// been published before this helper is called; commit history and the current
-/// snapshot must be installed before an indeterminate result is returned.
+/// caller holds the shared publication lock. The manifest candidate is already
+/// verified visible, but may lack durability acknowledgement; commit history
+/// and the current snapshot must be installed before an indeterminate result is
+/// returned.
 fn complete_visible_publication<T>(
     publish_commit_log: impl FnOnce(),
     publish_current: impl FnOnce(),
@@ -470,11 +471,11 @@ impl Dataset {
     ///
     /// Returns a typed storage, manifest, schema, or index error if the
     /// replacement objects cannot be written or publication fails. A
-    /// [`TxnError::Storage`] wrapping
-    /// [`strata_storage::StorageError::PublicationIndeterminate`] can follow
-    /// final-name publication but precede this handle's update; stop using
-    /// this handle, drop/reopen it, and inspect the recovered version and
-    /// schema. Reopen proves visibility, not durability.
+    /// [`TxnError::IndeterminateManifestPublication`] can follow final-name
+    /// publication after this handle has reconciled the verified-visible
+    /// candidate. The error is not a durability
+    /// acknowledgement and must not be blindly replayed; reopening proves
+    /// visibility, not durability.
     #[allow(clippy::too_many_lines)]
     pub fn compact(&self, policy: CompactionPolicy) -> Result<CompactionReport> {
         if !policy.retain_snapshots {
@@ -1246,10 +1247,10 @@ impl Dataset {
     /// Returns a typed storage, schema, corruption, or durability error.
     /// Definite failures before final-name publication leave the current
     /// handle unchanged. An indeterminate publication can return
-    /// [`TxnError::Storage`] wrapping
-    /// [`strata_storage::StorageError::PublicationIndeterminate`] before this
-    /// handle is updated; stop using it, drop/reopen, and inspect recovered
-    /// version/schema. Reopen proves visibility, not durability.
+    /// [`TxnError::IndeterminateManifestPublication`] after this handle has
+    /// reconciled the verified-visible candidate; stop using it, drop/reopen,
+    /// and inspect the recovered version/schema. Reopen proves visibility,
+    /// not durability.
     #[allow(clippy::too_many_lines)]
     pub fn migrate_schema(&self, migration: &SchemaMigration) -> Result<SchemaMigrationResult> {
         let _lifecycle_guard = self.lifecycle_coordinator.acquire_exclusive();
@@ -2098,8 +2099,9 @@ impl Transaction {
         // `Dataset::commit_lock`'s doc and `crate::row_id`). A poisoned
         // lock (a prior committer panicked) is recovered rather than
         // propagated — the CommitLog is only ever mutated by `push` as the
-        // final in-memory step after a durable commit, so it can't be
-        // observed half-updated.
+        // final in-memory step after acknowledged publication or a
+        // verified-visible indeterminate candidate, so it can't be observed
+        // half-updated.
         let mut commit_log = self
             .commit_lock
             .lock()
@@ -2315,9 +2317,11 @@ impl Transaction {
 
         commit_log.push(new_version, self.write_set);
 
-        // Only after commit_manifest succeeds does the new state become
-        // visible to future Dataset::snapshot() calls — the in-memory swap
-        // must never run ahead of the on-disk durability point.
+        // Only after commit_manifest acknowledges publication or verifies a
+        // visible indeterminate candidate does the new state become visible
+        // to future Dataset::snapshot() calls — the in-memory swap must never
+        // run ahead of the on-disk visibility point. The latter outcome is
+        // not a durability acknowledgement.
         // The new snapshot's segment set is the previous snapshot's parts
         // plus a reader over the very bytes just fsynced — no read-back.
         let index = match new_segment {

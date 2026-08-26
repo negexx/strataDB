@@ -65,10 +65,11 @@ impl Dataset {
     ///
     /// Returns a typed error if the policy is invalid or any compaction,
     /// retention, vacuum, or inventory operation fails. If one of the
-    /// publishing lifecycle operations reports `TxnError::Storage` wrapping
-    /// `StorageError::PublicationIndeterminate`, it can do so before this
-    /// handle is updated; stop using it, drop/reopen, and inspect recovered
-    /// version/schema. Reopen proves visibility, not durability.
+    /// publishing lifecycle operations reports
+    /// `TxnError::IndeterminateManifestPublication`, this handle has already
+    /// reconciled the verified-visible candidate before returning the error.
+    /// Stop using it, drop/reopen, and inspect the recovered version/schema.
+    /// Reopen proves visibility, not durability.
     pub fn maintain(
         &self,
         policy: LifecycleMaintenancePolicy,

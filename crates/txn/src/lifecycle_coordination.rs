@@ -2,8 +2,11 @@
 //!
 //! A transaction owns a [`PreparationLease`] from the first instruction of
 //! `Transaction::commit` until publication, typed failure, or panic unwind.
-//! `Dataset::prune_manifests` obtains [`LifecycleExclusiveGuard`] before
-//! `Dataset.commit_lock`; this module deliberately never takes that lock.
+//! Each individual mutating lifecycle operation obtains
+//! [`LifecycleExclusiveGuard`] before `Dataset.commit_lock`; this module
+//! deliberately never takes that lock. `Dataset::maintain` invokes several
+//! such operations sequentially, so it does not retain one guard for the
+//! composite run and writers may interleave between phases.
 
 #[cfg(loom)]
 use loom::sync::{Condvar, Mutex};
@@ -18,8 +21,10 @@ struct State {
 }
 
 /// Shared writer-preferring coordinator for commit preparation and lifecycle
-/// execution. A queued executor prevents later preparations from entering so
-/// continuous commits cannot starve exclusive lifecycle work.
+/// execution for one lifecycle operation. A queued executor prevents later
+/// preparations from entering so continuous commits cannot starve that
+/// exclusive operation; it does not make a multi-operation maintenance run
+/// atomic.
 #[derive(Default)]
 pub(crate) struct LifecycleCoordinator {
     state: Mutex<State>,
