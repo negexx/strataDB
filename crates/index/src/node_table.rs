@@ -530,6 +530,20 @@ mod tests {
         assert_eq!(table.get(5).unwrap().vector(), &[4.0, 5.0, 6.0]);
     }
 
+    #[test]
+    fn duplicate_insert_reclaims_a_real_node_instead_of_leaking_it() {
+        let table: NodeTable<crate::node::Node> = NodeTable::new(1);
+        let first = crate::node::Node::new(5, vec![1.0, 2.0, 3.0], 0, 32, 16);
+        table.insert(5, first).unwrap();
+
+        let duplicate = crate::node::Node::new(5, vec![4.0, 5.0, 6.0], 0, 32, 16);
+        let err = table
+            .insert(5, duplicate)
+            .expect_err("duplicate row-id must be rejected");
+        assert!(err.already_occupied);
+        assert_eq!(table.get(5).unwrap().vector(), &[1.0, 2.0, 3.0]);
+    }
+
     /// Not a leak-detector by itself under `cargo test` -- the point of
     /// this test is `cargo miri test -p strata-index --lib
     /// node_table::tests::dropping_a_table_of_real_nodes_frees_every_node

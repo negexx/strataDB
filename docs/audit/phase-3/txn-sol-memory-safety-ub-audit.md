@@ -85,6 +85,7 @@ follow-up is:
 cargo +nightly-2026-07-25 miri test -p strata-index --lib node_layout::tests::alloc_node_initializes_header_vector_and_every_slot_to_empty -- --exact
 cargo +nightly-2026-07-25 miri test -p strata-index --lib node_layout::tests::dealloc_node_frees_a_block_with_multiple_layers_without_use_after_free -- --exact
 cargo +nightly-2026-07-25 miri test -p strata-index --lib node_table::tests::a_row_id_past_capacity_reclaims_a_real_node_instead_of_leaking_it -- --exact
+cargo +nightly-2026-07-25 miri test -p strata-index --lib node_table::tests::duplicate_insert_reclaims_a_real_node_instead_of_leaking_it -- --exact
 cargo +nightly-2026-07-25 miri test -p strata-index --lib node_table::tests::dropping_a_table_of_real_nodes_frees_every_node -- --exact
 cargo +nightly-2026-07-25 miri test -p strata-index --lib segment_format::tests::aligned_bytes_lets_bytemuck_cast_every_typed_view_the_format_needs -- --exact
 
