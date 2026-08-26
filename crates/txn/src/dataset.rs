@@ -12051,11 +12051,37 @@ mod loom_tests {
         );
     }
 
+    struct LoomRendezvous {
+        ready: loom::sync::Mutex<bool>,
+        wake: loom::sync::Condvar,
+    }
+
+    impl LoomRendezvous {
+        fn new() -> Self {
+            Self {
+                ready: loom::sync::Mutex::new(false),
+                wake: loom::sync::Condvar::new(),
+            }
+        }
+
+        fn signal(&self) {
+            *self.ready.lock().unwrap() = true;
+            self.wake.notify_one();
+        }
+
+        fn wait(&self) {
+            let mut ready = self.ready.lock().unwrap();
+            while !*ready {
+                ready = self.wake.wait(ready).unwrap();
+            }
+        }
+    }
+
     struct ReconciliationPublication {
         commit_log_version: loom::sync::Mutex<usize>,
         visible_version: loom::sync::atomic::AtomicUsize,
         returned_indeterminate: loom::sync::atomic::AtomicBool,
-        reader_finished: loom::sync::atomic::AtomicBool,
+        reconciliation_ready: LoomRendezvous,
     }
 
     #[test]
@@ -12075,7 +12101,7 @@ mod loom_tests {
                 commit_log_version: loom::sync::Mutex::new(0),
                 visible_version: loom::sync::atomic::AtomicUsize::new(0),
                 returned_indeterminate: loom::sync::atomic::AtomicBool::new(false),
-                reader_finished: loom::sync::atomic::AtomicBool::new(false),
+                reconciliation_ready: LoomRendezvous::new(),
             });
             let reconciled = loom::sync::Arc::clone(&publication);
             let reconciliation = loom::thread::spawn(move || {
@@ -12094,6 +12120,19 @@ mod loom_tests {
                         ),
                     }),
                 );
+                // The helper must complete both in-memory publications before
+                // the caller crosses the indeterminate error boundary. This
+                // assertion is deliberately before the marker is published;
+                // moving `publish_current` after the helper returns makes the
+                // model fail instead of allowing the test to remain green.
+                assert_eq!(
+                    reconciled
+                        .visible_version
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    1,
+                    "reconciliation must install the candidate before the error boundary"
+                );
+                reconciled.reconciliation_ready.signal();
                 assert!(matches!(
                     result,
                     Err(TxnError::IndeterminateManifestPublication {
@@ -12117,30 +12156,25 @@ mod loom_tests {
                     .visible_version
                     .load(std::sync::atomic::Ordering::SeqCst);
                 assert!(
-                    visible == 0 || visible == 1,
+                    visible <= 2,
                     "reader observed an unpublished version: {visible}"
                 );
                 if returned {
-                    assert_eq!(visible, 1, "error return requires the candidate snapshot");
+                    assert!(visible >= 1, "error return requires the candidate snapshot");
                 }
-                OBSERVED_READER_VERSIONS
-                    .fetch_or(1 << visible, std::sync::atomic::Ordering::Relaxed);
-                reader_publication
-                    .reader_finished
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                OBSERVED_READER_VERSIONS.fetch_or(
+                    if visible == 0 { 0b01 } else { 0b10 },
+                    std::sync::atomic::Ordering::Relaxed,
+                );
             });
 
             let publisher_publication = loom::sync::Arc::clone(&publication);
             let following_publisher = loom::thread::spawn(move || {
-                while !publisher_publication
-                    .returned_indeterminate
-                    .load(std::sync::atomic::Ordering::SeqCst)
-                    || !publisher_publication
-                        .reader_finished
-                        .load(std::sync::atomic::Ordering::SeqCst)
-                {
-                    loom::thread::yield_now();
-                }
+                // Synchronize after reconciliation has completed the helper,
+                // without polling. The reconciliation thread still holds the
+                // commit-log mutex at this point, so this also models the
+                // subsequent publisher waiting for the real publication lock.
+                publisher_publication.reconciliation_ready.wait();
                 let mut commit_log = publisher_publication.commit_log_version.lock().unwrap();
                 assert_eq!(
                     (

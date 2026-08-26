@@ -174,9 +174,14 @@ fn shared_dataset_publication_stress_preserves_complete_snapshots() {
     let writer = std::thread::spawn(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             start.wait();
+            let readiness_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             while writer_ready.load(Ordering::Acquire) != 4 {
                 if writer_post_publication.is_failed() {
                     return Err("a reader failed before readiness".to_owned());
+                }
+                if std::time::Instant::now() >= readiness_deadline {
+                    writer_post_publication.fail();
+                    return Err("readers did not reach readiness before the deadline".to_owned());
                 }
                 std::thread::yield_now();
             }
