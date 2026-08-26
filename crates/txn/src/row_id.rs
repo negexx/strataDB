@@ -16,8 +16,9 @@
 //! allocation back inside the lock would drag every data-file and segment
 //! fsync in with it.
 //!
-//! Each inserting commit also publishes immutable reservation metadata. Its
-//! recovery scan is O(commits) per inserting commit and O(commits²)
+//! Each inserting attempt publishes immutable reservation metadata before the
+//! commit outcome is known. Its recovery scan is O(reservation records) per
+//! inserting attempt and O(attempts²)
 //! cumulatively; the scan is intentionally unbounded and excluded from
 //! lifecycle physical accounting and reclamation.
 //!

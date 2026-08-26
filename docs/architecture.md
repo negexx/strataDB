@@ -177,9 +177,9 @@ maximums. `lifecycle_report` and
 `storage_bound_met` exclude `_meta/row-id-high-water` reservation objects from physical accounting
 and reclamation.
 
-Every inserting transaction creates one immutable row-ID reservation metadata object. Recovering the
-allocation floor reads that catalog, making metadata reads O(commits) per inserting commit and
-O(commits²) cumulatively. This unbounded allocator scan is excluded from lifecycle physical accounting
+Every inserting attempt creates one immutable row-ID reservation metadata object before its commit
+outcome is known. Recovering the allocation floor reads that catalog, making metadata reads
+O(reservation records) per inserting attempt and O(attempts²) cumulatively. This unbounded allocator scan is excluded from lifecycle physical accounting
 and reclamation; it is a documented shared-handle/local-filesystem cost, not an independent-handle
 coordination mechanism.
 

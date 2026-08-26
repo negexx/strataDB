@@ -30,8 +30,8 @@ Locations:
 
 Each inserting transaction persists a durable high-water reservation. The
 operation lists and reads every immutable reservation record before creating
-another record. This produces O(commits) metadata reads per insert and
-O(commits²) cumulative metadata reads, plus one permanently retained metadata
+another record. This produces O(reservation records) metadata reads per inserting attempt and
+O(attempts²) cumulative metadata reads, plus one permanently retained metadata
 object per inserting transaction. Vacuum scans only `data/`, and lifecycle
 accounting excludes row-ID records.
 

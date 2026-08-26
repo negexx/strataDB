@@ -132,9 +132,9 @@ has been reconciled into the shared handle; the error still gives no durability 
 must not be blindly replayed. Reopening proves visibility, not durability. Existing snapshots stay
 immutable, while independent handles remain uncoordinated.
 
-Each inserting transaction writes one immutable row-ID reservation object. The allocation-floor
-recovery scan reads O(commits) reservation metadata per inserting commit, or O(commits²)
-cumulatively. This unbounded scan is allocator metadata outside lifecycle physical accounting and
+Each inserting attempt writes one immutable row-ID reservation object before its commit outcome is
+known. The allocation-floor recovery scan reads O(reservation records) metadata per inserting attempt,
+or O(attempts²) cumulatively. This unbounded scan is allocator metadata outside lifecycle physical accounting and
 reclamation: `_meta/row-id-high-water` is never deletion authority. This is a local filesystem,
 one-process/shared-`Dataset` cost; it does not coordinate independent handles.
 

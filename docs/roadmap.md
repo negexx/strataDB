@@ -38,8 +38,9 @@ storage-bound enforcement. Active snapshots, protected history, unknown objects,
 physical row IDs can keep physical growth above a requested limit. Cross-process quota and SLO
 semantics remain outside the embedded shared-handle boundary and require separately authorized work.
 
-Each inserting commit also writes immutable row-ID reservation metadata. Recovery scans that catalog
-in O(commits) metadata reads per inserting commit and O(commits²) cumulatively; this unbounded
+Each inserting attempt writes immutable row-ID reservation metadata before its commit outcome is known.
+Recovery scans that catalog in O(reservation records) metadata reads per inserting attempt and
+O(attempts²) cumulatively; this unbounded
 allocator scan is excluded from lifecycle physical accounting and reclamation.
 
 ## Phase 4 reservation and entry gates

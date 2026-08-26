@@ -51,8 +51,9 @@ after reconciling a verified-visible candidate into the shared handle. The error
 acknowledgement and must not be blindly replayed; reopening can establish visibility, not durability.
 Existing snapshots remain immutable in every outcome.
 
-Inserting transactions each write one immutable row-ID reservation. Recovering the allocation floor
-reads O(commits) reservation metadata per insert, yielding O(commits²) cumulative metadata reads.
+Each inserting attempt writes one immutable row-ID reservation before its commit outcome is known.
+Recovering the allocation floor reads O(reservation records) metadata per inserting attempt, yielding
+O(attempts²) cumulative metadata reads.
 This unbounded allocator scan is excluded from lifecycle physical accounting and reclamation; it does
 not coordinate independent handles.
 
