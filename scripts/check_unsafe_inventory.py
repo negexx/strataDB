@@ -70,6 +70,29 @@ def _raw_string_end(source: str, start: int) -> int | None:
     return len(source) if close < 0 else close + len(terminator)
 
 
+def _char_literal_end(source: str, start: int) -> int | None:
+    """Return the end of a Rust character literal, excluding lifetimes/labels."""
+    index = start + 1
+    if index >= len(source) or source[index] == "\n":
+        return None
+    if source[index] == "\\":
+        index += 1
+        if index >= len(source):
+            return None
+        if source[index] == "x":
+            index += 3
+        elif source[index] == "u" and index + 1 < len(source) and source[index + 1] == "{":
+            close = source.find("}", index + 2)
+            if close < 0 or close == index + 2:
+                return None
+            index = close + 1
+        else:
+            index += 1
+    else:
+        index += 1
+    return index + 1 if index < len(source) and source[index] == "'" else None
+
+
 def _mask_non_code(source: str) -> tuple[str, set[int]]:
     """Mask Rust comments and literals while preserving every newline."""
     masked = list(source)
@@ -133,16 +156,8 @@ def _mask_non_code(source: str) -> tuple[str, set[int]]:
             index = end
             continue
         if character == "'":
-            end = index + 1
-            while end < len(source) and source[end] != "\n":
-                if source[end] == "\\":
-                    end += 2
-                elif source[end] == "'":
-                    end += 1
-                    break
-                else:
-                    end += 1
-            if end <= len(source) and end > index + 1 and source[end - 1] == "'":
+            end = _char_literal_end(source, index)
+            if end is not None:
                 mask_until(end)
                 index = end
                 continue

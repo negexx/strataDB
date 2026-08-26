@@ -90,8 +90,8 @@ cargo +nightly-2026-07-25 miri test -p strata-index --lib segment_format::tests:
 
 # Linux x86_64 sanitizer characterization, only with an already-installed supporting nightly/target
 RUSTFLAGS="-Zsanitizer=address" cargo +nightly-2026-07-25 test -p strata-index --lib --target x86_64-unknown-linux-gnu node_layout::tests::dealloc_node_frees_a_block_with_multiple_layers_without_use_after_free -- --exact
-RUSTFLAGS="-Zsanitizer=thread" cargo +nightly-2026-07-25 test -p strata-index --lib --target x86_64-unknown-linux-gnu node::tests::full_node_publish_is_completely_visible_to_a_reader -- --exact
-RUSTFLAGS="-Zsanitizer=thread" cargo +nightly-2026-07-25 test -p strata-index --lib --target x86_64-unknown-linux-gnu node_table::tests::concurrent_chunk_allocation_publishes_exactly_one_chunk -- --exact
+RUSTFLAGS="-Zsanitizer=thread" cargo +nightly-2026-07-25 test -p strata-index --lib --target x86_64-unknown-linux-gnu graph::tests::concurrent_inserts_are_all_findable_afterward -- --exact
+RUSTFLAGS="-Zsanitizer=thread" cargo +nightly-2026-07-25 test -p strata-index --lib --target x86_64-unknown-linux-gnu graph::tests::concurrent_inserts_into_a_genuinely_empty_graph_never_strand_a_node -- --exact
 
 # Rudra, only when cargo-rudra is already installed; run from crates/index
 cargo rudra
@@ -116,7 +116,7 @@ index/benchmark files. The checker fails closed for unmarked, stale, duplicate,
 malformed, path/kind-mismatched, or unknown unsafe forms; it has no update or
 accept mode.
 
-The required `unsafe_inventory` CI step runs its thirteen independently scoped
+The required `unsafe_inventory` CI step runs its fourteen independently scoped
 fixture and repository-inventory tests before Build, and final CI provenance
 records its outcome.
 This is an admission guardrail only for project-owned explicit unsafe blocks,
@@ -169,7 +169,7 @@ pre-Task-7 and does not establish byte-for-byte preservation.
 | Command | Result |
 |---|---|
 | `cargo test -p strata-index` | Exit 0; 160 unit tests passed, 0 failed, 1 ignored; 5 doctests passed, 0 failed. |
-| `python -m unittest scripts/test_check_unsafe_inventory.py -v` | Exit 0; 13 independently scoped fixture and repository-inventory tests passed. |
+| `python -m unittest scripts/test_check_unsafe_inventory.py -v` | Exit 0; 14 independently scoped fixture and repository-inventory tests passed. |
 | `python scripts/check_unsafe_inventory.py --root . --inventory docs/audit/phase-3/unsafe-inventory.json` | Exit 0; 58 approved constructs (43 blocks, 15 functions/impls) across 6 files. |
 | `rustup run nightly-x86_64-pc-windows-msvc cargo miri --version` | **UNAVAILABLE**; exit 1, `cargo-miri.exe` is not installed. |
 | `cargo +nightly-2026-07-25 miri --version` | **UNAVAILABLE**; exit 1, `cargo-miri.exe` is not installed. |

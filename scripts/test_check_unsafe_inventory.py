@@ -70,6 +70,10 @@ class UnsafeInventoryTest(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.assertEqual(validate_inventory(root, inventory), [])
 
+    def test_lifetimes_and_labels_do_not_hide_unsafe_constructs(self) -> None:
+        source = "fn demo<'a>() { unsafe { } let _: &'a i32 = todo!(); 'outer: loop { break 'outer; } }\n"
+        self.assert_fails(source, [], "unmarked unsafe block")
+
     def test_unmarked_unsafe_construct_fails(self) -> None:
         self.assert_fails("unsafe {}\n", [], "unmarked unsafe block")
 
