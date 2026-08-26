@@ -1911,6 +1911,51 @@ mod tests {
     }
 
     #[test]
+    fn claim_and_prune_retries_after_physical_capacity_exhaustion() {
+        use std::sync::{Arc, Barrier};
+
+        // A logical capacity of one gives the layer exactly two physical
+        // slots. Three synchronized claimants therefore force one claim to
+        // observe physical exhaustion; the successful pruner must make room
+        // and that claimant must retry rather than silently losing its edge.
+        let graph = Arc::new(Graph::new(crate::distance::L2, 4));
+        for row_id in 0..4u64 {
+            graph
+                .nodes
+                .insert(
+                    row_id,
+                    Node::new(row_id, vec![row_id as f32, 0.0, 0.0], 0, 1, 1),
+                )
+                .unwrap();
+        }
+        let barrier = Arc::new(Barrier::new(3));
+
+        let handles: Vec<_> = (1..=3u64)
+            .map(|row_id| {
+                let graph = Arc::clone(&graph);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let seed = graph.nodes.get(0).expect("seed node must exist");
+                    graph.claim_and_prune(seed, row_id, 0, 0, 1, 0.5)
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle
+                .join()
+                .expect("claim worker must not panic")
+                .expect("physical claim exhaustion must converge after pruning");
+        }
+
+        let mut occupied = Vec::new();
+        let seed = graph.nodes.get(0).unwrap();
+        seed.layer(0).occupied_into(&mut occupied);
+        assert_eq!(occupied.len(), 1, "the logical capacity must be restored");
+    }
+
+    #[test]
     fn k_nn_search_finds_the_true_nearest_neighbor_across_layers() {
         let graph = Graph::new(crate::distance::L2, 20);
         let m_l = 1.0 / (16f64).ln();
@@ -2993,7 +3038,7 @@ mod loom_tests {
     #[test]
     fn concurrent_inserts_racing_on_one_shared_neighbor_always_keep_the_nearest() {
         let mut model = loom::model::Builder::new();
-        model.preemption_bound = Some(1);
+        model.preemption_bound = Some(2);
         model.check(move || {
             let graph = loom::sync::Arc::new(Graph::new(crate::distance::L2, 4));
             // Seeded sequentially, before any thread spawns: row 0 is the
