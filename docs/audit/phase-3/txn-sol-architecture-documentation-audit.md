@@ -4,16 +4,19 @@ Date: 2026-08-15
 Scope: active architecture/design/status/roadmap/ADR documents, module
 comments, public API documentation, links, and doc-test evidence  
 Reviewer: Sol (`gpt-5.6-sol`), independent read-only review  
-Baseline: `codex/readme-current-state` at `e7a4bee`
+Baseline: merged Audit 9 head `dcaa3da`; this remediation is the follow-up
+implementation slice for the findings below.
 
 ## Verdict
 
-**REJECT.** No P0 was confirmed, but two P1 documentation/operational gaps and
-several P2/P3 drift issues prevent approval.
+**IMPLEMENTED within named bounds.** The active contract now records the
+single-process/shared-`Dataset` boundary, indeterminate publication behavior,
+lifecycle resource limits, supported public surfaces, and compatibility rules.
+Historical evidence remains historical and is not rewritten.
 
 ## Findings
 
-### [P1] Indeterminate manifest publication is absent from active guidance
+### [P1 — resolved] Indeterminate manifest publication is absent from active guidance
 
 Locations:
 
@@ -29,7 +32,7 @@ manifest can become recoverable before directory synchronization returns an
 error. It lacks retry, reopen, reconciliation, and stale shared-handle
 guidance for this indeterminate outcome.
 
-### [P1] Lifecycle resource costs are missing from the active contract
+### [P1 — resolved] Lifecycle resource costs are missing from the active contract
 
 Locations:
 
@@ -45,7 +48,7 @@ has quadratic read growth and is excluded from lifecycle accounting. The active
 lifecycle contract does not explain these stop-the-world and accounting
 boundaries.
 
-### [P2] Active module documentation contains stale claims and links
+### [P2 — resolved] Active module documentation contains stale claims and links
 
 Examples:
 
@@ -63,7 +66,7 @@ Examples:
 Historical files under `docs/history/` are intentionally excluded from this
 finding because they are clearly archival.
 
-### [P2] Active status/design records contradict current completion evidence
+### [P2 — resolved] Active status/design records contradict current completion evidence
 
 Locations:
 
@@ -76,7 +79,7 @@ These files still describe final branch verification as outstanding, important
 suites as not CI-gated, or review fixes as in progress despite the current
 implementation and recorded verification evidence.
 
-### [P2] The new focused audit records contain broken relative source links
+### [P2 — resolved] The new focused audit records contain broken relative source links
 
 The first four focused audit records use four parent traversals from
 `docs/audit/phase-3`, but the repository root is three parents away. Some links
@@ -88,15 +91,16 @@ filename. The affected records are:
 - `txn-sol-coverage-mutation-audit.md`
 - `txn-sol-concurrency-thread-safety-audit.md`
 
-This audit record uses corrected relative link depth.
+The focused records are being normalized to three parent traversals from
+`docs/audit/phase-3`; line references remain informational source locations.
 
-### [P3] Public client documentation is thin
+### [P3 — resolved] Public client documentation is thin
 
 PyO3 has class summaries, but little method-level guidance for the stable
 client surface. CLI module documentation describes legacy/crash-loop behavior
 but not the stable administration surface listed in `docs/status.md`.
 
-### [P3] Decision ledger lacks follow-on rationale for accepted later surfaces
+### [P3 — resolved] Decision ledger lacks follow-on rationale for accepted later surfaces
 
 ADR 0009 explicitly did not create stable Python/admin contracts, but those
 contracts, schema migration, and lifecycle authority are now implemented. No
@@ -127,7 +131,9 @@ coherent and do not need deletion as historical decisions.
 - A repository-wide local Markdown validator was interrupted; no global
   link-clean claim is made.
 
-No files were edited by the Sol reviewer. Terra can execute bounded stale-link,
-comment, and status cleanup after scope is approved. Full remediation of the
-P1 publication and resource-contract gaps requires new Sol design work.
+Implementation files: `docs/designs/phase-3/audit5-architecture-documentation-remediation.md`
+and `docs/plans/audit5-architecture-documentation-plan.md`. The remaining
+limitations are explicit: documentation tooling not installed is not claimed
+green, and the contract does not make universal durability, serializability,
+or cross-process coordination claims.
 

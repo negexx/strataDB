@@ -61,7 +61,7 @@ fn explain_skips_files_whose_stats_cannot_match_and_scans_only_the_rest() {
         "the [1,3] and [100,102] files must both be skipped"
     );
     // Identify the surviving file by its manifest entry, not by parsing
-    // the filename: as of Phase 6, filenames embed an opaque per-attempt
+    // the filename: filenames embed an opaque per-attempt
     // counter (see `Transaction::commit`'s `write_attempt_counter`), not
     // the commit version, so the name prefix is an implementation detail
     // no test should decode.

@@ -7,7 +7,7 @@
 //! mid-run by `strata_storage::chaos`. Per-agent op *content* (which verb,
 //! which vector, which target) is fully seed-derived and reproducible;
 //! cross-agent *interleaving* is genuine OS thread scheduling and is NOT
-//! reproducible from the seed alone. See `docs/phase-1-audit.md` for the
+//! reproducible from the seed alone. See `docs/audit/phase-1/audit.md` for the
 //! current verification boundary.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 

@@ -1,7 +1,7 @@
 //! `mvp_schema()`'s fields plus the hidden row-id column — needed to read
 //! back the internal system row-id `Transaction::commit()` itself never
 //! returns. See
-//! `docs/phase-1-audit.md`; this is a read-back rather than a prediction
+//! `docs/audit/phase-1/audit.md`; this is a read-back rather than a prediction
 //! from the row-id allocator's own
 //! claim-order semantics.
 

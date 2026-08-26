@@ -1,8 +1,7 @@
 //! Transaction path for `strata-txn`. Implements spec §3's commit protocol
 //! in full, including real OCC conflict detection and an atomic
-//! commit critical section (Phase 6) — see
-//! `docs/design.md`
-//! and `docs/phase-1-audit.md` before editing anything
+//! commit critical section — see `docs/design.md` and
+//! `docs/audit/phase-1/audit.md` before editing anything
 //! here. Conflict detection is write-write only, keyed by row-id, and
 //! scoped to in-process concurrency (multiple threads/tasks sharing one
 //! `Dataset` handle) — see the design doc §1 for why cross-process
@@ -1530,7 +1529,7 @@ pub struct Transaction {
     /// piece of `base`-time state this type retains — `commit()` rebuilds
     /// `data_files`/`tombstones`/the rest of the manifest from the *latest*
     /// snapshot inside the lock, not from anything captured here, so
-    /// cloning the whole `Manifest` at `begin()` time (as earlier Phase 6
+    /// cloning the whole `Manifest` at `begin()` time (as the earlier design
     /// commits did) was pure waste: every field but `version` went unused.
     base_version: u64,
     /// The ownership and liveness view captured at `begin`. Delete and
@@ -1970,7 +1969,7 @@ impl Transaction {
         Ok(())
     }
 
-    /// Commits per spec §3's write/durability steps (3-5), with Phase 6's
+    /// Commits using the current design's write/durability steps, with
     /// real conflict check (§3.1/§3.2) in front of them. Data files and this
     /// commit's index segment are both built and fsynced outside any lock in
     /// `write_phase` (they are unique to this transaction); then, inside
