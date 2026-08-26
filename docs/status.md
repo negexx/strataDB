@@ -66,7 +66,9 @@ with live data and retained/protected history. The retained compaction fixture r
 74.16-second median with 1,090.4 MB peak live memory. Both are bounded evidence, not an SLO or
 maximum. `lifecycle_report` and
 `storage_bound_met` exclude `_meta/row-id-high-water` from physical accounting. Cross-process
-lifecycle work remains later design. Historical exact-head lifecycle evidence, plus the scoped current local record, is recorded in the
+lifecycle work remains later design. The linked Phase 3 closeout and verification records contain
+historical exact-head evidence plus the scoped local evidence they explicitly identify; they are not
+claims that every later documentation or audit commit has been independently hosted-verified. See
 [Phase 3 closeout audit](audit/phase-3/audit.md) and
 [Phase 3 verification report](phase-3-verification-report.md). See
 the [inventory design](designs/phase-3/lifecycle-inventory.md), [manifest executor

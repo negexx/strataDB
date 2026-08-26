@@ -54,7 +54,8 @@ Examples:
 
 - [`crates/txn/src/lib.rs:1`](../../../crates/txn/src/lib.rs#L1) and
   [`crates/txn/src/dataset.rs:1`](../../../crates/txn/src/dataset.rs#L1) link to
-  a nonexistent `docs/phase-1-audit.md`.
+  carried a retired Phase 1 reference at the audit baseline; the current
+  source now points to the current audit records.
 - [`crates/txn/src/lifecycle.rs:114`](../../../crates/txn/src/lifecycle.rs#L114)
   describes an implemented lifecycle report as future work.
 - [`crates/index/src/segment_set.rs:25`](../../../crates/index/src/segment_set.rs#L25)

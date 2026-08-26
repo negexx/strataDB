@@ -17,10 +17,10 @@ explicit limits of this audit.
 
 Locations:
 
-- [`crates/storage/src/manifest.rs:181`](../../../crates/storage/src/manifest.rs:181)
-- [`crates/storage/src/manifest.rs:272`](../../../crates/storage/src/manifest.rs:272)
-- [`crates/storage/src/manifest.rs:322`](../../../crates/storage/src/manifest.rs:322)
-- [`crates/storage/src/manifest.rs:457`](../../../crates/storage/src/manifest.rs:457)
+- [`crates/storage/src/manifest.rs:181`](../../../crates/storage/src/manifest.rs#L181)
+- [`crates/storage/src/manifest.rs:272`](../../../crates/storage/src/manifest.rs#L272)
+- [`crates/storage/src/manifest.rs:322`](../../../crates/storage/src/manifest.rs#L322)
+- [`crates/storage/src/manifest.rs:457`](../../../crates/storage/src/manifest.rs#L457)
 
 A format-v1 envelope written before `committed_at_us` existed omits that field.
 Current deserialization inserts zero with `#[serde(default)]`, then checksum
@@ -38,11 +38,11 @@ format-v1 regression is retained in `crates/storage/src/manifest.rs`.
 
 Locations:
 
-- [`crates/storage/src/backend/local.rs:288`](../../../crates/storage/src/backend/local.rs:288)
-- [`crates/storage/src/manifest.rs:453`](../../../crates/storage/src/manifest.rs:453)
-- [`crates/storage/src/manifest.rs:322`](../../../crates/storage/src/manifest.rs:322)
-- [`crates/storage/src/datafile.rs:430`](../../../crates/storage/src/datafile.rs:430)
-- [`crates/storage/src/datafile.rs:477`](../../../crates/storage/src/datafile.rs:477)
+- [`crates/storage/src/backend/local.rs:288`](../../../crates/storage/src/backend/local.rs#L288)
+- [`crates/storage/src/manifest.rs:453`](../../../crates/storage/src/manifest.rs#L453)
+- [`crates/storage/src/manifest.rs:322`](../../../crates/storage/src/manifest.rs#L322)
+- [`crates/storage/src/datafile.rs:430`](../../../crates/storage/src/datafile.rs#L430)
+- [`crates/storage/src/datafile.rs:477`](../../../crates/storage/src/datafile.rs#L477)
 
 Manifest loading reads the complete object, parses unrestricted JSON,
 deserializes and clones it, and builds another canonical JSON tree before
@@ -67,9 +67,9 @@ avoid re-enumerating `_versions` once per retained manifest.
 
 Locations:
 
-- [`crates/storage/src/backend/local.rs:223`](../../../crates/storage/src/backend/local.rs:223)
-- [`crates/storage/src/backend/local.rs:409`](../../../crates/storage/src/backend/local.rs:409)
-- [`crates/storage/src/row_id_high_water.rs:160`](../../../crates/storage/src/row_id_high_water.rs:160)
+- [`crates/storage/src/backend/local.rs:223`](../../../crates/storage/src/backend/local.rs#L223)
+- [`crates/storage/src/backend/local.rs:409`](../../../crates/storage/src/backend/local.rs#L409)
+- [`crates/storage/src/row_id_high_water.rs:160`](../../../crates/storage/src/row_id_high_water.rs#L160)
 
 Object listing recursively collects and sorts every matching object in memory,
 and row-ID recovery scans every named reservation record. Very large manifest
@@ -113,11 +113,11 @@ Reachable persistent objects have strong accidental-corruption checks:
   version identity, and unknown-field rejection.
 - Arrow row files: byte length and CRC32C before decode, then physical schema,
   row count/range, uniqueness, and ownership validation
-  ([`dataset.rs:3060`](../../../crates/txn/src/dataset.rs:3060)).
+  ([`dataset.rs:3060`](../../../crates/txn/src/dataset.rs#L3060)).
 - Segments: manifest byte-length/metadata cross-checks, complete header/body
   CRC32C, and checked geometry/topology
-  ([`dataset.rs:3200`](../../../crates/txn/src/dataset.rs:3200),
-  [`segment_reader.rs:113`](../../../crates/index/src/segment_reader.rs:113)).
+  ([`dataset.rs:3200`](../../../crates/txn/src/dataset.rs#L3200),
+  [`segment_reader.rs:113`](../../../crates/index/src/segment_reader.rs#L113)).
 - Row-ID records: exact 12-byte length, payload CRC32C, and filename/payload
   identity.
 

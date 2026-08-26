@@ -18,10 +18,10 @@ are unresolved.
 
 Locations:
 
-- [`local.rs:107`](../../../crates/storage/src/backend/local.rs:107)
-- [`local.rs:166`](../../../crates/storage/src/backend/local.rs:166)
-- [`local.rs:330`](../../../crates/storage/src/backend/local.rs:330)
-- [`local.rs:517`](../../../crates/storage/src/backend/local.rs:517)
+- [`local.rs:107`](../../../crates/storage/src/backend/local.rs#L107)
+- [`local.rs:166`](../../../crates/storage/src/backend/local.rs#L166)
+- [`local.rs:330`](../../../crates/storage/src/backend/local.rs#L330)
+- [`local.rs:517`](../../../crates/storage/src/backend/local.rs#L517)
 
 `LocalFs` checks symlinks before later path-based operations. Temporary names
 are predictable from PID/counter and opened with `File::create`, which follows
@@ -34,12 +34,12 @@ race-safe handle-relative/no-follow operations.
 
 Locations:
 
-- [`local.rs:288`](../../../crates/storage/src/backend/local.rs:288)
-- [`manifest.rs:447`](../../../crates/storage/src/manifest.rs:447)
-- [`dataset.rs:3060`](../../../crates/txn/src/dataset.rs:3060)
-- [`dataset.rs:3200`](../../../crates/txn/src/dataset.rs:3200)
-- [`datafile.rs:410`](../../../crates/storage/src/datafile.rs:410)
-- [`bindings/lib.rs:476`](../../../crates/bindings/src/lib.rs:476)
+- [`local.rs:288`](../../../crates/storage/src/backend/local.rs#L288)
+- [`manifest.rs:447`](../../../crates/storage/src/manifest.rs#L447)
+- [`dataset.rs:3060`](../../../crates/txn/src/dataset.rs#L3060)
+- [`dataset.rs:3200`](../../../crates/txn/src/dataset.rs#L3200)
+- [`datafile.rs:410`](../../../crates/storage/src/datafile.rs#L410)
+- [`bindings/lib.rs:476`](../../../crates/bindings/src/lib.rs#L476)
 
 Recovery loads complete objects before all bounds are validated. Manifest JSON
 is materialized multiple times; Arrow input retains allocation-failure and

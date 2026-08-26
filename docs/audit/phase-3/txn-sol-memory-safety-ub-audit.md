@@ -17,9 +17,9 @@ behavior was found at the audited head.
 
 Locations:
 
-- [`crates/index/src/node.rs:16`](../../../crates/index/src/node.rs:16)
-- [`crates/index/src/node_table.rs:253`](../../../crates/index/src/node_table.rs:253)
-- [`crates/index/src/graph.rs:566`](../../../crates/index/src/graph.rs:566)
+- [`crates/index/src/node.rs:16`](../../../crates/index/src/node.rs#L16)
+- [`crates/index/src/node_table.rs:253`](../../../crates/index/src/node_table.rs#L253)
+- [`crates/index/src/graph.rs:566`](../../../crates/index/src/graph.rs#L566)
 
 `Node` is `Copy`, while inserting the same handle into multiple slots would
 cause double reclamation when the table is dropped. The code documents this
@@ -53,28 +53,28 @@ Production project unsafe code is concentrated in the HNSW node allocator and
 node table:
 
 - Raw allocation, layout, initialization, and deallocation:
-  [`node_layout.rs:177`](../../../crates/index/src/node_layout.rs:177) and
-  [`node_layout.rs:261`](../../../crates/index/src/node_layout.rs:261).
+  [`node_layout.rs:177`](../../../crates/index/src/node_layout.rs#L177) and
+  [`node_layout.rs:261`](../../../crates/index/src/node_layout.rs#L261).
 - Manual reclamation, `Send`/`Sync`, and pointer-derived views:
-  [`node.rs:34`](../../../crates/index/src/node.rs:34),
-  [`node.rs:49`](../../../crates/index/src/node.rs:49),
-  [`node.rs:77`](../../../crates/index/src/node.rs:77),
-  [`node.rs:91`](../../../crates/index/src/node.rs:91),
-  [`node.rs:111`](../../../crates/index/src/node.rs:111), and
-  [`node.rs:138`](../../../crates/index/src/node.rs:138).
+  [`node.rs:34`](../../../crates/index/src/node.rs#L34),
+  [`node.rs:49`](../../../crates/index/src/node.rs#L49),
+  [`node.rs:77`](../../../crates/index/src/node.rs#L77),
+  [`node.rs:91`](../../../crates/index/src/node.rs#L91),
+  [`node.rs:111`](../../../crates/index/src/node.rs#L111), and
+  [`node.rs:138`](../../../crates/index/src/node.rs#L138).
 - Atomic pointer publication, `Box::from_raw`, reclamation, and insertion:
-  [`node_table.rs:62`](../../../crates/index/src/node_table.rs:62),
-  [`node_table.rs:101`](../../../crates/index/src/node_table.rs:101),
-  [`node_table.rs:136`](../../../crates/index/src/node_table.rs:136),
-  [`node_table.rs:207`](../../../crates/index/src/node_table.rs:207),
-  [`node_table.rs:288`](../../../crates/index/src/node_table.rs:288),
-  [`node_table.rs:352`](../../../crates/index/src/node_table.rs:352), and
-  [`node_table.rs:370`](../../../crates/index/src/node_table.rs:370).
+  [`node_table.rs:62`](../../../crates/index/src/node_table.rs#L62),
+  [`node_table.rs:101`](../../../crates/index/src/node_table.rs#L101),
+  [`node_table.rs:136`](../../../crates/index/src/node_table.rs#L136),
+  [`node_table.rs:207`](../../../crates/index/src/node_table.rs#L207),
+  [`node_table.rs:288`](../../../crates/index/src/node_table.rs#L288),
+  [`node_table.rs:352`](../../../crates/index/src/node_table.rs#L352), and
+  [`node_table.rs:370`](../../../crates/index/src/node_table.rs#L370).
 - Aligned byte-slice construction:
-  [`segment_format.rs:162`](../../../crates/index/src/segment_format.rs:162).
+  [`segment_format.rs:162`](../../../crates/index/src/segment_format.rs#L162).
 - Benchmark-only global allocators:
-  [`lifecycle_bench.rs:64`](../../../bench/benches/lifecycle_bench.rs:64) and
-  [`segment_recall_bench.rs:65`](../../../bench/benches/segment_recall_bench.rs:65).
+  [`lifecycle_bench.rs:64`](../../../bench/benches/lifecycle_bench.rs#L64) and
+  [`segment_recall_bench.rs:65`](../../../bench/benches/segment_recall_bench.rs#L65).
 
 No project unsafe blocks, raw-pointer access, `transmute`, `MaybeUninit`,
 custom core allocator, direct mmap view, or manual memory reclamation were

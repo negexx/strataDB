@@ -19,33 +19,33 @@ There is no audit-event type, centralized emitter, operation filter, ring
 buffer, asynchronous offload worker, sink, or flush/backpressure policy.
 Critical paths have no audit records:
 
-- Dataset create/open: [`dataset.rs:818`](../../../crates/txn/src/dataset.rs:818),
-  [`dataset.rs:945`](../../../crates/txn/src/dataset.rs:945)
+- Dataset create/open: [`dataset.rs:818`](../../../crates/txn/src/dataset.rs#L818),
+  [`dataset.rs:945`](../../../crates/txn/src/dataset.rs#L945)
 - Transaction begin/commit/conflict/failure:
-  [`dataset.rs:1347`](../../../crates/txn/src/dataset.rs:1347),
-  [`dataset.rs:2004`](../../../crates/txn/src/dataset.rs:2004),
-  [`dataset.rs:2052`](../../../crates/txn/src/dataset.rs:2052)
+  [`dataset.rs:1347`](../../../crates/txn/src/dataset.rs#L1347),
+  [`dataset.rs:2004`](../../../crates/txn/src/dataset.rs#L2004),
+  [`dataset.rs:2052`](../../../crates/txn/src/dataset.rs#L2052)
 - Migration and lifecycle operations:
-  [`dataset.rs:1192`](../../../crates/txn/src/dataset.rs:1192),
-  [`maintenance.rs:59`](../../../crates/txn/src/maintenance.rs:59),
-  [`vacuum.rs:29`](../../../crates/txn/src/vacuum.rs:29)
+  [`dataset.rs:1192`](../../../crates/txn/src/dataset.rs#L1192),
+  [`maintenance.rs:59`](../../../crates/txn/src/maintenance.rs#L59),
+  [`vacuum.rs:29`](../../../crates/txn/src/vacuum.rs#L29)
 - Row-ID reservation and recovery:
   [`row_id.rs:189`](../../../crates/txn/src/row_id.rs#L189),
-  [`dataset.rs:945`](../../../crates/txn/src/dataset.rs:945)
+  [`dataset.rs:945`](../../../crates/txn/src/dataset.rs#L945)
 
 Failures, conflicts, abandoned ranges, corruption detections, recovery
 outcomes, and lifecycle mutations are visible only to the immediate caller.
 
 ### [P1] Partial lifecycle effects can lose terminal evidence
 
-[`maintenance.rs:69`](../../../crates/txn/src/maintenance.rs:69) executes
+[`maintenance.rs:69`](../../../crates/txn/src/maintenance.rs#L69) executes
 compaction, retention, vacuum, and inventory using `?`. If an earlier phase
 publishes successfully and a later phase fails, the method returns only an
 error and does not preserve a durable partial-work record.
 
 ### [P2] `CommitLog` is not an audit log
 
-[`commit_log.rs:1`](../../../crates/txn/src/commit_log.rs:1) records only
+[`commit_log.rs:1`](../../../crates/txn/src/commit_log.rs#L1) records only
 successful commit versions/write sets after manifest durability. It omits
 begin, failure, conflict, recovery, migration, and lifecycle events, evicts
 entries, and is recreated empty on create/open. The only explicit metric is the
