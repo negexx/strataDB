@@ -94,6 +94,14 @@ class UnsafeInventoryTest(unittest.TestCase):
             "duplicate marker",
         )
 
+    def test_one_marker_cannot_cover_two_same_line_constructs(self) -> None:
+        source = "// SAFETY[TEST-BLOCK]: One construct only.\nunsafe {} + unsafe {}\n"
+        self.assert_fails(
+            source,
+            [self.site("TEST-BLOCK", "block", safety="One construct only.")],
+            "marker applies to multiple unsafe constructs",
+        )
+
     def test_path_mismatch_fails(self) -> None:
         self.assert_fails(
             "// SAFETY[TEST-BLOCK]: The fixture block is intentionally empty.\nunsafe {}\n",

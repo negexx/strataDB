@@ -169,8 +169,8 @@ pre-Task-7 and does not establish byte-for-byte preservation.
 
 | Command | Result |
 |---|---|
-| `cargo test -p strata-index` | Exit 0; 160 unit tests passed, 0 failed, 1 ignored; 5 doctests passed, 0 failed. |
-| `python -m unittest scripts/test_check_unsafe_inventory.py -v` | Exit 0; 14 independently scoped fixture and repository-inventory tests passed. |
+| `cargo test -p strata-index` | Exit 0; 164 unit tests passed, 0 failed, 1 ignored; 5 doctests passed, 0 failed. |
+| `python -m unittest scripts/test_check_unsafe_inventory.py -v` | Exit 0; 15 independently scoped fixture and repository-inventory tests passed. |
 | `python scripts/check_unsafe_inventory.py --root . --inventory docs/audit/phase-3/unsafe-inventory.json` | Exit 0; 58 approved constructs (43 blocks, 15 functions/impls) across 6 files. |
 | `rustup run nightly-x86_64-pc-windows-msvc cargo miri --version` | **UNAVAILABLE**; exit 1, `cargo-miri.exe` is not installed. |
 | `cargo +nightly-2026-07-25 miri --version` | **UNAVAILABLE**; exit 1, `cargo-miri.exe` is not installed. |

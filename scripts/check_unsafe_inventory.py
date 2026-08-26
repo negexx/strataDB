@@ -302,6 +302,7 @@ def validate_inventory(root: Path, inventory_path: Path) -> list[str]:
         sites.extend(scan_rust_source(relative_path, source))
 
     discovered_markers: set[str] = set()
+    marker_sites: dict[str, list[UnsafeSite]] = {}
     for site in sites:
         prefix = f"{site.path}:{site.line}:"
         if site.kind == "unknown":
@@ -314,6 +315,7 @@ def validate_inventory(root: Path, inventory_path: Path) -> list[str]:
             errors.append(f"{prefix} unmarked unsafe {site.kind}")
             continue
         discovered_markers.add(site.marker)
+        marker_sites.setdefault(site.marker, []).append(site)
         locations = marker_locations.get(site.marker, [])
         if len(locations) != 1:
             errors.append(f"{prefix} duplicate marker {site.marker}")
@@ -327,6 +329,13 @@ def validate_inventory(root: Path, inventory_path: Path) -> list[str]:
             errors.append(f"{prefix} kind mismatch for {site.marker}: inventory has {entry.kind}")
         if entry.safety != site.rationale:
             errors.append(f"{prefix} safety rationale mismatch for {site.marker}")
+
+    for marker, marked_sites in marker_sites.items():
+        if len(marked_sites) > 1:
+            first = marked_sites[0]
+            errors.append(
+                f"{first.path}:{first.line}: marker applies to multiple unsafe constructs: {marker}"
+            )
 
     for marker, locations in marker_locations.items():
         if marker not in discovered_markers:
