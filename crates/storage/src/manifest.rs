@@ -28,6 +28,7 @@ use std::path::PathBuf;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::ipc::convert::try_schema_from_flatbuffer_bytes;
 use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator, IpcWriteOptions};
+use serde::de::{self, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, StorageError};
@@ -51,6 +52,10 @@ const MAX_MANIFEST_DATA_FILES: usize = 900_000;
 const MAX_MANIFEST_SEGMENTS: usize = 1_000_000;
 const MAX_MANIFEST_TOMBSTONES: usize = 10_000_000;
 const MAX_MANIFEST_SCHEMA_IPC_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum number of JSON values visited by the streaming preflight. This is
+/// deliberately lower than the largest field-specific collection limits so a
+/// large array is rejected before `serde_json::Value` can materialize it.
+const MAX_MANIFEST_PRE_PARSE_NODES: usize = 1_000_000;
 
 /// One committed data file's name and the per-column statistics computed
 /// for it at commit time — see `docs/design.md`.
@@ -423,6 +428,205 @@ fn validate_json_limits(
     Ok(())
 }
 
+#[derive(Default)]
+struct ManifestJsonBudget {
+    nodes: usize,
+}
+
+impl ManifestJsonBudget {
+    fn visit<E: de::Error>(&mut self) -> std::result::Result<(), E> {
+        self.nodes = self.nodes.saturating_add(1);
+        if self.nodes > MAX_MANIFEST_PRE_PARSE_NODES {
+            return Err(E::custom(format!(
+                "JSON contains more than {MAX_MANIFEST_PRE_PARSE_NODES} values"
+            )));
+        }
+        Ok(())
+    }
+}
+
+struct ManifestJsonSeed<'a> {
+    budget: &'a mut ManifestJsonBudget,
+    array_limit: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for ManifestJsonSeed<'_> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(ManifestJsonVisitor {
+            budget: self.budget,
+            array_limit: self.array_limit,
+        })
+    }
+}
+
+struct ManifestJsonVisitor<'a> {
+    budget: &'a mut ManifestJsonBudget,
+    array_limit: usize,
+}
+
+impl<'de> Visitor<'de> for ManifestJsonVisitor<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a bounded JSON manifest")
+    }
+
+    fn visit_bool<E>(self, _: bool) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.budget.visit()?;
+        Ok(())
+    }
+
+    fn visit_i64<E>(self, _: i64) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.budget.visit()?;
+        Ok(())
+    }
+
+    fn visit_u64<E>(self, _: u64) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.budget.visit()?;
+        Ok(())
+    }
+
+    fn visit_f64<E>(self, _: f64) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.budget.visit()?;
+        Ok(())
+    }
+
+    fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.budget.visit()?;
+        if value.len() > MAX_MANIFEST_STRING_BYTES {
+            return Err(E::custom(format!(
+                "JSON string exceeds maximum length {MAX_MANIFEST_STRING_BYTES}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn visit_borrowed_str<E>(self, value: &'de str) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.visit_str(value)
+    }
+
+    fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.visit_str(&value)
+    }
+
+    fn visit_none<E>(self) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.budget.visit()?;
+        Ok(())
+    }
+
+    fn visit_unit<E>(self) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.budget.visit()?;
+        Ok(())
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(self)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        self.budget.visit()?;
+        let mut items = 0;
+        while let Some(()) = sequence.next_element_seed(ManifestJsonSeed {
+            budget: self.budget,
+            array_limit: self.array_limit,
+        })? {
+            items += 1;
+            if items > self.array_limit {
+                return Err(de::Error::custom(format!(
+                    "JSON array contains more than {} items",
+                    self.array_limit
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        self.budget.visit()?;
+        let mut fields = 0;
+        while let Some(key) = map.next_key::<String>()? {
+            fields += 1;
+            if fields > MAX_MANIFEST_OBJECT_FIELDS {
+                return Err(de::Error::custom(format!(
+                    "JSON object contains more than {MAX_MANIFEST_OBJECT_FIELDS} fields"
+                )));
+            }
+            if key.len() > MAX_MANIFEST_STRING_BYTES {
+                return Err(de::Error::custom(format!(
+                    "JSON object key exceeds maximum length {MAX_MANIFEST_STRING_BYTES}"
+                )));
+            }
+            let array_limit = match key.as_str() {
+                "tombstones" => MAX_MANIFEST_TOMBSTONES,
+                "schema_ipc" => MAX_MANIFEST_SCHEMA_IPC_BYTES,
+                "data_files" => MAX_MANIFEST_DATA_FILES,
+                "segments" => MAX_MANIFEST_SEGMENTS,
+                _ => MAX_MANIFEST_ARRAY_ITEMS,
+            };
+            map.next_value_seed(ManifestJsonSeed {
+                budget: self.budget,
+                array_limit,
+            })?;
+        }
+        Ok(())
+    }
+}
+
+fn preflight_manifest_json(bytes: &[u8], path: &Path) -> Result<()> {
+    let mut budget = ManifestJsonBudget::default();
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    deserializer
+        .deserialize_any(ManifestJsonVisitor {
+            budget: &mut budget,
+            array_limit: MAX_MANIFEST_ARRAY_ITEMS,
+        })
+        .map_err(|error| manifest_limit_error(path, error.to_string()))?;
+    deserializer
+        .end()
+        .map_err(|error| manifest_limit_error(path, error.to_string()))
+}
+
 fn validate_manifest_collection_limits(value: &serde_json::Value, path: &Path) -> Result<()> {
     let Some(manifest) = value.get("manifest").and_then(serde_json::Value::as_object) else {
         return Err(manifest_limit_error(
@@ -691,6 +895,10 @@ fn decode_manifest_with_byte_count(
             ),
         ));
     }
+    // Perform cardinality/depth checks while streaming the JSON tokens. This
+    // must precede `serde_json::Value` parsing: a compact array can be tiny on
+    // disk but expand into hundreds of megabytes of heap allocations.
+    preflight_manifest_json(bytes, &path)?;
     let value: serde_json::Value = serde_json::from_slice(bytes)
         .map_err(|error| StorageError::CorruptManifest(path.clone(), error.to_string()))?;
     if !value
@@ -1232,8 +1440,30 @@ mod tests {
         let result = read_current(&dir);
 
         assert!(
-            matches!(result, Err(StorageError::CorruptManifest(_, ref detail)) if detail.contains("data_files") || detail.contains("maximum is 900000")),
+            matches!(result, Err(StorageError::CorruptManifest(_, ref detail)) if detail.contains("data_files") || detail.contains("maximum is 900000") || detail.contains("array contains")),
             "expected the data-file bound, got {result:?}"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_current_rejects_large_json_arrays_before_value_materialization() {
+        let dir = temp_dataset_dir("manifest-preflight-node-limit");
+        let mut bytes = br#"{"format_version":1,"checksum":0,"manifest":{"tombstones":["#.to_vec();
+        for index in 0..=MAX_MANIFEST_PRE_PARSE_NODES {
+            if index != 0 {
+                bytes.push(b',');
+            }
+            bytes.push(b'0');
+        }
+        bytes.extend_from_slice(br"]}}");
+        write_raw_manifest_bytes(&dir, &bytes);
+
+        let result = read_current(&dir);
+
+        assert!(
+            matches!(result, Err(StorageError::CorruptManifest(_, ref detail)) if detail.contains("more than 1000000") || detail.contains("array contains")),
+            "expected the streaming preflight bound, got {result:?}"
         );
         fs::remove_dir_all(&dir).ok();
     }

@@ -7,7 +7,7 @@ Baseline: `codex/readme-current-state` at `e7a4bee`
 
 ## Verdict
 
-**IMPLEMENTED within named bounds.** The two P1 recovery blockers are fixed;
+**IMPLEMENTED within named bounds.** The three P1 recovery blockers are fixed;
 namespace amplification and independent historical Arrow-writer evidence remain
 explicit limits of this audit.
 
@@ -48,12 +48,20 @@ Manifest loading reads the complete object, parses unrestricted JSON,
 deserializes and clones it, and builds another canonical JSON tree before
 checksum validation. There is no maximum manifest byte size, field count,
 schema length, file count, segment count, tombstone count, or string length.
-Resolution: recovery rejects encoded manifests over 64 MiB, applies the
-serde_json depth guard (128 levels), limits object fields and strings, and
-limits manifest arrays, data files, segments, tombstones, and schema IPC bytes
-before typed envelope deserialization. Arrow row decoding retains its existing
-typed panic-to-corruption boundary; its allocator and nested Arrow-schema
-limits remain separate datafile concerns.
+Resolution: recovery rejects encoded manifests over 64 MiB and runs a
+streaming JSON preflight before constructing `serde_json::Value`. The preflight
+limits depth (128 levels), object fields, strings, field-specific arrays, and
+total visited JSON nodes (1,000,000), preventing compact high-cardinality
+arrays from expanding into an unbounded raw JSON tree. Typed manifest
+collection and schema IPC limits remain enforced after the preflight. Arrow
+row decoding retains its existing typed panic-to-corruption boundary; its
+allocator and nested Arrow-schema limits remain separate datafile concerns.
+
+### [Resolved P2] Compaction reused the manifest inventory size
+
+`Dataset::compact` now passes each already-listed `ListedManifest::bytes` value
+to the size-aware exact-key reader. Retention, vacuum, and compaction therefore
+avoid re-enumerating `_versions` once per retained manifest.
 
 ### [P2] Recovery namespace and object counts are unbounded
 
@@ -131,9 +139,10 @@ limits checksums to accidental/torn corruption.
 
 ## Verification status
 
-Fresh focused storage verification after the implementation included 117/117
-unit tests passing, including the historical checksum and recovery-bound
-regressions. Full workspace gates are recorded on the implementation PR.
+Fresh focused storage verification after the implementation included 120/120
+unit tests passing, including the historical checksum, recovery-bound, and
+streaming-preflight regressions. Full workspace gates are recorded on the
+implementation PR.
 
 The implementation follows the approved Sol format/bounds design; no new
 cross-process or authentication guarantee is claimed.

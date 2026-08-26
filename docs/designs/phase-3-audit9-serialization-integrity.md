@@ -23,12 +23,13 @@ coordination.
    object with only the `checksum` value replaced by zero. This preserves the
    presence/absence of legacy defaulted fields while remaining independent of
    JSON object insertion order.
-2. Apply bounded-input validation before typed deserialization. The limits are
-   explicit constants: 64 MiB encoded manifest bytes, 128 JSON nesting levels,
-   4,096 object members, 1 MiB strings, 1,000,000 items in any JSON array,
-   900,000 data-file entries, 1,000,000 segment entries, 10,000,000
-   tombstones, and 16 MiB schema IPC bytes. These limits are resource guards,
-   not format-version changes; exceeding one returns `CorruptManifest`.
+2. Apply bounded-input validation in a streaming JSON preflight before parsing
+   into `serde_json::Value`. The preflight enforces the 128-level depth,
+   4,096-object-field, 1 MiB-string, field-specific array, and 1,000,000-node
+   limits while tokens are visited, so compact high-cardinality arrays cannot
+   expand into an unbounded raw JSON tree. The subsequent 64 MiB encoded-input
+   and typed collection limits remain resource guards, not format-version
+   changes; exceeding one returns `CorruptManifest`.
 3. After the raw checks pass, deserialize with the existing
    `deny_unknown_fields` envelope and run the existing format, filename,
    schema-catalog, and Arrow-schema validation. New writers continue to use the
