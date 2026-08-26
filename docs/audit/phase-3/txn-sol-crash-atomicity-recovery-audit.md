@@ -49,7 +49,7 @@ the documented local ordered-operation guarantee and is not currently tested.
 Locations:
 
 - [`crates/txn/src/dataset.rs:2312`](../../../crates/txn/src/dataset.rs:2312)
-- [`crates/txn/src/row_id.rs:182`](../../../crates/txn/src/row_id.rs:182)
+- [`crates/txn/src/row_id.rs:189`](../../../crates/txn/src/row_id.rs#L189)
 
 Row IDs are reserved and row/segment files are written before conflict
 checking and manifest publication. Conflicts, injected failures, and panics

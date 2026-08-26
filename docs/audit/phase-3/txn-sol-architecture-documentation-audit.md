@@ -20,8 +20,8 @@ Historical evidence remains historical and is not rewritten.
 
 Locations:
 
-- [`crates/txn/src/dataset.rs:2229`](../../../crates/txn/src/dataset.rs:2229)
-- [`crates/storage/src/manifest.rs:370`](../../../crates/storage/src/manifest.rs:370)
+- [`crates/txn/src/dataset.rs:2229`](../../../crates/txn/src/dataset.rs#L2229)
+- [`crates/storage/src/manifest.rs:370`](../../../crates/storage/src/manifest.rs#L370)
 - [`docs/architecture.md:5`](../../architecture.md:5)
 - [`docs/architecture.md:105`](../../architecture.md:105)
 - [`docs/status.md:72`](../../status.md:72)
@@ -36,10 +36,10 @@ guidance for this indeterminate outcome.
 
 Locations:
 
-- [`crates/txn/src/dataset.rs:442`](../../../crates/txn/src/dataset.rs:442)
+- [`crates/txn/src/dataset.rs:442`](../../../crates/txn/src/dataset.rs#L442)
 - [`docs/status.md:40`](../../status.md:40)
 - [`docs/roadmap.md:19`](../../roadmap.md:19)
-- [`crates/txn/src/maintenance.rs:59`](../../../crates/txn/src/maintenance.rs:59)
+- [`crates/txn/src/maintenance.rs:59`](../../../crates/txn/src/maintenance.rs#L59)
 
 Compaction holds lifecycle exclusivity and `commit_lock` while rebuilding the
 live dataset. Retained evidence reports approximately 79.49 seconds and 1.29
@@ -52,14 +52,14 @@ boundaries.
 
 Examples:
 
-- [`crates/txn/src/lib.rs:1`](../../../crates/txn/src/lib.rs:1) and
-  [`crates/txn/src/dataset.rs:1`](../../../crates/txn/src/dataset.rs:1) link to
+- [`crates/txn/src/lib.rs:1`](../../../crates/txn/src/lib.rs#L1) and
+  [`crates/txn/src/dataset.rs:1`](../../../crates/txn/src/dataset.rs#L1) link to
   a nonexistent `docs/phase-1-audit.md`.
-- [`crates/txn/src/lifecycle.rs:114`](../../../crates/txn/src/lifecycle.rs:114)
+- [`crates/txn/src/lifecycle.rs:114`](../../../crates/txn/src/lifecycle.rs#L114)
   describes an implemented lifecycle report as future work.
-- [`crates/index/src/segment_set.rs:25`](../../../crates/index/src/segment_set.rs:25)
+- [`crates/index/src/segment_set.rs:25`](../../../crates/index/src/segment_set.rs#L25)
   says compaction does not exist.
-- [`crates/storage/src/manifest.rs:355`](../../../crates/storage/src/manifest.rs:355)
+- [`crates/storage/src/manifest.rs:355`](../../../crates/storage/src/manifest.rs#L355)
   still says Phase 1 has no conflict detection.
 - Obsolete “Phase 6/spec §” labels remain in active comments.
 

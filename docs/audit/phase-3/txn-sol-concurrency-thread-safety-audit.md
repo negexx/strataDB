@@ -50,7 +50,7 @@ catch a production-only publication ordering regression.
 
 Locations:
 
-- [`crates/txn/src/dataset.rs:446`](../../../crates/txn/src/dataset.rs#L446)
+- [`crates/txn/src/dataset.rs:479`](../../../crates/txn/src/dataset.rs#L479)
 - [`crates/txn/src/dataset.rs:1193`](../../../crates/txn/src/dataset.rs#L1193)
 - [`crates/txn/src/vacuum.rs:29`](../../../crates/txn/src/vacuum.rs#L29)
 

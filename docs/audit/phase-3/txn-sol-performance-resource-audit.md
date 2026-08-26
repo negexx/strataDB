@@ -22,7 +22,7 @@ microbenchmark evidence, and cache-locality evidence.
 
 Locations:
 
-- [`crates/txn/src/row_id.rs:182`](../../../crates/txn/src/row_id.rs#L182)
+- [`crates/txn/src/row_id.rs:189`](../../../crates/txn/src/row_id.rs#L189)
 - [`crates/storage/src/row_id_high_water.rs:111`](../../../crates/storage/src/row_id_high_water.rs#L111)
 - [`crates/storage/src/row_id_high_water.rs:289`](../../../crates/storage/src/row_id_high_water.rs#L289)
 - [`crates/txn/src/vacuum.rs:91`](../../../crates/txn/src/vacuum.rs#L91)
@@ -60,7 +60,7 @@ allocations despite an existing per-snapshot cache.
 
 Locations:
 
-- [`crates/txn/src/dataset.rs:446`](../../../crates/txn/src/dataset.rs#L446)
+- [`crates/txn/src/dataset.rs:479`](../../../crates/txn/src/dataset.rs#L479)
 - [`crates/txn/src/dataset.rs:475`](../../../crates/txn/src/dataset.rs#L475)
 - [`crates/txn/src/dataset.rs:598`](../../../crates/txn/src/dataset.rs#L598)
 - [`crates/txn/src/dataset.rs:632`](../../../crates/txn/src/dataset.rs#L632)

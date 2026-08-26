@@ -30,7 +30,7 @@ Critical paths have no audit records:
   [`maintenance.rs:59`](../../../crates/txn/src/maintenance.rs:59),
   [`vacuum.rs:29`](../../../crates/txn/src/vacuum.rs:29)
 - Row-ID reservation and recovery:
-  [`row_id.rs:182`](../../../crates/txn/src/row_id.rs:182),
+  [`row_id.rs:189`](../../../crates/txn/src/row_id.rs#L189),
   [`dataset.rs:945`](../../../crates/txn/src/dataset.rs:945)
 
 Failures, conflicts, abandoned ranges, corruption detections, recovery
