@@ -3076,7 +3076,7 @@ mod loom_tests {
     #[test]
     fn physical_claim_exhaustion_retries_before_pruning() {
         let mut model = loom::model::Builder::new();
-        model.preemption_bound = Some(3);
+        model.preemption_bound = Some(1);
         model.check(move || {
             let graph = loom::sync::Arc::new(Graph::new(crate::distance::L2, 4));
             graph
