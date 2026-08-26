@@ -31,8 +31,8 @@ coordination.
    not format-version changes; exceeding one returns `CorruptManifest`.
 3. After the raw checks pass, deserialize with the existing
    `deny_unknown_fields` envelope and run the existing format, filename,
-   schema-catalog, and Arrow-schema validation. New writers continue to use
-   the existing canonical typed envelope bytes.
+   schema-catalog, and Arrow-schema validation. New writers continue to use the
+   existing canonical typed envelope bytes.
 4. Keep the known recovery namespace amplification finding explicit: object
    listing and row-ID reservation scans remain bounded only by the documented
    local operational workload, because imposing an arbitrary global object

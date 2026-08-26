@@ -1,14 +1,12 @@
 # Audit 9 Serialization Integrity Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans or superpowers:subagent-driven-development to implement this plan task-by-task. Steps use checkbox syntax for tracking.
-
 **Goal:** Make manifest recovery preserve historical checksums and reject resource-exhausting serialized input within explicit bounds.
 
 **Architecture:** Keep the current versioned JSON envelope and typed validation. Add a raw JSON validation/checksum layer before typed deserialization, then reuse the existing `ManifestEnvelope::validate` and schema checks.
 
 **Tech Stack:** Rust 2024, serde_json, CRC32C, Arrow IPC, Cargo tests.
 
-**Spec:** `docs/superpowers/specs/2026-08-26-audit9-serialization-integrity-design.md`
+**Design:** [`docs/designs/phase-3-audit9-serialization-integrity.md`](../designs/phase-3-audit9-serialization-integrity.md)
 
 ## Global Constraints
 
@@ -18,7 +16,7 @@
 - Use TDD: each behavior test must fail before the implementation change.
 - Run focused storage tests, workspace tests, clippy, format, and diff checks.
 
-### Task 1: Add raw manifest bounds and checksum compatibility
+## Task 1: Add raw manifest bounds and checksum compatibility
 
 **Files:**
 - Modify: `crates/storage/src/manifest.rs`
@@ -32,7 +30,7 @@
 - [ ] Update manifest decode to reject oversized input/shape, validate raw format/checksum, then deserialize and run existing typed validation.
 - [ ] Run the compatibility and bounds tests and confirm they pass.
 
-### Task 2: Expand regression evidence and audit record
+## Task 2: Expand regression evidence and audit record
 
 **Files:**
 - Modify: `crates/storage/src/manifest.rs` tests
