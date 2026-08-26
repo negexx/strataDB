@@ -128,6 +128,8 @@ pub enum IndexError {
     DimensionMismatch { query_len: usize, expected: usize },
     #[error("row_id {row_id} is beyond the index's addressable capacity of {capacity} rows")]
     RowIdOutOfRange { row_id: u64, capacity: u64 },
+    #[error("row_id {0} is already present in the index")]
+    DuplicateRowId(u64),
     // Produced by `insert_batch_parallel` when the OS refuses to spawn a
     // worker thread for a chunk (`ChunkOutcome::SpawnFailed`) -- segment
     // (de)serialization itself is still entirely in-memory and has no I/O
@@ -1176,6 +1178,27 @@ mod tests {
                 expected: 3
             })
         ));
+    }
+
+    #[test]
+    fn insert_rejects_duplicate_row_id_without_replacing_the_original_vector() {
+        let index = HnswIndex::new(
+            MaxConnections(16),
+            MaxElements(100),
+            MaxLayers(16),
+            EfConstruction(200),
+        )
+        .unwrap();
+        index.insert(0, &[1.0, 2.0, 3.0]).unwrap();
+
+        let result = index.insert(0, &[9.0, 9.0, 9.0]);
+        assert!(matches!(result, Err(IndexError::DuplicateRowId(0))));
+        let results = index.search(&[1.0, 2.0, 3.0], 1, 50, |_| true).unwrap();
+        assert_eq!(results[0].row_id, 0);
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(results[0].squared_distance, 0.0);
+        }
     }
 
     #[test]

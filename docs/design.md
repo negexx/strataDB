@@ -46,13 +46,16 @@ manifest and installs a replacement immutable snapshot.
 Before returning `TxnError::IndeterminateManifestPublication`, commit installs the readable candidate
 and records the write set, so that transaction is terminal and must not be replayed. Create returns
 no handle; callers must open before retrying and must not create again when open succeeds. Compact,
-migrate, and maintain can return `TxnError::Storage(StorageError::PublicationIndeterminate(...))`
-before changing the existing handle, so callers must stop using it, drop/reopen, and inspect recovered version/schema.
+migrate, and maintain can propagate `TxnError::IndeterminateManifestPublication { .. }`
+after reconciling a verified-visible candidate into the shared handle. The error gives no durability
+acknowledgement and must not be blindly replayed; reopening can establish visibility, not durability.
 Existing snapshots remain immutable in every outcome.
 
-Inserting transactions each write one immutable row-ID reservation. Recovering the allocation floor
-reads O(commits) reservation metadata per insert, yielding O(commits²) cumulative metadata reads.
-This deliberately bounded cost does not coordinate independent handles.
+Each inserting attempt writes one immutable row-ID reservation before its commit outcome is known.
+Recovering the allocation floor reads O(reservation records) metadata per inserting attempt, yielding
+O(attempts²) cumulative metadata reads.
+This unbounded allocator scan is excluded from lifecycle physical accounting and reclamation; it does
+not coordinate independent handles.
 
 The supported concurrency boundary is one process sharing one `Dataset` handle. This bounded read
 API and write-write OCC have snapshot isolation as their ceiling, not full serializability; it is not
@@ -84,13 +87,16 @@ cost model, or a guaranteed cost bound for selective queries.
 
 ## Verification boundary
 
-Lifecycle mutation takes explicit lifecycle exclusivity followed by `commit_lock`, stopping write
-preparation, publication, migration, and other lifecycle execution for that shared handle while it
+Each lifecycle mutation takes explicit lifecycle exclusivity followed by `commit_lock`, stopping write
+preparation, publication, migration, and other lifecycle execution for that sub-operation while it
 materializes live data, publishes, validates protected history, and reclaims eligible objects.
-Immutable snapshot reads continue. Its cost scales with live data and retained/protected history.
-The retained fixture/runner evidence—79.49 seconds median and 1,289.2 MB peak live memory—is not an
-SLO or maximum. `lifecycle_report` and `storage_bound_met` exclude
-`_meta/row-id-high-water` reservation objects from physical accounting.
+Immutable snapshot reads continue. `maintain` invokes these sub-operations sequentially, releasing
+their guards between phases, so writers may interleave and the composed run is non-atomic. Cost scales
+with live data and retained/protected history. The retained compaction fixture evidence is a 79.49
+second median and 1,289.2 MB peak live memory; separate maintenance evidence records a 74.16-second
+median and 1,090.4 MB peak live memory. These are not SLOs or maximums. `lifecycle_report` and
+`storage_bound_met` exclude
+`_meta/row-id-high-water` reservation objects from physical accounting and reclamation.
 
 Normal unit/integration tests, loom models, property tests, fuzz targets, real-process chaos/reopen
 tests, and Criterion benchmarks cover useful slices. Several important suites are opt-in or not yet

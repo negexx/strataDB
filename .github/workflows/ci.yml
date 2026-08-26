@@ -361,6 +361,7 @@ jobs:
               graph::loom_tests::concurrent_advances_always_settle_on_the_highest_level
               graph::loom_tests::concurrent_inserts_of_distinct_rows_are_all_findable_and_uncorrupted
               graph::loom_tests::concurrent_inserts_racing_on_one_shared_neighbor_always_keep_the_nearest
+              graph::loom_tests::physical_claim_exhaustion_retries_before_pruning
               graph::loom_tests::concurrent_inserts_into_a_genuinely_empty_graph_never_strand_a_node_loom
               graph::loom_tests::concurrent_insert_never_uses_an_unpublished_node_as_a_descent_entry_loom
             )

@@ -54,14 +54,18 @@ provide explicit history and one final inventory observation of requested storag
 `storage_bound_met` is the final observation of one explicit maintenance run, not atomic or
 continuous enforcement. Active snapshots, protected history, unknown objects, and noncontiguous
 physical row IDs can prevent the requested bound; the API is not a cross-process quota or SLO.
-Snapshots remain protected rather than being deleted. Mutating lifecycle work explicitly stops
+Snapshots remain protected rather than being deleted. Each mutating lifecycle sub-operation stops
 write preparation, publication, migration, and other lifecycle execution on the shared handle: it
 takes lifecycle exclusivity then `commit_lock` while materializing live data, publishing, validating
-protected history, and reclaiming eligible objects; immutable snapshot reads continue. Its cost
-scales with live data and retained/protected history. The retained fixture/runner record of a
-79.49-second median and 1,289.2 MB peak live memory is bounded evidence, not an SLO or maximum.
-`lifecycle_report` and `storage_bound_met` exclude `_meta/row-id-high-water` from physical
-accounting. Cross-process lifecycle work remains later design. Historical exact-head lifecycle evidence, plus the scoped current local record, is recorded in the
+protected history, and reclaiming eligible objects; immutable snapshot reads continue.
+`maintain` invokes those sub-operations sequentially rather than holding one guard across the
+composed run, so writers may interleave between its phases and the run is non-atomic. Cost scales
+with live data and retained/protected history. The retained compaction fixture record is a
+79.49-second median with 1,289.2 MB peak live memory; separate maintenance evidence records a
+74.16-second median with 1,090.4 MB peak live memory. Both are bounded evidence, not an SLO or
+maximum. `lifecycle_report` and
+`storage_bound_met` exclude `_meta/row-id-high-water` from physical accounting. Cross-process
+lifecycle work remains later design. Historical exact-head lifecycle evidence, plus the scoped current local record, is recorded in the
 [Phase 3 closeout audit](audit/phase-3/audit.md) and
 [Phase 3 verification report](phase-3-verification-report.md). See
 the [inventory design](designs/phase-3/lifecycle-inventory.md), [manifest executor
@@ -122,15 +126,17 @@ immutable final-name candidate but a failed directory sync, so it reports no dur
 acknowledgement. Commit records its write set and installs that candidate before returning
 `TxnError::IndeterminateManifestPublication`; that transaction is terminal and must not be replayed.
 Create returns no handle, so callers open before retrying and never create again when open succeeds.
-`compact`, `migrate_schema`, and `maintain` may return
-`TxnError::Storage(StorageError::PublicationIndeterminate(...))` before updating the existing handle;
-callers must stop using it, drop/reopen, and inspect the recovered version and schema. Reopening proves visibility,
-not durability. Existing snapshots stay immutable, while independent handles remain uncoordinated.
+`compact`, `migrate_schema`, and `maintain` can propagate
+`TxnError::IndeterminateManifestPublication { .. }` after a verified-visible candidate
+has been reconciled into the shared handle; the error still gives no durability acknowledgement and
+must not be blindly replayed. Reopening proves visibility, not durability. Existing snapshots stay
+immutable, while independent handles remain uncoordinated.
 
-Each inserting transaction writes one immutable row-ID reservation object. The allocation-floor
-recovery scan reads O(commits) reservation metadata per inserting commit, or O(commits²)
-cumulatively. This is a local filesystem, one-process/shared-`Dataset` cost; it does not coordinate
-independent handles.
+Each inserting attempt writes one immutable row-ID reservation object before its commit outcome is
+known. The allocation-floor recovery scan reads O(reservation records) metadata per inserting attempt,
+or O(attempts²) cumulatively. This unbounded scan is allocator metadata outside lifecycle physical accounting and
+reclamation: `_meta/row-id-high-water` is never deletion authority. This is a local filesystem,
+one-process/shared-`Dataset` cost; it does not coordinate independent handles.
 
 ## Status vocabulary
 

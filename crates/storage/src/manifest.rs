@@ -3,8 +3,12 @@
 //!
 //! A manifest is one immutable file per version, named so lexicographic
 //! order equals numeric order (`{version:020}.manifest`, following Lance's
-//! own convention). Commit is: write to a temp name (via `LocalFs::put`),
-//! fsync, atomically rename into place.
+//! own convention). Commit is: write to a temp name, fsync it, publish the
+//! final name with `StorageOwner::put_if_absent` (the local backend uses a
+//! hard link), then synchronize the bounded directory chain from `_versions`
+//! through the dataset root. A final-name candidate can be readable if a
+//! directory sync fails; this is a verified-visible indeterminate
+//! publication, not a durability acknowledgement.
 //! A crash mid-write leaves only a `.tmp-*` file behind. Its stem (the
 //! part before `.manifest`) always starts with a `.` from the temp-name
 //! prefix, so it can never parse as a `u64` version — `read_current`
@@ -13,8 +17,8 @@
 //! single-guarded exclusion (numeric-parse failure), not a
 //! `*.manifest`-glob mismatch — but a reader still can never observe a
 //! partially-written version either way. This *is* the mechanism the
-//! Phase 1 "kill -9 mid-write, restart, recover last committed version"
-//! MVP checklist item tests.
+//! Phase 1 "kill -9 mid-write, restart, recover the newest readable final-name
+//! version" MVP checklist item tests.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -352,7 +356,10 @@ fn manifest_path(dataset_dir: &Path, version: u64) -> PathBuf {
     versions_dir(dataset_dir).join(format!("{version:020}.manifest"))
 }
 
-/// Durably and atomically commits `manifest` as the new current version.
+/// Publishes `manifest` atomically as a new immutable current-version candidate.
+/// A successful return is the local durability acknowledgement; a
+/// `PublicationIndeterminate` error can still leave the exact final-name
+/// candidate readable without that acknowledgement.
 /// Never call this twice concurrently for the same `dataset_dir` from
 /// separate writers in Phase 1 — there is no conflict detection yet (single
 /// writer only); see `crates/txn`.
@@ -395,9 +402,10 @@ pub fn commit_manifest_with(
     }
 }
 
-/// Returns the highest committed version's manifest, or `None` if the
-/// dataset has never been committed to. This is the entire crash-recovery
-/// mechanism: it only ever sees fully-renamed `*.manifest` files.
+/// Returns the highest readable final-name version's manifest, or `None` if
+/// the dataset has no final-name manifest. This is the crash-recovery selection
+/// mechanism: it only ever sees fully-published final-name `*.manifest` files, including a
+/// candidate whose publication outcome was indeterminate.
 ///
 /// # Errors
 ///

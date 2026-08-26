@@ -8,7 +8,7 @@ in [documentation history](history/README.md). Current implementation claims liv
 | 0 — Foundation | Implemented within named local bounds | Local format, manifests, row allocation, and bounded transaction primitives. See the [Phase 0 foundation audit](audit/phase-0/audit.md). | Restart-safe row-ID non-reuse and retained foundation evidence pass within the named local-filesystem boundary. |
 | 1 — Correctness and durability baseline | Implemented within named bounds | Shared-handle commits, immutable snapshots, typed conflicts, recovery/integrity, schema/error semantics, supported facade, and boundedness evidence. Publication reports acknowledged success, definite pre-publication failure, or an indeterminate final-name-visible/directory-sync-failed result without durability acknowledgement. | All asserted guarantees have scope, implementation evidence, regression coverage, and current bounded performance evidence. |
 | 2 — Query and usability | Implemented within named bounds | Stable versioned-schema/query APIs, scan/projection/filter/group-by integration, point lookup, administration CLI, and Python surface. The CLI includes inspect/schema, planned explain, explicit `add_nullable_column` migration validation/execution/status, and recovery/manifest status with human/JSON output and typed process categories. See the [Phase 2 audit](audit/phase-2/audit.md). | Supported query/client behavior is documented and integration-tested within the embedded single-process boundary; schema evolution remains limited to the one named deterministic transition. |
-| 3 — Operational lifecycle | Implemented within named bounds | Lifecycle diagnostics, explicit snapshot-preserving compaction, manifest retention including age policy, recognized orphan vacuum, and `Dataset::maintain(LifecycleMaintenancePolicy)` are implemented for one shared handle. Maintenance reports one run's final data-object and segment observation; active snapshots, protected history, unknown objects, and noncontiguous physical row IDs remain explicit limitations. See the [Phase 3 closeout audit](audit/phase-3/audit.md), [inventory design](designs/phase-3/lifecycle-inventory.md), [executor design](designs/phase-3/manifest-retention-executor.md), [vacuum design](designs/phase-3/vacuum.md), and focused lifecycle tests. | One explicit maintenance run safely applies the supported retention/reclamation policy and reports its final storage observation; it is neither atomic nor continuous enforcement and does not provide cross-process quota or SLO semantics. |
+| 3 — Operational lifecycle | Implemented within named bounds | Lifecycle diagnostics, explicit snapshot-preserving compaction, manifest retention including age policy, recognized orphan vacuum, and `Dataset::maintain(LifecycleMaintenancePolicy)` are implemented for one shared handle. Maintenance calls its lifecycle phases sequentially, so writers may interleave and one run is non-atomic; it reports one final data-object and segment observation. Active snapshots, protected history, unknown objects, and noncontiguous physical row IDs remain explicit limitations. See the [Phase 3 closeout audit](audit/phase-3/audit.md), [inventory design](designs/phase-3/lifecycle-inventory.md), [executor design](designs/phase-3/manifest-retention-executor.md), [vacuum design](designs/phase-3/vacuum.md), and focused lifecycle tests. | One explicit maintenance run safely applies the supported retention/reclamation policy and reports its final storage observation; it is neither atomic nor continuous enforcement and does not provide cross-process quota or SLO semantics. |
 | 4 — Cross-process coordination | Proposed | Durable conditional publication, independent opener semantics, shared allocation, and process-boundary guarantees. | Separate processes coordinate without violating visibility, conflict, or durability invariants. |
 | 5 — Branching and merge | Proposed | Fork, abort, merge, conflict reporting, and branch-aware manifests. | Branch behavior is correct under concurrency and recovery tests. |
 | 6 — Object storage and deployment | Proposed | Object-store conditional writes, S3-compatible backends, remote recovery, and durability testing. | The supported correctness suite passes against supported remote backends. |
@@ -22,18 +22,26 @@ Phase 3 lifecycle now also includes explicit snapshot-preserving compaction and 
 inventory evidence. Universal growth enforcement across independent processes or unknown object
 types remains outside the embedded single-process product boundary.
 
-Lifecycle mutations are stop-the-world only for write preparation, publication, migration, and
+Each lifecycle mutation is stop-the-world only for write preparation, publication, migration, and
 lifecycle execution on one shared handle: lifecycle exclusivity and `commit_lock` cover live-data
 materialization, publication, protected-history validation, and eligible reclamation, while immutable
-snapshot reads continue. Cost scales with live data/history. The retained 79.49-second median and
-1,289.2 MB peak-live-memory fixture/runner result is evidence, not an SLO or maximum; physical
-accounting for lifecycle reports and `storage_bound_met` excludes `_meta/row-id-high-water`.
+snapshot reads continue. `maintain` runs those mutations sequentially rather than under one guard, so
+writers may interleave between phases and the composite run is non-atomic. Cost scales with live
+data/history. The retained compaction fixture records a 79.49-second median and 1,289.2 MB peak
+live memory; separate maintenance evidence records a 74.16-second median and 1,090.4 MB peak live
+memory. These are evidence, not SLOs or maximums;
+physical accounting and reclamation exclude `_meta/row-id-high-water`.
 
 The Phase 3 exit signal above denotes evidence from one explicit maintenance run. In particular,
 `storage_bound_met` is that run's final inventory observation, not atomic or continuous
 storage-bound enforcement. Active snapshots, protected history, unknown objects, and noncontiguous
 physical row IDs can keep physical growth above a requested limit. Cross-process quota and SLO
 semantics remain outside the embedded shared-handle boundary and require separately authorized work.
+
+Each inserting attempt writes immutable row-ID reservation metadata before its commit outcome is known.
+Recovery scans that catalog in O(reservation records) metadata reads per inserting attempt and
+O(attempts²) cumulatively; this unbounded
+allocator scan is excluded from lifecycle physical accounting and reclamation.
 
 ## Phase 4 reservation and entry gates
 

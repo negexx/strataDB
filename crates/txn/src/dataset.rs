@@ -450,9 +450,10 @@ fn publish_candidate_manifest(
 }
 
 /// Completes the in-memory side of a verified-visible publication while the
-/// caller holds the shared publication lock. The durable manifest has already
-/// been published before this helper is called; commit history and the current
-/// snapshot must be installed before an indeterminate result is returned.
+/// caller holds the shared publication lock. The manifest candidate is already
+/// verified visible, but may lack durability acknowledgement; commit history
+/// and the current snapshot must be installed before an indeterminate result is
+/// returned.
 fn complete_visible_publication<T>(
     publish_commit_log: impl FnOnce(),
     publish_current: impl FnOnce(),
@@ -470,11 +471,11 @@ impl Dataset {
     ///
     /// Returns a typed storage, manifest, schema, or index error if the
     /// replacement objects cannot be written or publication fails. A
-    /// [`TxnError::Storage`] wrapping
-    /// [`strata_storage::StorageError::PublicationIndeterminate`] can follow
-    /// final-name publication but precede this handle's update; stop using
-    /// this handle, drop/reopen it, and inspect the recovered version and
-    /// schema. Reopen proves visibility, not durability.
+    /// [`TxnError::IndeterminateManifestPublication`] can follow final-name
+    /// publication after this handle has reconciled the verified-visible
+    /// candidate. The error is not a durability
+    /// acknowledgement and must not be blindly replayed; reopening proves
+    /// visibility, not durability.
     #[allow(clippy::too_many_lines)]
     pub fn compact(&self, policy: CompactionPolicy) -> Result<CompactionReport> {
         if !policy.retain_snapshots {
@@ -1246,10 +1247,10 @@ impl Dataset {
     /// Returns a typed storage, schema, corruption, or durability error.
     /// Definite failures before final-name publication leave the current
     /// handle unchanged. An indeterminate publication can return
-    /// [`TxnError::Storage`] wrapping
-    /// [`strata_storage::StorageError::PublicationIndeterminate`] before this
-    /// handle is updated; stop using it, drop/reopen, and inspect recovered
-    /// version/schema. Reopen proves visibility, not durability.
+    /// [`TxnError::IndeterminateManifestPublication`] after this handle has
+    /// reconciled the verified-visible candidate; stop using it, drop/reopen,
+    /// and inspect the recovered version/schema. Reopen proves visibility,
+    /// not durability.
     #[allow(clippy::too_many_lines)]
     pub fn migrate_schema(&self, migration: &SchemaMigration) -> Result<SchemaMigrationResult> {
         let _lifecycle_guard = self.lifecycle_coordinator.acquire_exclusive();
@@ -2098,8 +2099,9 @@ impl Transaction {
         // `Dataset::commit_lock`'s doc and `crate::row_id`). A poisoned
         // lock (a prior committer panicked) is recovered rather than
         // propagated — the CommitLog is only ever mutated by `push` as the
-        // final in-memory step after a durable commit, so it can't be
-        // observed half-updated.
+        // final in-memory step after acknowledged publication or a
+        // verified-visible indeterminate candidate, so it can't be observed
+        // half-updated.
         let mut commit_log = self
             .commit_lock
             .lock()
@@ -2315,9 +2317,11 @@ impl Transaction {
 
         commit_log.push(new_version, self.write_set);
 
-        // Only after commit_manifest succeeds does the new state become
-        // visible to future Dataset::snapshot() calls — the in-memory swap
-        // must never run ahead of the on-disk durability point.
+        // Only after commit_manifest acknowledges publication or verifies a
+        // visible indeterminate candidate does the new state become visible
+        // to future Dataset::snapshot() calls — the in-memory swap must never
+        // run ahead of the on-disk visibility point. The latter outcome is
+        // not a durability acknowledgement.
         // The new snapshot's segment set is the previous snapshot's parts
         // plus a reader over the very bytes just fsynced — no read-back.
         let index = match new_segment {
@@ -6572,20 +6576,19 @@ mod tests {
     /// holds either way, but "exactly 4 x 75" is a ≥4-core claim, not a
     /// universal one.
     ///
-    /// Uses `widely_separated_rows`-style far-apart points (mirroring
-    /// `crates/index/src/hnsw.rs`'s own choice for its analogous
-    /// findability test). This asserts EXACT recall (0 misses), not a
-    /// bounded miss rate: the clustered-data recall hazard this batch of
-    /// work found and fixed (`Graph::insert`'s own doc comment in
-    /// `crates/index/src/graph.rs` -- hazard #4, the dominant mechanism)
-    /// is now verified closed end to end (0/800 real commits of a
-    /// 200-row/20-cluster fixture under heavy concurrent load), and
-    /// widely-separated points don't even exercise that hazard's
-    /// clustered-topology precondition -- any miss here would be a real
-    /// regression, not an expected residual.
+    /// Uses dense, deterministic three-dimensional points (matching
+    /// `crates/index/src/hnsw.rs`'s direct parallel-insert gate). This asserts
+    /// EXACT self-retrieval (0 misses), not a bounded miss rate: the older
+    /// one-dimensional, widely-separated fixture was intentionally removed
+    /// because diversity pruning gives it a heavy-tailed miss distribution
+    /// unrelated to the end-to-end wiring this test is meant to cover.
+    /// The concurrent publication hazard is covered separately by the graph
+    /// Loom models and the committed real-thread stress evidence; this test
+    /// verifies that the production transaction path preserves the dense
+    /// index's exact self-retrieval behavior.
     #[test]
     #[cfg(feature = "parallel-insert")]
-    #[allow(clippy::cast_precision_loss)] // row indices here are always < 301, far under f32/f64's exact-integer ceiling
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)] // row indices and fixture draws are far below the relevant precision ceilings
     fn a_large_single_commit_is_built_via_the_parallel_insert_path_and_stays_searchable() {
         const N: i64 = 301;
 
@@ -6593,10 +6596,23 @@ mod tests {
         let ds = Dataset::create(&dir, vector_test_schema()).unwrap();
 
         let ids: Vec<i64> = (0..N).collect();
-        let vectors: Vec<[f32; 3]> = (0..N).map(|i| [i as f32 * 1000.0, 0.0, 0.0]).collect();
+        // Dense, deterministic points keep the end-to-end gate focused on
+        // exercising the real parallel commit path rather than the known
+        // heavy-tailed behavior of a one-dimensional, widely-separated
+        // fixture whose diversity pruning can leave a node with too few
+        // redundant routes for an exact self-query. The same fixture shape
+        // is used by the direct index parallel-insert regression test.
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next_unit = || {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            ((seed >> 11) as f64 / (1u64 << 53) as f64) as f32
+        };
+        let vectors: Vec<[f32; 3]> = (0..N)
+            .map(|_| [next_unit() * 10.0, next_unit() * 10.0, next_unit() * 10.0])
+            .collect();
 
         let mut txn = ds.begin();
-        txn.insert(vector_batch(ids, vectors)).unwrap();
+        txn.insert(vector_batch(ids, vectors.clone())).unwrap();
         txn.commit().unwrap();
 
         assert_eq!(
@@ -6607,9 +6623,8 @@ mod tests {
         );
 
         let mut misses = 0u64;
-        for i in 0..N {
-            let query = [i as f32 * 1000.0, 0.0, 0.0];
-            let hits = ds.snapshot().vector_search(&query, 1, None).unwrap();
+        for (i, query) in vectors.iter().enumerate() {
+            let hits = ds.snapshot().vector_search(query, 1, None).unwrap();
             if hits.first().map(|m| m.row_id) != u64::try_from(i).ok() {
                 misses += 1;
             }
@@ -6617,9 +6632,8 @@ mod tests {
         assert_eq!(
             misses, 0,
             "{misses}/{N} rows were not their own nearest neighbor after a large \
-             parallel-insert commit -- the clustered-data recall hazard this fixture \
-             predates is now fixed and verified closed, so any miss here is a real \
-             regression"
+             parallel-insert commit -- the dense end-to-end fixture must preserve \
+             exact self-retrieval; any miss here is a real regression"
         );
 
         std::fs::remove_dir_all(&dir).ok();

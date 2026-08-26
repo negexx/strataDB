@@ -16,6 +16,12 @@
 //! allocation back inside the lock would drag every data-file and segment
 //! fsync in with it.
 //!
+//! Each inserting attempt publishes immutable reservation metadata before the
+//! commit outcome is known. Its recovery scan is O(reservation records) per
+//! inserting attempt and O(attempts²)
+//! cumulatively; the scan is intentionally unbounded and excluded from
+//! lifecycle physical accounting and reclamation.
+//!
 //! # No in-flight exclusion set (removed — see the S1 segmented-index spec §6)
 //!
 //! An earlier version of this module paired the counter with a registry of
@@ -36,9 +42,10 @@
 //! eagerly-mutated structure for an in-flight transaction to leak into. A
 //! row-id can only ever be found via `scan`/`vector_search` if its owning
 //! transaction's data file/segment already appears in the snapshot's OWN
-//! manifest, which is only ever true after that transaction's
-//! `commit_manifest` succeeded — a watermark numerically covering an
-//! uncommitted row-id is therefore harmless, since there is nothing for a
+//! manifest, which is only ever true after that transaction's manifest
+//! publication succeeded or reported a verified-visible candidate. The latter
+//! remains without durability acknowledgement, but a watermark numerically
+//! covering an uncommitted row-id is harmless because there is nothing for a
 //! reader to find at that id regardless of what the watermark says.
 //! Separately, the `row_id <= watermark` bound was always redundant for
 //! anything `is_visible` is actually called with: every candidate it ever

@@ -1,7 +1,10 @@
 //! Read-only inventory helpers for lifecycle diagnostics.
 //!
 //! These helpers classify one captured manifest against backend object metadata;
-//! they never mutate storage, manifests, or snapshots.
+//! they never mutate storage, manifests, or snapshots. They inventory only
+//! `_versions/` and `data/`: the unbounded `_meta/row-id-high-water` reservation
+//! recovery scan is allocator metadata and is excluded from lifecycle accounting
+//! and reclamation.
 
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
@@ -10,12 +13,14 @@ use strata_storage::{Manifest, ObjectMeta, StorageError};
 
 use crate::error::{Result, TxnError};
 
-/// A read-only, snapshot-anchored storage inventory.
+/// A read-only, snapshot-anchored storage inventory of manifests and data objects.
 ///
 /// `orphan_candidate_*` values identify objects not referenced by the captured
 /// manifest. They are diagnostic evidence only: an orphan candidate is not a
 /// safe-to-delete claim because another live snapshot or a later lifecycle
-/// policy may still require that object.
+/// policy may still require that object. The report deliberately excludes
+/// `_meta/row-id-high-water` reservation metadata from its accounting and does
+/// not make it reclamation authority.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LifecycleReport {
     observed_version: u64,
