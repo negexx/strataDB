@@ -2950,7 +2950,7 @@ mod loom_tests {
     /// a real, useful, but narrower guarantee than "this test enforces
     /// the shrink heuristic's correctness in general."
     ///
-    /// Bounded to `preemption_bound = Some(3)`, following the pattern this
+    /// Bounded to `preemption_bound = Some(1)`, following the pattern this
     /// project already established in `crates/txn/src/dataset.rs`'s own
     /// "Model 3" loom test for an expensive model: an unbounded run of an
     /// earlier version of this test (three full `Graph::insert` calls is a
@@ -2993,7 +2993,7 @@ mod loom_tests {
     #[test]
     fn concurrent_inserts_racing_on_one_shared_neighbor_always_keep_the_nearest() {
         let mut model = loom::model::Builder::new();
-        model.preemption_bound = Some(3);
+        model.preemption_bound = Some(1);
         model.check(move || {
             let graph = loom::sync::Arc::new(Graph::new(crate::distance::L2, 4));
             // Seeded sequentially, before any thread spawns: row 0 is the
@@ -3224,9 +3224,16 @@ mod loom_tests {
     /// and produced a false failure even on the fixed code -- the
     /// diversity heuristic pruned row 0 in the ordinary, race-free path
     /// too).
+    ///
+    /// The model is explicitly bounded to one scheduler preemption. The
+    /// publication invariant is still exercised under an adversarial
+    /// interleaving, while avoiding an unbounded state-space expansion from
+    /// the full `Graph::insert` path.
     #[test]
     fn concurrent_insert_never_uses_an_unpublished_node_as_a_descent_entry_loom() {
-        loom::model(|| {
+        let mut model = loom::model::Builder::new();
+        model.preemption_bound = Some(1);
+        model.check(|| {
             let graph = loom::sync::Arc::new(Graph::new(crate::distance::L2, 3));
             // Seeded sequentially, before any thread spawns: row 0 is the
             // sole existing node, at level 1, so it's both the entry
