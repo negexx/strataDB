@@ -27,8 +27,8 @@ pub use manifest::{
     DataFileEntry, MANIFEST_FORMAT_VERSION, Manifest, ManifestEnvelope, SegmentEntry,
     commit_manifest, commit_manifest_with, read_current, read_current_with,
     read_current_with_byte_count, read_current_with_byte_count_with,
-    read_manifest_at_key_with_byte_count, read_manifest_at_key_with_byte_count_with,
-    read_manifest_with_byte_count,
+    read_manifest_at_key_with_byte_count, read_manifest_at_key_with_byte_count_and_size_with,
+    read_manifest_at_key_with_byte_count_with, read_manifest_with_byte_count,
 };
 pub use row_group::{RowGroupEntry, read_row_groups, row_group_index, write_row_groups};
 #[cfg(feature = "test-fault-injection")]

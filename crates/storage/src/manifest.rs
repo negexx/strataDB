@@ -620,38 +620,59 @@ pub fn read_manifest_at_key_with_byte_count_with(
     version: u64,
 ) -> Result<(Manifest, u64)> {
     let key = crate::backend::DatasetKey::new(key)?;
-    let bytes = read_bounded_manifest_bytes(owner, &key)?;
+    let bytes = read_bounded_manifest_bytes(owner, &key, None)?;
+    decode_manifest_with_byte_count(owner.root(), key.as_str(), version, &bytes)
+}
+
+/// Reads one exact manifest key when the caller already has its inventory size.
+///
+/// Lifecycle callers commonly enumerate `_versions/` once and then inspect
+/// several manifests from that inventory. Supplying the observed size avoids
+/// re-enumerating the namespace for every manifest while preserving the same
+/// pre-allocation byte bound as the standalone reader.
+#[allow(clippy::missing_errors_doc)]
+pub fn read_manifest_at_key_with_byte_count_and_size_with(
+    owner: &crate::backend::StorageOwner,
+    key: &str,
+    version: u64,
+    size: u64,
+) -> Result<(Manifest, u64)> {
+    let key = crate::backend::DatasetKey::new(key)?;
+    let bytes = read_bounded_manifest_bytes(owner, &key, Some(size))?;
     decode_manifest_with_byte_count(owner.root(), key.as_str(), version, &bytes)
 }
 
 fn read_bounded_manifest_bytes(
     owner: &crate::backend::StorageOwner,
     key: &crate::backend::DatasetKey,
+    known_size: Option<u64>,
 ) -> Result<Vec<u8>> {
-    let prefix = key
-        .as_str()
-        .rsplit_once('/')
-        .map_or("", |(prefix, _)| prefix);
-    let metadata = owner
-        .list(prefix)?
-        .into_iter()
-        .find(|meta| meta.key == key.as_str())
-        .ok_or_else(|| {
-            StorageError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("manifest object '{}' is missing", key.as_str()),
-            ))
-        })?;
-    if metadata.size > MAX_MANIFEST_BYTES as u64 {
+    let size = if let Some(size) = known_size {
+        size
+    } else {
+        let prefix = key
+            .as_str()
+            .rsplit_once('/')
+            .map_or("", |(prefix, _)| prefix);
+        owner
+            .list(prefix)?
+            .into_iter()
+            .find(|meta| meta.key == key.as_str())
+            .ok_or_else(|| {
+                StorageError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("manifest object '{}' is missing", key.as_str()),
+                ))
+            })?
+            .size
+    };
+    if size > MAX_MANIFEST_BYTES as u64 {
         return Err(manifest_limit_error(
             &owner.root().join(key.as_str()),
-            format!(
-                "manifest contains {} bytes; maximum is {MAX_MANIFEST_BYTES}",
-                metadata.size
-            ),
+            format!("manifest contains {size} bytes; maximum is {MAX_MANIFEST_BYTES}"),
         ));
     }
-    owner.get_range(key, 0..metadata.size)
+    owner.get_range(key, 0..size)
 }
 
 fn decode_manifest_with_byte_count(
@@ -731,7 +752,7 @@ pub fn read_current_with_byte_count(dataset_dir: &Path) -> Result<Option<(Manife
 pub fn read_current_with_byte_count_with(
     owner: &crate::backend::StorageOwner,
 ) -> Result<Option<(Manifest, u64)>> {
-    let mut best: Option<(u64, String)> = None;
+    let mut best: Option<(u64, String, u64)> = None;
     for meta in owner.list("_versions")? {
         let Some(stem) = meta
             .key
@@ -743,17 +764,17 @@ pub fn read_current_with_byte_count_with(
         let Ok(version) = stem.parse::<u64>() else {
             continue;
         };
-        let is_newer = best.as_ref().is_none_or(|(v, _)| version > *v);
+        let is_newer = best.as_ref().is_none_or(|(v, _, _)| version > *v);
         if is_newer {
-            best = Some((version, meta.key.clone()));
+            best = Some((version, meta.key.clone(), meta.size));
         }
     }
 
-    let Some((filename_version, key)) = best else {
+    let Some((filename_version, key, size)) = best else {
         return Ok(None);
     };
     let manifest_key = crate::backend::DatasetKey::new(&key)?;
-    let bytes = read_bounded_manifest_bytes(owner, &manifest_key)?;
+    let bytes = read_bounded_manifest_bytes(owner, &manifest_key, Some(size))?;
     decode_manifest_with_byte_count(owner.root(), &key, filename_version, &bytes).map(Some)
 }
 

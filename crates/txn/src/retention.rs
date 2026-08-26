@@ -13,7 +13,9 @@ use loom::sync::Mutex;
 #[cfg(not(loom))]
 use std::sync::Mutex;
 
-use strata_storage::{ObjectMeta, StorageError, read_manifest_at_key_with_byte_count_with};
+use strata_storage::{
+    ObjectMeta, StorageError, read_manifest_at_key_with_byte_count_and_size_with,
+};
 
 use crate::dataset::Dataset;
 use crate::error::{Result, TxnError};
@@ -75,7 +77,7 @@ pub(crate) struct ManifestPruneCandidate {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ListedManifest {
     pub(crate) key: String,
-    bytes: u64,
+    pub(crate) bytes: u64,
 }
 
 /// A lease held by every production-created [`Snapshot`](crate::Snapshot).
@@ -166,7 +168,9 @@ pub(crate) fn build_plan(dataset: &Dataset, policy: RetentionPolicy) -> Result<R
                 "retained manifest is missing from inventory".to_string(),
             ))
         })?;
-        let (manifest, _) = read_manifest_at_key_with_byte_count_with(&storage, &key.key, version)?;
+        let (manifest, _) = read_manifest_at_key_with_byte_count_and_size_with(
+            &storage, &key.key, version, key.bytes,
+        )?;
         let reachable = reachable_keys(&manifest)?;
         retained_data_keys.extend(reachable.data_files);
         retained_data_keys.extend(reachable.segments);
@@ -257,7 +261,9 @@ pub(crate) fn build_age_manifest_prune_authority(
         if version >= observed_version || protected.contains(&version) {
             continue;
         }
-        let (manifest, _) = read_manifest_at_key_with_byte_count_with(&storage, &key.key, version)?;
+        let (manifest, _) = read_manifest_at_key_with_byte_count_and_size_with(
+            &storage, &key.key, version, key.bytes,
+        )?;
         if !manifest_is_old_enough_for_age_prune(
             manifest.committed_at_us,
             now_us,
@@ -392,7 +398,9 @@ fn older_manifest_data_keys(
         .iter()
         .filter(|(version, _)| **version < observed_version && !retained.contains(version))
     {
-        let (manifest, _) = read_manifest_at_key_with_byte_count_with(storage, &key.key, version)?;
+        let (manifest, _) = read_manifest_at_key_with_byte_count_and_size_with(
+            storage, &key.key, version, key.bytes,
+        )?;
         let reachable = reachable_keys(&manifest)?;
         older_data_keys.extend(reachable.data_files);
         older_data_keys.extend(reachable.segments);
