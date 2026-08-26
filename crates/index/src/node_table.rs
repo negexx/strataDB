@@ -166,6 +166,7 @@ impl<T: Reclaim> Drop for NodeTable<T> {
 #[derive(Debug)]
 pub(crate) struct CapacityExceeded {
     pub(crate) capacity: u64,
+    pub(crate) already_occupied: bool,
 }
 
 impl<T: Reclaim> NodeTable<T> {
@@ -250,11 +251,11 @@ impl<T: Reclaim> NodeTable<T> {
         }
     }
 
-    /// Registers `value` at `row_id`. Must only be called once per
-    /// `row_id` — `crates/txn`'s calling convention assigns each row-id
-    /// exactly once and never re-inserts it, so this is a single `store`,
-    /// not a CAS (there is no per-node contention to resolve, only the
-    /// chunk-allocation race above).
+    /// Registers `value` at `row_id`. The slot is claimed with a CAS, so a
+    /// duplicate row-id is rejected without replacing or reclaiming the
+    /// already-published value. `crates/txn`'s calling convention assigns
+    /// each row-id exactly once, but the public index still must defend this
+    /// boundary for direct callers and concurrent duplicate attempts.
     ///
     /// **Load-bearing beyond that:** each distinct `value` may be passed to
     /// `insert` (across *any* row-id, on *any* table) at most once. This
@@ -272,7 +273,7 @@ impl<T: Reclaim> NodeTable<T> {
     /// # Errors
     ///
     /// Returns [`CapacityExceeded`] if `row_id` is beyond the table's
-    /// addressable range. The bound is checked *before* the value is boxed,
+    /// addressable range or if the row-id is already occupied. The bound is checked *before* the value is boxed,
     /// so nothing is ever boxed on this path — but `value` may still own
     /// out-of-band memory of its own (e.g. `crate::node::Node`'s
     /// `alloc_node` block), so this reclaims it explicitly before
@@ -302,6 +303,7 @@ impl<T: Reclaim> NodeTable<T> {
             }
             return Err(CapacityExceeded {
                 capacity: self.addressable_capacity(),
+                already_occupied: false,
             });
         };
         let value_ptr = Box::into_raw(Box::new(value));
@@ -309,8 +311,30 @@ impl<T: Reclaim> NodeTable<T> {
         // is exactly `slots.len()` — so this index can never be out of
         // bounds once the chunk exists. Only the directory access above is
         // bounded by the caller's `row_id`.
-        chunk.slots[offset].store(value_ptr, Ordering::SeqCst);
-        Ok(())
+        if chunk.slots[offset]
+            .compare_exchange(
+                ptr::null_mut(),
+                value_ptr,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            Ok(())
+        } else {
+            // SAFETY: the failed CAS means this pointer was never
+            // published. Reclaim the out-of-band value exactly once,
+            // then let the Box deallocate its handle storage.
+            unsafe {
+                let boxed = Box::from_raw(value_ptr);
+                let value = *boxed;
+                value.reclaim();
+            }
+            Err(CapacityExceeded {
+                capacity: self.addressable_capacity(),
+                already_occupied: true,
+            })
+        }
     }
 
     /// Registers an already-allocated `value` at `row_id`, storing the
@@ -345,8 +369,9 @@ impl<T: Reclaim> NodeTable<T> {
     /// # Errors
     ///
     /// Returns [`CapacityExceeded`] if `row_id` is beyond the table's
-    /// addressable range, mirroring [`Self::insert`]. On that path nothing is
-    /// stored, so the caller retains ownership of `ptr` (it must free it) —
+    /// addressable range or already occupied, mirroring [`Self::insert`]. On
+    /// either error path nothing is stored, so the caller retains ownership
+    /// of `ptr` (it must free it) —
     /// unreachable in practice, since `crates/txn` bounds row-ids upstream;
     /// it exists so this path cannot panic on an out-of-range directory index.
     pub(crate) unsafe fn insert_ptr(
@@ -358,10 +383,21 @@ impl<T: Reclaim> NodeTable<T> {
         let Some(chunk) = self.get_or_create_chunk(chunk_idx) else {
             return Err(CapacityExceeded {
                 capacity: self.addressable_capacity(),
+                already_occupied: false,
             });
         };
-        chunk.slots[offset].store(ptr, Ordering::SeqCst);
-        Ok(())
+        match chunk.slots[offset].compare_exchange(
+            ptr::null_mut(),
+            ptr,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => Ok(()),
+            Err(_) => Err(CapacityExceeded {
+                capacity: self.addressable_capacity(),
+                already_occupied: true,
+            }),
+        }
     }
 
     /// Looks up the value at `row_id`. Returns `None` if `row_id` has
@@ -408,6 +444,17 @@ mod tests {
     fn insert_then_get_round_trips() {
         let table = NodeTable::new(100);
         table.insert(5, 42u32).unwrap();
+        assert_eq!(table.get(5), Some(&42));
+    }
+
+    #[test]
+    fn duplicate_insert_is_rejected_without_replacing_the_original_value() {
+        let table = NodeTable::new(100);
+        table.insert(5, 42u32).unwrap();
+        let err = table
+            .insert(5, 99u32)
+            .expect_err("a duplicate row-id must be rejected");
+        assert!(err.already_occupied);
         assert_eq!(table.get(5), Some(&42));
     }
 
@@ -544,6 +591,32 @@ mod loom_tests {
             // allocation race.
             assert_eq!(table.get(0), Some(&100));
             assert_eq!(table.get(1), Some(&200));
+        });
+    }
+
+    #[test]
+    fn concurrent_duplicate_insert_publishes_exactly_one_value() {
+        loom::model(|| {
+            let table = loom::sync::Arc::new(NodeTable::<u64>::new(1));
+            let t1_table = loom::sync::Arc::clone(&table);
+            let t1 = loom::thread::spawn(move || t1_table.insert(7, 100));
+            let t2_table = loom::sync::Arc::clone(&table);
+            let t2 = loom::thread::spawn(move || t2_table.insert(7, 200));
+
+            let first = t1.join().unwrap();
+            let second = t2.join().unwrap();
+            assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+            assert!(
+                first
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| error.already_occupied)
+                    || second
+                        .as_ref()
+                        .err()
+                        .is_some_and(|error| error.already_occupied)
+            );
+            assert!(matches!(table.get(7), Some(&100) | Some(&200)));
         });
     }
 }

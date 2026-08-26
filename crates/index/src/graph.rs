@@ -634,12 +634,16 @@ impl<D: Distance> Graph<D> {
         // then panicked, so this is not a regression.) The `crates/txn`
         // commit path already refuses such row-ids upstream; this makes the
         // `pub` index self-defending for any other caller.
-        self.nodes
-            .insert(row_id, node)
-            .map_err(|e| crate::hnsw::IndexError::RowIdOutOfRange {
-                row_id,
-                capacity: e.capacity,
-            })?;
+        self.nodes.insert(row_id, node).map_err(|e| {
+            if e.already_occupied {
+                crate::hnsw::IndexError::DuplicateRowId(row_id)
+            } else {
+                crate::hnsw::IndexError::RowIdOutOfRange {
+                    row_id,
+                    capacity: e.capacity,
+                }
+            }
+        })?;
 
         // `claim_if_empty` (not a plain `get()`-then-branch) closes the
         // empty-graph race: see its own doc comment for the two-threads-
@@ -1918,8 +1922,8 @@ mod tests {
         // slots. Three synchronized claimants therefore force one claim to
         // observe physical exhaustion; the successful pruner must make room
         // and that claimant must retry rather than silently losing its edge.
-        let graph = Arc::new(Graph::new(crate::distance::L2, 4));
-        for row_id in 0..4u64 {
+        let graph = Arc::new(Graph::new(crate::distance::L2, 6));
+        for row_id in 0..6u64 {
             graph
                 .nodes
                 .insert(
@@ -1928,9 +1932,12 @@ mod tests {
                 )
                 .unwrap();
         }
+        let seed = graph.nodes.get(0).unwrap();
+        assert!(seed.layer(0).claim(1));
+        assert!(seed.layer(0).claim(2));
         let barrier = Arc::new(Barrier::new(3));
 
-        let handles: Vec<_> = (1..=3u64)
+        let handles: Vec<_> = (3..=5u64)
             .map(|row_id| {
                 let graph = Arc::clone(&graph);
                 let barrier = Arc::clone(&barrier);
