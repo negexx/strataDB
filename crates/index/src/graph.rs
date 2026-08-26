@@ -536,7 +536,7 @@ impl<D: Distance> Graph<D> {
     // (consumed as-is by Task 9's tests, Task 11's stress test, and Task
     // 14's `HnswIndex` wrapper), not something to restructure into a
     // struct just to satisfy the lint.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub fn insert(
         &self,
         row_id: u64,
