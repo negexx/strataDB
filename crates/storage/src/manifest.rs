@@ -354,7 +354,12 @@ fn manifest_limit_error(path: &Path, detail: impl Into<String>) -> StorageError 
     StorageError::CorruptManifest(path.to_path_buf(), detail.into())
 }
 
-fn validate_json_limits(value: &serde_json::Value, path: &Path, depth: usize) -> Result<()> {
+fn validate_json_limits(
+    value: &serde_json::Value,
+    path: &Path,
+    depth: usize,
+    array_limit: usize,
+) -> Result<()> {
     if depth > MAX_MANIFEST_JSON_DEPTH {
         return Err(manifest_limit_error(
             path,
@@ -364,17 +369,17 @@ fn validate_json_limits(value: &serde_json::Value, path: &Path, depth: usize) ->
 
     match value {
         serde_json::Value::Array(values) => {
-            if values.len() > MAX_MANIFEST_ARRAY_ITEMS {
+            if values.len() > array_limit {
                 return Err(manifest_limit_error(
                     path,
                     format!(
-                        "JSON array contains {} items; maximum is {MAX_MANIFEST_ARRAY_ITEMS}",
-                        values.len()
+                        "JSON array contains {} items; maximum is {array_limit}",
+                        values.len(),
                     ),
                 ));
             }
             for value in values {
-                validate_json_limits(value, path, depth + 1)?;
+                validate_json_limits(value, path, depth + 1, array_limit)?;
             }
         }
         serde_json::Value::Object(values) => {
@@ -396,7 +401,14 @@ fn validate_json_limits(value: &serde_json::Value, path: &Path, depth: usize) ->
                         ),
                     ));
                 }
-                validate_json_limits(value, path, depth + 1)?;
+                let child_array_limit = match key.as_str() {
+                    "tombstones" => MAX_MANIFEST_TOMBSTONES,
+                    "schema_ipc" => MAX_MANIFEST_SCHEMA_IPC_BYTES,
+                    "data_files" => MAX_MANIFEST_DATA_FILES,
+                    "segments" => MAX_MANIFEST_SEGMENTS,
+                    _ => MAX_MANIFEST_ARRAY_ITEMS,
+                };
+                validate_json_limits(value, path, depth + 1, child_array_limit)?;
             }
         }
         serde_json::Value::String(value) if value.len() > MAX_MANIFEST_STRING_BYTES => {
@@ -666,7 +678,7 @@ fn decode_manifest_with_byte_count(
     {
         return Err(StorageError::LegacyFormatNeedsMigration(path));
     }
-    validate_json_limits(&value, &path, 0)?;
+    validate_json_limits(&value, &path, 0, MAX_MANIFEST_ARRAY_ITEMS)?;
     validate_manifest_collection_limits(&value, &path)?;
     let (raw_format_version, stored_checksum, expected_checksum) =
         raw_envelope_checksum(&value, &path)?;
@@ -1199,10 +1211,25 @@ mod tests {
         let result = read_current(&dir);
 
         assert!(
-            matches!(result, Err(StorageError::CorruptManifest(_, ref detail)) if detail.contains("data_files")),
+            matches!(result, Err(StorageError::CorruptManifest(_, ref detail)) if detail.contains("data_files") || detail.contains("maximum is 900000")),
             "expected the data-file bound, got {result:?}"
         );
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn field_specific_array_limits_are_not_shadowed_by_generic_limit() {
+        let value = serde_json::json!({
+            "manifest": {
+                "tombstones": std::iter::repeat_n(serde_json::Value::from(0),
+                    MAX_MANIFEST_ARRAY_ITEMS + 1).collect::<Vec<_>>()
+            }
+        });
+
+        assert!(
+            validate_json_limits(&value, Path::new("manifest"), 0, MAX_MANIFEST_ARRAY_ITEMS)
+                .is_ok()
+        );
     }
 
     #[test]
