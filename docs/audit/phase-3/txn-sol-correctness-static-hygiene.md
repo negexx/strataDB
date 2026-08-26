@@ -17,10 +17,10 @@ manifest-publication path prevents approval.
 
 Locations:
 
-- [`crates/txn/src/dataset.rs:2231`](../../../crates/txn/src/dataset.rs:2231)
-- [`crates/storage/src/backend/local.rs:344`](../../../crates/storage/src/backend/local.rs:344)
-- [`crates/storage/src/backend/local.rs:359`](../../../crates/storage/src/backend/local.rs:359)
-- [`crates/storage/src/backend/mod.rs:55`](../../../crates/storage/src/backend/mod.rs:55)
+- [`crates/txn/src/dataset.rs:2231`](../../../crates/txn/src/dataset.rs#L2231)
+- [`crates/storage/src/backend/local.rs:344`](../../../crates/storage/src/backend/local.rs#L344)
+- [`crates/storage/src/backend/local.rs:359`](../../../crates/storage/src/backend/local.rs#L359)
+- [`crates/storage/src/backend/mod.rs:55`](../../../crates/storage/src/backend/mod.rs#L55)
 
 `Transaction::commit` returns the manifest-sync error before updating the
 commit log or the in-memory current snapshot. The local backend can rename the
@@ -39,11 +39,11 @@ coverage before Terra implementation.
 
 Locations:
 
-- [`crates/txn/src/query.rs:45`](../../../crates/txn/src/query.rs:45)
-- [`crates/txn/src/query.rs:57`](../../../crates/txn/src/query.rs:57)
-- [`crates/txn/src/query.rs:78`](../../../crates/txn/src/query.rs:78)
-- [`crates/txn/src/query.rs:502`](../../../crates/txn/src/query.rs:502)
-- [`crates/txn/src/query.rs:957`](../../../crates/txn/src/query.rs:957)
+- [`crates/txn/src/query.rs:45`](../../../crates/txn/src/query.rs#L45)
+- [`crates/txn/src/query.rs:57`](../../../crates/txn/src/query.rs#L57)
+- [`crates/txn/src/query.rs:78`](../../../crates/txn/src/query.rs#L78)
+- [`crates/txn/src/query.rs:502`](../../../crates/txn/src/query.rs#L502)
+- [`crates/txn/src/query.rs:957`](../../../crates/txn/src/query.rs#L957)
 
 `LogicalType`, `LogicalColumn`, `DatasetSchema`, aggregate-output validation,
 and related aliases are retained behind `#[allow(dead_code)]`. The graph found
@@ -54,22 +54,22 @@ can drift from the active query path.
 
 Locations:
 
-- [`crates/txn/src/dataset.rs:3044`](../../../crates/txn/src/dataset.rs:3044)
-- [`crates/txn/src/dataset.rs:3190`](../../../crates/txn/src/dataset.rs:3190)
+- [`crates/txn/src/dataset.rs:3044`](../../../crates/txn/src/dataset.rs#L3044)
+- [`crates/txn/src/dataset.rs:3190`](../../../crates/txn/src/dataset.rs#L3190)
 
 `validate_data_files` and `load_segments` are suppressed with
 `#[allow(dead_code)]`; production callers use the owner-aware variants.
 
 ## Structural risks
 
-- [`snapshot.rs:73`](../../../crates/txn/src/snapshot.rs:73): recursive
+- [`snapshot.rs:73`](../../../crates/txn/src/snapshot.rs#L73): recursive
   predicate translation, cognitive complexity 55.
-- [`snapshot.rs:1663`](../../../crates/txn/src/snapshot.rs:1663): recursive
+- [`snapshot.rs:1663`](../../../crates/txn/src/snapshot.rs#L1663): recursive
   filter evaluation, cognitive complexity 39.
-- [`dataset.rs:2004`](../../../crates/txn/src/dataset.rs:2004):
+- [`dataset.rs:2004`](../../../crates/txn/src/dataset.rs#L2004):
   `Transaction::commit` spans approximately 275 lines and combines conflict
   checking, manifest construction, durability, and in-memory installation.
-- [`dataset.rs:3200`](../../../crates/txn/src/dataset.rs:3200): segment
+- [`dataset.rs:3200`](../../../crates/txn/src/dataset.rs#L3200): segment
   loading spans approximately 122 lines and combines integrity validation,
   ownership checks, dimension checks, and accounting.
 
