@@ -20,10 +20,10 @@ mutation coverage.
 
 Locations:
 
-- [`crates/storage/src/backend/local.rs:344`](../../../../crates/storage/src/backend/local.rs:344)
-- [`crates/storage/src/backend/local.rs:359`](../../../../crates/storage/src/backend/local.rs:359)
-- [`crates/txn/src/dataset.rs:2231`](../../../../crates/txn/src/dataset.rs:2231)
-- [`crates/txn/src/dataset.rs:2239`](../../../../crates/txn/src/dataset.rs:2239)
+- [`crates/storage/src/backend/local.rs:344`](../../../crates/storage/src/backend/local.rs:344)
+- [`crates/storage/src/backend/local.rs:359`](../../../crates/storage/src/backend/local.rs:359)
+- [`crates/txn/src/dataset.rs:2231`](../../../crates/txn/src/dataset.rs:2231)
+- [`crates/txn/src/dataset.rs:2239`](../../../crates/txn/src/dataset.rs:2239)
 
 Storage tests prove that a manifest can become visible before directory sync
 returns an error, but no transaction test verifies reopen/retry behavior,
@@ -44,25 +44,25 @@ results.
 
 The destructive authority branch protecting manifests with
 `committed_at_us == 0` is at
-[`retention.rs:261`](../../../../crates/txn/src/retention.rs:261). The age
+[`retention.rs:261`](../../../crates/txn/src/retention.rs:261). The age
 retention test creates only positively timestamped manifests at
-[`retention_age.rs:7`](../../../../crates/txn/tests/retention_age.rs:7).
+[`retention_age.rs:7`](../../../crates/txn/tests/retention_age.rs:7).
 Removing the zero-timestamp guard would likely survive existing tests.
 
 ### [P2] Maintenance policy validation lacks invalid-branch tests
 
 Three zero-value conditions are joined by `||` at
-[`maintenance.rs:63`](../../../../crates/txn/src/maintenance.rs:63), while the
+[`maintenance.rs:63`](../../../crates/txn/src/maintenance.rs:63), while the
 tests use valid policies at
-[`maintenance.rs:7`](../../../../crates/txn/tests/maintenance.rs:7) and
-[`maintenance.rs:38`](../../../../crates/txn/tests/maintenance.rs:38).
+[`maintenance.rs:7`](../../../crates/txn/tests/maintenance.rs:7) and
+[`maintenance.rs:38`](../../../crates/txn/tests/maintenance.rs:38).
 An `||` to `&&` mutation or removal of an individual guard would likely
 survive.
 
 ### [P3] Some fault tests verify failure but not error identity
 
 For example, injected manifest failures use generic `is_err()` assertions at
-[`dataset.rs:8687`](../../../../crates/txn/src/dataset.rs:8687). Changing the
+[`dataset.rs:8687`](../../../crates/txn/src/dataset.rs:8687). Changing the
 error category could survive. Conflict, target, unsupported-read, and many
 lifecycle tests do assert exact variants, so this gap is localized.
 
@@ -80,14 +80,14 @@ Existing tests substantively verify:
 - row/index visibility interleavings through loom models.
 
 Representative evidence includes
-[`dataset.rs:8224`](../../../../crates/txn/src/dataset.rs:8224),
-[`commit_log.rs:278`](../../../../crates/txn/src/commit_log.rs:278),
-[`dataset.rs:8110`](../../../../crates/txn/src/dataset.rs:8110),
-[`concurrent_snapshot_isolation.rs:24`](../../../../crates/txn/tests/concurrent_snapshot_isolation.rs:24),
-[`row_id_reservation_restart.rs:37`](../../../../crates/txn/tests/row_id_reservation_restart.rs:37),
-[`compaction.rs:84`](../../../../crates/txn/tests/compaction.rs:84),
-[`vacuum.rs:68`](../../../../crates/txn/tests/vacuum.rs:68), and
-[`query_planner.rs:475`](../../../../crates/txn/tests/query_planner.rs:475).
+[`dataset.rs:8224`](../../../crates/txn/src/dataset.rs:8224),
+[`commit_log.rs:278`](../../../crates/txn/src/commit_log.rs:278),
+[`dataset.rs:8110`](../../../crates/txn/src/dataset.rs:8110),
+[`concurrent_snapshot_isolation.rs:24`](../../../crates/txn/tests/concurrent_snapshot_isolation.rs:24),
+[`row_id_reservation_restart.rs:37`](../../../crates/txn/tests/row_id_reservation_restart.rs:37),
+[`compaction.rs:84`](../../../crates/txn/tests/compaction.rs:84),
+[`vacuum.rs:68`](../../../crates/txn/tests/vacuum.rs:68), and
+[`query_planner.rs:475`](../../../crates/txn/tests/query_planner.rs:475).
 
 ## Representative mutation assessment
 

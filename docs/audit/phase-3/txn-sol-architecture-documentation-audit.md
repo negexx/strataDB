@@ -91,7 +91,7 @@ filename. The affected records are:
 - `txn-sol-coverage-mutation-audit.md`
 - `txn-sol-concurrency-thread-safety-audit.md`
 
-The focused records are being normalized to three parent traversals from
+The focused records now use three parent traversals from
 `docs/audit/phase-3`; line references remain informational source locations.
 
 ### [P3 — resolved] Public client documentation is thin

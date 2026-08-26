@@ -19,11 +19,11 @@ defect remains blocking.
 
 Locations:
 
-- [`crates/txn/src/dataset.rs:2231`](../../../../crates/txn/src/dataset.rs:2231)
-- [`crates/storage/src/backend/local.rs:344`](../../../../crates/storage/src/backend/local.rs:344)
-- [`crates/storage/src/backend/local.rs:359`](../../../../crates/storage/src/backend/local.rs:359)
-- [`crates/txn/src/dataset.rs:598`](../../../../crates/txn/src/dataset.rs:598)
-- [`crates/txn/src/dataset.rs:1290`](../../../../crates/txn/src/dataset.rs:1290)
+- [`crates/txn/src/dataset.rs:2231`](../../../crates/txn/src/dataset.rs:2231)
+- [`crates/storage/src/backend/local.rs:344`](../../../crates/storage/src/backend/local.rs:344)
+- [`crates/storage/src/backend/local.rs:359`](../../../crates/storage/src/backend/local.rs:359)
+- [`crates/txn/src/dataset.rs:598`](../../../crates/txn/src/dataset.rs:598)
+- [`crates/txn/src/dataset.rs:1290`](../../../crates/txn/src/dataset.rs:1290)
 
 Manifest `N+1` can become visible by rename before directory synchronization
 fails. `Transaction::commit` returns before updating the commit log or current
@@ -38,8 +38,8 @@ outcomes, shared-handle reconciliation, and retry/reopen semantics.
 
 Locations:
 
-- [`crates/txn/src/dataset.rs:105`](../../../../crates/txn/src/dataset.rs:105)
-- [`crates/txn/src/dataset.rs:124`](../../../../crates/txn/src/dataset.rs:124)
+- [`crates/txn/src/dataset.rs:105`](../../../crates/txn/src/dataset.rs:105)
+- [`crates/txn/src/dataset.rs:124`](../../../crates/txn/src/dataset.rs:124)
 
 Production uses `ArcSwap`; loom substitutes a mutex-backed `SnapshotCell`
 because ArcSwap is not loom-instrumented. The existing models test old-or-new
@@ -50,9 +50,9 @@ catch a production-only publication ordering regression.
 
 Locations:
 
-- [`crates/txn/src/dataset.rs:446`](../../../../crates/txn/src/dataset.rs:446)
-- [`crates/txn/src/dataset.rs:1193`](../../../../crates/txn/src/dataset.rs:1193)
-- [`crates/txn/src/vacuum.rs:29`](../../../../crates/txn/src/vacuum.rs:29)
+- [`crates/txn/src/dataset.rs:446`](../../../crates/txn/src/dataset.rs:446)
+- [`crates/txn/src/dataset.rs:1193`](../../../crates/txn/src/dataset.rs:1193)
+- [`crates/txn/src/vacuum.rs:29`](../../../crates/txn/src/vacuum.rs:29)
 
 Compaction, migration, vacuum, and manifest pruning acquire lifecycle
 exclusivity and retain `commit_lock` across filesystem reads, rewrites,
