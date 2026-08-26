@@ -521,6 +521,10 @@ pub fn commit_manifest_with(
 ) -> Result<()> {
     let key = owner.manifest_object_key(manifest.version);
     let json = serde_json::to_vec(&ManifestEnvelope::new(manifest.clone())?)?;
+    // Validate the exact serialized bytes before publication. Recovery applies
+    // the same bounds and raw-checksum rules, so a successful commit must never
+    // create a final-name manifest that the next reopen would reject.
+    decode_manifest_with_byte_count(owner.root(), key.as_str(), manifest.version, &json)?;
     // `put_if_absent` makes a manifest version immutable: a retry can never
     // overwrite the bytes recovery may already select. `LocalFs` publishes
     // its final hard-link name before synchronizing the directory, so a
@@ -604,8 +608,38 @@ pub fn read_manifest_at_key_with_byte_count_with(
     version: u64,
 ) -> Result<(Manifest, u64)> {
     let key = crate::backend::DatasetKey::new(key)?;
-    let bytes = owner.get(&key)?;
+    let bytes = read_bounded_manifest_bytes(owner, &key)?;
     decode_manifest_with_byte_count(owner.root(), key.as_str(), version, &bytes)
+}
+
+fn read_bounded_manifest_bytes(
+    owner: &crate::backend::StorageOwner,
+    key: &crate::backend::DatasetKey,
+) -> Result<Vec<u8>> {
+    let prefix = key
+        .as_str()
+        .rsplit_once('/')
+        .map_or("", |(prefix, _)| prefix);
+    let metadata = owner
+        .list(prefix)?
+        .into_iter()
+        .find(|meta| meta.key == key.as_str())
+        .ok_or_else(|| {
+            StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("manifest object '{}' is missing", key.as_str()),
+            ))
+        })?;
+    if metadata.size > MAX_MANIFEST_BYTES as u64 {
+        return Err(manifest_limit_error(
+            &owner.root().join(key.as_str()),
+            format!(
+                "manifest contains {} bytes; maximum is {MAX_MANIFEST_BYTES}",
+                metadata.size
+            ),
+        ));
+    }
+    owner.get_range(key, 0..metadata.size)
 }
 
 fn decode_manifest_with_byte_count(
@@ -707,7 +741,7 @@ pub fn read_current_with_byte_count_with(
         return Ok(None);
     };
     let manifest_key = crate::backend::DatasetKey::new(&key)?;
-    let bytes = owner.get(&manifest_key)?;
+    let bytes = read_bounded_manifest_bytes(owner, &manifest_key)?;
     decode_manifest_with_byte_count(owner.root(), &key, filename_version, &bytes).map(Some)
 }
 
@@ -1034,6 +1068,24 @@ mod tests {
             !bytes.contains(&b'\n'),
             "compact JSON must not contain newlines"
         );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn commit_manifest_rejects_output_that_recovery_would_bound() {
+        let dir = temp_dataset_dir("writer-bound");
+        let manifest = manifest(
+            0,
+            vec![data_file(&"x".repeat(MAX_MANIFEST_STRING_BYTES + 1))],
+        );
+
+        let result = commit_manifest(&dir, &manifest);
+
+        assert!(
+            matches!(result, Err(StorageError::CorruptManifest(_, ref detail)) if detail.contains("JSON string")),
+            "expected the writer-side bound, got {result:?}"
+        );
+        assert!(!versions_dir(&dir).exists());
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -1475,9 +1527,15 @@ mod tests {
         // Break caught: treating a newer catalog version as a known schema
         // could reinterpret rows and vector segments without a migration.
         let dir = temp_dataset_dir("unknown-schema-version");
-        let mut manifest = Manifest::empty();
-        manifest.schema_version = Some(99);
-        commit_manifest(&dir, &manifest).unwrap();
+        let mut value =
+            serde_json::to_value(ManifestEnvelope::new(Manifest::empty()).unwrap()).unwrap();
+        value["manifest"]["schema_version"] = serde_json::json!(99);
+        value["checksum"] = serde_json::json!(0);
+        let checksum =
+            crc32c::crc32c(&serde_json::to_vec(&canonicalize_json(value.clone())).unwrap());
+        value["checksum"] = serde_json::json!(checksum);
+        fs::create_dir_all(versions_dir(&dir)).unwrap();
+        fs::write(manifest_path(&dir, 0), serde_json::to_vec(&value).unwrap()).unwrap();
 
         let result = read_current(&dir);
         assert!(

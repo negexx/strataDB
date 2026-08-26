@@ -158,6 +158,11 @@ impl StorageOwner {
         self.backend.get(&self.prefixed(key.as_str()))
     }
     /// # Errors
+    /// Propagates the backend range-read error.
+    pub fn get_range(&self, key: &DatasetKey, range: std::ops::Range<u64>) -> Result<Vec<u8>> {
+        self.backend.get_range(&self.prefixed(key.as_str()), range)
+    }
+    /// # Errors
     /// Propagates the backend durable-write error.
     pub fn put(&self, key: &DatasetKey, bytes: &[u8]) -> Result<()> {
         self.backend.put(&self.prefixed(key.as_str()), bytes)

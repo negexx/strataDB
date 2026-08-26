@@ -5989,9 +5989,8 @@ mod tests {
     #[test]
     fn opening_a_legacy_manifest_requires_explicit_migration() {
         let dir = temp_dir("legacy-manifest-migration");
-        let mut legacy_manifest = Manifest::empty();
-        legacy_manifest.schema_ipc.clear();
-        strata_storage::commit_manifest(&dir, &legacy_manifest).unwrap();
+        std::fs::create_dir_all(dir.join("_versions")).unwrap();
+        std::fs::write(dir.join("_versions/00000000000000000000.manifest"), b"{}").unwrap();
 
         let result = Dataset::open(&dir);
         assert!(
