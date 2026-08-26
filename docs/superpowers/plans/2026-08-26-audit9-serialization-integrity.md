@@ -39,7 +39,7 @@
 - Modify: `docs/audit/phase-3/txn-sol-serialization-schema-integrity-audit.md`
 - Modify: `docs/status.md` only for the capability/evidence wording required by the audit verdict
 
-- [ ] Add tests for reordered raw object keys, each array/field bound, unknown fields, unsupported versions, mutated checksums, and current writer round trips.
+- [ ] Add tests for reordered raw object keys, representative array/field bounds, unknown fields, unsupported versions, mutated checksums, and current writer round trips.
 - [ ] Run the focused storage tests and inspect failure counts.
 - [ ] Update the Audit 9 verdict to `IMPLEMENTED within named bounds`, list the implemented bounds and historical fixture evidence, and retain the namespace/object-count limitation explicitly.
 - [ ] Run `cargo fmt --check`, `cargo test -p strata-storage`, `cargo test --workspace --no-default-features`, `cargo clippy --workspace --all-targets -- -D warnings`, and `git diff --check`.

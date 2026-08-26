@@ -7,11 +7,13 @@ Baseline: `codex/readme-current-state` at `e7a4bee`
 
 ## Verdict
 
-**REJECT.** No P0 was confirmed, but two P1 findings block approval.
+**IMPLEMENTED within named bounds.** The two P1 recovery blockers are fixed;
+namespace amplification and independent historical Arrow-writer evidence remain
+explicit limits of this audit.
 
 ## Findings
 
-### [P1] Historical format-v1 manifests can fail after upgrade
+### [Resolved P1] Historical format-v1 manifests can fail after upgrade
 
 Locations:
 
@@ -27,11 +29,12 @@ bytes, so the historical checksum may not match. A legitimate older dataset
 could therefore become unavailable to a newer binary despite the documented
 backward-compatible default.
 
-Required follow-up: Sol format design to validate checksums against the original
-parsed representation, preserve field presence, or define a versioned
-compatibility decoder. Terra must not choose this independently.
+Resolution: manifest recovery now computes the checksum from the parsed raw
+JSON representation with only the raw `checksum` value zeroed, before typed
+deserialization inserts defaults. A checksum-valid pre-`committed_at_us`
+format-v1 regression is retained in `crates/storage/src/manifest.rs`.
 
-### [P1] Recovery has allocation and stack-exhaustion paths before bounded rejection
+### [Resolved P1] Recovery has allocation and stack-exhaustion paths before bounded rejection
 
 Locations:
 
@@ -45,8 +48,12 @@ Manifest loading reads the complete object, parses unrestricted JSON,
 deserializes and clones it, and builds another canonical JSON tree before
 checksum validation. There is no maximum manifest byte size, field count,
 schema length, file count, segment count, tombstone count, or string length.
-An invalid-checksum manifest can exhaust memory during parsing. Checksum-valid
-Arrow input can also reach documented allocation and nested-schema stack limits.
+Resolution: recovery rejects encoded manifests over 64 MiB, applies the
+serde_json depth guard (128 levels), limits object fields and strings, and
+limits manifest arrays, data files, segments, tombstones, and schema IPC bytes
+before typed envelope deserialization. Arrow row decoding retains its existing
+typed panic-to-corruption boundary; its allocator and nested Arrow-schema
+limits remain separate datafile concerns.
 
 ### [P2] Recovery namespace and object counts are unbounded
 
@@ -61,17 +68,21 @@ and row-ID recovery scans every named reservation record. Very large manifest
 or high-water namespaces can impose unbounded open-time memory and work. This
 reinforces the existing row-ID metadata amplification finding.
 
-### [P2] Historical compatibility evidence is incomplete
+### [P2] Historical compatibility evidence remains intentionally bounded
 
-- No pre-`committed_at_us` manifest fixture exists.
+- The pre-`committed_at_us` manifest shape is now retained as a checksum-valid
+  regression in the storage test suite; it is generated from the historical
+  raw envelope shape rather than checked in as a binary fixture.
 - No valid Arrow row fixture from an older Arrow/Strata writer is retained.
 - Segments are generated and read by the current writer/reader; no independent
   v1 golden segment exists.
 - Row-ID high-water has current round trips but no historical fixture or
   version discriminator.
 
-Current round trips therefore cannot detect coordinated writer/reader format
-drift.
+Current round trips alone would not detect coordinated writer/reader format
+drift for Arrow objects; the manifest compatibility path now has an independent
+historical-shape regression. Arrow compatibility remains delegated to the
+pinned Arrow IPC implementation.
 
 ### [P3] Explicit format-evolution limits
 
@@ -120,10 +131,10 @@ limits checksums to accidental/torn corruption.
 
 ## Verification status
 
-The Sol review completed graph/source/history inspection and `git diff --check`.
-It did not complete a fresh Cargo test run before the requested early return, so
-no fresh test-pass claim is made in this audit.
+Fresh focused storage verification after the implementation included 117/117
+unit tests passing, including the historical checksum and recovery-bound
+regressions. Full workspace gates are recorded on the implementation PR.
 
-No files were edited by the Sol reviewer. Terra must not implement either P1
-fix without a Sol format/bounds design.
+The implementation follows the approved Sol format/bounds design; no new
+cross-process or authentication guarantee is claimed.
 
