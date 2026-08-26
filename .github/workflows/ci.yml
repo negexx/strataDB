@@ -240,6 +240,12 @@ jobs:
             if [ -f Cargo.lock ]; then sha256sum Cargo.lock; else printf 'Cargo.lock=unavailable\n'; fi
           } >> "$log"
 
+      - name: Check unsafe inventory
+        id: unsafe_inventory
+        run: |
+          python3 -m unittest scripts/test_check_unsafe_inventory.py -v
+          python3 scripts/check_unsafe_inventory.py --root . --inventory docs/audit/phase-3/unsafe-inventory.json
+
       - name: Build
         id: build
         run: cargo build --workspace
@@ -450,6 +456,7 @@ jobs:
             printf 'step.checkout=%s\n' '${{ steps.checkout.outcome }}'
             printf 'step.install_toolchain=%s\n' '${{ steps.install_toolchain.outcome }}'
             printf 'step.record_provenance=%s\n' '${{ steps.record_provenance.outcome }}'
+            printf 'step.unsafe_inventory=%s\n' '${{ steps.unsafe_inventory.outcome }}'
             printf 'job.status=%s\n' '${{ job.status }}'
             printf 'step.build=%s\n' '${{ steps.build.outcome }}'
             printf 'step.test=%s\n' '${{ steps.test.outcome }}'

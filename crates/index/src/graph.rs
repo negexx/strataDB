@@ -300,7 +300,7 @@ impl<D: Distance> Graph<D> {
     /// `row_id` `search_layer` just returned, which the `NodeTable` lookup
     /// below will always resolve.
     fn is_published(&self, row_id: u64) -> bool {
-        self.nodes.get(row_id).is_some_and(|n| n.is_published())
+        self.nodes.get(row_id).is_some_and(Node::is_published)
     }
 
     /// Core of `run_shrink_retry_loop`'s per-attempt step (see that
@@ -318,7 +318,6 @@ impl<D: Distance> Graph<D> {
     /// violated invariant into a silent, capacity-violating `break`
     /// instead of the typed `IndexError::NeighborShrinkDidNotConverge`
     /// `run_shrink_retry_loop` now surfaces for exactly this case.
-    #[allow(clippy::trivially_copy_pass_by_ref)] // deliberately `&Node`, not `Node`, despite `Node: Copy` -- `node_table.rs`'s own doc comment warns that a duplicated `Node` handle inserted twice causes a double-free on drop; taking a reference here, even though this function only reads through it, keeps that invariant visibly enforced at every call site rather than relying on callers to copy carefully
     fn shrink_and_check(
         &self,
         neighbor_node: &Node,
@@ -1188,10 +1187,7 @@ impl<D: Distance> NodeSource for Graph<D> {
     }
 
     fn level(&self, local: u64) -> Option<usize> {
-        // `Node::level` takes `self` by value (it's `Copy`, not a
-        // reference) so it can't be passed directly to `Option<&Node>::map`
-        // as a function item -- `|node| node.level()` reborrows through
-        // method-call syntax instead.
+        #[allow(clippy::redundant_closure_for_method_calls)]
         self.nodes.get(local).map(|node| node.level())
     }
 
@@ -1217,9 +1213,7 @@ impl<D: Distance> NodeSource for Graph<D> {
     }
 
     fn is_deleted(&self, local: u64) -> bool {
-        // Same reason as `level` above: `Node::is_deleted` takes `self` by
-        // value, so it's passed through a reborrowing closure rather than
-        // as a bare function item.
+        #[allow(clippy::redundant_closure_for_method_calls)]
         self.nodes.get(local).is_some_and(|node| node.is_deleted())
     }
 }

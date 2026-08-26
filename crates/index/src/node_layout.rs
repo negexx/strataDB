@@ -11,6 +11,30 @@ use std::sync::atomic::{AtomicU8, AtomicU64};
 
 use crate::slot_array::EMPTY;
 
+#[cfg(test)]
+thread_local! {
+    static RAW_NODE_BLOCK_ALLOCATION_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn alloc_node_block(layout: Layout) -> *mut u8 {
+    #[cfg(test)]
+    RAW_NODE_BLOCK_ALLOCATION_COUNT.with(|count| count.set(count.get() + 1));
+
+    // SAFETY[IDX-NODE-LAYOUT-ALLOC-BLOCK]: The non-zero NodeHeader-containing layout is valid for allocation.
+    // node block contains a `NodeHeader`.
+    unsafe { std::alloc::alloc(layout) }
+}
+
+#[cfg(test)]
+fn reset_raw_node_block_allocation_count() {
+    RAW_NODE_BLOCK_ALLOCATION_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn raw_node_block_allocation_count() -> usize {
+    RAW_NODE_BLOCK_ALLOCATION_COUNT.with(std::cell::Cell::get)
+}
+
 #[repr(C)]
 pub(crate) struct NodeHeader {
     pub(crate) row_id: u64,
@@ -173,6 +197,7 @@ pub(crate) fn layer_byte_offset(
 // header contains a `u64`), and every offset comes from `Layout::extend`,
 // which aligns each region to its own type's alignment; the SAFETY comment
 // at each cast site restates the specific guarantee.
+// SAFETY[IDX-NODE-LAYOUT-ALLOC-NODE]: Callers publish the returned initialized allocation with a synchronizing store.
 #[allow(clippy::expect_used, clippy::cast_ptr_alignment)]
 pub(crate) unsafe fn alloc_node(
     row_id: u64,
@@ -181,9 +206,17 @@ pub(crate) unsafe fn alloc_node(
     mmax0: usize,
     mmax: usize,
 ) -> *mut u8 {
+    let header = NodeHeader {
+        row_id,
+        dim: u32::try_from(vector.len()).expect("dim must fit in u32"),
+        level: u8::try_from(level).expect("level must fit in u8 (see graph.rs LEVEL_MASK)"),
+        mmax0: u16::try_from(mmax0).expect("mmax0 must fit in u16"),
+        mmax: u16::try_from(mmax).expect("mmax must fit in u16"),
+        deleted: AtomicU8::new(0),
+        published: AtomicU8::new(0),
+    };
     let (layout, offsets) = compute_node_layout(vector.len(), level, mmax0, mmax);
-    // SAFETY: `layout` has non-zero size (NodeHeader alone is non-zero-sized).
-    let ptr = unsafe { std::alloc::alloc(layout) };
+    let ptr = alloc_node_block(layout);
     if ptr.is_null() {
         // Not `assert!`: formatting a panic message would itself allocate,
         // during the very OOM condition being reported --
@@ -191,28 +224,18 @@ pub(crate) unsafe fn alloc_node(
         std::alloc::handle_alloc_error(layout);
     }
 
-    // SAFETY: `ptr` was just allocated with exactly `layout`, which
+    // SAFETY[IDX-NODE-LAYOUT-WRITE-HEADER]: The fresh allocation reserves one aligned NodeHeader at offset zero.
     // reserves space for one `NodeHeader` at offset 0 with correct
     // alignment (`Layout::new::<NodeHeader>()` is `compute_node_layout`'s
     // first component) -- writing one `NodeHeader` here does not exceed
     // the allocation and does not read the uninitialized memory it
-    // overwrites.
+    // overwrites. `header` was fully validated before this allocation and
+    // is moved here exactly once.
     unsafe {
-        std::ptr::write(
-            ptr.cast::<NodeHeader>(),
-            NodeHeader {
-                row_id,
-                dim: u32::try_from(vector.len()).expect("dim must fit in u32"),
-                level: u8::try_from(level).expect("level must fit in u8 (see graph.rs LEVEL_MASK)"),
-                mmax0: u16::try_from(mmax0).expect("mmax0 must fit in u16"),
-                mmax: u16::try_from(mmax).expect("mmax must fit in u16"),
-                deleted: AtomicU8::new(0),
-                published: AtomicU8::new(0),
-            },
-        );
+        std::ptr::write(ptr.cast::<NodeHeader>(), header);
     }
 
-    // SAFETY: `offsets.vector_offset` plus `vector.len() * 4` bytes was
+    // SAFETY[IDX-NODE-LAYOUT-COPY-VECTOR]: The layout reserves the non-overlapping initialized vector region.
     // reserved by `compute_node_layout`'s `Layout::array::<f32>(dim)`
     // extension using this exact `vector.len()`, and the target region
     // does not overlap `vector`'s own backing memory (freshly allocated).
@@ -230,7 +253,7 @@ pub(crate) unsafe fn alloc_node(
     for (lc, &layer_offset) in offsets.layer_offsets.iter().enumerate() {
         let slot_count = layer_slot_count(mmax0, mmax, lc);
         for i in 0..slot_count {
-            // SAFETY: each slot's address (`layer_offset + i *
+            // SAFETY[IDX-NODE-LAYOUT-INITIALIZE-SLOT]: Each computed slot address is within its uniquely initialized layer region.
             // size_of::<AtomicU64>()`) is within the region
             // `compute_node_layout` reserved for this layer via
             // `Layout::array::<AtomicU64>(capacity)` -- the same
@@ -257,9 +280,10 @@ pub(crate) unsafe fn alloc_node(
 /// `ptr` must have been returned by `alloc_node`, must not already have
 /// been freed, and the caller must have exclusive access to it (no other
 /// reference may read or write through it during or after this call).
+// SAFETY[IDX-NODE-LAYOUT-DEALLOC-NODE]: Callers provide the unique live allocation originally returned by alloc_node.
 #[allow(clippy::cast_ptr_alignment)]
 pub(crate) unsafe fn dealloc_node(ptr: *mut u8) {
-    // SAFETY: `ptr` was returned by `alloc_node`, which always writes a
+    // SAFETY[IDX-NODE-LAYOUT-READ-HEADER]: The live allocation contains the initialized NodeHeader at offset zero.
     // fully-initialized `NodeHeader` at offset 0 before returning, and the
     // caller guarantees `ptr` is still valid and not aliased -- reading the
     // header back here is sound.
@@ -270,7 +294,7 @@ pub(crate) unsafe fn dealloc_node(ptr: *mut u8) {
         header.mmax0 as usize,
         header.mmax as usize,
     );
-    // SAFETY: `layout` is recomputed from the exact same parameters
+    // SAFETY[IDX-NODE-LAYOUT-DEALLOC-BLOCK]: The recomputed layout exactly matches this uniquely owned allocation.
     // `alloc_node` used to build this block (the same function, the same
     // arithmetic), and the caller guarantees `ptr` was returned by
     // `alloc_node` and is not freed or aliased elsewhere.
@@ -342,7 +366,7 @@ mod tests {
                      for (dim={dim}, level={level}, mmax0={mmax0}, mmax={mmax}, lc={lc})"
                 );
             }
-            // SAFETY: `node` was constructed by this iteration alone, is
+            // SAFETY[IDX-NODE-LAYOUT-TEST-RECLAIM]: This test exclusively owns the freshly constructed node.
             // never stored in a `NodeTable`, and nothing else references it.
             unsafe {
                 node.reclaim();
@@ -357,12 +381,31 @@ mod tests {
     }
 
     #[test]
+    fn alloc_node_rejects_invalid_header_before_raw_allocation() {
+        for (level, mmax0, mmax) in [
+            (usize::from(u8::MAX) + 1, 0, 0),
+            (0, usize::from(u16::MAX) + 1, 0),
+            (0, 0, usize::from(u16::MAX) + 1),
+        ] {
+            reset_raw_node_block_allocation_count();
+            let result = std::panic::catch_unwind(|| {
+                // SAFETY[IDX-NODE-LAYOUT-TEST-INVALID-ALLOC]: Invalid arguments panic before returning an allocation to reclaim.
+                // so no publication obligation arises.
+                unsafe { alloc_node(0, &[], level, mmax0, mmax) }
+            });
+
+            assert!(result.is_err());
+            assert_eq!(raw_node_block_allocation_count(), 0);
+        }
+    }
+
+    #[test]
     fn alloc_node_initializes_header_vector_and_every_slot_to_empty() {
         let vector = vec![1.0f32, 2.0, 3.0];
-        // SAFETY: test-only call, immediately read back and never shared
+        // SAFETY[IDX-NODE-LAYOUT-TEST-ALLOCATE]: This test immediately owns the newly allocated, unpublished block.
         // across threads before the read.
         let ptr = unsafe { alloc_node(7, &vector, 1, 32, 16) };
-        // SAFETY: `ptr` was just returned by `alloc_node` above and is
+        // SAFETY[IDX-NODE-LAYOUT-TEST-READ]: The freshly returned block is fully initialized and still exclusively owned.
         // fully initialized per its own contract.
         unsafe {
             let header = &*ptr.cast::<NodeHeader>();
@@ -389,7 +432,7 @@ mod tests {
                 }
             }
         }
-        // SAFETY: `ptr` was returned by `alloc_node` above, has not been
+        // SAFETY[IDX-NODE-LAYOUT-TEST-DEALLOCATE]: The test owns this live block and no reference survives reclamation.
         // freed, and nothing else holds a reference to it.
         unsafe {
             dealloc_node(ptr);
@@ -405,17 +448,17 @@ mod tests {
         // `alloc_node` escapes `dealloc_node`'s recomputed `Layout`) and "no
         // use-after-free" (nothing reads `ptr` afterward).
         let vector = vec![1.0f32; 512];
-        // SAFETY: test-only call, immediately read back and never shared
+        // SAFETY[IDX-NODE-LAYOUT-TEST-MULTILAYER-ALLOCATE]: The test immediately owns the newly allocated multi-layer block.
         // across threads before the read.
         let ptr = unsafe { alloc_node(0, &vector, 4, 32, 16) };
-        // SAFETY: `ptr` is freshly allocated and fully initialized by
+        // SAFETY[IDX-NODE-LAYOUT-TEST-MULTILAYER-READ]: The fresh multi-layer block is initialized before this exclusive read.
         // `alloc_node`.
         unsafe {
             let header = &*ptr.cast::<NodeHeader>();
             assert_eq!(header.dim, 512);
             assert_eq!(header.level, 4);
         }
-        // SAFETY: `ptr` was returned by `alloc_node` above, has not been
+        // SAFETY[IDX-NODE-LAYOUT-TEST-MULTILAYER-DEALLOCATE]: The test uniquely owns this live multi-layer block.
         // freed, and nothing else holds a reference to it.
         unsafe {
             dealloc_node(ptr);
