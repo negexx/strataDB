@@ -27,8 +27,9 @@ lifecycle execution on one shared handle: lifecycle exclusivity and `commit_lock
 materialization, publication, protected-history validation, and eligible reclamation, while immutable
 snapshot reads continue. `maintain` runs those mutations sequentially rather than under one guard, so
 writers may interleave between phases and the composite run is non-atomic. Cost scales with live
-data/history. The retained 79.49-second median and 1,289.2 MB peak-live-memory fixture/runner result
-measures maintenance rather than standalone compaction and is evidence, not an SLO or maximum;
+data/history. The retained compaction fixture records a 79.49-second median and 1,289.2 MB peak
+live memory; separate maintenance evidence records a 74.16-second median and 1,090.4 MB peak live
+memory. These are evidence, not SLOs or maximums;
 physical accounting and reclamation exclude `_meta/row-id-high-water`.
 
 The Phase 3 exit signal above denotes evidence from one explicit maintenance run. In particular,

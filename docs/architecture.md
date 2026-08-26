@@ -170,9 +170,10 @@ before `commit_lock`, which remains held while live data is materialized, a repl
 published, protected history is validated, and eligible objects are reclaimed. Immutable snapshot
 reads can continue. `maintain` is a sequential composition of those individually excluded operations,
 not one atomic exclusion; writers can interleave between phases. Cost therefore scales with live data
-and retained/protected history. The retained bounded fixture/runner evidence is a 79.49-second median
-and 1,289.2 MB peak live memory for the maintenance runner, not a standalone compaction measurement;
-it is evidence for that fixture and runner, not an SLO or a maximum. `lifecycle_report` and
+and retained/protected history. The retained compaction fixture evidence is a 79.49-second median
+and 1,289.2 MB peak live memory; separate maintenance evidence records a 74.16-second median and
+1,090.4 MB peak live memory. These are evidence for their named fixtures and runners, not SLOs or
+maximums. `lifecycle_report` and
 `storage_bound_met` exclude `_meta/row-id-high-water` reservation objects from physical accounting
 and reclamation.
 

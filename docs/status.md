@@ -60,9 +60,10 @@ takes lifecycle exclusivity then `commit_lock` while materializing live data, pu
 protected history, and reclaiming eligible objects; immutable snapshot reads continue.
 `maintain` invokes those sub-operations sequentially rather than holding one guard across the
 composed run, so writers may interleave between its phases and the run is non-atomic. Cost scales
-with live data and retained/protected history. The retained fixture/runner record of a 79.49-second
-median and 1,289.2 MB peak live memory measures the named maintenance runner, not standalone
-compaction; it is bounded evidence, not an SLO or maximum. `lifecycle_report` and
+with live data and retained/protected history. The retained compaction fixture record is a
+79.49-second median with 1,289.2 MB peak live memory; separate maintenance evidence records a
+74.16-second median with 1,090.4 MB peak live memory. Both are bounded evidence, not an SLO or
+maximum. `lifecycle_report` and
 `storage_bound_met` exclude `_meta/row-id-high-water` from physical accounting. Cross-process
 lifecycle work remains later design. Historical exact-head lifecycle evidence, plus the scoped current local record, is recorded in the
 [Phase 3 closeout audit](audit/phase-3/audit.md) and

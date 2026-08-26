@@ -91,9 +91,10 @@ preparation, publication, migration, and other lifecycle execution for that sub-
 materializes live data, publishes, validates protected history, and reclaims eligible objects.
 Immutable snapshot reads continue. `maintain` invokes these sub-operations sequentially, releasing
 their guards between phases, so writers may interleave and the composed run is non-atomic. Cost scales
-with live data and retained/protected history. The retained fixture/runner evidence—79.49 seconds
-median and 1,289.2 MB peak live memory—measures the maintenance runner, not standalone compaction,
-and is not an SLO or maximum. `lifecycle_report` and `storage_bound_met` exclude
+with live data and retained/protected history. The retained compaction fixture evidence is a 79.49
+second median and 1,289.2 MB peak live memory; separate maintenance evidence records a 74.16-second
+median and 1,090.4 MB peak live memory. These are not SLOs or maximums. `lifecycle_report` and
+`storage_bound_met` exclude
 `_meta/row-id-high-water` reservation objects from physical accounting and reclamation.
 
 Normal unit/integration tests, loom models, property tests, fuzz targets, real-process chaos/reopen
