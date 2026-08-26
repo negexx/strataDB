@@ -22,11 +22,11 @@ microbenchmark evidence, and cache-locality evidence.
 
 Locations:
 
-- [`crates/txn/src/row_id.rs:182`](../../../../crates/txn/src/row_id.rs:182)
-- [`crates/storage/src/row_id_high_water.rs:111`](../../../../crates/storage/src/row_id_high_water.rs:111)
-- [`crates/storage/src/row_id_high_water.rs:289`](../../../../crates/storage/src/row_id_high_water.rs:289)
-- [`crates/txn/src/vacuum.rs:91`](../../../../crates/txn/src/vacuum.rs:91)
-- [`crates/txn/src/lifecycle.rs:20`](../../../../crates/txn/src/lifecycle.rs:20)
+- [`crates/txn/src/row_id.rs:189`](../../../crates/txn/src/row_id.rs#L189)
+- [`crates/storage/src/row_id_high_water.rs:111`](../../../crates/storage/src/row_id_high_water.rs#L111)
+- [`crates/storage/src/row_id_high_water.rs:289`](../../../crates/storage/src/row_id_high_water.rs#L289)
+- [`crates/txn/src/vacuum.rs:91`](../../../crates/txn/src/vacuum.rs#L91)
+- [`crates/txn/src/lifecycle.rs:20`](../../../crates/txn/src/lifecycle.rs#L20)
 
 Each inserting transaction persists a durable high-water reservation. The
 operation lists and reads every immutable reservation record before creating
@@ -42,11 +42,11 @@ on-disk-format design; Terra must not change it independently.
 
 Locations:
 
-- [`crates/txn/src/snapshot.rs:1082`](../../../../crates/txn/src/snapshot.rs:1082)
-- [`crates/txn/src/snapshot.rs:1146`](../../../../crates/txn/src/snapshot.rs:1146)
-- [`crates/txn/src/snapshot.rs:1251`](../../../../crates/txn/src/snapshot.rs:1251)
-- [`crates/storage/src/datafile.rs:559`](../../../../crates/storage/src/datafile.rs:559)
-- [`crates/storage/src/backend/local.rs:287`](../../../../crates/storage/src/backend/local.rs:287)
+- [`crates/txn/src/snapshot.rs:1082`](../../../crates/txn/src/snapshot.rs#L1082)
+- [`crates/txn/src/snapshot.rs:1146`](../../../crates/txn/src/snapshot.rs#L1146)
+- [`crates/txn/src/snapshot.rs:1251`](../../../crates/txn/src/snapshot.rs#L1251)
+- [`crates/storage/src/datafile.rs:559`](../../../crates/storage/src/datafile.rs#L559)
+- [`crates/storage/src/backend/local.rs:287`](../../../crates/storage/src/backend/local.rs#L287)
 
 `vector_search_query` rebuilds filtered row IDs on every invocation, while
 the older predicate-based `vector_search` uses `LiveSetCache`. The projected
@@ -60,10 +60,10 @@ allocations despite an existing per-snapshot cache.
 
 Locations:
 
-- [`crates/txn/src/dataset.rs:446`](../../../../crates/txn/src/dataset.rs:446)
-- [`crates/txn/src/dataset.rs:475`](../../../../crates/txn/src/dataset.rs:475)
-- [`crates/txn/src/dataset.rs:598`](../../../../crates/txn/src/dataset.rs:598)
-- [`crates/txn/src/dataset.rs:632`](../../../../crates/txn/src/dataset.rs:632)
+- [`crates/txn/src/dataset.rs:479`](../../../crates/txn/src/dataset.rs#L479)
+- [`crates/txn/src/dataset.rs:475`](../../../crates/txn/src/dataset.rs#L475)
+- [`crates/txn/src/dataset.rs:598`](../../../crates/txn/src/dataset.rs#L598)
+- [`crates/txn/src/dataset.rs:632`](../../../crates/txn/src/dataset.rs#L632)
 
 Compaction holds lifecycle exclusivity and the commit lock while it reads all
 surviving batches, concatenates and re-encodes the complete live dataset,
@@ -104,16 +104,16 @@ Graph hotspots include `Dataset::compact`, `Transaction::commit`,
 These are estimable risks, not measured defects:
 
 - One `Vec<f32>` allocation/copy per vector row
-  ([`dataset.rs:3392`](../../../../crates/txn/src/dataset.rs:3392)).
+  ([`dataset.rs:3392`](../../../crates/txn/src/dataset.rs#L3392)).
 - Separate row-ID and timestamp vectors per batch
-  ([`dataset.rs:3583`](../../../../crates/txn/src/dataset.rs:3583)).
+  ([`dataset.rs:3583`](../../../crates/txn/src/dataset.rs#L3583)).
 - Batch collection followed by concatenation during scans
-  ([`snapshot.rs:405`](../../../../crates/txn/src/snapshot.rs:405)).
+  ([`snapshot.rs:405`](../../../crates/txn/src/snapshot.rs#L405)).
 - Boolean-mask allocation for tombstone filtering
-  ([`snapshot.rs:371`](../../../../crates/txn/src/snapshot.rs:371)).
+  ([`snapshot.rs:371`](../../../crates/txn/src/snapshot.rs#L371)).
 - Live-set cache accounting excludes buckets, synchronization/`Arc` headers,
   allocator metadata, and global retained memory
-  ([`live_set_cache.rs:18`](../../../../crates/txn/src/live_set_cache.rs:18)).
+  ([`live_set_cache.rs:18`](../../../crates/txn/src/live_set_cache.rs#L18)).
 - Hash-based tombstone checks during HNSW traversal lack cache-locality
   measurements.
 

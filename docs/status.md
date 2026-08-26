@@ -13,7 +13,8 @@ finding-level acceptance and evidence obligations; retained historical exact-hea
 the original phase within its named bounds, while later evidence is scoped to the results recorded
 in the current verification report.
 
-The closeout work is merged into `main` at `65449a9` (PR #68).
+The current checked-in closeout is based on merged Audit 9 at `dcaa3da` (PR #80);
+later audit follow-ups must record their own exact head and CI evidence.
 
 **Phase 0: Implemented within named local bounds.** This implementation closure does not establish
 complete platform or loom coverage. The local Arrow/manifest/segmented-index foundation and
@@ -65,7 +66,9 @@ with live data and retained/protected history. The retained compaction fixture r
 74.16-second median with 1,090.4 MB peak live memory. Both are bounded evidence, not an SLO or
 maximum. `lifecycle_report` and
 `storage_bound_met` exclude `_meta/row-id-high-water` from physical accounting. Cross-process
-lifecycle work remains later design. Historical exact-head lifecycle evidence, plus the scoped current local record, is recorded in the
+lifecycle work remains later design. The linked Phase 3 closeout and verification records contain
+historical exact-head evidence plus the scoped local evidence they explicitly identify; they are not
+claims that every later documentation or audit commit has been independently hosted-verified. See
 [Phase 3 closeout audit](audit/phase-3/audit.md) and
 [Phase 3 verification report](phase-3-verification-report.md). See
 the [inventory design](designs/phase-3/lifecycle-inventory.md), [manifest executor
@@ -79,7 +82,7 @@ tests.
 |---|---|---|
 | Local storage/manifests | Implemented within named bounds | Arrow files, manifests, statistics, and local filesystem persistence work. Manifest recovery preserves checksum bytes for historical format-v1 envelopes and performs a streaming preflight that rejects oversized, over-deep, and over-cardinality serialized input before raw JSON tree construction and typed state construction. Manifest pruning, age retention, explicit snapshot-preserving compaction/reclamation, and recognized orphan vacuum exist; unknown object types and unbounded namespace enumeration remain outside cleanup authority. |
 | Transactions/conflicts | Partial | Shared-handle write-write OCC and typed row-ID conflicts exist; no serializability claim. |
-| Row/index publication | Partial | Manifest/snapshot publication validates row ownership/uniqueness, manifest-listed metadata and checksums, and row/index consistency. It does not establish byte-for-byte identity of decoded Arrow vector values: tampering that changes vector values while recomputing the corresponding metadata/checksums is outside the supported integrity boundary. Final branch verification and current evidence remain. |
+| Row/index publication | Partial | Manifest/snapshot publication validates row ownership/uniqueness, manifest-listed metadata and checksums, and row/index consistency. It does not establish byte-for-byte identity of decoded Arrow vector values: tampering that changes vector values while recomputing the corresponding metadata/checksums is outside the supported integrity boundary. Exact-head evidence is recorded in the current Phase 3 verification report. |
 | Snapshot/query reads | Partial | Immutable scan, predicate, explain, and vector-search reads exist. The stable transaction API also provides bounded transaction-base reads: scans (including predicate reads) and group reads expose staged inserts, replacements, and deletes; lookup reflects staged replacements/deletes only for physical row IDs already in the base snapshot, because staged inserts receive no physical row ID until commit and cannot be looked up pre-commit. `vector_search` after staged writes returns a typed unsupported-transaction-read error. This is not a general read/write query interface and does not provide full serializability. |
 | Query operators/pruning | Implemented within named bounds | The bounded logical/physical planner covers supported immutable-snapshot scan, grouped aggregation, and vector-search requests. Its stable explain value lists logical operators, selected reused physical operators, and captured row-file/index-segment pruning plus overlay observations; these are not cost or cardinality guarantees. It delegates to the existing scan, zone-map pruning, tombstone, group-by, and immutable HNSW-segment paths, preserving their result and immutable-snapshot contracts. Local Criterion evidence used four committed 64-row batches (256 rows): direct/planned 95% intervals were 577.39–581.76/567.16–575.79 µs (projection), 136.70–137.28/138.81–140.99 µs (selective scan), 150.72–152.72/151.74–152.36 µs (group-by), and 1.3549–1.3710/1.3599–1.3729 ms (vector); see the command and limits in the [Phase 3 verification report](phase-3-verification-report.md#task-3-query-planning-evidence). This is not SQL, a general optimizer, a stronger isolation claim, or a universal performance result. |
 | Immutable vector segments | Implemented | Manifest-listed HNSW segments load and fan out across snapshots; explicit compaction can replace the current segment set while preserving active historical snapshots. |

@@ -165,7 +165,7 @@ pub struct Manifest {
     pub next_row_id: u64,
     /// Row-ids tombstoned (deleted, or superseded by `update`) as of this
     /// version. Accumulated across every committed version, same as
-    /// `data_files` — see Phase 6's design doc for why this lives directly
+    /// `data_files` — see the current design documentation for why this lives directly
     /// in the manifest rather than in some per-commit artifact: a
     /// delete-only transaction has no data file (no dataset-wide fixed
     /// schema to fabricate an empty batch from) and no index segment (no
@@ -713,9 +713,9 @@ fn manifest_path(dataset_dir: &Path, version: u64) -> PathBuf {
 /// A successful return is the local durability acknowledgement; a
 /// `PublicationIndeterminate` error can still leave the exact final-name
 /// candidate readable without that acknowledgement.
-/// Never call this twice concurrently for the same `dataset_dir` from
-/// separate writers in Phase 1 — there is no conflict detection yet (single
-/// writer only); see `crates/txn`.
+/// Never use this helper as an independent multi-writer coordination
+/// protocol; transaction-level conflict detection belongs to `crates/txn`
+/// and applies to callers sharing a `Dataset` handle.
 ///
 /// # Errors
 ///

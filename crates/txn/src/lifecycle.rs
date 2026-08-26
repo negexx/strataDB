@@ -119,7 +119,7 @@ pub(crate) struct ReachableKeys {
 /// Joins captured backend listings with a captured manifest without touching
 /// the filesystem.
 ///
-/// The future `Dataset::lifecycle_report` entry point supplies listings rooted
+/// The `Dataset::lifecycle_report` entry point supplies listings rooted
 /// at `_versions/` and `data/` from exactly one captured snapshot.
 pub(crate) fn collect(
     manifest_objects: &[ObjectMeta],

@@ -22,8 +22,8 @@
 //! opaquely, without either crate compromising: `crates/txn` is the only
 //! code that ever downcasts it back to a `HashMap<String, ColumnStats>`.
 //!
-//! Dedup by row-id is a no-op in S1 (each row-id lives in exactly one
-//! segment, since there is no compaction yet) and is implemented now so
+//! Dedup by row-id is normally a no-op for uncompacted segments (each row-id
+//! lives in exactly one segment) and is implemented so
 //! S2's compaction — where a row transiently exists in both a source
 //! segment and its compacted output — does not require reopening this
 //! merge logic.

@@ -1,6 +1,8 @@
 # Agent Production Readiness Design
 
-Status: approved design; Tasks 1 through 5 are accepted within named bounds, with final production-readiness review fixes in progress
+Status: implemented within named bounds; Tasks 1 through 5 are accepted within
+named bounds. The active contract and final evidence are maintained by the
+Phase 3 audit records and the current verification report.
 
 ## Objective
 

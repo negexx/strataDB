@@ -208,7 +208,7 @@ mod tests {
 }
 
 /// Run with: `cargo rustc -p strata-index --lib --profile test -- --cfg loom`
-/// (never a workspace-wide `RUSTFLAGS` — see `docs/phase-1-audit.md`).
+/// (never a workspace-wide `RUSTFLAGS` — see `docs/audit/phase-1/audit.md`).
 #[cfg(loom)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod loom_tests {

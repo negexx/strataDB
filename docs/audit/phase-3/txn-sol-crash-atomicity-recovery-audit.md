@@ -21,9 +21,9 @@ separate immutable row-ID high-water collection.
 
 Locations:
 
-- [`crates/storage/src/backend/local.rs:330`](../../../crates/storage/src/backend/local.rs:330)
-- [`crates/txn/src/dataset.rs:2230`](../../../crates/txn/src/dataset.rs:2230)
-- [`crates/storage/src/manifest.rs:502`](../../../crates/storage/src/manifest.rs:502)
+- [`crates/storage/src/backend/local.rs:330`](../../../crates/storage/src/backend/local.rs#L330)
+- [`crates/txn/src/dataset.rs:2230`](../../../crates/txn/src/dataset.rs#L2230)
+- [`crates/storage/src/manifest.rs:502`](../../../crates/storage/src/manifest.rs#L502)
 
 The local backend renames the manifest into its final name before synchronizing
 the directory chain. That later sync can fail. `Transaction::commit` returns
@@ -48,8 +48,8 @@ the documented local ordered-operation guarantee and is not currently tested.
 
 Locations:
 
-- [`crates/txn/src/dataset.rs:2312`](../../../crates/txn/src/dataset.rs:2312)
-- [`crates/txn/src/row_id.rs:182`](../../../crates/txn/src/row_id.rs:182)
+- [`crates/txn/src/dataset.rs:2312`](../../../crates/txn/src/dataset.rs#L2312)
+- [`crates/txn/src/row_id.rs:189`](../../../crates/txn/src/row_id.rs#L189)
 
 Row IDs are reserved and row/segment files are written before conflict
 checking and manifest publication. Conflicts, injected failures, and panics
@@ -62,14 +62,14 @@ orphan cleanup and bounded growth remain explicit limits.
 - Row IDs are durably reserved before row-file writes; uncertain reservation
   publication consumes the range.
 - Conflict and live-target checks precede manifest publication
-  ([`dataset.rs:2049`](../../../crates/txn/src/dataset.rs:2049)).
+  ([`dataset.rs:2049`](../../../crates/txn/src/dataset.rs#L2049)).
 - One manifest contains both new row-file and segment references, providing the
   shared visibility boundary
-  ([`dataset.rs:2098`](../../../crates/txn/src/dataset.rs:2098)).
+  ([`dataset.rs:2098`](../../../crates/txn/src/dataset.rs#L2098)).
 - Recovery validates manifest checksum/version, row-file length/CRC/schema/
   ownership, tombstones, segments, and row-ID high-water state
-  ([`manifest.rs:252`](../../../crates/storage/src/manifest.rs:252),
-  [`dataset.rs:941`](../../../crates/txn/src/dataset.rs:941)).
+  ([`manifest.rs:252`](../../../crates/storage/src/manifest.rs#L252),
+  [`dataset.rs:941`](../../../crates/txn/src/dataset.rs#L941)).
 - Temporary manifests are ignored; a malformed highest renamed manifest fails
   closed instead of silently falling back.
 

@@ -78,6 +78,28 @@ around one authoritative `Dataset`, not independent openers or a distributed tra
 
 This decision does not authorize implementation, dependency additions, or a new isolation level.
 
+## 0011 - Stable client and administration surfaces
+
+**Status:** Accepted and implemented within the embedded, single-process
+boundary.
+
+The supported client path is the `strata-txn` facade exposed through the
+Rust API, the documented PyO3 package, and the `strata` administration CLI.
+The query planner, schema migration surface, lifecycle reports, and
+administration commands are versioned by the package/repository contract and
+must reject unsupported or corrupt state loudly. Internal storage, index, and
+query crates remain implementation layers rather than independent supported
+APIs.
+
+This decision does not add full serializability, cross-process coordination,
+distributed transactions, or universal durability claims. On-disk schema and
+manifest changes require explicit compatibility tests and a migration/recovery
+path; unsupported future formats must return typed errors. Public-surface
+changes require documentation, a regression test, and an update to the
+compatibility notes before release. Lifecycle maintenance remains exclusive
+and its measured stop-the-world/resource bounds remain part of the operational
+contract.
+
 ## Decision rules
 
 - Preserve the embedded, single-node scope and the one-process/shared-`Dataset` concurrency boundary.
