@@ -3263,22 +3263,6 @@ fn catalog_row_id_range(
     }
 }
 
-#[allow(dead_code)]
-pub(crate) fn validate_data_files(
-    dir: &Path,
-    manifest: &Manifest,
-    logical_schema: &SchemaRef,
-    accounting: Option<&mut RecoveryByteAccounting>,
-) -> Result<HashSet<u64>> {
-    validate_data_files_with_owner(
-        &StorageOwner::local(dir),
-        dir,
-        manifest,
-        logical_schema,
-        accounting,
-    )
-}
-
 pub(crate) fn validate_data_files_with_owner(
     owner: &StorageOwner,
     dir: &Path,
@@ -3409,16 +3393,6 @@ pub(crate) fn validate_tombstones(
 /// the corruption the original race could produce — would pass every one
 /// of them; only this cross-segment check catches it), or
 /// [`TxnError::Index`] if a segment fails its own header/body validation.
-#[allow(dead_code)]
-pub(crate) fn load_segments(
-    dir: &Path,
-    manifest: &Manifest,
-    owned_rows: &HashSet<u64>,
-    accounting: Option<&mut RecoveryByteAccounting>,
-) -> Result<strata_index::SegmentSet> {
-    load_segments_with_owner(&StorageOwner::local(dir), manifest, owned_rows, accounting)
-}
-
 pub(crate) fn load_segments_with_owner(
     owner: &StorageOwner,
     manifest: &Manifest,

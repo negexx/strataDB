@@ -1,19 +1,21 @@
 # Strata-Txn Sol Correctness and Static Hygiene Audit
 
-Date: 2026-08-15  
+Date: 2026-08-27
 Scope: `crates/txn` and the manifest publication boundary in `crates/storage`  
 Reviewer: Sol (`gpt-5.6-sol`), independent read-only review  
-Baseline: `codex/readme-current-state` at `e7a4bee`
+Baseline: merged Audit 11 head `2d32dfb`
 
 ## Verdict
 
-**REJECT.** The normal commit path has coherent conflict ordering, immutable
-snapshot publication, and row/index manifest coupling, but one uncertain
-manifest-publication path prevents approval.
+**IMPLEMENTED WITH NAMED LIMITS.** The normal commit path has coherent
+conflict ordering, immutable snapshot publication, and row/index manifest
+coupling. The former indeterminate-publication defect is reconciled and
+covered by transaction-level recovery tests; this remains bounded to the
+documented local, single-process/shared-`Dataset` contract.
 
 ## Confirmed findings
 
-### [P1] Post-publication manifest-sync failure can leave the shared handle stale
+### [Resolved P1] Post-publication manifest-sync failure is reconciled
 
 Locations:
 
@@ -22,20 +24,13 @@ Locations:
 - [`crates/storage/src/backend/local.rs:359`](../../../crates/storage/src/backend/local.rs#L359)
 - [`crates/storage/src/backend/mod.rs:55`](../../../crates/storage/src/backend/mod.rs#L55)
 
-`Transaction::commit` returns the manifest-sync error before updating the
-commit log or the in-memory current snapshot. The local backend can rename the
-new manifest into visibility before directory synchronization completes. A
-sync failure can therefore leave version `N+1` visible on disk while the shared
-handle remains at `N`. A subsequent commit may calculate `N+1` again. Since
-the publication path is overwrite-capable while the documented manifest
-primitive is `put_if_absent`, retry behavior can overwrite the uncertain
-manifest on POSIX or fail repeatedly on Windows.
+The commit path now classifies a verified-visible post-publication sync failure,
+installs the candidate in the shared commit history and snapshot before
+returning the typed indeterminate error, and prohibits blind transaction
+replay. Focused tests cover reopen visibility, unique subsequent publication,
+row/index state, and compaction/migration publication barriers.
 
-Required follow-up: Sol design of indeterminate-commit reconciliation,
-reopen/retry semantics, immutable version publication, and focused regression
-coverage before Terra implementation.
-
-### [P3] Dead query-validation implementation is hidden by broad allowances
+### [Resolved P3] Query validation is active and no longer broadly suppressed
 
 Locations:
 
@@ -45,20 +40,20 @@ Locations:
 - [`crates/txn/src/query.rs:502`](../../../crates/txn/src/query.rs#L502)
 - [`crates/txn/src/query.rs:957`](../../../crates/txn/src/query.rs#L957)
 
-`LogicalType`, `LogicalColumn`, `DatasetSchema`, aggregate-output validation,
-and related aliases are retained behind `#[allow(dead_code)]`. The graph found
-no production inbound path to `DatasetSchema`. This parallel test-only model
-can drift from the active query path.
+The query schema and aggregate validation model is used by the active
+snapshot/query paths. Broad `#[allow(dead_code)]` attributes were removed;
+the test-only schema accessor is explicitly `#[cfg(test)]`, making future dead
+code visible to clippy without suppressing active validation.
 
-### [P3] Unused recovery wrappers remain in production source
+### [Resolved P3] Unused recovery wrappers removed
 
 Locations:
 
 - [`crates/txn/src/dataset.rs:3044`](../../../crates/txn/src/dataset.rs#L3044)
 - [`crates/txn/src/dataset.rs:3190`](../../../crates/txn/src/dataset.rs#L3190)
 
-`validate_data_files` and `load_segments` are suppressed with
-`#[allow(dead_code)]`; production callers use the owner-aware variants.
+The unused local wrappers were deleted. Recovery retains the owner-aware
+variants that are the production call path.
 
 ## Structural risks
 
@@ -79,16 +74,19 @@ These are maintainability risks, not independently confirmed correctness bugs.
 
 - `cargo fmt --check`: passed.
 - `cargo clippy -p strata-txn --all-targets --no-default-features -- -D warnings`: passed.
-- `cargo test -p strata-txn --no-default-features`: blocked before execution by
-  missing MSVC `link.exe`.
-- `cargo check -p strata-txn --no-default-features`: blocked by the same linker
-  environment issue.
+- `cargo test -p strata-txn --no-default-features`: passed (271 unit tests,
+  all integration tests, and 6 doctests; one scheduled stress test ignored).
+- Targeted query validation tests: passed (19 unit tests and 9 planner tests).
+- `cargo clippy -p strata-txn --all-targets --no-default-features -- -D warnings`:
+  passed.
+- `cargo fmt --check` and `git diff --check`: passed.
 - Codebase-memory fast index: 3,381 nodes and 18,621 edges repository-wide;
   1,075 nodes and 7,085 edges scoped to `crates/txn`.
 - No TODO/FIXME/HACK markers or production `unsafe` blocks were found in the
   scoped source scan.
 
-The linker failure is an environment limitation, not a repository finding.
-Runtime tests, loom, and full native verification remain unverified until the
-MSVC developer environment is active.
+The remaining structural complexity observations are maintainability limits,
+not confirmed correctness defects. Full workspace verification and the
+separate concurrency/chaos evidence remain governed by their own audit
+reports.
 
