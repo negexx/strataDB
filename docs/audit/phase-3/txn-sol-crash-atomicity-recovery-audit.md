@@ -20,17 +20,18 @@ separate immutable row-ID high-water collection.
 
 ## Findings
 
-### [Resolved P1] Post-rename manifest-sync failure is reconciled before returning
+### [Resolved P1] Final-name publication sync failure is reconciled before returning
 
 Locations:
 
-- [`crates/storage/src/backend/local.rs:330`](../../../crates/storage/src/backend/local.rs#L330)
+- [`crates/storage/src/backend/local.rs:368`](../../../crates/storage/src/backend/local.rs#L368)
 - [`crates/txn/src/dataset.rs:2230`](../../../crates/txn/src/dataset.rs#L2230)
 - [`crates/storage/src/manifest.rs:502`](../../../crates/storage/src/manifest.rs#L502)
 
-The local backend still renames the manifest before synchronizing its directory
-chain, so the sync result can be uncertain. `commit_manifest_with` now verifies
-the exact final-name bytes and returns a typed
+The local backend publishes the immutable manifest by linking its temporary
+file to the final name with `put_if_absent`/`fs::hard_link`, then synchronizes
+the owned directory chain, so the sync result can be uncertain. `commit_manifest_with`
+now verifies the exact final-name bytes and returns a typed
 `StorageError::PublicationIndeterminate` only when those bytes are readable.
 `Transaction::commit` installs the verified candidate snapshot and commit-log
 entry while holding `commit_lock` before returning the typed indeterminate
@@ -41,9 +42,16 @@ The behavior is regression-covered by
 `dataset::tests::indeterminate_manifest_publication_installs_the_candidate_before_reporting_it`,
 `storage::manifest::tests::commit_manifest_reports_indeterminate_after_final_name_creation_sync_failure`,
 and the compaction/schema-migration equivalents. The API requires callers to
-stop using an indeterminate handle and reopen it before retrying creation;
-this is a typed, bounded local-filesystem contract, not a universal power-loss
-proof.
+use different recovery rules for dataset creation and ordinary transactions.
+`Dataset::create` returns no handle on indeterminate initial publication, so
+callers must use `Dataset::open` before retrying creation. An ordinary
+`Transaction::commit` makes that transaction terminal, installs its candidate
+and write-set into the existing shared handle, and must not replay the same
+transaction; subsequent transactions may continue on that handle subject to
+normal OCC. Dataset-level compaction and schema migration likewise reconcile
+their candidate before returning the typed error, after which callers should
+drop/reopen to inspect the recovered version and schema. These are typed,
+bounded local-filesystem contracts, not universal power-loss proofs.
 
 ### [P2] Arbitrary byte-prefix or volume rollback is unsupported
 
@@ -86,7 +94,7 @@ orphan cleanup and bounded growth remain explicit limits.
 
 | Mutation | Static assessment |
 |---|---|
-| Skip manifest fsync | Existing sync-order/failure tests should detect it, but the ordinary post-rename case is missing |
+| Skip manifest directory synchronization | Covered by the final-name publication sync-failure regression and typed indeterminate result |
 | Publish before conflict check | Covered by conflict/orphan regressions |
 | Expose uncommitted rows or segments | Rejected by manifest-only visibility and reopen tests |
 | Reuse abandoned row IDs | Covered by reservation-failure and process-restart tests |
