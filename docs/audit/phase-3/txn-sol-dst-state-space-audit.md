@@ -87,8 +87,10 @@ and 360-minute CI timeout make this gate repeatable and diagnosable.
 
 ### [Named limit] Full deterministic replay and virtual fault environment remain out of scope
 
-Chaos child processes have bounded receive timeouts and seed/abort rerun
-diagnostics, and CI retains Loom/chaos evidence. There is still no virtual
+Chaos child processes now have a 60-second per-worker deadline; a timed-out
+worker is killed, its pipes are drained, and the failure includes the exact
+seed/abort rerun diagnostics. CI retains Loom/chaos evidence. There is still no
+virtual
 clock, deterministic scheduler, virtual WAL, arbitrary volume-prefix rollback
 simulator, or replayable checkpoint format. Those capabilities are outside the
 current embedded local contract.
@@ -145,6 +147,7 @@ Fresh local verification on this branch:
 | `cargo fmt --check` | Exit 0 |
 | `git diff --check` | Exit 0 |
 | `cargo test -p strata-txn --no-default-features` | Exit 0; 269 unit tests passed, 1 scheduled stress test ignored; all integration tests and 6 doctests passed |
+| `cargo test -p strata-sim --no-default-features fast_tier_random_seeds_survive_random_crash_points -- --exact --nocapture` | Exit 0; 1 test passed, 30 crash-seed iterations completed |
 
 ## Representative mutation/state-space assessment
 

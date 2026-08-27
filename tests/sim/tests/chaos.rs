@@ -7,7 +7,8 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::process::Command;
+use std::process::{Child, Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use rand::Rng as _;
 use rand::SeedableRng as _;
@@ -176,6 +177,46 @@ struct RunResult {
     max_tolerated_phantoms: usize,
 }
 
+/// A wedged worker must not hold the whole chaos campaign until the CI job's
+/// outer timeout.  The worker is an intentionally separate process, so the
+/// harness owns the kill boundary and reports the seed that needs replay.
+const WORKER_TIMEOUT: Duration = Duration::from_mins(1);
+
+fn wait_for_worker(mut child: Child, seed: u64, abort_at: Option<u64>) -> Output {
+    let deadline = Instant::now() + WORKER_TIMEOUT;
+    loop {
+        match child.try_wait().unwrap_or_else(|error| {
+            panic!("failed polling chaos-worker at seed={seed} abort_at={abort_at:?}: {error}")
+        }) {
+            Some(_) => {
+                return child.wait_with_output().unwrap_or_else(|error| {
+                    panic!(
+                        "failed collecting chaos-worker output at seed={seed} \
+                         abort_at={abort_at:?}: {error}"
+                    )
+                });
+            }
+            None if Instant::now() >= deadline => {
+                child.kill().unwrap_or_else(|error| {
+                    panic!(
+                        "chaos-worker timed out after {WORKER_TIMEOUT:?} at seed={seed} \
+                         abort_at={abort_at:?}, and kill failed: {error}"
+                    )
+                });
+                // Drain the pipes while waiting after the kill.  A plain
+                // `wait` could itself block if a wedged worker filled stderr.
+                let _ = child.wait_with_output();
+                panic!(
+                    "chaos-worker timed out after {WORKER_TIMEOUT:?} at seed={seed} \
+                     abort_at={abort_at:?}; rerun with STRATA_CHAOS_ONLY_SEED={seed} \
+                     STRATA_CHAOS_CONCURRENCY=1"
+                );
+            }
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn run_worker(dir: &std::path::Path, seed: u64, abort_at: Option<u64>) -> RunResult {
     let mut cmd = Command::new(worker_bin_path());
@@ -188,7 +229,12 @@ fn run_worker(dir: &std::path::Path, seed: u64, abort_at: Option<u64>) -> RunRes
     if let Some(n) = abort_at {
         cmd.env("STRATA_CHAOS_ABORT_AT", n.to_string());
     }
-    let output = cmd.output().unwrap();
+    let child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|error| panic!("failed to spawn chaos-worker: {error}"));
+    let output = wait_for_worker(child, seed, abort_at);
 
     // Exit code 2 is the reserved genuine-failure signal (design doc
     // §3.4) -- a real bug, never an expected chaos-abort. Fail the test
