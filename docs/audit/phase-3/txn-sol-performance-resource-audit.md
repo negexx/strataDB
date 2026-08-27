@@ -8,7 +8,7 @@ Baseline: merged Audit 1 head `bcb6d4b`
 ## Verdict
 
 **IMPLEMENTED WITH NAMED LIMITS.** No P0 performance defect was confirmed.
-The filtered-vector cache remediation is implemented and measured. The
+The filtered-vector cache remediation is implemented and regression-tested;
 row-ID reservation catalog and whole-dataset compaction retain documented
 scalability limits; neither is claimed as a universal RAF/SAF or latency
 guarantee, and durable-format redesign remains a separate product decision.
@@ -53,11 +53,6 @@ Locations:
 - [`crates/txn/src/snapshot.rs:1251`](../../../crates/txn/src/snapshot.rs#L1251)
 - [`crates/storage/src/datafile.rs:559`](../../../crates/storage/src/datafile.rs#L559)
 - [`crates/storage/src/backend/local.rs:287`](../../../crates/storage/src/backend/local.rs#L287)
-
-`vector_search_query` rebuilds filtered row IDs on every invocation, while
-the older predicate-based `vector_search` uses `LiveSetCache`. The projected
-reader loads the complete object into a `Vec<u8>` and local reads use
-`fs::read`; projection reduces decoding but not physical bytes read.
 
 The filtered query path now keys and reuses the bounded per-snapshot live-set
 cache. Existing projected reads still decode from complete backend payloads;
@@ -148,7 +143,9 @@ focused benchmark evidence.
 ## Verification evidence
 
 - Filtered-cache implementation and regression tests are present in the
-  merged Audit 2 history.
+  merged Audit 2 history. No cache-specific Criterion result is claimed here;
+  a reproducible cold/warm benchmark should be added before using this report
+  as quantitative performance evidence.
 - Current transaction tests and clippy pass at the merged Audit 1 head.
 - Retained benchmark evidence reports latency, memory, and lifecycle
   measurements with their fixture and scope limitations; no universal WAF,
