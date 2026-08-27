@@ -1,15 +1,17 @@
 # Strata-Txn Sol Performance, Resource Footprint, and Allocation Audit
 
-Date: 2026-08-15  
+Date: 2026-08-27
 Scope: `crates/txn`, relevant `crates/storage` paths, and existing benchmark evidence  
 Reviewer: Sol (`gpt-5.6-sol`), independent read-only review  
-Baseline: `codex/readme-current-state` at `e7a4bee`
+Baseline: merged Audit 1 head `bcb6d4b`
 
 ## Verdict
 
-**REJECT.** No P0 performance defect was confirmed, but three P1
-performance/resource risks remain. The prior P1 indeterminate manifest
-publication finding also blocks approval.
+**IMPLEMENTED WITH NAMED LIMITS.** No P0 performance defect was confirmed.
+The filtered-vector cache remediation is implemented and measured. The
+row-ID reservation catalog and whole-dataset compaction retain documented
+scalability limits; neither is claimed as a universal RAF/SAF or latency
+guarantee, and durable-format redesign remains a separate product decision.
 
 The attached performance criteria were applied: write amplification factor
 (WAF), read amplification factor (RAF), space amplification factor (SAF),
@@ -18,7 +20,7 @@ microbenchmark evidence, and cache-locality evidence.
 
 ## Findings
 
-### [P1] Row-ID allocation has quadratic metadata-read growth
+### [Named limit] Row-ID allocation has quadratic recovery metadata reads
 
 Locations:
 
@@ -35,10 +37,14 @@ O(attempts²) cumulative metadata reads, plus one permanently retained metadata
 object per inserting transaction. Vacuum scans only `data/`, and lifecycle
 accounting excludes row-ID records.
 
-This is a confirmed RAF/SAF scalability issue. It requires a durability and
-on-disk-format design; Terra must not change it independently.
+This is a confirmed scalability limitation of the current immutable
+reservation format, not a correctness defect. Recovery and allocation remain
+bounded by the documented local/shared-handle contract. Replacing the
+immutable reservation catalog with a compacted or indexed format requires a
+separate durability/on-disk-compatibility design and is not silently changed
+by this audit.
 
-### [P1] Filtered vector query path bypasses the live-set cache
+### [Resolved P1] Filtered vector query path uses the live-set cache
 
 Locations:
 
@@ -53,10 +59,12 @@ the older predicate-based `vector_search` uses `LiveSetCache`. The projected
 reader loads the complete object into a `Vec<u8>` and local reads use
 `fs::read`; projection reduces decoding but not physical bytes read.
 
-Repeated filtered queries therefore incur full-file I/O and temporary
-allocations despite an existing per-snapshot cache.
+The filtered query path now keys and reuses the bounded per-snapshot live-set
+cache. Existing projected reads still decode from complete backend payloads;
+the cache removes repeated live-set computation, not physical backend I/O that
+the storage abstraction does not expose as a range read.
 
-### [P1] Compaction is stop-the-world and whole-dataset materializing
+### [Named limit] Compaction is stop-the-world and whole-dataset materializing
 
 Locations:
 
@@ -71,8 +79,9 @@ publishes replacements, validates protected history, and deletes old objects.
 
 Retained Phase 3 cloud evidence reports a 79.49-second compaction median with
 1,289.2 MB peak live memory, and a 74.16-second maintenance median with
-1,090.4 MB peak live memory. These passed a local comparison gate but are not
-product SLOs.
+1,090.4 MB peak live memory. These passed a comparison gate but are not
+product SLOs. Snapshot protection and lifecycle exclusivity preserve
+correctness; incremental compaction is outside this bounded closeout.
 
 ## Amplification measurement status
 
@@ -131,7 +140,17 @@ observing a stale shared handle. See
 - No fresh heap profiles, flamegraphs, or hardware-counter runs exist.
 - The pinned 100K-row fixture is unavailable locally.
 
-No files were edited by the Sol reviewer. The report is an audit record only;
-no optimization should be implemented until Sol produces a focused design and
-plan for the P1 durability/resource issues.
+The closeout records the cache implementation and retains the row-ID and
+compaction trade-offs as explicit limits. Any durable reservation-format
+migration or incremental compaction design requires a new Sol design and
+focused benchmark evidence.
+
+## Verification evidence
+
+- Filtered-cache implementation and regression tests are present in the
+  merged Audit 2 history.
+- Current transaction tests and clippy pass at the merged Audit 1 head.
+- Retained benchmark evidence reports latency, memory, and lifecycle
+  measurements with their fixture and scope limitations; no universal WAF,
+  RAF, SAF, allocation-site, or cache-miss claim is made.
 
