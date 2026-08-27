@@ -42,7 +42,6 @@ pub enum LogicalType {
     Vector { dimensions: usize },
 }
 
-#[allow(dead_code)]
 impl LogicalType {
     fn is_scalar(&self) -> bool {
         !matches!(self, Self::Vector { .. })
@@ -54,7 +53,6 @@ impl LogicalType {
 }
 
 /// One logical column owned by a persisted dataset.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LogicalColumn {
     pub(crate) name: String,
@@ -62,7 +60,6 @@ pub(crate) struct LogicalColumn {
     pub(crate) nullable: bool,
 }
 
-#[allow(dead_code)]
 impl LogicalColumn {
     #[must_use]
     pub(crate) fn new(name: impl Into<String>, data_type: LogicalType, nullable: bool) -> Self {
@@ -75,13 +72,11 @@ impl LogicalColumn {
 }
 
 /// Internal logical schema owned by a persisted dataset, excluding physical columns.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DatasetSchema {
     columns: Vec<LogicalColumn>,
 }
 
-#[allow(dead_code)]
 impl DatasetSchema {
     /// Builds a schema while rejecting duplicate and reserved column names.
     ///
@@ -109,6 +104,7 @@ impl DatasetSchema {
         Ok(Self { columns })
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn columns(&self) -> &[LogicalColumn] {
         &self.columns
@@ -499,7 +495,6 @@ pub enum AggregateFunction {
     Average,
 }
 
-#[allow(dead_code)]
 impl AggregateFunction {
     fn output_type(self, input: &LogicalType) -> Option<LogicalType> {
         match self {
@@ -954,10 +949,8 @@ impl From<crate::TxnError> for QueryError {
 
 /// The result type for public query-contract operations.
 pub type QueryResult<T> = std::result::Result<T, QueryError>;
-#[allow(dead_code)]
 type ValidationResult<T> = std::result::Result<T, QueryValidationError>;
 
-#[allow(dead_code)]
 fn validate_user_column_name(name: &str) -> ValidationResult<()> {
     if name == crate::ROW_ID_COLUMN || name == crate::TIMESTAMP_COLUMN {
         return Err(QueryValidationError::ReservedColumn {
