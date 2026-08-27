@@ -162,7 +162,7 @@ impl AlignedBytes {
     pub(crate) fn from_slice(src: &[u8]) -> Self {
         let block_count = src.len().div_ceil(64).max(1);
         let mut blocks = vec![Align64([0_u8; 64]); block_count];
-        // SAFETY: `Align64` is `#[repr(C, align(64))]` around exactly one
+        // SAFETY[IDX-SEGMENT-FORMAT-FROM-SLICE]: The fresh Align64 allocation is a contiguous uniquely writable byte region.
         // `[u8; 64]` and therefore has size 64 with no padding, so
         // `blocks`'s allocation is a contiguous, fully-initialized run of
         // `block_count * 64` bytes. `blocks.as_mut_ptr()` is valid for
@@ -187,7 +187,7 @@ impl AlignedBytes {
     /// The logical contents — exactly `src.len()` bytes, without the
     /// zero padding `from_slice` added to reach a whole block.
     pub(crate) fn as_slice(&self) -> &[u8] {
-        // SAFETY: same layout guarantee as `from_slice` — `blocks` is a
+        // SAFETY[IDX-SEGMENT-FORMAT-AS-SLICE]: The immutable blocks contain the initialized logical byte prefix.
         // contiguous run of `blocks.len() * 64` initialized bytes, `u8` has
         // alignment 1, and `self.len <= blocks.len() * 64` by construction
         // (`from_slice` is the only constructor). The returned slice

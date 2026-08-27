@@ -13,41 +13,38 @@ use crate::node_layout::{
 use crate::node_table::Reclaim;
 use crate::slot_array::SlotArray;
 
-/// A thin, `Copy` handle to a single raw-allocated node block. Never
-/// freed or moved while the `NodeTable` slot holding it is alive; freed
-/// exactly once, via [`Reclaim::reclaim`] (called by `NodeTable`'s
-/// `Drop`), when that slot's table is dropped.
+/// A unique owning handle to a single raw-allocated node block. It is moved
+/// into one `NodeTable` slot and freed exactly once via
+/// [`Reclaim::reclaim`] when that owner reaches its explicit reclaim
+/// boundary.
 ///
-/// Being `Copy` and owning out-of-band memory is a real tension:
-/// `NodeTable::insert` is a safe function, so nothing in the type system
-/// stops a caller from inserting the *same* `Node` value at two different
-/// row-ids -- `NodeTable`'s `Drop` would then call `reclaim` on it twice,
-/// a double-free. This holds today only because every construction site
-/// (`Graph::insert`) builds one fresh `Node` per call and stores it
-/// exactly once -- see `NodeTable::insert`'s doc comment for the full
-/// invariant. Don't add a second call site that reuses an existing `Node`
-/// value across more than one `insert` without revisiting this.
-#[derive(Clone, Copy)]
+/// The handle intentionally implements neither `Clone` nor `Copy`: safe code
+/// cannot duplicate ownership of the out-of-band allocation. Readers borrow
+/// the stored node through `&Node`; they never need an owning handle.
 pub(crate) struct Node(std::ptr::NonNull<u8>);
 
 impl Reclaim for Node {
+    // SAFETY[IDX-NODE-RECLAIM]: Consuming the unique Node owner reaches its single final reclaim boundary.
     unsafe fn reclaim(self) {
-        // SAFETY: `self.0` was produced by `alloc_node` (`Node::new`'s only
-        // constructor), and `NodeTable`'s `Drop` -- the only caller of
-        // `reclaim` -- guarantees this runs at most once, with exclusive
-        // access and no other reference to this node outstanding.
+        // SAFETY[IDX-NODE-RECLAIM-ALLOC]: This unique owner contains the live allocation produced by alloc_node.
+        // constructor), and consuming the unique `Node` owner makes this
+        // the final reclaim boundary. `NodeTable`'s `Drop` invokes it once
+        // under exclusive access; standalone owners must satisfy the same
+        // single-reclaim, no-outstanding-reference contract.
         unsafe {
             dealloc_node(self.0.as_ptr());
         }
     }
 }
 
-// SAFETY: every field this type's methods read is either immutable after
-// construction (header's row_id/dim/level/mmax0/mmax, the vector bytes) or
-// an atomic (deleted flag, edge slots) -- concurrent shared access through
-// `&Node`/`Node` (it's `Copy`) is exactly what those atomics are for.
+// SAFETY[IDX-NODE-SEND]: Moving this unique owning handle transfers its allocation ownership.
+// Every field readers access through shared references is either immutable
+// after construction (header's row_id/dim/level/mmax0/mmax, vector bytes) or
+// atomic (deleted flag, published flag, edge slots).
 unsafe impl Send for Node {}
-// SAFETY: same reasoning as the `Send` impl above.
+// SAFETY[IDX-NODE-SYNC]: Concurrent readers only use shared access to immutable fields and atomics.
+// fields and atomics; the unique owner is reclaimed only at its final
+// explicit ownership boundary.
 unsafe impl Sync for Node {}
 
 impl Node {
@@ -68,7 +65,7 @@ impl Node {
         mmax0: usize,
         mmax: usize,
     ) -> Self {
-        // SAFETY: `alloc_node`'s only contract is that its result is
+        // SAFETY[IDX-NODE-NEW-ALLOCATE]: NodeTable publishes this initialized node through its synchronizing AtomicPtr store.
         // published via a synchronizing store before any other thread
         // reads it -- the caller (`Graph::insert`, handing this `Node` to
         // `NodeTable::insert`) does so through that table's
@@ -89,7 +86,7 @@ impl Node {
     // `alloc_node` itself).
     #[allow(clippy::cast_ptr_alignment)]
     fn header(&self) -> &NodeHeader {
-        // SAFETY: `self.0` was produced by `alloc_node`, which reserves
+        // SAFETY[IDX-NODE-HEADER]: This Node always holds the live allocation with its initialized header at offset zero.
         // and initializes a `NodeHeader` at offset 0 (see
         // `compute_node_layout`) before returning; this `Node` is never
         // constructed from any other pointer.
@@ -103,7 +100,7 @@ impl Node {
     // consumer (and exercised by this module's own
     // `vector_and_row_id_are_preserved` test).
     #[allow(dead_code)]
-    pub(crate) fn row_id(self) -> u64 {
+    pub(crate) fn row_id(&self) -> u64 {
         self.header().row_id
     }
 
@@ -115,7 +112,7 @@ impl Node {
         // (drift-guarded by a test in node_layout.rs) -- this accessor sits
         // on `search_layer`'s hot path and must not allocate.
         let vector_offset = vector_byte_offset(header.dim as usize);
-        // SAFETY: `[vector_offset, vector_offset + dim * 4)` was reserved
+        // SAFETY[IDX-NODE-VECTOR]: The initialized vector range is reserved by the same layout arithmetic used at allocation.
         // and fully initialized by `alloc_node` using this same
         // `header.dim`.
         unsafe {
@@ -127,7 +124,7 @@ impl Node {
     }
 
     /// This node's highest layer — it participates in layers `0..=level()`.
-    pub(crate) fn level(self) -> usize {
+    pub(crate) fn level(&self) -> usize {
         usize::from(self.header().level)
     }
 
@@ -153,7 +150,7 @@ impl Node {
             lc,
         );
         let capacity = Self::layer_capacity(header, lc);
-        // SAFETY: `[start, start + capacity * size_of::<AtomicU64>())` is
+        // SAFETY[IDX-NODE-LAYER]: The initialized layer range is reserved by the same drift-guarded layout arithmetic.
         // exactly the byte range `alloc_node` reserved and initialized
         // (every slot set to `EMPTY`) for layer `lc`, per the same
         // layout arithmetic (`layer_byte_offset` mirrors
@@ -179,7 +176,7 @@ impl Node {
         layer_slot_count(usize::from(header.mmax0), usize::from(header.mmax), lc)
     }
 
-    pub(crate) fn is_deleted(self) -> bool {
+    pub(crate) fn is_deleted(&self) -> bool {
         self.header().deleted.load(Ordering::SeqCst) != 0
     }
 
@@ -189,7 +186,7 @@ impl Node {
     // `#[allow(dead_code)]`. Also exercised by this module's own
     // `mark_deleted_is_observed_by_is_deleted` test and `graph.rs`'s
     // deletion tests.
-    pub(crate) fn mark_deleted(self) {
+    pub(crate) fn mark_deleted(&self) {
         self.header().deleted.store(1, Ordering::SeqCst);
     }
 
@@ -210,7 +207,7 @@ impl Node {
     /// entry selection specifically (not from ordinary candidate
     /// selection, which must stay untouched) took real commit-path
     /// failures from ~28.5% down to 0.0% across hundreds of trials.
-    pub(crate) fn is_published(self) -> bool {
+    pub(crate) fn is_published(&self) -> bool {
         self.header().published.load(Ordering::SeqCst) != 0
     }
 
@@ -218,7 +215,7 @@ impl Node {
     /// insert`, after every layer's connections are built. Never reset:
     /// there is no "un-publish", only the one transition from under-
     /// construction to done.
-    pub(crate) fn mark_published(self) {
+    pub(crate) fn mark_published(&self) {
         self.header().published.store(1, Ordering::SeqCst);
     }
 }
@@ -250,6 +247,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn node_is_neither_clone_nor_copy() {
+        trait AmbiguousIfImpl<Marker> {
+            fn probe() {}
+        }
+        struct Fallback;
+        struct CloneMarker;
+        struct CopyMarker;
+        impl<T: ?Sized> AmbiguousIfImpl<Fallback> for T {}
+        impl<T: Clone> AmbiguousIfImpl<CloneMarker> for T {}
+        impl<T: Copy> AmbiguousIfImpl<CopyMarker> for T {}
+
+        let _ = <Node as AmbiguousIfImpl<_>>::probe;
+    }
+
+    #[test]
     fn new_node_participates_in_layers_zero_through_level() {
         let node = Node::new(0, vec![1.0, 2.0, 3.0], 2, 32, 16);
         assert_eq!(node.level(), 2);
@@ -268,7 +280,7 @@ mod tests {
             17,
             "layer 2 uses mmax + 1 headroom slot"
         );
-        // SAFETY: `node` was constructed by this test alone, is never
+        // SAFETY[IDX-NODE-TEST-RECLAIM-LAYERS]: This test exclusively owns its freshly constructed node.
         // stored in a `NodeTable`, and nothing else references it.
         unsafe {
             node.reclaim();
@@ -280,7 +292,7 @@ mod tests {
         let node = Node::new(0, vec![1.0], 0, 32, 16);
         assert_eq!(node.level(), 0);
         assert_eq!(node.layer(0).capacity(), 33, "mmax0 + 1 headroom slot");
-        // SAFETY: same as above -- test-local, never stored, never aliased.
+        // SAFETY[IDX-NODE-TEST-RECLAIM-LEVEL-ZERO]: This test exclusively owns its test-local node.
         unsafe {
             node.reclaim();
         }
@@ -290,7 +302,7 @@ mod tests {
     fn new_node_is_not_deleted() {
         let node = Node::new(0, vec![1.0], 0, 32, 16);
         assert!(!node.is_deleted());
-        // SAFETY: same as above -- test-local, never stored, never aliased.
+        // SAFETY[IDX-NODE-TEST-RECLAIM-DELETE-STATE]: This test exclusively owns its test-local node.
         unsafe {
             node.reclaim();
         }
@@ -301,7 +313,7 @@ mod tests {
         let node = Node::new(0, vec![1.0], 0, 32, 16);
         node.mark_deleted();
         assert!(node.is_deleted());
-        // SAFETY: same as above -- test-local, never stored, never aliased.
+        // SAFETY[IDX-NODE-TEST-RECLAIM-DELETED]: This test exclusively owns its test-local node.
         unsafe {
             node.reclaim();
         }
@@ -312,7 +324,7 @@ mod tests {
         let node = Node::new(7, vec![1.0, 2.0, 3.0], 0, 32, 16);
         assert_eq!(node.row_id(), 7);
         assert_eq!(node.vector(), &[1.0, 2.0, 3.0]);
-        // SAFETY: same as above -- test-local, never stored, never aliased.
+        // SAFETY[IDX-NODE-TEST-RECLAIM-VECTOR]: This test exclusively owns its test-local node.
         unsafe {
             node.reclaim();
         }
@@ -366,7 +378,7 @@ mod loom_tests {
             let reader = loom::thread::spawn(move || {
                 let ptr = reader_published.load(loom::sync::atomic::Ordering::SeqCst);
                 if !ptr.is_null() {
-                    // SAFETY: a non-null `ptr` was published by the
+                    // SAFETY[IDX-NODE-LOOM-READ-PUBLISHED]: The non-null pointer was published after full initialization.
                     // writer's store above, after Node::new's alloc_node
                     // call fully returned.
                     let node = unsafe { &*ptr };

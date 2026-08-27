@@ -61,11 +61,13 @@ static LIVE: AtomicI64 = AtomicI64::new(0);
 static PEAK: AtomicI64 = AtomicI64::new(0);
 static TOTAL: AtomicU64 = AtomicU64::new(0);
 
-// SAFETY: delegates every allocation to the system allocator unchanged and
+// SAFETY[BENCH-LIFECYCLE-ALLOC-IMPL]: The allocator forwards all allocations unchanged and only records atomics.
 // only adds atomic bookkeeping around it; the returned pointers and layouts
 // are exactly the system allocator's, so all `GlobalAlloc` invariants hold.
 unsafe impl GlobalAlloc for Counting {
+    // SAFETY[BENCH-LIFECYCLE-ALLOC-ALLOC]: GlobalAlloc callers provide a valid allocation layout.
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY[BENCH-LIFECYCLE-ALLOC-SYSTEM-ALLOC]: The caller-provided GlobalAlloc layout is forwarded unchanged to System.
         let p = unsafe { System.alloc(layout) };
         if !p.is_null() {
             let sz = layout.size() as i64;
@@ -75,7 +77,9 @@ unsafe impl GlobalAlloc for Counting {
         }
         p
     }
+    // SAFETY[BENCH-LIFECYCLE-ALLOC-DEALLOC]: GlobalAlloc callers provide the matching live allocation and layout.
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY[BENCH-LIFECYCLE-ALLOC-SYSTEM-DEALLOC]: The caller-provided pointer and matching layout are forwarded unchanged to System.
         unsafe { System.dealloc(ptr, layout) };
         LIVE.fetch_sub(layout.size() as i64, Ordering::Relaxed);
     }

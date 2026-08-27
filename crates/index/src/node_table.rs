@@ -54,20 +54,19 @@ const MAX_ROW_ID_CAPACITY: usize = 1_000_000_000;
 /// Types stored in a [`NodeTable`] that own memory *beyond* the `Box`
 /// wrapper `NodeTable` itself manages (e.g. `crate::node::Node`'s separate
 /// `alloc_node`-allocated block) must implement this so `NodeTable`'s
-/// `Drop` can free it. `Node` cannot implement `Drop` directly -- it
-/// derives `Copy`, and Rust forbids a type being both `Copy` and `Drop`
-/// (a `Copy` value can be implicitly duplicated, so a `Drop` impl on it
-/// would risk freeing the same out-of-band memory more than once) -- so
-/// this trait is the seam `NodeTable` uses instead.
+/// `Drop` can free it. `Node` deliberately has no `Drop` impl: this trait is
+/// the explicit out-of-band ownership seam through which `NodeTable` owns
+/// the final reclaim boundary, while standalone owners can reclaim directly.
 pub(crate) trait Reclaim {
     /// Frees any memory owned by `self` beyond its own in-place bytes (a
     /// no-op for a type with nothing extra to free, such as a plain
     /// integer).
     ///
     /// # Safety
-    /// Must be called at most once per value, with no other reference to
-    /// it outstanding. `NodeTable`'s `Drop` is the only caller in this
-    /// crate, which satisfies this via `&mut self`'s exclusive access.
+    /// Must be called at most once per unique owning value, with no other
+    /// reference to it outstanding. `NodeTable`'s `Drop` satisfies this via
+    /// `&mut self`'s exclusive access; standalone owners must do the same.
+    // SAFETY[IDX-NODE-TABLE-RECLAIM-DECL]: Callers invoke reclamation once with no outstanding references.
     unsafe fn reclaim(self);
 }
 
@@ -77,10 +76,12 @@ pub(crate) trait Reclaim {
 // only `Reclaim` impl a non-test build ever sees is `Node`'s.
 #[cfg(any(test, loom))]
 impl Reclaim for u32 {
+    // SAFETY[IDX-NODE-TABLE-RECLAIM-U32]: Plain u32 owns no out-of-band resource to reclaim.
     unsafe fn reclaim(self) {}
 }
 #[cfg(any(test, loom))]
 impl Reclaim for u64 {
+    // SAFETY[IDX-NODE-TABLE-RECLAIM-U64]: Plain u64 owns no out-of-band resource to reclaim.
     unsafe fn reclaim(self) {}
 }
 
@@ -110,7 +111,7 @@ impl<T: Reclaim> Drop for Chunk<T> {
             if value_ptr.is_null() {
                 continue;
             }
-            // SAFETY: a non-null slot was published by `NodeTable::insert`'s
+            // SAFETY[IDX-NODE-TABLE-CHUNK-DROP-BOX]: Exclusive chunk drop reconstructs the one Box published for this slot.
             // `Box::into_raw(Box::new(value))` (or `insert_ptr`, whose own
             // safety contract requires the same eventual single reclaim)
             // and never freed or moved since -- `&mut self` here means no
@@ -119,7 +120,7 @@ impl<T: Reclaim> Drop for Chunk<T> {
             // is sound.
             let boxed: Box<T> = unsafe { Box::from_raw(value_ptr) };
             let value: T = *boxed;
-            // SAFETY: this value has never had `reclaim` called on it
+            // SAFETY[IDX-NODE-TABLE-CHUNK-DROP-RECLAIM]: This exclusively dropped value has not yet crossed its reclaim boundary.
             // before (it was only ever stored, never read out until this
             // drop), and nothing else can reference it now.
             unsafe {
@@ -141,7 +142,7 @@ impl<T: Reclaim> Drop for NodeTable<T> {
             if chunk_ptr.is_null() {
                 continue;
             }
-            // SAFETY: a non-null directory slot was published by
+            // SAFETY[IDX-NODE-TABLE-DROP-CHUNK]: Exclusive table drop reconstructs the one published chunk Box.
             // `get_or_create_chunk`'s successful compare_exchange and
             // never freed or moved since -- `&mut self` here means no
             // other reference to this table (or any chunk it points to)
@@ -213,7 +214,7 @@ impl<T: Reclaim> NodeTable<T> {
         let slot = self.chunks.get(chunk_idx)?;
         let existing = slot.load(Ordering::SeqCst);
         if !existing.is_null() {
-            // SAFETY: a non-null pointer in this directory slot was
+            // SAFETY[IDX-NODE-TABLE-EXISTING-CHUNK]: A published chunk remains live and immovable for the table lifetime.
             // published by a successful compare_exchange below and is
             // never freed or moved afterward (Stage 1 never reclaims
             // chunks), so dereferencing it for the table's own lifetime is
@@ -227,7 +228,7 @@ impl<T: Reclaim> NodeTable<T> {
             Ordering::SeqCst,
             Ordering::SeqCst,
         ) {
-            // SAFETY: `new_chunk` was just published by this successful
+            // SAFETY[IDX-NODE-TABLE-WINNING-CHUNK]: The successful compare_exchange published this live chunk permanently.
             // compare_exchange and is never freed or moved afterward.
             Ok(_) => Some(unsafe { &*new_chunk }),
             Err(actual) => {
@@ -236,13 +237,13 @@ impl<T: Reclaim> NodeTable<T> {
                 // published it failed), so no other thread can hold a
                 // reference to it — safe to drop synchronously, no
                 // reclamation scheme needed.
-                // SAFETY: `new_chunk` came from `Box::into_raw` on the line
+                // SAFETY[IDX-NODE-TABLE-LOSE-CHUNK]: The losing unpublished Box has no other references and may be dropped.
                 // above in this same function and has not been shared with
                 // any other thread (the publish attempt failed).
                 unsafe {
                     drop(Box::from_raw(new_chunk));
                 }
-                // SAFETY: `actual` is the pointer that won the race — by
+                // SAFETY[IDX-NODE-TABLE-ACTUAL-CHUNK]: The winning published chunk remains live for the table lifetime.
                 // the same invariant as the `existing` branch above, it's
                 // published and never freed/moved for the table's
                 // lifetime.
@@ -257,18 +258,11 @@ impl<T: Reclaim> NodeTable<T> {
     /// each row-id exactly once, but the public index still must defend this
     /// boundary for direct callers and concurrent duplicate attempts.
     ///
-    /// **Load-bearing beyond that:** each distinct `value` may be passed to
-    /// `insert` (across *any* row-id, on *any* table) at most once. This
-    /// method is safe to call, but `T: Reclaim` means `NodeTable`'s `Drop`
-    /// will call `reclaim()` on every stored copy independently — for
-    /// `crate::node::Node`, which is `Copy`, inserting the same value twice
-    /// (e.g. `table.insert(a, node)` then `table.insert(b, node)`) stores
-    /// two handles to the *same* `alloc_node` block and reclaims it twice,
-    /// which is a double-free. Nothing in the type system prevents this;
-    /// every current caller (`Graph::insert`) constructs a fresh `Node` per
-    /// call and inserts it exactly once, so the invariant holds today by
-    /// construction, not by enforcement — keep it that way if `Node`
-    /// construction sites ever change.
+    /// **Load-bearing beyond that:** moving a non-`Copy`
+    /// `crate::node::Node` into `insert` statically prevents safe code from
+    /// reusing that owner. `NodeTable`'s `Drop` calls `reclaim()` once for
+    /// each stored value, and every current `Graph::insert` call constructs
+    /// one fresh `Node` and moves it here exactly once.
     ///
     /// # Errors
     ///
@@ -277,15 +271,12 @@ impl<T: Reclaim> NodeTable<T> {
     /// so nothing is ever boxed on this path — but `value` may still own
     /// out-of-band memory of its own (e.g. `crate::node::Node`'s
     /// `alloc_node` block), so this reclaims it explicitly before
-    /// returning, rather than relying on `value`'s own drop glue (which,
-    /// for a `Copy` type like `Node`, does nothing).
+    /// returning, rather than relying on `value`'s own drop glue (which for
+    /// `Node` intentionally does not reclaim its separate allocation).
     ///
-    /// **On `Err`, `value` has already been reclaimed by this call.** For a
-    /// `Copy` type like `Node`, `insert` taking `value` by value does *not*
-    /// stop the caller's own binding from still being in scope after this
-    /// returns — that binding is now a dangling handle. Do not read
-    /// through, or pass onward, `value` after an `Err` return; treat it the
-    /// same as a value that was moved out and dropped.
+    /// **On `Err`, this call consumes and reclaims `value` before
+    /// returning.** The caller has moved the unique owner into `insert` and
+    /// cannot reuse it after either result.
     pub(crate) fn insert(&self, row_id: u64, value: T) -> Result<(), CapacityExceeded> {
         let (chunk_idx, offset) = Self::chunk_index(row_id);
         let Some(chunk) = self.get_or_create_chunk(chunk_idx) else {
@@ -295,7 +286,7 @@ impl<T: Reclaim> NodeTable<T> {
             // soft constant so the error means precisely what it says. (Any
             // id that reaches here is `>= this`, hence also `> 1e9`, so it is
             // genuinely beyond `crates/txn`'s own upstream limit too.)
-            // SAFETY: `value` was never stored anywhere (this returns before
+            // SAFETY[IDX-NODE-TABLE-CAPACITY-RECLAIM]: The rejected value was never stored and reaches its sole reclaim boundary.
             // any `Box`/slot is created), so this is the only handle to it
             // and reclaiming it here is a single, final reclaim.
             unsafe {
@@ -322,7 +313,7 @@ impl<T: Reclaim> NodeTable<T> {
         {
             Ok(())
         } else {
-            // SAFETY: the failed CAS means this pointer was never
+            // SAFETY[IDX-NODE-TABLE-FAILED-CAS-RECLAIM]: The failed CAS means this pointer was never
             // published. Reclaim the out-of-band value exactly once,
             // then let the Box deallocate its handle storage.
             unsafe {
@@ -374,6 +365,7 @@ impl<T: Reclaim> NodeTable<T> {
     /// of `ptr` (it must free it) —
     /// unreachable in practice, since `crates/txn` bounds row-ids upstream;
     /// it exists so this path cannot panic on an out-of-range directory index.
+    // SAFETY[IDX-NODE-TABLE-INSERT-PTR]: Callers supply one live Box-derived pointer for the table's ownership lifetime.
     pub(crate) unsafe fn insert_ptr(
         &self,
         row_id: u64,
@@ -412,7 +404,7 @@ impl<T: Reclaim> NodeTable<T> {
         if chunk_ptr.is_null() {
             return None;
         }
-        // SAFETY: `chunk_ptr` is non-null, so it was published by
+        // SAFETY[IDX-NODE-TABLE-GET-CHUNK]: The non-null published chunk remains live and immovable for the table lifetime.
         // `get_or_create_chunk`'s successful compare_exchange and is never
         // freed or moved afterward.
         let chunk = unsafe { &*chunk_ptr };
@@ -420,7 +412,7 @@ impl<T: Reclaim> NodeTable<T> {
         if value_ptr.is_null() {
             return None;
         }
-        // SAFETY: `value_ptr` is non-null, so it was published by the
+        // SAFETY[IDX-NODE-TABLE-GET-VALUE]: The non-null published value remains live and immovable for the table lifetime.
         // `store` in `insert` (or `insert_ptr`, its currently-unused
         // raw-pointer sibling — same publication contract) and is never
         // freed or moved afterward (Stage 1 never removes a node once
@@ -462,7 +454,7 @@ mod tests {
     fn insert_ptr_then_get_round_trips() {
         let table: NodeTable<u32> = NodeTable::new(100);
         let boxed: *mut u32 = Box::into_raw(Box::new(42u32));
-        // SAFETY: `boxed` is non-null, points to a validly initialized
+        // SAFETY[IDX-NODE-TABLE-TEST-INSERT-PTR]: This test transfers its one valid Box-derived pointer to the table.
         // u32, and is never freed elsewhere in this test.
         unsafe { table.insert_ptr(5, boxed) }.unwrap();
         assert_eq!(table.get(5), Some(&42));
@@ -536,6 +528,20 @@ mod tests {
         let ok_node = crate::node::Node::new(5, vec![4.0, 5.0, 6.0], 0, 32, 16);
         table.insert(5, ok_node).unwrap();
         assert_eq!(table.get(5).unwrap().vector(), &[4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn duplicate_insert_reclaims_a_real_node_instead_of_leaking_it() {
+        let table: NodeTable<crate::node::Node> = NodeTable::new(1);
+        let first = crate::node::Node::new(5, vec![1.0, 2.0, 3.0], 0, 32, 16);
+        table.insert(5, first).unwrap();
+
+        let duplicate = crate::node::Node::new(5, vec![4.0, 5.0, 6.0], 0, 32, 16);
+        let err = table
+            .insert(5, duplicate)
+            .expect_err("duplicate row-id must be rejected");
+        assert!(err.already_occupied);
+        assert_eq!(table.get(5).unwrap().vector(), &[1.0, 2.0, 3.0]);
     }
 
     /// Not a leak-detector by itself under `cargo test` -- the point of
