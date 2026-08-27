@@ -1,20 +1,25 @@
 # Strata-Txn Sol Deterministic Simulation and State-Space Audit
 
-Date: 2026-08-15  
+Date: 2026-08-27
 Scope: `crates/txn`, its direct concurrency/fault harness boundary, loom,
 chaos, and simulation CI recipes  
 Reviewer: Sol (`gpt-5.6-sol`), independent read-only review  
-Baseline: `codex/readme-current-state` at `e7a4bee`
+Baseline: merged Audit 7 mainline at `d36f9f1`
 
 ## Verdict
 
-**REJECT.** No P0 was found, but two P1 gaps prevent claiming deterministic
-simulation or adequate crash-publication state-space coverage. Current testing
-is useful targeted concurrency testing, not a full DST system.
+**IMPLEMENTED WITH NAMED LIMITS.** The bounded deterministic state-space
+evidence required for the supported single-process/shared-`Dataset` contract
+is implemented and retained in CI. Audit 7's indeterminate-publication model,
+the transaction-overlay and migration-exclusivity models, direct model
+enumeration, pinned toolchain, and retained logs close the previously missing
+transaction state transitions. This is not a claim of a full DST hypervisor,
+complete OS-schedule replay, universal power-loss simulation, or
+cross-process coordination.
 
 ## Findings
 
-### [P1] A seed does not replay the complete execution
+### [Named limit] A seed does not replay the complete OS execution
 
 Locations:
 
@@ -30,52 +35,69 @@ ordinal can change between identical runs. Time and filesystem behavior are
 real; there is no virtual clock, scheduler, or environment controller.
 
 Chaos supports seed and abort-ordinal reruns, but not complete schedule replay.
+The OS scheduler, wall clock, and filesystem are not virtualized, so a seed is
+a reproducible scenario input and crash checkpoint, not a complete schedule
+transcript. Full DST scheduler replay is outside the embedded single-node
+product boundary.
 
-### [P1] The critical post-publication failure transition is not deterministically modeled
-
-Locations:
-
-- [`storage/src/backend/local.rs:330`](../../../crates/storage/src/backend/local.rs#L330)
-- [`storage/src/manifest.rs:370`](../../../crates/storage/src/manifest.rs#L370)
-- [`txn/src/dataset.rs:2230`](../../../crates/txn/src/dataset.rs#L2230)
-
-A manifest rename can succeed and directory synchronization then fail. The
-transaction returns before updating its in-memory snapshot/OCC log, leaving an
-uncertain durable publication. No deterministic model exercises retry,
-stale-handle visibility, or version uniqueness after this transition.
-
-### [P2] Loom models abstractions, not the complete transaction state machine
+### [Resolved P1] Critical post-publication failure is deterministically modeled
 
 Locations:
 
-- [`txn/src/dataset.rs:105`](../../../crates/txn/src/dataset.rs#L105)
-- [`txn/src/dataset.rs:9580`](../../../crates/txn/src/dataset.rs#L9580)
-- [`txn/src/row_id.rs:136`](../../../crates/txn/src/row_id.rs#L136)
-- [`txn/src/dataset.rs:10781`](../../../crates/txn/src/dataset.rs#L10781)
+- [`storage/src/backend/local.rs:368`](../../../crates/storage/src/backend/local.rs#L368)
+- [`storage/src/manifest.rs:734`](../../../crates/storage/src/manifest.rs#L734)
+- [`txn/src/dataset.rs:456`](../../../crates/txn/src/dataset.rs#L456)
 
-Under Loom, `ArcSwap` is replaced with a mutex-backed cell. Filesystem, Arrow,
-and index operations remain real and uninstrumented. Row-ID and semantic
-models explicitly omit durable storage or production commit behavior.
+The final-name hard-link publication path can report an uncertain directory
+synchronization result. `Transaction::commit` reconciles the verified-visible
+candidate's commit-log entry and current snapshot before returning the typed
+indeterminate error. The Loom model at
+`dataset::loom_tests::indeterminate_reconciliation_precedes_readers_and_a_subsequent_publisher`
+invokes the same `complete_visible_publication` helper and represents the
+separate commit-log mutex, snapshot atomic, error-return boundary, reader, and
+following publisher. Its rendezvous is blocking rather than a polling loop.
+Focused fault-injection tests additionally cover storage, transaction,
+compaction, and migration.
 
-### [P2] State-space bounds and recurring coverage are incomplete
+### [Named limit] Loom models synchronization state, not external I/O
 
-Models at [`dataset.rs:9922`](../../../crates/txn/src/dataset.rs#L9922),
-[`dataset.rs:10831`](../../../crates/txn/src/dataset.rs#L10831), and
-[`dataset.rs:10942`](../../../crates/txn/src/dataset.rs#L10942) use preemption
-bounds of 2, 2, and 3. CI does not pin or archive Loom state-space limits or
-checkpoints and omits transaction-overlay and migration-exclusivity models.
+Locations:
 
-### [P2] Replay and hang diagnostics are insufficient
+- [`txn/src/dataset.rs:107`](../../../crates/txn/src/dataset.rs#L107)
+- [`txn/src/dataset.rs:10556`](../../../crates/txn/src/dataset.rs#L10556)
+- [`txn/src/row_id.rs:366`](../../../crates/txn/src/row_id.rs#L366)
+- [`txn/src/lifecycle_coordination.rs:271`](../../../crates/txn/src/lifecycle_coordination.rs#L271)
 
-Worker execution uses blocking `Command::output()` without a per-process
-timeout. Loom artifacts are logs rather than replayable checkpoints. Chaos
-provides seed/abort reruns but not schedule replay.
+Under Loom, production snapshot publication is represented by the repository's
+documented `SnapshotCell` shim and instrumented synchronization primitives.
+Filesystem, Arrow, and index operations remain real and uninstrumented. The
+models therefore prove ordering and invariants at the transaction boundary;
+they do not claim to simulate arbitrary external I/O.
 
-### [P3] Coverage comments overstate model bounds
+### [Resolved P2] Required transaction models and state-space bounds are retained
 
-The Loom module says two models are bounded and the remainder unbounded, while
-three source models have explicit preemption bounds. See
-[`dataset.rs:9725`](../../../crates/txn/src/dataset.rs#L9725).
+CI directly builds the crate-scoped `strata-txn` test binary with `--cfg loom`
+and enumerates exact model names before executing each with one test thread.
+The retained list includes transaction overlay privacy, migration exclusivity,
+indeterminate reconciliation, atomic row/index visibility, row-ID monotonicity,
+retention, lifecycle coordination, and the existing conflict models. Explicit
+preemption bounds remain documented in the source; they are finite safety
+models, not exhaustive exploration of all thread counts. The pinned toolchain
+and 360-minute CI timeout make this gate repeatable and diagnosable.
+
+### [Named limit] Full deterministic replay and virtual fault environment remain out of scope
+
+Chaos child processes have bounded receive timeouts and seed/abort rerun
+diagnostics, and CI retains Loom/chaos evidence. There is still no virtual
+clock, deterministic scheduler, virtual WAL, arbitrary volume-prefix rollback
+simulator, or replayable checkpoint format. Those capabilities are outside the
+current embedded local contract.
+
+### [Resolved P3] Coverage comments describe the finite model bounds
+
+The Loom module now documents each explicit preemption bound and why the
+full-stack model is finite. See
+[`dataset.rs:10600`](../../../crates/txn/src/dataset.rs#L10600).
 
 ## Positive evidence
 
@@ -90,25 +112,58 @@ three source models have explicit preemption bounds. See
   [`commit_log.rs:278`](../../../crates/txn/src/commit_log.rs#L278).
 - CI retains Loom and chaos logs for 90 days.
 
-Historical reports—not fresh current-head evidence—record expensive Loom
-models passing and a 2,000/2,000 thorough chaos run.
+The exact Loom model list is executed by the current CI workflow, which retains
+the model and chaos logs for 90 days. The expensive thorough-chaos sweep remains
+an explicitly scheduled gate rather than a claim attached to every pull request.
+
+## Verification status
+
+The current CI recipe builds the crate-scoped test binary with:
+
+```text
+cargo rustc -p strata-txn --lib --profile test --message-format=json -- --cfg loom
+```
+
+It then verifies every named model is present and executes it with
+`--exact --test-threads=1`, including:
+
+```text
+dataset::loom_tests::transaction_read_overlay_stays_private_while_disjoint_and_contested_writes_commit
+dataset::loom_tests::migration_exclusivity_rejects_a_stale_schema_commit_or_migrates_its_published_rows
+dataset::loom_tests::indeterminate_reconciliation_precedes_readers_and_a_subsequent_publisher
+```
+
+The same workflow retains the Loom log, chaos log, and provenance artifacts for
+90 days. Focused recovery-test results are recorded in the Audit 7 report.
+These checks establish the finite, supported state-space contract; they do not
+turn the explicitly named scheduler and virtual-I/O limits into claims.
+
+Fresh local verification on this branch:
+
+| Command | Result |
+|---|---|
+| `cargo fmt --check` | Exit 0 |
+| `git diff --check` | Exit 0 |
+| `cargo test -p strata-txn --no-default-features` | Exit 0; 269 unit tests passed, 1 scheduled stress test ignored; all integration tests and 6 doctests passed |
 
 ## Representative mutation/state-space assessment
 
-Likely killed by existing targeted tests:
+Covered by the current targeted models and tests:
 
 - removal of same-row conflict detection;
 - split row/index publication;
 - failed pre-manifest segment leakage;
 - row-ID overlap;
 - lifecycle exclusivity violations.
+- exposure of staged transaction reads;
+- stale schema publication during migration;
+- publication before in-memory reconciliation.
 
-Likely to survive current modeling:
+Remaining named-limit scenarios:
 
-- post-rename sync-failure handling;
-- production `ArcSwap` ordering defects;
-- durable row-ID storage races;
-- executions requiring more than configured preemption bounds;
+- a complete OS schedule transcript from one chaos seed;
+- filesystem and Arrow behavior inside the Loom state space;
+- executions requiring more than the configured finite preemption bounds;
 - schedule-dependent crash-checkpoint remapping.
 
 Strata's immutable files plus versioned manifest are a functional WAL
@@ -119,7 +174,8 @@ Cross-process correctness, power-loss semantics, object storage, and
 scheduled-only exhaustive chaos remain explicit scope limits and must not be
 described as covered.
 
-No files were edited by the Sol reviewer. A complete DST architecture or
-uncertain-publication fix requires new Sol design work before Terra
-implementation.
+The bounded state-space and deterministic-input evidence is implemented within
+the supported product boundary. A full DST scheduler, virtual filesystem, or
+cross-process coordinator would require a separate design and is not implied by
+this audit closure.
 
