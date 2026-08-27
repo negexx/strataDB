@@ -27,6 +27,12 @@ impl Dataset {
     /// Returns a typed storage or manifest error when protected state cannot
     /// be validated or a deletion fails.
     pub fn vacuum(&self) -> Result<VacuumReport> {
+        let result = self.vacuum_inner();
+        self.record_lifecycle_result(&result);
+        result
+    }
+
+    fn vacuum_inner(&self) -> Result<VacuumReport> {
         let _lifecycle_guard = self.lifecycle_coordinator.acquire_exclusive();
         let _commit_guard = self
             .commit_lock

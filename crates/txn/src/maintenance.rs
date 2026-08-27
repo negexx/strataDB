@@ -74,6 +74,15 @@ impl Dataset {
         &self,
         policy: LifecycleMaintenancePolicy,
     ) -> Result<LifecycleMaintenanceReport> {
+        let result = self.maintain_inner(policy);
+        self.record_lifecycle_result(&result);
+        result
+    }
+
+    fn maintain_inner(
+        &self,
+        policy: LifecycleMaintenancePolicy,
+    ) -> Result<LifecycleMaintenanceReport> {
         if policy.keep_latest_versions == 0
             || policy.max_data_objects == 0
             || policy.max_segments == 0

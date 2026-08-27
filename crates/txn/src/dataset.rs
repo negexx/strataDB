@@ -46,6 +46,10 @@ use crate::error::{Result, TxnError};
 use crate::facade::{DataFileInfo, SegmentInfo};
 use crate::lifecycle_coordination::LifecycleCoordinator;
 use crate::live_set_cache::LiveSetCache;
+use crate::observability::{
+    OperationalEvent, OperationalEventFilter, OperationalEventKind, OperationalEventLog,
+    OperationalEventOutcome,
+};
 use crate::retention::{
     AgeRetentionPolicy, RetentionPlan, RetentionPolicy, SnapshotLeaseRegistry,
     index_manifest_objects,
@@ -100,6 +104,9 @@ pub const TIMESTAMP_COLUMN: &str = "_timestamp";
 /// a row/version-keyed overlap check that doesn't need a bounded window at
 /// all.
 const COMMIT_LOG_CAPACITY: usize = 2048;
+
+/// Fixed memory budget for the handle-local operational journal.
+const OPERATIONAL_EVENT_CAPACITY: usize = 1024;
 
 /// Storage backing `Dataset.current` / `Transaction.current` — the shared
 /// cell holding whichever `Snapshot` is currently visible to new readers.
@@ -231,6 +238,8 @@ pub struct Dataset {
     /// complex active-transaction-lifetime tracking this was weighed
     /// against. See [`Dataset::insufficient_history_conflict_count`].
     insufficient_history_conflicts: Arc<AtomicU64>,
+    /// Redacted, bounded operational events shared by clones of this handle.
+    operational_events: Arc<OperationalEventLog>,
     /// Lock-free issuance floor for `_timestamp` values — see
     /// `issue_timestamp`. Seeded from `Manifest.commit_time_high_water` on
     /// both `create` and `open`, so this floor survives a restart.
@@ -477,6 +486,13 @@ impl Dataset {
     /// visibility, not durability.
     #[allow(clippy::too_many_lines)]
     pub fn compact(&self, policy: CompactionPolicy) -> Result<CompactionReport> {
+        let result = self.compact_inner(policy);
+        self.record_lifecycle_result(&result);
+        result
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn compact_inner(&self, policy: CompactionPolicy) -> Result<CompactionReport> {
         if !policy.retain_snapshots {
             return Err(TxnError::InvalidCompactionPolicy);
         }
@@ -918,6 +934,11 @@ impl Dataset {
             tombstones: Arc::new(imbl::HashSet::new()),
             live_set_cache: LiveSetCache::new(crate::snapshot::LIVE_SET_CACHE_BYTE_BUDGET),
         };
+        let operational_events = Arc::new(OperationalEventLog::new(OPERATIONAL_EVENT_CAPACITY));
+        operational_events.record(
+            OperationalEventKind::DatasetCreated,
+            OperationalEventOutcome::Succeeded,
+        );
         Ok(Self {
             dir,
             storage,
@@ -928,6 +949,7 @@ impl Dataset {
             commit_lock: Arc::new(Mutex::new(CommitLog::new(commit_log_capacity))),
             lifecycle_coordinator: Arc::new(LifecycleCoordinator::default()),
             insufficient_history_conflicts: Arc::new(AtomicU64::new(0)),
+            operational_events,
             last_issued_timestamp,
         })
     }
@@ -1102,6 +1124,11 @@ impl Dataset {
             tombstones: Arc::new(tombstones),
             live_set_cache: LiveSetCache::new(crate::snapshot::LIVE_SET_CACHE_BYTE_BUDGET),
         };
+        let operational_events = Arc::new(OperationalEventLog::new(OPERATIONAL_EVENT_CAPACITY));
+        operational_events.record(
+            OperationalEventKind::DatasetOpened,
+            OperationalEventOutcome::Succeeded,
+        );
         Ok(Self {
             dir,
             storage,
@@ -1112,6 +1139,7 @@ impl Dataset {
             commit_lock: Arc::new(Mutex::new(CommitLog::new(COMMIT_LOG_CAPACITY))),
             lifecycle_coordinator: Arc::new(LifecycleCoordinator::default()),
             insufficient_history_conflicts: Arc::new(AtomicU64::new(0)),
+            operational_events,
             last_issued_timestamp,
         })
     }
@@ -1123,6 +1151,43 @@ impl Dataset {
     #[must_use]
     pub fn snapshot(&self) -> Arc<Snapshot> {
         self.current.load_full()
+    }
+
+    pub(crate) fn record_lifecycle_result<T>(&self, result: &Result<T>) {
+        let (kind, outcome) = if result.is_ok() {
+            (
+                OperationalEventKind::LifecycleSucceeded,
+                OperationalEventOutcome::Succeeded,
+            )
+        } else {
+            (
+                OperationalEventKind::LifecycleFailed,
+                OperationalEventOutcome::Failed,
+            )
+        };
+        self.operational_events.record(kind, outcome);
+    }
+
+    /// Returns matching redacted operational events in sequence order.
+    #[must_use]
+    pub fn operational_events(&self, filter: OperationalEventFilter) -> Vec<OperationalEvent> {
+        self.operational_events.snapshot(filter)
+    }
+
+    /// Drains matching events for an application-owned asynchronous exporter.
+    /// Nonmatching events remain in the journal.
+    #[must_use]
+    pub fn drain_operational_events(
+        &self,
+        filter: OperationalEventFilter,
+    ) -> Vec<OperationalEvent> {
+        self.operational_events.drain(filter)
+    }
+
+    /// Number of events evicted because the bounded journal was full.
+    #[must_use]
+    pub fn operational_events_dropped(&self) -> u64 {
+        self.operational_events.dropped_count()
     }
 
     /// Returns a read-only inventory anchored to one captured immutable snapshot.
@@ -1140,6 +1205,12 @@ impl Dataset {
     /// if the captured manifest and object inventory contain invalid,
     /// duplicate, missing, or overflowing lifecycle metadata.
     pub fn lifecycle_report(&self) -> Result<crate::LifecycleReport> {
+        let result = self.lifecycle_report_inner();
+        self.record_lifecycle_result(&result);
+        result
+    }
+
+    fn lifecycle_report_inner(&self) -> Result<crate::LifecycleReport> {
         let snapshot = self.snapshot();
         let manifest_objects = self.storage.list("_versions")?;
         let data_objects = self.storage.list("data")?;
@@ -1158,6 +1229,12 @@ impl Dataset {
     /// Returns a typed error for an invalid policy or any malformed, missing,
     /// unsafe, or overflowing retained state.
     pub fn retention_plan(&self, policy: RetentionPolicy) -> Result<RetentionPlan> {
+        let result = self.retention_plan_inner(policy);
+        self.record_lifecycle_result(&result);
+        result
+    }
+
+    fn retention_plan_inner(&self, policy: RetentionPolicy) -> Result<RetentionPlan> {
         crate::retention::build_plan(self, policy)
     }
 
@@ -1173,6 +1250,12 @@ impl Dataset {
     /// or a failed delete. A post-unlink directory-sync failure is returned;
     /// callers can safely retry because the next execution relists objects.
     pub fn prune_manifests(&self, policy: RetentionPolicy) -> Result<crate::ManifestPruneReport> {
+        let result = self.prune_manifests_inner(policy);
+        self.record_lifecycle_result(&result);
+        result
+    }
+
+    fn prune_manifests_inner(&self, policy: RetentionPolicy) -> Result<crate::ManifestPruneReport> {
         let _lifecycle_guard = self.lifecycle_coordinator.acquire_exclusive();
         #[cfg(test)]
         crate::retention_executor::pause_after_lifecycle_exclusive();
@@ -1191,6 +1274,15 @@ impl Dataset {
     /// Returns a typed error if the age policy is invalid, retention state is
     /// malformed, or a manifest deletion fails.
     pub fn prune_manifests_by_age(
+        &self,
+        policy: AgeRetentionPolicy,
+    ) -> Result<crate::ManifestPruneReport> {
+        let result = self.prune_manifests_by_age_inner(policy);
+        self.record_lifecycle_result(&result);
+        result
+    }
+
+    fn prune_manifests_by_age_inner(
         &self,
         policy: AgeRetentionPolicy,
     ) -> Result<crate::ManifestPruneReport> {
@@ -1260,6 +1352,13 @@ impl Dataset {
     /// not durability.
     #[allow(clippy::too_many_lines)]
     pub fn migrate_schema(&self, migration: &SchemaMigration) -> Result<SchemaMigrationResult> {
+        let result = self.migrate_schema_inner(migration);
+        self.record_lifecycle_result(&result);
+        result
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn migrate_schema_inner(&self, migration: &SchemaMigration) -> Result<SchemaMigrationResult> {
         let _lifecycle_guard = self.lifecycle_coordinator.acquire_exclusive();
         let mut commit_log = self
             .commit_lock
@@ -1421,6 +1520,10 @@ impl Dataset {
     #[must_use]
     pub fn begin(&self) -> Transaction {
         let snapshot = self.snapshot();
+        self.operational_events.record(
+            OperationalEventKind::TransactionBegan,
+            OperationalEventOutcome::Succeeded,
+        );
         Transaction {
             dir: self.dir.clone(),
             base_version: snapshot.version,
@@ -1437,6 +1540,7 @@ impl Dataset {
             commit_lock: Arc::clone(&self.commit_lock),
             lifecycle_coordinator: Arc::clone(&self.lifecycle_coordinator),
             insufficient_history_conflicts: Arc::clone(&self.insufficient_history_conflicts),
+            operational_events: Arc::clone(&self.operational_events),
             last_issued_timestamp: Arc::clone(&self.last_issued_timestamp),
             #[cfg(any(test, loom))]
             inject_manifest_commit_failure: false,
@@ -1557,6 +1661,8 @@ pub struct Transaction {
     commit_lock: Arc<Mutex<CommitLog>>,
     lifecycle_coordinator: Arc<LifecycleCoordinator>,
     insufficient_history_conflicts: Arc<AtomicU64>,
+    /// Shared operational event journal for this transaction's dataset.
+    operational_events: Arc<OperationalEventLog>,
     /// Consumed by [`Transaction::commit`] via `issue_timestamp`, as the
     /// very first step of `commit`, before `write_phase` runs.
     last_issued_timestamp: Arc<AtomicI64>,
@@ -2082,6 +2188,28 @@ impl Transaction {
     /// production builds and never triggered otherwise.
     #[allow(clippy::too_many_lines)]
     pub fn commit(self) -> Result<()> {
+        let operational_events = Arc::clone(&self.operational_events);
+        let result = self.commit_inner();
+        let (kind, outcome) = match &result {
+            Ok(()) => (
+                OperationalEventKind::TransactionCommitted,
+                OperationalEventOutcome::Succeeded,
+            ),
+            Err(TxnError::Conflict { .. } | TxnError::InsufficientHistory { .. }) => (
+                OperationalEventKind::TransactionConflict,
+                OperationalEventOutcome::Conflict,
+            ),
+            Err(_) => (
+                OperationalEventKind::TransactionFailed,
+                OperationalEventOutcome::Failed,
+            ),
+        };
+        operational_events.record(kind, outcome);
+        result
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn commit_inner(self) -> Result<()> {
         let _preparation_lease = self.lifecycle_coordinator.acquire_preparation();
         let ts = issue_timestamp(&self.last_issued_timestamp)?;
         let data_dir = data_subdir(&self.dir);

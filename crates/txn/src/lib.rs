@@ -16,6 +16,7 @@ mod lifecycle_coordination;
 pub(crate) mod live_set_cache;
 pub mod maintenance;
 pub mod mvp_fixtures;
+pub mod observability;
 pub mod query;
 pub(crate) mod retention;
 mod retention_executor;
@@ -33,6 +34,10 @@ pub use error::{Result, TxnError};
 pub use facade::{DataFileInfo, SegmentInfo};
 pub use lifecycle::LifecycleReport;
 pub use maintenance::{LifecycleMaintenancePolicy, LifecycleMaintenanceReport};
+pub use observability::{
+    OperationalEvent, OperationalEventFilter, OperationalEventKind, OperationalEventLog,
+    OperationalEventOutcome,
+};
 pub use query::{
     Aggregate, AggregateFunction, AggregateOutput, Comparison, ComparisonOperator,
     FilterExpression, FilterLiteral, GroupByRequest, GroupByResult, GroupedRow, HydrationError,
