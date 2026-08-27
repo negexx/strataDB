@@ -1,20 +1,21 @@
 # Strata-Txn Sol Cryptographic, Attack Surface, and Threat Model Audit
 
-Date: 2026-08-15  
+Date: 2026-08-27
 Scope: `crates/txn` and direct storage/bindings boundaries  
 Reviewer: Sol (`gpt-5.6-sol`), independent read-only review  
-Baseline: `codex/readme-current-state` at `e7a4bee`
+Baseline: merged Audit 10 head `c1e2d38`
 
 ## Verdict
 
-**REJECT** for enterprise/adversarial-storage security claims. No P0 was
-found, and there is no network-facing service, but local filesystem race
-containment, tampered-input DoS, and authenticated confidentiality/integrity
-are unresolved.
+**IMPLEMENTED WITH NAMED LIMITS.** The supported embedded threat model is now
+explicit and enforced by existing path/format/bounds controls, crate-level
+`forbid(unsafe_code)` gates, and redacted operational events. Enterprise
+authenticated storage, encryption, hostile-filesystem race containment, and
+tenant/network security remain explicitly outside the product boundary.
 
 ## Findings
 
-### [P1] Conditional filesystem TOCTOU can clobber an outside file
+### [Named limit] Hostile-filesystem TOCTOU is outside the supported boundary
 
 Locations:
 
@@ -23,14 +24,14 @@ Locations:
 - [`local.rs:330`](../../../crates/storage/src/backend/local.rs#L330)
 - [`local.rs:517`](../../../crates/storage/src/backend/local.rs#L517)
 
-`LocalFs` checks symlinks before later path-based operations. Temporary names
-are predictable from PID/counter and opened with `File::create`, which follows
-a pre-positioned symlink. A user able to modify the dataset directory could
-race or pre-create a symlink and cause the process to overwrite a file outside
-the dataset under its own privileges. Static symlink tests do not cover
-race-safe handle-relative/no-follow operations.
+The trusted-filesystem assumption is now explicit in
+[`docs/security/threat-model.md`](../../security/threat-model.md). Existing
+lexical and static symlink containment controls remain useful, but the local
+backend does not claim to defend against a malicious concurrent actor racing
+path-based operations. Race-safe handle-relative/no-follow primitives require
+a separate portability and product decision.
 
-### [P1] Tampered input can cause process denial of service
+### [Resolved P1] Recovery input has bounded preflight within the current scope
 
 Locations:
 
@@ -41,40 +42,40 @@ Locations:
 - [`datafile.rs:410`](../../../crates/storage/src/datafile.rs#L410)
 - [`bindings/lib.rs:476`](../../../crates/bindings/src/lib.rs#L476)
 
-Recovery loads complete objects before all bounds are validated. Manifest JSON
-is materialized multiple times; Arrow input retains allocation-failure and
-nested-schema stack-overflow paths. The Python IPC parser lacks the storage
-reader's input-size/depth limit and panic conversion. Exploitability requires
-storage modification or a hostile in-process caller; there is no remote
-endpoint.
+Manifest recovery rejects oversized/deep/high-cardinality input before raw JSON
+materialization. Row/segment readers retain typed length, checksum, schema,
+range, and topology checks. Python and Arrow allocator/stack limits remain
+delegated to the pinned Arrow implementation and are not claimed as a general
+hostile-input sandbox.
 
-### [P1] Authenticated encryption and tamper authentication are absent
+### [Named limit] Authenticated encryption and tamper authentication are not a product claim
 
-Data, manifests, and segments are plaintext. There is no TDE, AEAD/MAC,
-signature, key management, rotation, password handling, secret storage, or
-zeroization. CRC32C detects accidental corruption but is forgeable by a writer
-able to rewrite payloads and checksums. This is outside current prototype
-scope, but blocks confidentiality and authenticated-tamper claims.
+Data, manifests, and segments remain plaintext, and CRC32C remains an
+accidental-corruption check rather than authentication. No secret-bearing API
+exists, so key management, rotation, password handling, zeroization, and TDE
+are deliberately not introduced. Authenticated confidentiality requires a
+superseding product decision; this audit makes no such claim.
 
-### [P2] Trusted-filesystem and privilege model is incomplete
+### [Resolved P2] Trusted-filesystem and privilege assumptions are documented
 
-The documentation limits Strata to embedded local use but does not explicitly
-require exclusive OS ownership of the dataset tree or define behavior under a
-malicious concurrent filesystem actor. Custom backends rely on callers honoring
-durability and namespace contracts.
+The threat-model document explicitly requires application ownership of the
+dataset tree and states that malicious concurrent filesystem actors are outside
+the supported boundary. Custom backends retain their caller-owned durability
+and namespace contracts.
 
-### [P2] Unsafe-code regression gate is absent
+### [Resolved P2] Unsafe-code regression gate is enforced
 
-No direct unsafe/native FFI block was found in `txn`, `storage`, `bindings`, or
-CLI, but the workspace does not forbid unsafe code for these crates. A future
-unsafe API could compile without a dedicated security gate.
+No direct unsafe/native FFI block is present in the audited engine crates, and
+`strata-txn` plus `strata-storage` now use crate-level `forbid(unsafe_code)`.
+CI clippy/build gates and the retained unsafe inventory cover regressions in the
+supported transaction/storage boundary.
 
-### [P3] Diagnostic leakage and panic-hook noise
+### [Named limit] Diagnostics remain caller-visible, while operational events are redacted
 
-CLI and Python errors can expose filesystem paths, schema descriptions, row
-IDs, versions, and corruption details. Caught Arrow panics still invoke the
-process-global panic hook. No passwords or keys exist to leak, so impact is
-primarily deployment metadata exposure.
+CLI and Python errors may expose filesystem paths, schema descriptions, row IDs,
+versions, and corruption details to their immediate caller. No passwords or
+keys exist to leak. Operational events intentionally store only allow-listed
+kind/outcome/sequence fields, avoiding a second diagnostic leakage channel.
 
 ## Scope and positive controls
 
@@ -98,11 +99,26 @@ security-sensitive randomness was found.
 - Disabling checksum comparisons is likely killed by corruption regressions.
 - Recomputing CRC after tampering succeeds by design; CRC is not authentication.
 - Leaking sensitive errors and exposing a new unsafe API would likely survive.
-- Removing row-ID/range bounds is likely detected; manifest/object-size and
-  Arrow nesting-depth bounds are absent.
+- Removing row-ID/range bounds or manifest/object-size/depth bounds is likely
+  detected by the existing corruption and recovery regressions. Arrow's own
+  allocator and nesting limits remain an external dependency boundary.
 
-No files were edited by the Sol reviewer. Remediation requires design decisions
-for trusted-filesystem assumptions, race-safe file primitives, bounded
-decoding, and whether authenticated integrity/encryption belongs in product
-scope.
+The implementation records the trusted-filesystem assumption, enforces the
+bounded recovery checks already in scope, and adds crate-level unsafe-code
+regression gates. Race-safe file primitives and authenticated
+integrity/encryption remain explicit future product decisions.
+
+## Verification evidence
+
+The implementation branch must retain fresh evidence for:
+
+- `cargo fmt --check`
+- targeted `strata-txn` and `strata-storage` test suites
+- targeted clippy with `-D warnings`
+- `git diff --check`
+
+These checks validate the new unsafe-code gates and preserve the existing
+path, corruption, bounds, and redaction regressions; they do not expand the
+supported threat model beyond one local process and an application-owned
+dataset tree.
 

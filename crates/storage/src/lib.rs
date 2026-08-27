@@ -4,6 +4,8 @@
 //! engine facade. Direct storage use is an implementation surface and does
 //! not carry the facade's schema, conflict, or recovery guarantees.
 
+#![forbid(unsafe_code)]
+
 pub mod backend;
 pub mod chaos;
 pub mod datafile;

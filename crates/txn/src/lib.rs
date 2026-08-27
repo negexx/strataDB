@@ -5,6 +5,8 @@
 //! `Dataset`, `Snapshot`, and `Transaction` are the supported engine surface;
 //! storage, index, and query crates are internal implementation layers.
 
+#![forbid(unsafe_code)]
+
 pub mod commit_log;
 pub mod compaction;
 pub mod dataset;
