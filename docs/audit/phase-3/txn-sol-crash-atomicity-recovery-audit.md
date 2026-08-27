@@ -109,7 +109,7 @@ power-loss behavior, or cross-process coordination.
 
 | Command | Result |
 |---|---|
-| `cargo test -p strata-storage --no-default-features --features test-fault-injection --lib manifest::tests::commit_manifest_reports_indeterminate_after_final_name_creation_sync_failure -- --exact` | Exit 0; 1 test passed; the post-rename sync fault is classified as indeterminate and the final manifest remains readable. |
+| `cargo test -p strata-storage --no-default-features --features test-fault-injection --lib manifest::tests::commit_manifest_reports_indeterminate_after_final_name_creation_sync_failure -- --exact` | Exit 0; 1 test passed; the post-final-name hard-link synchronization fault is classified as indeterminate and the final manifest remains readable. |
 | `cargo test -p strata-txn --no-default-features --features test-fault-injection --lib dataset::tests::indeterminate_manifest_publication_installs_the_candidate_before_reporting_it -- --exact` | Exit 0; 1 test passed; the shared handle installs the verified candidate before returning the typed error. |
 | `cargo test -p strata-txn --no-default-features --features test-fault-injection --test compaction compaction_indeterminate_publication_installs_candidate_before_returning_error -- --exact` | Exit 0; 1 test passed; compaction applies the same reconciliation boundary. |
 | `cargo test -p strata-txn --no-default-features --features test-fault-injection --test schema_migrations migration_indeterminate_publication_installs_schema_before_returning_error -- --exact` | Exit 0; 1 test passed; schema publication applies the same reconciliation boundary. |
