@@ -1,15 +1,18 @@
 # Strata-Txn Sol Crash Atomicity, Fault Injection, and Recovery Audit
 
-Date: 2026-08-15  
+Date: 2026-08-27
 Scope: `crates/txn` and the storage publication/recovery APIs it directly
 depends on  
 Reviewer: Sol (`gpt-5.6-sol`), independent read-only review  
-Baseline: `codex/readme-current-state` at `e7a4bee`
+Baseline: merged Audit 6 mainline at `3f9d5e6`
 
 ## Verdict
 
-**REJECT.** No P0 was found, but one P1 recovery-state defect and missing fresh
-verification prevent approval.
+**IMPLEMENTED WITH NAMED LIMITS.** The former P1 recovery-state defect is
+resolved in the current transaction and storage publication paths, with
+focused fault-injection and recovery regressions. The remaining P2/P3 items
+are explicit product boundaries rather than unaddressed crash-atomicity
+defects.
 
 Strata does not use a WAL in this path. Its durability model is based on
 immutable Arrow row files, immutable HNSW segments, versioned manifests, and a
@@ -17,7 +20,7 @@ separate immutable row-ID high-water collection.
 
 ## Findings
 
-### [P1] Post-rename manifest-sync failure can leave the live handle behind disk
+### [Resolved P1] Post-rename manifest-sync failure is reconciled before returning
 
 Locations:
 
@@ -25,16 +28,22 @@ Locations:
 - [`crates/txn/src/dataset.rs:2230`](../../../crates/txn/src/dataset.rs#L2230)
 - [`crates/storage/src/manifest.rs:502`](../../../crates/storage/src/manifest.rs#L502)
 
-The local backend renames the manifest into its final name before synchronizing
-the directory chain. That later sync can fail. `Transaction::commit` returns
-before updating the OCC log or in-memory snapshot, while recovery selects the
-highest renamed manifest. After an uncertain sync error, `Dataset::open` may
-see the commit while the existing handle does not. A same-handle retry can
-derive the same next version and overwrite the manifest key.
+The local backend still renames the manifest before synchronizing its directory
+chain, so the sync result can be uncertain. `commit_manifest_with` now verifies
+the exact final-name bytes and returns a typed
+`StorageError::PublicationIndeterminate` only when those bytes are readable.
+`Transaction::commit` installs the verified candidate snapshot and commit-log
+entry while holding `commit_lock` before returning the typed indeterminate
+error. A same-handle retry therefore cannot overwrite the immutable candidate
+or derive an unrecorded version.
 
-Ordinary commits lack typed uncertainty, handle poisoning/refresh, retry
-guidance, and a deterministic post-rename regression. Sol must define the
-uncertain-publication semantics before Terra changes implementation.
+The behavior is regression-covered by
+`dataset::tests::indeterminate_manifest_publication_installs_the_candidate_before_reporting_it`,
+`storage::manifest::tests::commit_manifest_reports_indeterminate_after_final_name_creation_sync_failure`,
+and the compaction/schema-migration equivalents. The API requires callers to
+stop using an indeterminate handle and reopen it before retrying creation;
+this is a typed, bounded local-filesystem contract, not a universal power-loss
+proof.
 
 ### [P2] Arbitrary byte-prefix or volume rollback is unsupported
 
@@ -86,13 +95,17 @@ orphan cleanup and bounded growth remain explicit limits.
 
 ## Verification status
 
-The Sol review did not complete a fresh Cargo command before its requested
-early return, so no fresh pass is claimed in its report. CI recipes and
-historical evidence were inspected for fault injection, row-ID restart, fast
-chaos, loom publication models, and scheduled 2,000-seed chaos. Historical
-evidence is not current-head evidence.
+The current branch has fresh focused verification for the publication and
+recovery paths. The report does not claim arbitrary volume rollback, universal
+power-loss behavior, or cross-process coordination.
 
-No files were edited by the Sol reviewer. Implementation requires a focused Sol
-design for ordinary-commit uncertain-publication semantics, followed by a
-Terra plan and regression coverage.
+| Command | Result |
+|---|---|
+| `cargo test -p strata-storage --no-default-features --features test-fault-injection --lib manifest::tests::commit_manifest_reports_indeterminate_after_final_name_creation_sync_failure -- --exact` | Exit 0; 1 test passed; the post-rename sync fault is classified as indeterminate and the final manifest remains readable. |
+| `cargo test -p strata-txn --no-default-features --features test-fault-injection --lib dataset::tests::indeterminate_manifest_publication_installs_the_candidate_before_reporting_it -- --exact` | Exit 0; 1 test passed; the shared handle installs the verified candidate before returning the typed error. |
+| `cargo test -p strata-txn --no-default-features --features test-fault-injection --test compaction compaction_indeterminate_publication_installs_candidate_before_returning_error -- --exact` | Exit 0; 1 test passed; compaction applies the same reconciliation boundary. |
+| `cargo test -p strata-txn --no-default-features --features test-fault-injection --test schema_migrations migration_indeterminate_publication_installs_schema_before_returning_error -- --exact` | Exit 0; 1 test passed; schema publication applies the same reconciliation boundary. |
+
+The exact hosted CI evidence for this branch is recorded by its pull request;
+local results above are the focused behavioral evidence for the audit finding.
 
