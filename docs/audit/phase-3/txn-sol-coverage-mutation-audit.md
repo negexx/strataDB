@@ -4,16 +4,20 @@ Date: 2026-08-27
 Scope: `crates/txn`, transaction tests, CI recipes, loom, fuzz, chaos, and
 benchmark evidence  
 Reviewer: Sol (`gpt-5.6-sol`), independent read-only review  
-Baseline: merged Audit 2 head `d08f5d6`
+Baseline for the measured coverage/mutation evidence: remediation head
+`f851d2b` (`test(txn): close audit 3 coverage and mutation gaps`). The later
+merged Audit 2 head `d08f5d6` is explicitly outside those measurements.
 
 ## Verdict
 
-**IMPLEMENTED WITH NAMED LIMITS.** The correctness-critical publication
-scenario and the practical normal-code mutation gaps identified by the audit
-were closed with focused behavioral tests and independently reviewed
-remediation slices. Measured coverage and mutation evidence is recorded below;
-these results are not a universal release threshold or a claim of exhaustive
-state-space coverage.
+**IMPLEMENTED WITH NAMED LIMITS.** At the measured remediation head
+`f851d2b`, the correctness-critical publication scenario and the practical
+normal-code mutation gaps identified by the audit were closed with focused
+behavioral tests and independently reviewed remediation slices. The later
+merged changes through `d08f5d6` are explicitly excluded from the quoted
+coverage/mutation denominator; this report is not a current-head coverage
+claim. The results below are not a universal release threshold or a claim of
+exhaustive state-space coverage.
 
 Coverage percentages and mutation outcomes are recorded in the execution
 addenda below; they are evidence for this bounded audit, not a universal
@@ -29,6 +33,8 @@ Locations:
 - [`crates/storage/src/backend/local.rs:359`](../../../crates/storage/src/backend/local.rs#L359)
 - [`crates/txn/src/dataset.rs:2231`](../../../crates/txn/src/dataset.rs#L2231)
 - [`crates/txn/src/dataset.rs:2239`](../../../crates/txn/src/dataset.rs#L2239)
+- [`crates/txn/tests/compaction.rs:264`](../../../crates/txn/tests/compaction.rs#L264)
+- [`crates/txn/tests/schema_migrations.rs:253`](../../../crates/txn/tests/schema_migrations.rs#L253)
 
 Transaction-level tests now verify indeterminate publication reconciliation,
 reopen visibility, unique subsequent publication, and row/index state after
@@ -49,26 +55,29 @@ The destructive authority branch protecting manifests with
 `committed_at_us == 0` is at
 [`retention.rs:261`](../../../crates/txn/src/retention.rs#L261). The age
 retention test creates only positively timestamped manifests at
-[`retention_age.rs:7`](../../../crates/txn/tests/retention_age.rs#L7).
+[`retention_age.rs:58`](../../../crates/txn/tests/retention_age.rs#L58).
 The retention suite now covers the zero-timestamp protection branch,
 including the never-age-prune behavior.
 
 ### [Resolved P2] Maintenance policy validation has invalid-branch tests
 
 Three zero-value conditions are joined by `||` at
-[`maintenance.rs:63`](../../../crates/txn/src/maintenance.rs#L63), while the
-tests use valid policies at
-[`maintenance.rs:7`](../../../crates/txn/tests/maintenance.rs#L7) and
-[`maintenance.rs:38`](../../../crates/txn/tests/maintenance.rs#L38).
+[`maintenance.rs:86`](../../../crates/txn/src/maintenance.rs#L86), with
+invalid-policy tests at
+[`maintenance.rs:68`](../../../crates/txn/tests/maintenance.rs#L68),
+[`maintenance.rs:85`](../../../crates/txn/tests/maintenance.rs#L85), and
+[`maintenance.rs:102`](../../../crates/txn/tests/maintenance.rs#L102).
 The maintenance suite covers each invalid zero-value policy condition and the
 valid paths, preventing the identified guard mutations from silently passing.
 
 ### [Named P3] Some fault tests verify failure but not error identity
 
-For example, injected manifest failures use generic `is_err()` assertions at
-[`dataset.rs:8687`](../../../crates/txn/src/dataset.rs#L8687). Changing the
-error category could survive. Conflict, target, unsupported-read, and many
-lifecycle tests do assert exact variants, so this gap is localized.
+For example, the injected manifest-failure path is asserted with its exact
+typed I/O variant at
+[`dataset.rs:10244`](../../../crates/txn/src/dataset.rs#L10244), while some
+other fault tests still use generic failure assertions. Conflict, target,
+unsupported-read, and many lifecycle tests assert exact variants, so this
+remaining gap is localized.
 
 ## Strong behavioral/state evidence
 
@@ -118,6 +127,10 @@ classification of survivors.
   environment.
 - `cargo-llvm-cov` and `cargo-mutants` were installed and executed; grcov and
   cargo-tarpaulin were not required for the recorded evidence.
+- The measured campaign is intentionally pinned to `f851d2b`; later changes
+  through `d08f5d6` are outside its evidence scope. A current-head refresh was
+  attempted separately but is not used as evidence when its complete result
+  is unavailable.
 - Fuzz CI runs deterministic smoke inputs, not a sustained transaction-state
   fuzz campaign.
 - Thorough chaos runs are scheduled/manual rather than part of every CI run.
