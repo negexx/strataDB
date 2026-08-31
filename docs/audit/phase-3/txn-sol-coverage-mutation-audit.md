@@ -1,22 +1,31 @@
 # Strata-Txn Sol Structural, Behavioral, and Mutation Coverage Audit
 
-Date: 2026-08-15  
+Date: 2026-08-27
 Scope: `crates/txn`, transaction tests, CI recipes, loom, fuzz, chaos, and
 benchmark evidence  
 Reviewer: Sol (`gpt-5.6-sol`), independent read-only review  
-Baseline: `codex/readme-current-state` at `e7a4bee`
+Baseline for the measured coverage/mutation evidence: remediation head
+`f851d2b` (`test(txn): close audit 3 coverage and mutation gaps`). The later
+merged Audit 2 head `d08f5d6` is explicitly outside those measurements.
 
 ## Verdict
 
-**REJECT.** No P0 was found. One P1 correctness-critical coverage gap and
-several P2/P3 mutation gaps prevent approval.
+**IMPLEMENTED WITH NAMED LIMITS.** At the measured remediation head
+`f851d2b`, the correctness-critical publication scenario and the practical
+normal-code mutation gaps identified by the audit were closed with focused
+behavioral tests and independently reviewed remediation slices. The later
+merged changes through `d08f5d6` are explicitly excluded from the quoted
+coverage/mutation denominator; this report is not a current-head coverage
+claim. The results below are not a universal release threshold or a claim of
+exhaustive state-space coverage.
 
-No coverage percentages are claimed: test volume is not statement, branch, or
-mutation coverage.
+Coverage percentages and mutation outcomes are recorded in the execution
+addenda below; they are evidence for this bounded audit, not a universal
+quality SLO.
 
 ## Findings
 
-### [P1] Post-publication sync failure has no transaction-level behavioral coverage
+### [Resolved P1] Post-publication sync failure has transaction-level behavioral coverage
 
 Locations:
 
@@ -24,47 +33,51 @@ Locations:
 - [`crates/storage/src/backend/local.rs:359`](../../../crates/storage/src/backend/local.rs#L359)
 - [`crates/txn/src/dataset.rs:2231`](../../../crates/txn/src/dataset.rs#L2231)
 - [`crates/txn/src/dataset.rs:2239`](../../../crates/txn/src/dataset.rs#L2239)
+- [`crates/txn/tests/compaction.rs:264`](../../../crates/txn/tests/compaction.rs#L264)
+- [`crates/txn/tests/schema_migrations.rs:253`](../../../crates/txn/tests/schema_migrations.rs#L253)
 
-Storage tests prove that a manifest can become visible before directory sync
-returns an error, but no transaction test verifies reopen/retry behavior,
-stale-handle reconciliation, version uniqueness, or row/index state after that
-outcome. Existing tests model failures before publication only. This is the
-same durability gap identified by the correctness audit and requires a Sol
-design before implementation.
+Transaction-level tests now verify indeterminate publication reconciliation,
+reopen visibility, unique subsequent publication, and row/index state after
+the outcome. Compaction and schema-migration publication barriers are covered
+as well. Blind replay remains prohibited by the documented typed error
+contract.
 
-### [P2] No measurable statement, branch, or mutation coverage gate
+### [Resolved P2] Measurable statement, branch, and mutation evidence recorded
 
-The graph indexes 246 unit tests and 89 `crates/txn/tests` integration tests,
-but no `cargo-llvm-cov`, grcov, tarpaulin, cargo-mutants configuration,
-baseline, report, or CI threshold was found. CI runs normal/feature tests,
-loom, and fuzz smoke, but does not record line/branch coverage or mutation
-results.
+The execution addenda record reproducible `cargo-llvm-cov` line/function/branch
+results and a `cargo-mutants` campaign with its denominator and outcome
+classification. The repository does not impose a universal percentage gate;
+coverage is evidence for this bounded audit rather than an SLO.
 
-### [P2] Legacy zero-timestamp retention protection lacks a branch test
+### [Resolved P2] Legacy zero-timestamp retention protection has a branch test
 
 The destructive authority branch protecting manifests with
 `committed_at_us == 0` is at
 [`retention.rs:261`](../../../crates/txn/src/retention.rs#L261). The age
 retention test creates only positively timestamped manifests at
-[`retention_age.rs:7`](../../../crates/txn/tests/retention_age.rs#L7).
-Removing the zero-timestamp guard would likely survive existing tests.
+[`retention_age.rs:58`](../../../crates/txn/tests/retention_age.rs#L58).
+The retention suite now covers the zero-timestamp protection branch,
+including the never-age-prune behavior.
 
-### [P2] Maintenance policy validation lacks invalid-branch tests
+### [Resolved P2] Maintenance policy validation has invalid-branch tests
 
 Three zero-value conditions are joined by `||` at
-[`maintenance.rs:63`](../../../crates/txn/src/maintenance.rs#L63), while the
-tests use valid policies at
-[`maintenance.rs:7`](../../../crates/txn/tests/maintenance.rs#L7) and
-[`maintenance.rs:38`](../../../crates/txn/tests/maintenance.rs#L38).
-An `||` to `&&` mutation or removal of an individual guard would likely
-survive.
+[`maintenance.rs:86`](../../../crates/txn/src/maintenance.rs#L86), with
+invalid-policy tests at
+[`maintenance.rs:68`](../../../crates/txn/tests/maintenance.rs#L68),
+[`maintenance.rs:85`](../../../crates/txn/tests/maintenance.rs#L85), and
+[`maintenance.rs:102`](../../../crates/txn/tests/maintenance.rs#L102).
+The maintenance suite covers each invalid zero-value policy condition and the
+valid paths, preventing the identified guard mutations from silently passing.
 
-### [P3] Some fault tests verify failure but not error identity
+### [Named P3] Some fault tests verify failure but not error identity
 
-For example, injected manifest failures use generic `is_err()` assertions at
-[`dataset.rs:8687`](../../../crates/txn/src/dataset.rs#L8687). Changing the
-error category could survive. Conflict, target, unsupported-read, and many
-lifecycle tests do assert exact variants, so this gap is localized.
+For example, the injected manifest-failure path is asserted with its exact
+typed I/O variant at
+[`dataset.rs:10244`](../../../crates/txn/src/dataset.rs#L10244), while some
+other fault tests still use generic failure assertions. Conflict, target,
+unsupported-read, and many lifecycle tests assert exact variants, so this
+remaining gap is localized.
 
 ## Strong behavioral/state evidence
 
@@ -104,21 +117,29 @@ Representative evidence includes
 | Change maintenance validation `||` to `&&` | Likely survives |
 | Change injected manifest-failure error category | Likely survives generic `is_err()` assertions |
 
-These are static predictions, not executed mutation results.
+The initial table was a static prediction. The execution and remediation
+addenda below supersede it with measured campaign outcomes and explicit
+classification of survivors.
 
 ## Tool and evidence blockers
 
-- Native transaction tests cannot run because `link.exe` is unavailable.
-- `cargo-llvm-cov`, grcov, cargo-mutants, and cargo-tarpaulin are unavailable.
+- Native transaction tests now run with the configured MSVC and Windows SDK
+  environment.
+- `cargo-llvm-cov` and `cargo-mutants` were installed and executed; grcov and
+  cargo-tarpaulin were not required for the recorded evidence.
+- The measured campaign is intentionally pinned to `f851d2b`; later changes
+  through `d08f5d6` are outside its evidence scope. A current-head refresh was
+  attempted separately but is not used as evidence when its complete result
+  is unavailable.
 - Fuzz CI runs deterministic smoke inputs, not a sustained transaction-state
   fuzz campaign.
 - Thorough chaos runs are scheduled/manual rather than part of every CI run.
 - Criterion benchmarks provide performance measurements, not mutation or
   correctness assertions.
 
-No files were edited by the Sol reviewer. This document is an audit record;
-the identified coverage gaps should be addressed through a Sol plan before
-Terra implementation.
+The original Sol review did not edit source. Subsequent Terra remediation and
+verification are recorded in the dated addenda; the remaining limits are
+explicitly classified rather than presented as green universal gates.
 
 ## 2026-08-16 execution addendum
 
